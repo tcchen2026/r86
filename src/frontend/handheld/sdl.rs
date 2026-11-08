@@ -7,7 +7,8 @@
 //! Keys and controller buttons become the evdev codes the rest of the
 //! frontend reads. Controller buttons are positional (SDL's A is the bottom
 //! face button); the mapping suits Nintendo-labelled handhelds, whose A is
-//! the right face button. The right stick is the mouse, the left stick arrows.
+//! the right face button. The right stick is the mouse, the left stick arrows;
+//! a real mouse (the simulator's, or USB) moves the guest's mouse too.
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::time::{Duration, Instant};
@@ -29,6 +30,9 @@ const TEXTUREACCESS_STREAMING: c_int = 1;
 const QUIT: u32 = 0x100;
 const KEYDOWN: u32 = 0x300;
 const KEYUP: u32 = 0x301;
+const MOUSE_MOTION: u32 = 0x400;
+const MOUSE_BUTTON_DOWN: u32 = 0x401;
+const MOUSE_BUTTON_UP: u32 = 0x402;
 const CONTROLLER_AXIS: u32 = 0x650;
 const CONTROLLER_BUTTON_DOWN: u32 = 0x651;
 const CONTROLLER_BUTTON_UP: u32 = 0x652;
@@ -81,6 +85,9 @@ impl Event {
     }
     fn u32(&self, at: usize) -> u32 {
         u32::from_ne_bytes(self.0[at..at + 4].try_into().unwrap())
+    }
+    fn i32(&self, at: usize) -> i32 {
+        i32::from_ne_bytes(self.0[at..at + 4].try_into().unwrap())
     }
     fn i16(&self, at: usize) -> i16 {
         i16::from_ne_bytes(self.0[at..at + 2].try_into().unwrap())
@@ -226,6 +233,8 @@ pub struct Window {
     triggers: [bool; 2],
     pointer_time: Instant,
     pointer_rest: (f32, f32),
+    /// Relative motion of a real mouse (the simulator's, or a USB mouse).
+    mouse: (i32, i32),
 }
 
 impl Window {
@@ -305,6 +314,7 @@ impl Window {
                 triggers: [false; 2],
                 pointer_time: Instant::now(),
                 pointer_rest: (0.0, 0.0),
+                mouse: (0, 0),
             };
             for index in 0..(this.api.num_joysticks)() {
                 this.open_controller(index);
@@ -440,6 +450,18 @@ impl Window {
                     }
                     _ => {}
                 }
+            }
+            MOUSE_MOTION => {
+                self.mouse.0 += event.i32(28);
+                self.mouse.1 += event.i32(32);
+            }
+            kind @ (MOUSE_BUTTON_DOWN | MOUSE_BUTTON_UP) => {
+                let code = match event.u8(16) {
+                    1 => keymap::BTN_LEFT,
+                    3 => keymap::BTN_RIGHT,
+                    _ => return,
+                };
+                self.key(code, kind == MOUSE_BUTTON_DOWN);
             }
             CONTROLLER_ADDED => self.open_controller(event.u32(8) as c_int),
             _ => {}
@@ -612,7 +634,8 @@ impl Device for Window {
         let x = self.pointer_rest.0 + stick_speed(self.stick.0) * POINTER_SPEED * dt;
         let y = self.pointer_rest.1 + stick_speed(self.stick.1) * POINTER_SPEED * dt;
         self.pointer_rest = (x.fract(), y.fract());
-        (x.trunc() as i32, y.trunc() as i32)
+        let (mx, my) = std::mem::take(&mut self.mouse);
+        (x.trunc() as i32 + mx, y.trunc() as i32 + my)
     }
 
     fn menu_keys(&self) -> &'static str {
@@ -620,6 +643,23 @@ impl Device for Window {
             "Start"
         } else {
             "Ctrl+Alt+M"
+        }
+    }
+
+    fn help(&self) -> &'static [(&'static str, &'static str)] {
+        if self.full_screen {
+            &[
+                ("Right stick", "move the mouse"),
+                ("R1 or R3", "left click"),
+                ("R2 or L3", "right click"),
+                ("Select", "on-screen keyboard"),
+                ("Start", "r86 menu"),
+            ]
+        } else {
+            &[
+                ("Ctrl+Alt+K", "on-screen keyboard"),
+                ("Ctrl+Alt+M", "r86 menu"),
+            ]
         }
     }
 }

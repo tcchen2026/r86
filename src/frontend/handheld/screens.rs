@@ -24,6 +24,8 @@ pub struct Ctx {
     pub memory_limit: u32,
     /// The chord that opens the in-VM menu, for hints.
     pub menu_keys: &'static str,
+    /// Mouse and menu controls, for the VM menu's help screen.
+    pub help: &'static [(&'static str, &'static str)],
 }
 
 pub enum Reply {
@@ -39,7 +41,6 @@ pub enum Reply {
 pub enum Action {
     Resume,
     CycleView,
-    ToggleMouseKeys,
     CtrlAltDel,
     Cd(Option<PathBuf>),
     PowerButton,
@@ -1206,6 +1207,44 @@ impl View for Message {
     }
 }
 
+/// The device's mouse and menu controls, from the VM menu.
+struct Help;
+
+impl View for Help {
+    fn draw(&mut self, c: &mut Canvas, ctx: &Ctx) {
+        c.fill(BG);
+        ui::header(c, "Help", "");
+        let area = ui::body(c);
+        let font = Font::Normal;
+        let gap = 16;
+        let left = ctx
+            .help
+            .iter()
+            .map(|row| font.width(row.0))
+            .max()
+            .unwrap_or(0);
+        let right = ctx
+            .help
+            .iter()
+            .map(|row| font.width(row.1))
+            .max()
+            .unwrap_or(0);
+        let x = (c.width - left - gap - right) / 2;
+        let line = font.height() + 4;
+        let mut y = area.y + (area.h - ctx.help.len() as i32 * line) / 2;
+        for &(control, action) in ctx.help {
+            c.text(x, y, control, TEXT, font);
+            c.text(x + left + gap, y, action, MUTED, font);
+            y += line;
+        }
+        ui::footer(c, "Any key: back");
+    }
+
+    fn key(&mut self, _key: UiKey, _ctx: &Ctx) -> Nav {
+        Nav::Pop(None)
+    }
+}
+
 /// Shows a background job; pops `Reply::Done` when it finishes.
 struct Progress {
     title: String,
@@ -1295,7 +1334,6 @@ pub struct VmOverlay {
 pub struct OverlayLabels {
     pub name: String,
     pub view: &'static str,
-    pub mouse_keys: bool,
     pub cd: Option<String>,
     /// The console address while remote management is on.
     pub remote: Option<String>,
@@ -1321,10 +1359,10 @@ impl VmOverlay {
         self.menu = Menu::new(vec![
             Item::new("Resume").color(GOOD),
             Item::new("View").detail(l.view),
-            Item::new("Mouse keys").detail(if l.mouse_keys { "on" } else { "off" }),
             Item::new("Send Ctrl+Alt+Del"),
             Item::new("CD").detail(cd),
             Item::new("Remote management").detail(if l.remote.is_some() { "on" } else { "off" }),
+            Item::new("Help"),
             Item::new("Power button"),
             Item::new("Reset"),
             Item::new("Turn off now").color(BAD),
@@ -1343,8 +1381,8 @@ impl View for VmOverlay {
             w: c.width,
             h: c.height,
         });
-        let name = self.labels.borrow().name.clone();
-        ui::header(c, &name, "paused");
+        let title = format!("r86: {}", self.labels.borrow().name);
+        ui::header(c, &title, "paused");
         let area = ui::body(c);
         let panel = Rect {
             x: 40,
@@ -1371,9 +1409,8 @@ impl View for VmOverlay {
             UiKey::Enter => match self.menu.selected {
                 0 => Nav::Action(Action::Resume),
                 1 => Nav::Action(Action::CycleView),
-                2 => Nav::Action(Action::ToggleMouseKeys),
-                3 => Nav::Action(Action::CtrlAltDel),
-                4 => {
+                2 => Nav::Action(Action::CtrlAltDel),
+                3 => {
                     self.cd = true;
                     Nav::Push(Box::new(Browser::new(
                         "Insert a CD image",
@@ -1382,7 +1419,8 @@ impl View for VmOverlay {
                         Some("Eject"),
                     )))
                 }
-                5 => Nav::Action(Action::Remote),
+                4 => Nav::Action(Action::Remote),
+                5 => Nav::Push(Box::new(Help)),
                 6 => Nav::Action(Action::PowerButton),
                 7 => Nav::Action(Action::Reset),
                 _ => Nav::Push(Box::new(Confirm::new(

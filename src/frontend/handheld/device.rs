@@ -36,6 +36,9 @@ pub trait Device {
     fn read(&mut self, out: &mut Vec<KeyEvent>);
     /// The chord that opens the in-VM menu, for on-screen hints.
     fn menu_keys(&self) -> &'static str;
+    /// Mouse and menu controls as (control, action) rows, for the VM menu's
+    /// help screen.
+    fn help(&self) -> &'static [(&'static str, &'static str)];
 }
 
 #[derive(Clone, Copy, Debug)]

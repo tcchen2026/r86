@@ -9,8 +9,11 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+use super::cardputer;
 use super::device::{Device, KeyEvent};
+use super::keymap;
 use super::ui::Canvas;
 
 /// The Linux framebuffer LCD and evdev keyboards.
@@ -32,8 +35,24 @@ impl Device for Lcd {
     fn read(&mut self, out: &mut Vec<KeyEvent>) {
         self.keyboard.read(out);
     }
+    fn pointer_motion(&mut self) -> (i32, i32) {
+        self.keyboard.pointer_motion()
+    }
     fn menu_keys(&self) -> &'static str {
-        "Fn+Sym"
+        "Fn+Esc"
+    }
+    fn help(&self) -> &'static [(&'static str, &'static str)] {
+        if self.keyboard.cardputer() {
+            &[
+                ("Sym+F / Sym+X", "mouse up / down"),
+                ("Sym+Z / Sym+C", "mouse left / right"),
+                ("Sym+Enter", "left click"),
+                ("Sym+Space", "right click"),
+                ("Fn+Esc", "r86 menu"),
+            ]
+        } else {
+            &[("Ctrl+Alt+M", "r86 menu")]
+        }
     }
 }
 
@@ -184,12 +203,31 @@ struct InputEvent {
 }
 
 const EV_KEY: u16 = 1;
+const EV_REP: u32 = 20;
+/// Held keys repeat like a PC keyboard's typematic on devices without it.
+const REPEAT_DELAY: Duration = Duration::from_millis(400);
+const REPEAT_INTERVAL: Duration = Duration::from_millis(80);
+
+struct Input {
+    file: File,
+    /// The CardputerZero keyboard, translated for the PC guest.
+    cardputer: Option<cardputer::Keys>,
+    /// The kernel does not autorepeat this device's keys; r86 does.
+    repeats: bool,
+}
 
 pub struct Keyboard {
-    devices: Vec<File>,
+    devices: Vec<Input>,
+    /// The repeating key and when it next repeats.
+    repeat: Option<(u16, Instant)>,
 }
 
 impl Keyboard {
+    /// Whether a CardputerZero keyboard (with Sym mouse keys) is open.
+    fn cardputer(&self) -> bool {
+        self.devices.iter().any(|input| input.cardputer.is_some())
+    }
+
     /// Open `paths`, or every input device the kernel lists with a keyboard
     /// handler. Devices are shared, not grabbed: the launcher watches ESC.
     pub fn open(paths: &[PathBuf]) -> Result<Self, String> {
@@ -198,45 +236,75 @@ impl Keyboard {
         } else {
             paths.to_vec()
         };
-        let devices: Vec<File> = paths
+        let devices: Vec<Input> = paths
             .iter()
             .filter_map(|path| {
-                OpenOptions::new()
+                let file = OpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NONBLOCK)
                     .open(path)
                     .map_err(|err| eprintln!("r86: cannot open {}: {err}", path.display()))
-                    .ok()
+                    .ok()?;
+                // /dev/input/eventN describes itself under /sys/class/input/eventN/device.
+                let sysfs = path
+                    .file_name()
+                    .map(|name| Path::new("/sys/class/input").join(name).join("device"));
+                let read = |field: &str| {
+                    sysfs
+                        .as_ref()
+                        .and_then(|dir| fs::read_to_string(dir.join(field)).ok())
+                        .unwrap_or_default()
+                };
+                let ev = u32::from_str_radix(read("capabilities/ev").trim(), 16).unwrap_or(0);
+                Some(Input {
+                    file,
+                    cardputer: (read("name").trim() == cardputer::NAME)
+                        .then(cardputer::Keys::default),
+                    repeats: sysfs.is_some() && ev & 1 << EV_REP == 0,
+                })
             })
             .collect();
         if devices.is_empty() {
             return Err("No keyboard input device could be opened".into());
         }
-        Ok(Self { devices })
+        Ok(Self {
+            devices,
+            repeat: None,
+        })
     }
 
-    /// Sleep until input arrives, a signal is delivered, or the timeout ends.
+    /// Sleep until input arrives, a signal is delivered, a held key repeats,
+    /// or the timeout ends.
     pub fn wait(&self, timeout_ms: i32) {
+        let mut timeout = timeout_ms;
+        if let Some((_, at)) = self.repeat {
+            let until = at.saturating_duration_since(Instant::now()).as_millis();
+            timeout = timeout.min(until as i32);
+        }
+        if self.moving() {
+            timeout = timeout.min(10);
+        }
         let mut fds: Vec<libc::pollfd> = self
             .devices
             .iter()
-            .map(|file| libc::pollfd {
-                fd: file.as_raw_fd(),
+            .map(|input| libc::pollfd {
+                fd: input.file.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             })
             .collect();
         // SAFETY: `fds` is a valid, exclusively borrowed pollfd array.
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
     }
 
     /// Append pending key events without blocking.
     pub fn read(&mut self, out: &mut Vec<KeyEvent>) {
         const SIZE: usize = std::mem::size_of::<InputEvent>();
         let mut buffer = [0u8; SIZE * 32];
-        for device in &mut self.devices {
+        for input in &mut self.devices {
+            let first = out.len();
             loop {
-                let len = match device.read(&mut buffer) {
+                let len = match input.file.read(&mut buffer) {
                     Ok(0) => break,
                     Ok(len) => len,
                     Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
@@ -247,16 +315,75 @@ impl Keyboard {
                     // every bit pattern is a valid InputEvent.
                     let event: InputEvent =
                         unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
-                    if event.kind == EV_KEY {
-                        out.push(KeyEvent {
+                    match &mut input.cardputer {
+                        Some(keys) => keys.event(event.kind, event.code, event.value, out),
+                        None if event.kind == EV_KEY => out.push(KeyEvent {
                             code: event.code,
                             value: event.value,
-                        });
+                        }),
+                        None => {}
+                    }
+                }
+            }
+            if input.repeats {
+                for event in &out[first..] {
+                    match event.value {
+                        1 if repeats(event.code) => {
+                            self.repeat = Some((event.code, Instant::now() + REPEAT_DELAY));
+                        }
+                        0 if self.repeat.is_some_and(|(code, _)| code == event.code) => {
+                            self.repeat = None;
+                        }
+                        _ => {}
                     }
                 }
             }
         }
+        let now = Instant::now();
+        if let Some((code, at)) = self.repeat
+            && now >= at
+        {
+            out.push(KeyEvent { code, value: 2 });
+            self.repeat = Some((code, now + REPEAT_INTERVAL));
+        }
     }
+
+    fn moving(&self) -> bool {
+        self.devices.iter().any(|input| {
+            input
+                .cardputer
+                .as_ref()
+                .is_some_and(cardputer::Keys::moving)
+        })
+    }
+
+    /// Pointer motion from keyboard mouse keys since the last call.
+    pub fn pointer_motion(&mut self) -> (i32, i32) {
+        self.devices
+            .iter_mut()
+            .filter_map(|input| input.cardputer.as_mut())
+            .map(cardputer::Keys::pointer_motion)
+            .fold((0, 0), |(x, y), (dx, dy)| (x + dx, y + dy))
+    }
+}
+
+/// Modifiers, mouse buttons and r86's own keys do not repeat.
+fn repeats(code: u16) -> bool {
+    !matches!(
+        code,
+        keymap::LEFT_SHIFT
+            | keymap::RIGHT_SHIFT
+            | keymap::LEFT_CTRL
+            | keymap::RIGHT_CTRL
+            | keymap::LEFT_ALT
+            | keymap::RIGHT_ALT
+            | keymap::FN
+            | keymap::SYM
+            | keymap::BTN_LEFT
+            | keymap::BTN_RIGHT
+            | keymap::MENU
+            | keymap::OSK
+    )
 }
 
 fn keyboard_devices() -> Vec<PathBuf> {

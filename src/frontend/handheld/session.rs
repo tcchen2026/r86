@@ -1,6 +1,7 @@
 //! A running VM on the handheld screen. One thread interleaves guest slices,
 //! keyboard input, display updates and remote-management requests. The
-//! in-VM menu (Fn+Sym, or Ctrl+Alt+M on other keyboards) pauses the guest.
+//! in-VM menu (Fn+Esc, Start on a controller, or Ctrl+Alt+M on other
+//! keyboards) pauses the guest.
 //!
 //! Remote management serves the r86 web console (ws_frontend::Remote) on the
 //! Wi-Fi: screen, keyboard, mouse, power, virtual CD and, while the VM is off,
@@ -66,7 +67,6 @@ impl View {
 #[derive(Default)]
 struct Modifiers {
     fn_key: bool,
-    sym: bool,
     ctrl: bool,
     alt: bool,
     shift: bool,
@@ -77,7 +77,6 @@ struct Session<'a> {
     machine: Machine,
     ctx: &'a Ctx,
     view: View,
-    mouse_keys: bool,
     /// Keys this frontend holds down in the guest, by evdev code.
     held: Vec<(u16, InputKey)>,
     buttons: Ps2ButtonState,
@@ -137,7 +136,6 @@ pub fn run(
         machine,
         view,
         ctx,
-        mouse_keys: false,
         held: Vec::new(),
         buttons: Ps2ButtonState::default(),
         pointer: (0, 0),
@@ -468,7 +466,6 @@ impl Session<'_> {
         OverlayLabels {
             name: self.vm.name.clone(),
             view: self.view.label(),
-            mouse_keys: self.mouse_keys,
             cd: self.vm.iso.as_ref().map(|iso| {
                 iso.file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -481,13 +478,12 @@ impl Session<'_> {
         let down = event.value != 0;
         match event.code {
             keymap::FN => self.modifiers.fn_key = down,
-            keymap::SYM => self.modifiers.sym = down,
             keymap::LEFT_CTRL | keymap::RIGHT_CTRL => self.modifiers.ctrl = down,
             keymap::LEFT_ALT | keymap::RIGHT_ALT => self.modifiers.alt = down,
             keymap::LEFT_SHIFT | keymap::RIGHT_SHIFT => self.modifiers.shift = down,
             _ => {}
         }
-        let menu_chord = (self.modifiers.fn_key && self.modifiers.sym)
+        let menu_chord = (self.modifiers.fn_key && event.code == keymap::ESC)
             || (self.modifiers.ctrl && self.modifiers.alt && event.code == keymap::KEY_M)
             || event.code == keymap::MENU;
         if let Some(overlay) = &mut self.overlay {
@@ -580,8 +576,9 @@ impl Session<'_> {
             }
             return Ok(None);
         }
-        if self.mouse_keys && self.mouse_key(event) {
-            return Ok(None);
+        if event.code == keymap::ESC && event.value == 1 {
+            // Esc stays the guest's; remind the user how to reach r86.
+            self.notify(&format!("{}: r86 menu", self.ctx.menu_keys));
         }
         self.guest_key(event);
         Ok(None)
@@ -623,35 +620,6 @@ impl Session<'_> {
             }
             _ => {}
         }
-    }
-
-    /// Arrows move the PS/2 mouse, accelerating while held; Enter is the
-    /// left button and Tab the right. Other keys go to the guest.
-    fn mouse_key(&mut self, event: KeyEvent) -> bool {
-        let step = if event.value == 2 { 10 } else { 3 };
-        let (dx, dy) = match event.code {
-            keymap::LEFT => (-step, 0),
-            keymap::RIGHT => (step, 0),
-            keymap::UP => (0, -step),
-            keymap::DOWN => (0, step),
-            keymap::ENTER | keymap::TAB => {
-                if event.value != 2 {
-                    let down = event.value == 1;
-                    if event.code == keymap::ENTER {
-                        self.buttons.left = down;
-                    } else {
-                        self.buttons.right = down;
-                    }
-                    self.machine.inject_mouse(0, 0, self.buttons);
-                }
-                return true;
-            }
-            _ => return false,
-        };
-        if event.value != 0 {
-            self.move_pointer(dx, dy);
-        }
-        true
     }
 
     /// Move the PS/2 mouse and the approximate pointer that zoomed views follow.
@@ -696,23 +664,11 @@ impl Session<'_> {
                     View::Stretch => View::Integer,
                     View::Integer => View::Aspect,
                 };
-                if self.view == View::Integer && !self.mouse_keys {
+                if self.view == View::Integer {
                     self.pointer = (self.frame.0 / 2, self.frame.1 / 2);
                 }
                 self.render_guest();
                 close = false;
-            }
-            Action::ToggleMouseKeys => {
-                self.mouse_keys = !self.mouse_keys;
-                if self.mouse_keys {
-                    self.pointer = (self.frame.0 / 2, self.frame.1 / 2);
-                }
-                let text = if self.mouse_keys {
-                    "Mouse keys on: arrows move, Enter click, Tab right-click"
-                } else {
-                    "Mouse keys off"
-                };
-                self.notify(text);
             }
             Action::CtrlAltDel => {
                 for name in ["controlleft", "altleft", "delete"] {

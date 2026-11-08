@@ -24,6 +24,7 @@ mod ws;
 #[path = "../ws_frontend.rs"]
 mod ws_frontend;
 
+mod cardputer;
 mod device;
 mod keymap;
 mod lcd;
@@ -183,6 +184,7 @@ fn run() -> Result<(), String> {
         home,
         memory_limit: memory_limit(),
         menu_keys: device.menu_keys(),
+        help: device.help(),
     };
     let mut stack = Stack::new(Box::new(Home::new(&ctx)));
     let mut events = Vec::new();
