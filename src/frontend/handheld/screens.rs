@@ -45,6 +45,7 @@ pub enum Reply {
 pub enum Action {
     Resume,
     CycleView,
+    Display,
     CtrlAltDel,
     Cd(Option<PathBuf>),
     PowerButton,
@@ -1449,6 +1450,8 @@ pub struct VmOverlay {
 pub struct OverlayLabels {
     pub name: String,
     pub view: &'static str,
+    /// Present only on an LCD device with an HDMI connector.
+    pub display: Option<bool>,
     pub cd: Option<String>,
     /// The console address while remote management is on.
     pub remote: Option<String>,
@@ -1471,9 +1474,14 @@ impl VmOverlay {
             l.cd.as_deref()
                 .map_or("empty".to_string(), |c| ui::clip(c, 16));
         let selected = self.menu.selected;
-        self.menu = Menu::new(vec![
+        let mut items = vec![
             Item::new("Resume").color(GOOD),
             Item::new("View").detail(l.view),
+        ];
+        if let Some(hdmi) = l.display {
+            items.push(Item::new("Display").detail(if hdmi { "HDMI" } else { "LCD" }));
+        }
+        items.extend([
             Item::new("Send Ctrl+Alt+Del"),
             Item::new("CD").detail(cd),
             Item::new("Remote management").detail(if l.remote.is_some() { "on" } else { "off" }),
@@ -1481,15 +1489,15 @@ impl VmOverlay {
             Item::new("Power button"),
             Item::new("Reset"),
             Item::new("Turn off now").color(BAD),
-        ])
-        .select(selected);
+        ]);
+        self.menu = Menu::new(items).select(selected);
     }
 }
 
 impl View for VmOverlay {
     fn draw(&mut self, c: &mut Canvas, ctx: &Ctx) {
         self.rebuild();
-        // The session has drawn the guest; dim it and float the menu on top.
+        // Dim the session canvas and float the menu on top.
         c.dim(Rect {
             x: 0,
             y: 0,
@@ -1519,9 +1527,14 @@ impl View for VmOverlay {
         if self.menu.key(key) {
             return Nav::Stay;
         }
+        let display = self.labels.borrow().display.is_some();
+        if key == UiKey::Enter && display && self.menu.selected == 2 {
+            return Nav::Action(Action::Display);
+        }
+        let selected = self.menu.selected - usize::from(display && self.menu.selected > 2);
         match key {
             UiKey::Back => Nav::Action(Action::Resume),
-            UiKey::Enter => match self.menu.selected {
+            UiKey::Enter => match selected {
                 0 => Nav::Action(Action::Resume),
                 1 => Nav::Action(Action::CycleView),
                 2 => Nav::Action(Action::CtrlAltDel),
@@ -1555,6 +1568,80 @@ impl View for VmOverlay {
             Some(Reply::NoFile) if cd => Nav::Action(Action::Cd(None)),
             Some(Reply::Yes) => Nav::Action(Action::TurnOff),
             _ => Nav::Stay,
+        }
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    #[test]
+    fn optional_display_keeps_the_other_menu_actions() {
+        let ctx = Ctx {
+            library: PathBuf::new(),
+            share: PathBuf::new(),
+            vhd: PathBuf::new(),
+            iso: PathBuf::new(),
+            memory_limit: 256,
+            menu_keys: "Fn+Esc",
+            help: &[],
+        };
+        for display in [None, Some(false), Some(true)] {
+            let labels = Rc::new(RefCell::new(OverlayLabels {
+                display,
+                ..OverlayLabels::default()
+            }));
+            let mut overlay = VmOverlay::new(labels);
+            let extra = usize::from(display.is_some());
+            assert_eq!(overlay.menu.items.len(), 9 + extra);
+            if let Some(active) = display {
+                assert_eq!(overlay.menu.items[2].label, "Display");
+                assert_eq!(
+                    overlay.menu.items[2].detail,
+                    if active { "HDMI" } else { "LCD" }
+                );
+                overlay.menu.selected = 2;
+                assert!(matches!(
+                    overlay.key(UiKey::Enter, &ctx),
+                    Nav::Action(Action::Display)
+                ));
+            }
+            overlay.menu.selected = 2 + extra;
+            assert!(matches!(
+                overlay.key(UiKey::Enter, &ctx),
+                Nav::Action(Action::CtrlAltDel)
+            ));
+            overlay.menu.selected = 3 + extra;
+            assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
+            assert!(matches!(
+                overlay.reply(Some(Reply::NoFile), &ctx),
+                Nav::Action(Action::Cd(None))
+            ));
+            overlay.menu.selected = 4 + extra;
+            assert!(matches!(
+                overlay.key(UiKey::Enter, &ctx),
+                Nav::Action(Action::Remote)
+            ));
+            overlay.menu.selected = 5 + extra;
+            assert_eq!(overlay.menu.items[overlay.menu.selected].label, "Help");
+            assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
+            overlay.menu.selected = 6 + extra;
+            assert!(matches!(
+                overlay.key(UiKey::Enter, &ctx),
+                Nav::Action(Action::PowerButton)
+            ));
+            overlay.menu.selected = 7 + extra;
+            assert!(matches!(
+                overlay.key(UiKey::Enter, &ctx),
+                Nav::Action(Action::Reset)
+            ));
+            overlay.menu.selected = 8 + extra;
+            assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
+            assert!(matches!(
+                overlay.reply(Some(Reply::Yes), &ctx),
+                Nav::Action(Action::TurnOff)
+            ));
         }
     }
 }

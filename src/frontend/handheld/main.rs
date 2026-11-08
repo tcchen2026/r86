@@ -120,10 +120,21 @@ fn open_device(options: &Options) -> Result<Box<dyn Device>, String> {
         return Ok(Box::new(sdl::Window::simulator(3)?));
     }
     let lcd = || -> Result<Box<dyn Device>, String> {
-        Ok(Box::new(lcd::Lcd {
-            fb: Framebuffer::open(options.fb.as_deref())?,
-            keyboard: Keyboard::open(&options.inputs)?,
-        }))
+        let lcd = lcd::Lcd::new(
+            Framebuffer::open(options.fb.as_deref())?,
+            Keyboard::open(&options.inputs)?,
+        );
+        if lcd.hdmi().is_some()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+            && let Some(socket) = sdl::wayland_socket(std::path::Path::new(&runtime))
+        {
+            // SAFETY: device discovery runs at startup, before SDL or any
+            // download/remote threads. libwayland needs this environment key;
+            // the SDL video driver itself is selected later with SDL_SetHint.
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", socket) };
+        }
+        Ok(Box::new(lcd))
     };
     // A dedicated panel (the CardputerZero's LCD) wins over SDL, which would
     // pick another display such as HDMI.

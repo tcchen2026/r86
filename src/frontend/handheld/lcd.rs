@@ -14,12 +14,62 @@ use std::time::{Duration, Instant};
 use super::cardputer;
 use super::device::{Device, KeyEvent};
 use super::keymap;
-use super::ui::Canvas;
+use super::sdl;
+use super::ui::{self, Canvas, Font, Rect};
+
+const HDMI_STATUS: &str = "/sys/class/drm/card0-HDMI-A-1/status";
 
 /// The Linux framebuffer LCD and evdev keyboards.
 pub struct Lcd {
-    pub fb: Framebuffer,
-    pub keyboard: Keyboard,
+    fb: Framebuffer,
+    keyboard: Keyboard,
+    connector: Option<PathBuf>,
+    hdmi: Option<sdl::Window>,
+    notice: Option<Canvas>,
+    next_hdmi_check: Instant,
+    disconnected: bool,
+}
+
+impl Lcd {
+    pub fn new(fb: Framebuffer, keyboard: Keyboard) -> Self {
+        Self {
+            fb,
+            keyboard,
+            connector: (panel().is_some() && Path::new(HDMI_STATUS).exists())
+                .then(|| PathBuf::from(HDMI_STATUS)),
+            hdmi: None,
+            notice: None,
+            next_hdmi_check: Instant::now(),
+            disconnected: false,
+        }
+    }
+
+    fn connected(&self) -> bool {
+        self.connector
+            .as_ref()
+            .and_then(|path| fs::read_to_string(path).ok())
+            .is_some_and(|status| status.trim() == "connected")
+    }
+
+    fn disconnect(&mut self) {
+        self.hdmi = None;
+        self.notice = None;
+        self.disconnected = true;
+    }
+
+    fn display_result(&mut self, result: Result<(), String>) {
+        if let Err(err) = result {
+            eprintln!("r86: HDMI: {err}");
+            self.disconnect();
+        }
+    }
+
+    fn present_notice(&mut self) -> Result<(), String> {
+        if let Some(notice) = &self.notice {
+            self.fb.present(notice).map_err(|err| err.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 impl Device for Lcd {
@@ -27,16 +77,97 @@ impl Device for Lcd {
         (self.fb.width, self.fb.height)
     }
     fn present(&mut self, canvas: &Canvas) -> Result<(), String> {
+        if let Some(hdmi) = &mut self.hdmi {
+            let result = hdmi.present(canvas);
+            self.display_result(result);
+        }
         self.fb.present(canvas).map_err(|err| err.to_string())
     }
+    fn present_vm(&mut self, canvas: &Canvas) -> Result<(), String> {
+        if let Some(hdmi) = &mut self.hdmi {
+            let result = hdmi.present(canvas);
+            self.display_result(result);
+            self.present_notice()
+        } else {
+            self.fb.present(canvas).map_err(|err| err.to_string())
+        }
+    }
+    fn guest_layer(&self) -> bool {
+        self.hdmi.is_some()
+    }
+    fn present_frame(
+        &mut self,
+        rgba: &[u8],
+        size: (i32, i32),
+        _stretch: bool,
+        view: Rect,
+        ui: &Canvas,
+        ui_area: Option<Rect>,
+    ) -> Result<(), String> {
+        let result = self
+            .hdmi
+            .as_mut()
+            .expect("HDMI guest layer")
+            .present_frame(rgba, size, false, view, ui, ui_area);
+        self.display_result(result);
+        self.present_notice()
+    }
+    fn hdmi(&self) -> Option<bool> {
+        self.connector.as_ref().map(|_| self.hdmi.is_some())
+    }
+    fn set_hdmi(&mut self, enabled: bool, vm_name: &str) -> Result<(), String> {
+        if !enabled {
+            self.hdmi = None;
+            self.notice = None;
+        } else if self.hdmi.is_none() {
+            if !self.connected() {
+                return Err("No HDMI display".into());
+            }
+            let window = sdl::Window::external()?;
+            let mut notice = Canvas::new(self.fb.width, self.fb.height);
+            notice.fill(ui::BG);
+            ui::header(&mut notice, &format!("r86: {vm_name}"), "");
+            let y = (notice.height - Font::Normal.height()) / 2;
+            notice.text_centered(y, "Showing on HDMI", ui::TEXT, Font::Normal);
+            ui::footer(&mut notice, "Fn+Esc: r86 menu");
+            self.notice = Some(notice);
+            self.hdmi = Some(window);
+            self.next_hdmi_check = Instant::now() + Duration::from_secs(1);
+        }
+        self.disconnected = false;
+        Ok(())
+    }
+    fn take_display_disconnect(&mut self) -> bool {
+        std::mem::take(&mut self.disconnected)
+    }
     fn wait(&mut self, timeout_ms: i32) {
-        self.keyboard.wait(timeout_ms);
+        // evdev is the keyboard source; poll SDL's desktop mouse promptly too.
+        self.keyboard.wait(if self.hdmi.is_some() {
+            timeout_ms.min(16)
+        } else {
+            timeout_ms
+        });
     }
     fn read(&mut self, out: &mut Vec<KeyEvent>) {
         self.keyboard.read(out);
+        if let Some(hdmi) = &mut self.hdmi {
+            hdmi.read(out);
+            if hdmi.closed() {
+                self.disconnect();
+            }
+        }
+        let now = Instant::now();
+        if self.hdmi.is_some() && now >= self.next_hdmi_check {
+            self.next_hdmi_check = now + Duration::from_secs(1);
+            if !self.connected() {
+                self.disconnect();
+            }
+        }
     }
     fn pointer_motion(&mut self) -> (i32, i32) {
-        self.keyboard.pointer_motion()
+        let (x, y) = self.keyboard.pointer_motion();
+        let (dx, dy) = self.hdmi.as_mut().map_or((0, 0), Device::pointer_motion);
+        (x + dx, y + dy)
     }
     fn menu_keys(&self) -> &'static str {
         "Fn+Esc"
@@ -395,4 +526,118 @@ fn keyboard_devices() -> Vec<PathBuf> {
         .filter_map(|handlers| handlers.split_whitespace().find(|h| h.starts_with("event")))
         .map(|event| Path::new("/dev/input").join(event))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Run alone on a disposable desktop (e.g. Xvfb). Uses a file framebuffer
+    /// and connector status; the window, renderer and event queue are SDL's.
+    #[test]
+    #[ignore = "requires SDL2 and a Wayland or X11 desktop"]
+    fn hdmi_desktop_lifecycle() {
+        #[repr(C, align(8))]
+        struct Event([u8; 64]);
+        // SAFETY: SDL2's event ABI is a 56-byte, 8-byte-aligned union.
+        // Keep the library open until the last event and window are gone.
+        let lib = unsafe { libc::dlopen(c"libSDL2-2.0.so.0".as_ptr(), libc::RTLD_NOW) };
+        assert!(!lib.is_null());
+        let push: unsafe extern "C" fn(*mut Event) -> i32 = unsafe {
+            let symbol = libc::dlsym(lib, c"SDL_PushEvent".as_ptr());
+            assert!(!symbol.is_null());
+            std::mem::transmute(symbol)
+        };
+        let send = |kind: u32, fields: &[(usize, i32)]| {
+            let mut event = Event([0; 64]);
+            event.0[..4].copy_from_slice(&kind.to_ne_bytes());
+            for &(offset, value) in fields {
+                event.0[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+            }
+            assert_eq!(unsafe { push(&mut event) }, 1);
+        };
+        let dir = std::env::temp_dir().join(format!("r86-hdmi-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let fb = dir.join("fb");
+        let input = dir.join("input");
+        let status = dir.join("status");
+        fs::write(&fb, []).unwrap();
+        fs::write(&input, []).unwrap();
+        fs::write(&status, "disconnected\n").unwrap();
+        let mut lcd = Lcd::new(
+            Framebuffer::open(Some(&fb)).unwrap(),
+            Keyboard::open(&[input]).unwrap(),
+        );
+        lcd.connector = Some(status.clone());
+        assert_eq!(lcd.set_hdmi(true, "Test VM"), Err("No HDMI display".into()));
+        assert!(!lcd.guest_layer());
+        fs::write(&status, "connected\n").unwrap();
+        lcd.set_hdmi(true, "Test VM").unwrap();
+        assert_eq!(lcd.size(), (320, 170));
+        assert!(lcd.guest_layer());
+        let mut canvas = Canvas::new(320, 170);
+        let view = Rect {
+            x: 0,
+            y: 0,
+            w: 320,
+            h: 170,
+        };
+        let mut guest = [255, 0, 0, 255].repeat(640 * 480);
+        lcd.present_frame(&guest, (640, 480), true, view, &canvas, None)
+            .unwrap();
+        let notice = fs::read(&fb).unwrap();
+        guest.copy_from_slice(&[0, 255, 0, 255].repeat(640 * 480));
+        lcd.present_frame(&guest, (640, 480), false, view, &canvas, None)
+            .unwrap();
+        assert_eq!(fs::read(&fb).unwrap(), notice, "guest must not reach LCD");
+        canvas.fill(ui::PANEL);
+        lcd.present(&canvas).unwrap();
+        let menu: Vec<u8> = canvas.pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
+        assert_eq!(fs::read(&fb).unwrap(), menu, "menus must reach LCD");
+        lcd.present_vm(&canvas).unwrap();
+        assert_eq!(fs::read(&fb).unwrap(), notice, "resume restores the notice");
+
+        let mut events = Vec::new();
+        lcd.read(&mut events);
+        events.clear();
+        lcd.pointer_motion();
+        send(0x300, &[(16, 4)]); // SDL A down/up: evdev owns the keyboard.
+        send(0x301, &[(16, 4)]);
+        send(0x651, &[(12, 1)]); // Controller A also must be ignored.
+        send(0x400, &[(28, 60), (32, -40)]);
+        send(0x401, &[(16, 1)]); // Left mouse down/up.
+        send(0x402, &[(16, 1)]);
+        lcd.read(&mut events);
+        assert_eq!(
+            events.iter().map(|e| (e.code, e.value)).collect::<Vec<_>>(),
+            [(keymap::BTN_LEFT, 1), (keymap::BTN_LEFT, 0)]
+        );
+        let (dx, dy) = lcd.pointer_motion();
+        assert!(dx > 0 && dy < 0, "desktop mouse motion: {dx},{dy}");
+
+        fs::write(&status, "disconnected\n").unwrap();
+        lcd.next_hdmi_check = Instant::now();
+        lcd.read(&mut Vec::new());
+        assert_eq!(lcd.hdmi(), Some(false));
+        assert!(lcd.take_display_disconnect());
+        assert!(!lcd.take_display_disconnect());
+        lcd.present_vm(&canvas).unwrap();
+        assert_eq!(fs::read(&fb).unwrap(), menu, "LCD resumes drawing");
+        fs::write(&status, "connected\n").unwrap();
+        for (kind, fields) in [(0x200, vec![(12, 14)]), (0x100, vec![])] {
+            lcd.set_hdmi(true, "Test VM").unwrap();
+            send(kind, &fields); // Window close, then SDL compositor-loss quit.
+            lcd.read(&mut Vec::new());
+            assert_eq!(lcd.hdmi(), Some(false));
+            assert!(lcd.take_display_disconnect());
+            assert!(!super::super::device::stop_requested());
+        }
+        lcd.set_hdmi(true, "Test VM").unwrap();
+        lcd.set_hdmi(false, "Test VM").unwrap();
+        assert_eq!(lcd.hdmi(), Some(false));
+        assert!(!lcd.take_display_disconnect());
+        drop(lcd);
+        unsafe { libc::dlclose(lib) };
+        fs::remove_dir_all(dir).unwrap();
+    }
 }

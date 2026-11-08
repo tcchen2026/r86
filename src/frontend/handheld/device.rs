@@ -7,6 +7,22 @@ use super::ui::{Canvas, Rect};
 pub trait Device {
     fn size(&self) -> (i32, i32);
     fn present(&mut self, canvas: &Canvas) -> Result<(), String>;
+    /// VM content without a guest layer (blank screen or remote status).
+    /// An external display leaves a notice on the LCD; menus use `present`.
+    fn present_vm(&mut self, canvas: &Canvas) -> Result<(), String> {
+        self.present(canvas)
+    }
+    /// None without an LCD/HDMI pair; otherwise whether HDMI is active.
+    fn hdmi(&self) -> Option<bool> {
+        None
+    }
+    fn set_hdmi(&mut self, _enabled: bool, _vm_name: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Consume a display-loss notification after returning to the LCD.
+    fn take_display_disconnect(&mut self) -> bool {
+        false
+    }
     /// Whether the guest frame is shown as its own scaled layer
     /// (present_frame) instead of being drawn into the UI canvas.
     fn guest_layer(&self) -> bool {

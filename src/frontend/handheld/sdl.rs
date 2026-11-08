@@ -1,8 +1,8 @@
 //! SDL2 screen and input, loaded with dlopen so one glibc build runs on any
 //! Linux handheld whose firmware ships libSDL2 (KMSDRM on TrimUI), and needs
-//! no SDL2 at build time. Two modes: a desktop window imitating the
-//! CardputerZero (feature handheld-sdl), or full screen with a game
-//! controller, where the guest frame is a separate GPU-scaled layer.
+//! no SDL2 at build time. The simulator and controller handhelds use SDL
+//! input; CardputerZero HDMI uses only its desktop mouse, keeping evdev as
+//! the keyboard source. Full-screen windows have a GPU-scaled guest layer.
 //!
 //! Keys and controller buttons become the evdev codes the rest of the
 //! frontend reads. Controller buttons are positional (SDL's A is the bottom
@@ -11,6 +11,10 @@
 //! a real mouse (the simulator's, or USB) moves the guest's mouse too.
 use std::collections::VecDeque;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::fs;
+use std::os::unix::fs::FileTypeExt;
+use std::os::unix::net::UnixStream;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::device::{Device, KeyEvent, request_stop};
@@ -28,6 +32,9 @@ const PIXELFORMAT_ABGR8888: u32 = 0x1676_2004;
 const TEXTUREACCESS_STREAMING: c_int = 1;
 
 const QUIT: u32 = 0x100;
+const WINDOW_EVENT: u32 = 0x200;
+const WINDOW_CLOSE: u8 = 14;
+const RENDER_DEVICE_RESET: u32 = 0x2001;
 const KEYDOWN: u32 = 0x300;
 const KEYUP: u32 = 0x301;
 const MOUSE_MOTION: u32 = 0x400;
@@ -98,14 +105,19 @@ type Ptr = *mut c_void;
 
 /// The SDL2 functions this frontend calls, resolved once from the library.
 struct Api {
+    lib: Ptr,
     init: unsafe extern "C" fn(u32) -> c_int,
+    quit_subsystem: unsafe extern "C" fn(u32),
     get_error: unsafe extern "C" fn() -> *const c_char,
     set_hint: unsafe extern "C" fn(*const c_char, *const c_char) -> c_int,
     desktop_mode: unsafe extern "C" fn(c_int, *mut DisplayMode) -> c_int,
     create_window: unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, c_int, u32) -> Ptr,
+    destroy_window: unsafe extern "C" fn(Ptr),
     create_renderer: unsafe extern "C" fn(Ptr, c_int, u32) -> Ptr,
+    destroy_renderer: unsafe extern "C" fn(Ptr),
     output_size: unsafe extern "C" fn(Ptr, *mut c_int, *mut c_int) -> c_int,
     set_logical_size: unsafe extern "C" fn(Ptr, c_int, c_int) -> c_int,
+    set_integer_scale: unsafe extern "C" fn(Ptr, c_int) -> c_int,
     create_texture: unsafe extern "C" fn(Ptr, u32, c_int, c_int, c_int) -> Ptr,
     destroy_texture: unsafe extern "C" fn(Ptr),
     update_texture: unsafe extern "C" fn(Ptr, *const SdlRect, *const c_void, c_int) -> c_int,
@@ -115,15 +127,17 @@ struct Api {
     poll_event: unsafe extern "C" fn(*mut Event) -> c_int,
     wait_event_timeout: unsafe extern "C" fn(*mut Event, c_int) -> c_int,
     show_cursor: unsafe extern "C" fn(c_int) -> c_int,
+    relative_mouse: unsafe extern "C" fn(c_int) -> c_int,
     num_joysticks: unsafe extern "C" fn() -> c_int,
     is_game_controller: unsafe extern "C" fn(c_int) -> c_int,
     game_controller_open: unsafe extern "C" fn(c_int) -> Ptr,
+    game_controller_close: unsafe extern "C" fn(Ptr),
 }
 
 impl Api {
     fn load() -> Result<Self, String> {
-        // SAFETY: dlopen and dlsym take NUL-terminated names. The handle is
-        // never closed, so every resolved function stays valid.
+        // SAFETY: dlopen and dlsym take NUL-terminated names. Api owns the
+        // library handle and outlives every call through these functions.
         unsafe {
             let lib = [c"libSDL2-2.0.so.0", c"libSDL2.so"]
                 .iter()
@@ -132,9 +146,10 @@ impl Api {
                 .ok_or("libSDL2-2.0.so.0 is not available")?;
             macro_rules! load {
                 ($($field:ident = $name:literal),* $(,)?) => {
-                    Self { $($field: {
+                    Self { lib, $($field: {
                         let symbol = libc::dlsym(lib, $name.as_ptr());
                         if symbol.is_null() {
+                            libc::dlclose(lib);
                             return Err(format!("libSDL2 lacks {}", $name.to_string_lossy()));
                         }
                         std::mem::transmute::<*mut c_void, _>(symbol)
@@ -143,13 +158,17 @@ impl Api {
             }
             Ok(load! {
                 init = c"SDL_Init",
+                quit_subsystem = c"SDL_QuitSubSystem",
                 get_error = c"SDL_GetError",
                 set_hint = c"SDL_SetHint",
                 desktop_mode = c"SDL_GetDesktopDisplayMode",
                 create_window = c"SDL_CreateWindow",
+                destroy_window = c"SDL_DestroyWindow",
                 create_renderer = c"SDL_CreateRenderer",
+                destroy_renderer = c"SDL_DestroyRenderer",
                 output_size = c"SDL_GetRendererOutputSize",
                 set_logical_size = c"SDL_RenderSetLogicalSize",
+                set_integer_scale = c"SDL_RenderSetIntegerScale",
                 create_texture = c"SDL_CreateTexture",
                 destroy_texture = c"SDL_DestroyTexture",
                 update_texture = c"SDL_UpdateTexture",
@@ -159,9 +178,11 @@ impl Api {
                 poll_event = c"SDL_PollEvent",
                 wait_event_timeout = c"SDL_WaitEventTimeout",
                 show_cursor = c"SDL_ShowCursor",
+                relative_mouse = c"SDL_SetRelativeMouseMode",
                 num_joysticks = c"SDL_NumJoysticks",
                 is_game_controller = c"SDL_IsGameController",
                 game_controller_open = c"SDL_GameControllerOpen",
+                game_controller_close = c"SDL_GameControllerClose",
             })
         }
     }
@@ -172,9 +193,9 @@ impl Api {
         format!("{what}: {}", text.to_string_lossy())
     }
 
-    fn hint(&self, name: &CStr, value: &CStr) {
+    fn hint(&self, name: &CStr, value: &CStr) -> bool {
         // SAFETY: both strings are NUL-terminated; SDL copies them.
-        unsafe { (self.set_hint)(name.as_ptr(), value.as_ptr()) };
+        unsafe { (self.set_hint)(name.as_ptr(), value.as_ptr()) != 0 }
     }
 
     /// A streaming texture; `smooth` selects linear instead of nearest
@@ -199,6 +220,13 @@ impl Api {
     }
 }
 
+impl Drop for Api {
+    fn drop(&mut self) {
+        // SAFETY: Window releases all SDL resources before dropping its Api.
+        unsafe { libc::dlclose(self.lib) };
+    }
+}
+
 /// A texture with the size it was created for.
 struct Texture {
     raw: Ptr,
@@ -216,11 +244,22 @@ const ARROW_RELEASE: f32 = 0.3;
 const REPEAT_DELAY: Duration = Duration::from_millis(400);
 const REPEAT_INTERVAL: Duration = Duration::from_millis(80);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Simulator,
+    Handheld,
+    External,
+}
+
 pub struct Window {
     api: Api,
+    window: Ptr,
     renderer: Ptr,
     size: (i32, i32),
-    full_screen: bool,
+    mode: Mode,
+    init_flags: u32,
+    closed: bool,
+    controllers: Vec<Ptr>,
     ui: Option<Texture>,
     frame: Option<Texture>,
     pending: VecDeque<KeyEvent>,
@@ -240,71 +279,66 @@ pub struct Window {
 impl Window {
     /// The CardputerZero simulator window, `scale` times its 320x170 panel.
     pub fn simulator(scale: i32) -> Result<Self, String> {
-        Self::open(false, (320 * scale, 170 * scale))
+        Self::open(Mode::Simulator, (320 * scale, 170 * scale))
     }
 
     /// Full screen, with the UI at the largest whole multiple of 320x170
     /// that fits and controllers opened.
     pub fn full_screen() -> Result<Self, String> {
-        Self::open(true, (320, 170))
+        Self::open(Mode::Handheld, (320, 170))
     }
 
-    fn open(full_screen: bool, mut window: (i32, i32)) -> Result<Self, String> {
+    /// The LCD device's desktop window, with no SDL keyboard/controller input.
+    pub fn external() -> Result<Self, String> {
+        Self::open(Mode::External, (320, 170))
+    }
+
+    pub fn closed(&self) -> bool {
+        self.closed
+    }
+
+    fn open(mode: Mode, mut window: (i32, i32)) -> Result<Self, String> {
         let api = Api::load()?;
-        // SAFETY: plain SDL calls with valid arguments; returned handles are
-        // checked and owned by this Window until the process exits.
-        unsafe {
-            if (api.init)(INIT_VIDEO | INIT_GAMECONTROLLER) != 0 {
-                return Err(api.error("SDL_Init"));
-            }
-            // Size the window to the display too: without a window manager,
-            // X11 does not resize a full-screen-desktop window itself.
-            let mut mode = DisplayMode {
-                format: 0,
-                w: 0,
-                h: 0,
-                refresh_rate: 0,
-                driver_data: std::ptr::null_mut(),
-            };
-            if full_screen && (api.desktop_mode)(0, &mut mode) == 0 {
-                window = (mode.w, mode.h);
-            }
-            let title = CString::new("r86").unwrap();
-            let flags = if full_screen {
-                WINDOW_FULLSCREEN_DESKTOP
+        if mode == Mode::External {
+            // WAYLAND_DISPLAY was discovered at startup, before threads.
+            // Never let SDL auto-select KMSDRM and take over the LCD's card1.
+            let driver = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                c"wayland"
+            } else if std::env::var_os("DISPLAY").is_some() {
+                c"x11"
             } else {
+                return Err("No Wayland or X11 desktop is available".into());
+            };
+            if !api.hint(c"SDL_VIDEODRIVER", driver)
+                && std::env::var("SDL_VIDEODRIVER").ok().as_deref() != driver.to_str().ok()
+            {
+                return Err("Cannot select the desktop SDL video driver".into());
+            }
+        }
+        let full_screen = mode != Mode::Simulator;
+        let init_flags = INIT_VIDEO
+            | if mode == Mode::External {
                 0
-            };
-            let win = (api.create_window)(
-                title.as_ptr(),
-                WINDOWPOS_CENTERED,
-                WINDOWPOS_CENTERED,
-                window.0,
-                window.1,
-                flags,
-            );
-            if win.is_null() {
-                return Err(api.error("SDL_CreateWindow"));
-            }
-            let renderer = (api.create_renderer)(win, -1, RENDERER_ACCELERATED);
-            if renderer.is_null() {
-                return Err(api.error("SDL_CreateRenderer"));
-            }
-            let (mut w, mut h) = (0, 0);
-            (api.output_size)(renderer, &mut w, &mut h);
-            let scale = (w / 320).min(h / 170).max(1);
-            let size = if full_screen {
-                (api.show_cursor)(0);
-                (w / scale, h / scale)
             } else {
-                (320, 170)
+                INIT_GAMECONTROLLER
             };
-            (api.set_logical_size)(renderer, size.0, size.1);
+        // SAFETY: plain SDL calls with valid arguments; returned handles are
+        // checked and owned by this Window, including on initialization errors.
+        unsafe {
+            if (api.init)(init_flags) != 0 {
+                let err = api.error("SDL_Init");
+                (api.quit_subsystem)(init_flags);
+                return Err(err);
+            }
             let mut this = Self {
                 api,
-                renderer,
-                size,
-                full_screen,
+                window: std::ptr::null_mut(),
+                renderer: std::ptr::null_mut(),
+                size: (320, 170),
+                mode,
+                init_flags,
+                closed: false,
+                controllers: Vec::new(),
                 ui: None,
                 frame: None,
                 pending: VecDeque::new(),
@@ -316,18 +350,82 @@ impl Window {
                 pointer_rest: (0.0, 0.0),
                 mouse: (0, 0),
             };
-            for index in 0..(this.api.num_joysticks)() {
-                this.open_controller(index);
+            let api = &this.api;
+            // Size the window to the display too: without a window manager,
+            // X11 does not resize a full-screen-desktop window itself.
+            let mut desktop = DisplayMode {
+                format: 0,
+                w: 0,
+                h: 0,
+                refresh_rate: 0,
+                driver_data: std::ptr::null_mut(),
+            };
+            if full_screen && (api.desktop_mode)(0, &mut desktop) == 0 {
+                window = (desktop.w, desktop.h);
+            }
+            let title = CString::new("r86").unwrap();
+            let flags = if full_screen {
+                WINDOW_FULLSCREEN_DESKTOP
+            } else {
+                0
+            };
+            this.window = (api.create_window)(
+                title.as_ptr(),
+                WINDOWPOS_CENTERED,
+                WINDOWPOS_CENTERED,
+                window.0,
+                window.1,
+                flags,
+            );
+            if this.window.is_null() {
+                return Err(api.error("SDL_CreateWindow"));
+            }
+            this.renderer = (api.create_renderer)(this.window, -1, RENDERER_ACCELERATED);
+            let renderer = this.renderer;
+            if this.renderer.is_null() {
+                return Err(api.error("SDL_CreateRenderer"));
+            }
+            let (mut w, mut h) = (0, 0);
+            if (api.output_size)(renderer, &mut w, &mut h) != 0 || w <= 0 || h <= 0 {
+                return Err(api.error("SDL_GetRendererOutputSize"));
+            }
+            let scale = (w / 320).min(h / 170).max(1);
+            if full_screen {
+                (api.show_cursor)(0);
+            }
+            let size = if mode == Mode::Handheld {
+                (w / scale, h / scale)
+            } else {
+                (320, 170)
+            };
+            this.size = size;
+            if (api.set_logical_size)(renderer, size.0, size.1) != 0 {
+                return Err(api.error("SDL_RenderSetLogicalSize"));
+            }
+            if mode == Mode::External {
+                if w >= 320 && h >= 170 && (api.set_integer_scale)(renderer, 1) != 0 {
+                    return Err(api.error("SDL_RenderSetIntegerScale"));
+                }
+                if (api.relative_mouse)(1) != 0 {
+                    eprintln!("r86: {}", api.error("SDL relative mouse unavailable"));
+                }
+            } else {
+                for index in 0..(this.api.num_joysticks)() {
+                    this.open_controller(index);
+                }
             }
             Ok(this)
         }
     }
 
     fn open_controller(&mut self, index: c_int) {
-        // SAFETY: SDL validates the index; an opened controller lives until exit.
+        // SAFETY: SDL validates the index; Window owns each returned controller.
         unsafe {
             if (self.api.is_game_controller)(index) != 0 {
-                (self.api.game_controller_open)(index);
+                let controller = (self.api.game_controller_open)(index);
+                if !controller.is_null() {
+                    self.controllers.push(controller);
+                }
             }
         }
     }
@@ -413,9 +511,13 @@ impl Window {
     }
 
     fn translate(&mut self, event: &Event) {
+        let external = self.mode == Mode::External;
         match event.u32(0) {
+            QUIT if external => self.closed = true,
             QUIT => request_stop(),
-            kind @ (KEYDOWN | KEYUP) => {
+            WINDOW_EVENT if external && event.u8(12) == WINDOW_CLOSE => self.closed = true,
+            RENDER_DEVICE_RESET if external => self.closed = true,
+            kind @ (KEYDOWN | KEYUP) if !external => {
                 let value = match (kind, event.u8(13)) {
                     (KEYUP, _) => 0,
                     (_, 0) => 1,
@@ -426,12 +528,12 @@ impl Window {
                     self.pending.push_back(KeyEvent { code, value });
                 }
             }
-            kind @ (CONTROLLER_BUTTON_DOWN | CONTROLLER_BUTTON_UP) => {
+            kind @ (CONTROLLER_BUTTON_DOWN | CONTROLLER_BUTTON_UP) if !external => {
                 if let Some(code) = button_code(event.u8(12)) {
                     self.key(code, kind == CONTROLLER_BUTTON_DOWN);
                 }
             }
-            CONTROLLER_AXIS => {
+            CONTROLLER_AXIS if !external => {
                 let value = event.i16(16);
                 let deflection = f32::from(value) / 32767.0;
                 match event.u8(12) {
@@ -463,7 +565,7 @@ impl Window {
                 };
                 self.key(code, kind == MOUSE_BUTTON_DOWN);
             }
-            CONTROLLER_ADDED => self.open_controller(event.u32(8) as c_int),
+            CONTROLLER_ADDED if !external => self.open_controller(event.u32(8) as c_int),
             _ => {}
         }
     }
@@ -471,6 +573,51 @@ impl Window {
     fn stick_active(&self) -> bool {
         self.stick.0.abs() > STICK_DEAD_ZONE || self.stick.1.abs() > STICK_DEAD_ZONE
     }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // SAFETY: these handles belong to this Window. DestroyRenderer also
+        // destroys its textures. Quitting video closes the compositor socket,
+        // so a subsequent HDMI session can initialize a fresh connection.
+        unsafe {
+            if self.mode == Mode::External {
+                (self.api.relative_mouse)(0);
+            }
+            for &controller in &self.controllers {
+                (self.api.game_controller_close)(controller);
+            }
+            if !self.renderer.is_null() {
+                (self.api.destroy_renderer)(self.renderer);
+            }
+            if !self.window.is_null() {
+                (self.api.destroy_window)(self.window);
+            }
+            (self.api.quit_subsystem)(self.init_flags);
+        }
+    }
+}
+
+/// Find the first numbered Wayland socket that accepts a connection. A stale
+/// wayland-0 file must not hide the desktop actually listening on wayland-1.
+pub fn wayland_socket(runtime: &Path) -> Option<PathBuf> {
+    let mut sockets: Vec<(u32, PathBuf)> = fs::read_dir(runtime)
+        .ok()?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let number = name.to_str()?.strip_prefix("wayland-")?.parse().ok()?;
+            entry
+                .file_type()
+                .ok()?
+                .is_socket()
+                .then(|| (number, entry.path()))
+        })
+        .collect();
+    sockets.sort_by_key(|(number, _)| *number);
+    sockets
+        .into_iter()
+        .find_map(|(_, path)| UnixStream::connect(&path).ok().map(|_| path))
 }
 
 /// Controller button to evdev code: D-pad arrows, right face Enter, bottom
@@ -514,15 +661,23 @@ impl Device for Window {
         let texture = self.upload_ui(canvas)?;
         // SAFETY: renderer and texture are live.
         unsafe {
-            (self.api.render_clear)(self.renderer);
-            (self.api.render_copy)(self.renderer, texture, std::ptr::null(), std::ptr::null());
+            if (self.api.render_clear)(self.renderer) != 0
+                || (self.api.render_copy)(
+                    self.renderer,
+                    texture,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ) != 0
+            {
+                return Err(self.api.error("SDL_RenderCopy"));
+            }
             (self.api.render_present)(self.renderer);
         }
         Ok(())
     }
 
     fn guest_layer(&self) -> bool {
-        self.full_screen
+        self.mode != Mode::Simulator
     }
 
     fn present_frame(
@@ -575,11 +730,21 @@ impl Device for Window {
             {
                 return Err(self.api.error("SDL_UpdateTexture"));
             }
-            (self.api.render_clear)(self.renderer);
-            (self.api.render_copy)(self.renderer, frame, std::ptr::null(), &SdlRect::from(area));
+            if (self.api.render_clear)(self.renderer) != 0
+                || (self.api.render_copy)(
+                    self.renderer,
+                    frame,
+                    std::ptr::null(),
+                    &SdlRect::from(area),
+                ) != 0
+            {
+                return Err(self.api.error("SDL_RenderCopy"));
+            }
             if let (Some(texture), Some(area)) = (ui_texture, ui_area) {
                 let area = SdlRect::from(area);
-                (self.api.render_copy)(self.renderer, texture, &area, &area);
+                if (self.api.render_copy)(self.renderer, texture, &area, &area) != 0 {
+                    return Err(self.api.error("SDL_RenderCopy"));
+                }
             }
             (self.api.render_present)(self.renderer);
         }
@@ -639,7 +804,7 @@ impl Device for Window {
     }
 
     fn menu_keys(&self) -> &'static str {
-        if self.full_screen {
+        if self.mode == Mode::Handheld {
             "Start"
         } else {
             "Ctrl+Alt+M"
@@ -647,7 +812,7 @@ impl Device for Window {
     }
 
     fn help(&self) -> &'static [(&'static str, &'static str)] {
-        if self.full_screen {
+        if self.mode == Mode::Handheld {
             &[
                 ("Right stick", "move the mouse"),
                 ("R1 or R3", "left click"),
@@ -690,6 +855,25 @@ fn evdev_code(usage: i32) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wayland_discovery_skips_stale_sockets_and_sorts_numbers() {
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("r86-wayland-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        drop(UnixListener::bind(dir.join("wayland-0")).unwrap());
+        let ten = UnixListener::bind(dir.join("wayland-10")).unwrap();
+        let two = UnixListener::bind(dir.join("wayland-2")).unwrap();
+        fs::write(dir.join("wayland-1"), "not a socket").unwrap();
+        let lock = UnixListener::bind(dir.join("wayland-1.lock")).unwrap();
+        assert_eq!(wayland_socket(&dir), Some(dir.join("wayland-2")));
+        drop(two);
+        assert_eq!(wayland_socket(&dir), Some(dir.join("wayland-10")));
+        drop(ten);
+        assert_eq!(wayland_socket(&dir), None);
+        drop(lock);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn sdl_scancodes_map_to_evdev_codes() {

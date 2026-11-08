@@ -160,8 +160,10 @@ pub fn run(
         session.notify(&format!("{}: r86 menu", device.menu_keys()));
     }
     let result = session.run(device, canvas);
+    let display_closed = device.set_hdmi(false, &session.vm.name);
     let flushed = session.machine.flush_disks();
     let end = result?;
+    display_closed?;
     flushed.map(|()| end)
 }
 
@@ -176,9 +178,25 @@ impl Session<'_> {
             }
             device.read(&mut events);
             for event in events.drain(..) {
-                if let Some(end) = self.key(event)? {
+                if let Some(end) = self.key(event, device)? {
                     return Ok(end);
                 }
+            }
+            if device.take_display_disconnect() {
+                self.release_guest_input();
+                if self.overlay.is_some() {
+                    self.render_guest();
+                }
+                *self.labels.borrow_mut() = self.current_labels(device);
+                self.notify("HDMI disconnected");
+            }
+            if self
+                .toast
+                .as_ref()
+                .is_some_and(|(_, until)| Instant::now() >= *until)
+            {
+                self.toast = None;
+                self.redraw = true;
             }
             let (dx, dy) = device.pointer_motion();
             if (dx, dy) != (0, 0) && self.overlay.is_none() && !self.machine.powered_off() {
@@ -200,8 +218,15 @@ impl Session<'_> {
             }
             if let Some(overlay) = &mut self.overlay {
                 if self.redraw {
-                    canvas.pixels.copy_from_slice(&self.guest.pixels);
+                    if device.hdmi() == Some(true) {
+                        canvas.fill(ui::BG);
+                    } else {
+                        canvas.pixels.copy_from_slice(&self.guest.pixels);
+                    }
                     overlay.draw(canvas, self.ctx);
+                    if let Some((text, _)) = &self.toast {
+                        draw_toast(canvas, text, canvas.height);
+                    }
                     device.present(canvas)?;
                     self.redraw = false;
                 }
@@ -236,10 +261,6 @@ impl Session<'_> {
                 self.redraw = true;
             }
             self.blink_phase = phase;
-            if self.toast.as_ref().is_some_and(|(_, until)| now >= *until) {
-                self.toast = None;
-                self.redraw = true;
-            }
             if now >= next_frame && (self.redraw || self.machine.vga().whole_frame_dirty()) {
                 let note = self.toast.as_ref().map(|(text, _)| text.clone());
                 self.show_frame(device, canvas, note.as_deref())?;
@@ -277,9 +298,17 @@ impl Session<'_> {
         }
         if off {
             draw_remote_off(canvas, &self.vm.name, &remote.url(), state.1);
-            device.present(canvas)?;
+            if let Some((text, _)) = &self.toast {
+                draw_toast(canvas, text, canvas.height);
+            }
+            device.present_vm(canvas)?;
         } else {
-            self.show_frame(device, canvas, Some("Paused from the browser"))?;
+            let note = self
+                .toast
+                .as_ref()
+                .map_or("Paused from the browser", |(text, _)| text)
+                .to_string();
+            self.show_frame(device, canvas, Some(&note))?;
         }
         self.remote_shown = Some(state);
         self.redraw = false;
@@ -309,7 +338,9 @@ impl Session<'_> {
         note: Option<&str>,
     ) -> Result<(), String> {
         let layer = device.guest_layer() && self.render_rgba();
-        if !layer {
+        if layer {
+            self.native_text = false;
+        } else {
             self.render_guest();
             canvas.pixels.copy_from_slice(&self.guest.pixels);
         }
@@ -319,7 +350,7 @@ impl Session<'_> {
         let bottom = osk.map_or(canvas.height, |area| area.y);
         let toast = note.map(|text| draw_toast(canvas, text, bottom));
         if !layer {
-            return device.present(canvas);
+            return device.present_vm(canvas);
         }
         let area = match (toast, osk) {
             (Some(toast), Some(osk)) => Some(Rect {
@@ -462,10 +493,11 @@ impl Session<'_> {
         self.pointer
     }
 
-    fn current_labels(&self) -> OverlayLabels {
+    fn current_labels(&self, device: &dyn Device) -> OverlayLabels {
         OverlayLabels {
             name: self.vm.name.clone(),
             view: self.view.label(),
+            display: device.hdmi(),
             cd: self.vm.iso.as_ref().map(|iso| {
                 iso.file_name()
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
@@ -474,7 +506,7 @@ impl Session<'_> {
         }
     }
 
-    fn key(&mut self, event: KeyEvent) -> Result<Option<End>, String> {
+    fn key(&mut self, event: KeyEvent, device: &mut dyn Device) -> Result<Option<End>, String> {
         let down = event.value != 0;
         match event.code {
             keymap::FN => self.modifiers.fn_key = down,
@@ -488,7 +520,7 @@ impl Session<'_> {
             || event.code == keymap::MENU;
         if let Some(overlay) = &mut self.overlay {
             if event.value == 1 && menu_chord {
-                return self.act(Action::Resume);
+                return self.act(Action::Resume, device);
             }
             let ui_key = (event.value != 0)
                 .then(|| keymap::ui_key(event.code, self.modifiers.shift))
@@ -496,8 +528,8 @@ impl Session<'_> {
             if let Some(key) = ui_key {
                 self.redraw = true;
                 match overlay.key(key, self.ctx) {
-                    Some(Outcome::Action(action)) => return self.act(action),
-                    Some(Outcome::Closed) => return self.act(Action::Resume),
+                    Some(Outcome::Action(action)) => return self.act(action, device),
+                    Some(Outcome::Closed) => return self.act(Action::Resume, device),
                     _ => {}
                 }
             }
@@ -518,9 +550,12 @@ impl Session<'_> {
         }
         if event.value == 1 && menu_chord {
             self.release_guest_input();
-            // The menu draws over the UI canvas's copy of the guest screen.
-            self.render_guest();
-            *self.labels.borrow_mut() = self.current_labels();
+            // HDMI menus share a plain canvas with the LCD; never put the
+            // guest on the LCD while it belongs to the external display.
+            if device.hdmi() != Some(true) {
+                self.render_guest();
+            }
+            *self.labels.borrow_mut() = self.current_labels(device);
             let overlay = VmOverlay::new(self.labels.clone());
             self.overlay = Some(Stack::new(Box::new(overlay)));
             self.toast = None;
@@ -647,7 +682,7 @@ impl Session<'_> {
         }
     }
 
-    fn act(&mut self, action: Action) -> Result<Option<End>, String> {
+    fn act(&mut self, action: Action, device: &mut dyn Device) -> Result<Option<End>, String> {
         let mut close = true;
         match action {
             Action::Resume => {
@@ -667,7 +702,21 @@ impl Session<'_> {
                 if self.view == View::Integer {
                     self.pointer = (self.frame.0 / 2, self.frame.1 / 2);
                 }
-                self.render_guest();
+                if device.hdmi() != Some(true) {
+                    self.render_guest();
+                }
+                close = false;
+            }
+            Action::Display => {
+                if let Some(active) = device.hdmi() {
+                    if let Err(err) = device.set_hdmi(!active, &self.vm.name) {
+                        eprintln!("r86: HDMI: {err}");
+                        self.notify("No HDMI display");
+                    }
+                    if device.hdmi() == Some(false) {
+                        self.render_guest();
+                    }
+                }
                 close = false;
             }
             Action::CtrlAltDel => {
@@ -694,7 +743,7 @@ impl Session<'_> {
                         self.vm.iso = path;
                         // This session holds the VM lock.
                         self.vm.save_locked()?;
-                        let name = self.current_labels().cd;
+                        let name = self.current_labels(device).cd;
                         if let Some(remote) = &mut self.remote {
                             remote.media_changed(&self.machine, name);
                         }
@@ -742,7 +791,7 @@ impl Session<'_> {
         if close {
             self.overlay = None;
         }
-        *self.labels.borrow_mut() = self.current_labels();
+        *self.labels.borrow_mut() = self.current_labels(device);
         self.redraw = true;
         Ok(None)
     }

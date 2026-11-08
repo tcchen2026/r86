@@ -6,7 +6,7 @@
 set -eu
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 app=$STAGE$APP_INSTALL_DIR
-install -D -m 0755 "$root/target/aarch64-unknown-linux-musl/release/r86-handheld" "$app/r86-handheld"
+install -D -m 0755 "$root/target/aarch64-unknown-linux-gnu/release/r86-handheld" "$app/r86-handheld"
 "$root/ports/share.sh" "$app"
 
 cat >"$STAGE$INSTALL_PREFIX/bin/$PKG_NAME" <<WRAPPER
