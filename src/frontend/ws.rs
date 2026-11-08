@@ -268,7 +268,9 @@ pub fn websocket_accept_value(key: &str) -> String {
     let mut bytes = Vec::with_capacity(key.len() + WS_GUID.len());
     bytes.extend_from_slice(key.as_bytes());
     bytes.extend_from_slice(WS_GUID.as_bytes());
-    base64_encode(&sha1_digest(&bytes))
+    let mut sha1 = Sha1::new();
+    sha1.update(&bytes);
+    base64_encode(&sha1.digest())
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -342,65 +344,88 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn sha1_digest(input: &[u8]) -> [u8; 20] {
-    let mut h0 = 0x6745_2301u32;
-    let mut h1 = 0xefcd_ab89u32;
-    let mut h2 = 0x98ba_dcfeu32;
-    let mut h3 = 0x1032_5476u32;
-    let mut h4 = 0xc3d2_e1f0u32;
-    let mut msg = input.to_vec();
-    let bit_len = (msg.len() as u64).wrapping_mul(8);
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0);
+/// SHA-1 (FIPS 180-4), fed incrementally: the WebSocket handshake and the
+/// names of saved uploads (media.rs).
+#[derive(Clone)]
+pub struct Sha1 {
+    state: [u32; 5],
+    block: [u8; 64],
+    used: usize,
+    bytes: u64,
+}
+
+impl Sha1 {
+    pub fn new() -> Self {
+        Self {
+            state: [
+                0x6745_2301,
+                0xefcd_ab89,
+                0x98ba_dcfe,
+                0x1032_5476,
+                0xc3d2_e1f0,
+            ],
+            block: [0; 64],
+            used: 0,
+            bytes: 0,
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for chunk in msg.chunks_exact(64) {
+
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.bytes += data.len() as u64;
+        while !data.is_empty() {
+            let n = (64 - self.used).min(data.len());
+            self.block[self.used..self.used + n].copy_from_slice(&data[..n]);
+            self.used += n;
+            data = &data[n..];
+            if self.used == 64 {
+                self.compress();
+                self.used = 0;
+            }
+        }
+    }
+
+    pub fn digest(&self) -> [u8; 20] {
+        let mut last = self.clone();
+        let bits = self.bytes * 8;
+        last.update(&[0x80]);
+        while last.used != 56 {
+            last.update(&[0]);
+        }
+        last.update(&bits.to_be_bytes());
+        let mut out = [0; 20];
+        for (bytes, word) in out.chunks_exact_mut(4).zip(last.state) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+
+    fn compress(&mut self) {
         let mut w = [0u32; 80];
-        for (index, word) in w[..16].iter_mut().enumerate() {
-            let at = index * 4;
-            *word = u32::from_be_bytes([chunk[at], chunk[at + 1], chunk[at + 2], chunk[at + 3]]);
+        for (i, word) in self.block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes(word.try_into().unwrap());
         }
-        for index in 16..80 {
-            w[index] = (w[index - 3] ^ w[index - 8] ^ w[index - 14] ^ w[index - 16]).rotate_left(1);
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
         }
-        let mut a = h0;
-        let mut b = h1;
-        let mut c = h2;
-        let mut d = h3;
-        let mut e = h4;
-        for (index, word) in w.iter().copied().enumerate() {
-            let (f, k) = match index {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
+        let [mut a, mut b, mut c, mut d, mut e] = self.state;
+        for (i, &word) in w.iter().enumerate() {
+            let (f, k) = match i / 20 {
+                0 => ((b & c) | (!b & d), 0x5a82_7999),
+                1 => (b ^ c ^ d, 0x6ed9_eba1),
+                2 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
                 _ => (b ^ c ^ d, 0xca62_c1d6),
             };
-            let temp = a
+            let t = a
                 .rotate_left(5)
                 .wrapping_add(f)
                 .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
+                .wrapping_add(k);
+            (e, d, c, b, a) = (d, c, b.rotate_left(30), a, t.wrapping_add(word));
         }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
+        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e]) {
+            *state = state.wrapping_add(value);
+        }
     }
-    let mut out = [0u8; 20];
-    out[0..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
 }
 
 fn sha256_digest(input: &[u8]) -> [u8; 32] {
@@ -581,6 +606,33 @@ mod tests {
         let mut pong = [0u8; 4];
         client.read_exact(&mut pong).unwrap();
         assert_eq!(pong, [0x8A, 2, b'h', b'i']);
+    }
+
+    #[test]
+    fn sha1_matches_fips_vectors_across_chunk_boundaries() {
+        let digest = |data: &[u8], chunk: usize| {
+            let mut sha1 = Sha1::new();
+            data.chunks(chunk.max(1)).for_each(|part| sha1.update(part));
+            sha1.digest()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(digest(b"", 1), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
+        assert_eq!(
+            digest(b"abc", 1),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+        let two_blocks = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+        assert_eq!(
+            digest(two_blocks, 7),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        let million = vec![b'a'; 1_000_000];
+        assert_eq!(
+            digest(&million, 4099),
+            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
+        );
     }
 
     #[test]

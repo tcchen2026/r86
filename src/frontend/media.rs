@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::ws::Sha1;
 use r86::iso9660::{IsoBuilder, IsoTime};
 
 /// Largest image one upload may stage. An in-memory image stays in host
@@ -272,7 +273,11 @@ impl Part {
 
     fn finish(self) -> Result<Image, String> {
         self.file.sync_all().map_err(save_error)?;
-        let name = format!("{}-{}.{}", self.stem, &self.sha1.hex()[..8], self.ext);
+        let tag: String = self.sha1.digest()[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let name = format!("{}-{tag}.{}", self.stem, self.ext);
         let dest = self.path.with_file_name(name);
         fs::rename(&self.path, &dest).map_err(save_error)?;
         let file = fs::File::open(&dest).map_err(save_error)?;
@@ -339,88 +344,6 @@ fn check_space(dir: &Path, size: u64) -> Result<(), String> {
     Ok(())
 }
 
-/// SHA-1 (FIPS 180-4), naming saved images by content.
-#[derive(Clone)]
-struct Sha1 {
-    state: [u32; 5],
-    block: [u8; 64],
-    used: usize,
-    bytes: u64,
-}
-
-impl Sha1 {
-    fn new() -> Self {
-        Self {
-            state: [
-                0x6745_2301,
-                0xefcd_ab89,
-                0x98ba_dcfe,
-                0x1032_5476,
-                0xc3d2_e1f0,
-            ],
-            block: [0; 64],
-            used: 0,
-            bytes: 0,
-        }
-    }
-
-    fn update(&mut self, mut data: &[u8]) {
-        self.bytes += data.len() as u64;
-        while !data.is_empty() {
-            let n = (64 - self.used).min(data.len());
-            self.block[self.used..self.used + n].copy_from_slice(&data[..n]);
-            self.used += n;
-            data = &data[n..];
-            if self.used == 64 {
-                self.compress();
-                self.used = 0;
-            }
-        }
-    }
-
-    fn hex(&self) -> String {
-        let mut last = self.clone();
-        let bits = self.bytes * 8;
-        last.update(&[0x80]);
-        while last.used != 56 {
-            last.update(&[0]);
-        }
-        last.update(&bits.to_be_bytes());
-        last.state
-            .iter()
-            .map(|word| format!("{word:08x}"))
-            .collect()
-    }
-
-    fn compress(&mut self) {
-        let mut w = [0u32; 80];
-        for (i, word) in self.block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes(word.try_into().unwrap());
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let [mut a, mut b, mut c, mut d, mut e] = self.state;
-        for (i, &word) in w.iter().enumerate() {
-            let (f, k) = match i / 20 {
-                0 => ((b & c) | (!b & d), 0x5a82_7999),
-                1 => (b ^ c ^ d, 0x6ed9_eba1),
-                2 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc),
-                _ => (b ^ c ^ d, 0xca62_c1d6),
-            };
-            let t = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k);
-            (e, d, c, b, a) = (d, c, b.rotate_left(30), a, t.wrapping_add(word));
-        }
-        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e]) {
-            *state = state.wrapping_add(value);
-        }
-    }
-}
-
 fn limit_error() -> String {
     format!("Virtual media is limited to {} MiB.", MEDIA_LIMIT >> 20)
 }
@@ -456,30 +379,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sha1_matches_fips_vectors_across_chunk_boundaries() {
-        let digest = |data: &[u8], chunk: usize| {
-            let mut sha1 = Sha1::new();
-            data.chunks(chunk.max(1)).for_each(|part| sha1.update(part));
-            sha1.hex()
-        };
-        assert_eq!(digest(b"", 1), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
-        assert_eq!(
-            digest(b"abc", 1),
-            "a9993e364706816aba3e25717850c26c9cd0d89d"
-        );
-        let two_blocks = b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
-        assert_eq!(
-            digest(two_blocks, 7),
-            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
-        );
-        let million = vec![b'a'; 1_000_000];
-        assert_eq!(
-            digest(&million, 4099),
-            "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
-        );
-    }
-
-    #[test]
     fn saved_images_are_named_by_sender_name_and_content() {
         let dir = std::env::temp_dir().join(format!("r86-media-{}", std::process::id()));
         let save = |name: &str, data: &[u8]| -> Result<String, String> {
@@ -494,11 +393,12 @@ mod tests {
         };
         let sector = [7u8; 512];
         // SHA-1 of 512 bytes of 7 starts with these 8 digits.
-        let tag = &{
-            let mut sha1 = Sha1::new();
-            sha1.update(&sector);
-            sha1.hex()
-        }[..8];
+        let mut sha1 = Sha1::new();
+        sha1.update(&sector);
+        let tag: String = sha1.digest()[..4]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         assert_eq!(
             save("C:\\guests\\Win: 98?.VHD", &sector),
             Ok(format!("Win_ 98_-{tag}.vhd"))
