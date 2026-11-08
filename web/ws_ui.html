@@ -297,7 +297,7 @@ function online(id, hello) {
   decoder = new TextDecoder();
   note(`connected, step ${hello.step}`);
   setUi(true);
-  loop(id, 33, pollFrame);
+  loop(id, 100, pollFrame);
   loop(id, 250, pollLogs);
   loop(id, 1000, pollStatus);
 }
@@ -314,8 +314,13 @@ async function loop(id, interval, fn) {
 let frameGen, serialNext = 0, eventNext = 0, decoder = new TextDecoder();
 let running = false, lastStep = null, lastTime = 0;
 
+// At most 10 frames per second; once a second while paused, and none while
+// the VM is off and its screen is hidden.
+let framePolled = 0;
 async function pollFrame() {
-  if (document.hidden) return;
+  if (document.hidden || poweredOff) return;
+  if (!running && performance.now() - framePolled < 1000) return;
+  framePolled = performance.now();
   const { json, binary } = await request({ cmd: "frame", since: frameGen });
   frameGen = json.generation;
   if (binary) draw(binary);
@@ -399,6 +404,7 @@ function event(ev) {
 }
 
 function note(message, error = false) {
+  (error ? console.error : console.log)(`r86: ${message}`);
   const line = document.createElement("div");
   if (error) line.className = "err";
   line.textContent = `ui: ${message}`;
@@ -757,6 +763,7 @@ function showPower(off) {
 let drive = null, folder = [], driveFree = {};
 const diskPath = parts => `${drive}:/${parts.join("/")}`;
 function fstatus(text, error = false) {
+  if (error) console.error(`r86: ${text}`);
   $("f-status").textContent = text;
   $("f-status").className = error ? "err" : "";
 }
@@ -922,22 +929,23 @@ async function collect(entry, prefix, out) {
   if (empty) out.push({ path, dir: true });
 }
 
+// Cancel every drag first: a drop the page does not take would make the
+// browser open the file and leave the console.
 let dragDepth = 0;
-const dragsFiles = e => e.dataTransfer?.types?.includes("Files");
+const dragsFiles = e => Array.from(e.dataTransfer?.types ?? []).includes("Files");
 addEventListener("dragenter", e => {
-  if (!dragsFiles(e)) return;
   e.preventDefault();
-  if (++dragDepth === 1) document.body.classList.add("dragging");
+  if (dragsFiles(e) && ++dragDepth === 1) document.body.classList.add("dragging");
 });
 addEventListener("dragleave", e => {
   if (dragsFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
 });
-addEventListener("dragover", e => { if (dragsFiles(e)) e.preventDefault(); });
+addEventListener("dragover", e => e.preventDefault());
 addEventListener("drop", async e => {
-  if (!dragsFiles(e)) return;
   e.preventDefault();
   dragDepth = 0;
   document.body.classList.remove("dragging");
+  if (!dragsFiles(e)) return;
   const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);
   const items = [];
   for (const entry of entries) await collect(entry, "", items);
@@ -948,6 +956,10 @@ addEventListener("drop", async e => {
   const label = entries.length === 1 && entries[0].isDirectory ? entries[0].name : "FILES";
   insertMedia(items, label);
 });
+
+// Uncaught errors are kept in the browser console and the Events tab.
+addEventListener("error", e => note(`error: ${e.message}`, true));
+addEventListener("unhandledrejection", e => note(`error: ${e.reason?.message ?? e.reason}`, true));
 
 setUi(false);
 $("state").textContent = "connecting";

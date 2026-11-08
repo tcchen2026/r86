@@ -1524,12 +1524,15 @@ impl Remote {
                 if !service.clients.contains_key(&id) {
                     return;
                 }
-                let text = if service.file_put.as_ref().is_some_and(|put| put.owner == id) {
+                let result = if service.file_put.as_ref().is_some_and(|put| put.owner == id) {
                     service.file_data(machine, &data)
                 } else {
                     service.media_data(id, &data)
-                }
-                .unwrap_or_else(|error| error_json(machine.step_count(), &error));
+                };
+                let text = result.unwrap_or_else(|error| {
+                    service.event(machine, "command-error", &error);
+                    error_json(machine.step_count(), &error)
+                });
                 service.reply(id, Reply::text(text));
             }
             Request::Command(id, message) => {

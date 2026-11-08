@@ -305,8 +305,10 @@ first returns a JSON acknowledgement and then sends one binary frame.
 received generation as ``since``; omit it for a full frame, including after a
 reconnect. All viewers share the rendered cache; one viewer cannot clear another
 viewer's pending update. Dirty frames are converted only when queried, with no
-hashing on this path. The binary header's step is the time of capture; the JSON
-step is the current VM time. No display frames are pushed unsolicited.
+hashing on this path. The Web UI polls at most 10 times per second while the
+guest runs, once per second while paused, and not while powered off.
+The binary header's step is the time of capture; the JSON step is the current
+VM time. No display frames are pushed unsolicited.
 
 Binary frame layout is little-endian and defined by ``FRAME_HEADER``:
 
