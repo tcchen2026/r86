@@ -41,6 +41,31 @@ use monitor::Mapping;
 pub(super) const ENTRY_TABLES: usize = 4096;
 type EntryWords = [u32; super::links::PAGE_BYTES];
 
+pub(super) fn cache_limits() -> (usize, usize) {
+    #[cfg(target_os = "linux")]
+    if std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .is_some_and(|info| small_host(&info))
+    {
+        return (32 * 1024 * 1024, 1024);
+    }
+    (128 * 1024 * 1024, ENTRY_TABLES)
+}
+
+#[cfg(target_os = "linux")]
+fn small_host(info: &str) -> bool {
+    info.lines()
+        .find_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            if fields.next()? != "MemTotal:" {
+                return None;
+            }
+            let kib = fields.next()?.parse::<u64>().ok()?;
+            (fields.next()? == "kB").then_some(kib)
+        })
+        .is_some_and(|kib| kib != 0 && kib < 1024 * 1024)
+}
+
 /// Constructed only by the arena's bounded table allocator. The fixed pool is
 /// present in every arena; slices still borrow their actual mapping owner.
 #[derive(Clone, Copy)]
@@ -76,6 +101,7 @@ pub struct CodeArena {
     capacity: usize,
     entries_start: usize,
     entries_used: usize,
+    entry_capacity: usize,
     used: usize,
     hot_cursor: usize,
     cold_cursor: usize,
@@ -85,13 +111,20 @@ pub struct CodeArena {
 
 impl CodeArena {
     pub fn new(capacity: usize) -> Result<Self, CodeError> {
-        let (mapping, entries_start) =
-            Mapping::new(capacity, ENTRY_TABLES * size_of::<EntryWords>())?;
+        Self::with_limits(capacity, ENTRY_TABLES)
+    }
+
+    pub(super) fn with_limits(capacity: usize, tables: usize) -> Result<Self, CodeError> {
+        if tables == 0 || tables > ENTRY_TABLES {
+            return Err(CodeError::Capacity);
+        }
+        let (mapping, entries_start) = Mapping::new(capacity, tables * size_of::<EntryWords>())?;
         Ok(Self {
             mapping,
             capacity,
             entries_start,
             entries_used: 0,
+            entry_capacity: tables,
             used: 0,
             hot_cursor: 0,
             cold_cursor: 0,
@@ -104,8 +137,23 @@ impl CodeArena {
         self.used
     }
 
+    pub(super) fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub(super) fn tables_used(&self) -> usize {
+        self.entries_used
+    }
+
+    pub(super) fn table_capacity(&self) -> usize {
+        self.entry_capacity
+    }
+
     pub(super) fn allocate_entries(&mut self) -> TableIndex {
-        assert!(self.entries_used < ENTRY_TABLES, "JIT entry pool exhausted");
+        assert!(
+            self.entries_used < self.entry_capacity,
+            "JIT entry pool exhausted"
+        );
         let index = TableIndex(self.entries_used as u16);
         self.entries_used += 1;
         self.entries_mut(index).fill(0);
@@ -114,7 +162,7 @@ impl CodeArena {
 
     pub(super) fn entries(&self, index: TableIndex) -> &EntryWords {
         let offset = self.entries_start + usize::from(index.0) * size_of::<EntryWords>();
-        // SAFETY: only this module constructs indices, all are below ENTRY_TABLES.
+        // SAFETY: only this module constructs indices, all are below entry_capacity.
         // The complete aligned pool is initialized shared backing. The slice
         // borrows this live owner; publication/native execution are exclusive.
         unsafe {
@@ -354,6 +402,23 @@ impl CodeArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn compact_pool_uses_total_ram_below_one_gib() {
+        assert!(small_host("MemFree: 100 kB\nMemTotal: 360448 kB\n"));
+        assert!(small_host("MemTotal: 1048575 kB\n"));
+        for info in [
+            "MemTotal: 1048576 kB\nMemAvailable: 100 kB\n",
+            "MemTotal: 16777216 kB\n",
+            "MemFree: 360448 kB\n",
+            "MemTotal: 0 kB\n",
+            "MemTotal: invalid kB\n",
+            "MemTotal: 360448 MB\n",
+        ] {
+            assert!(!small_host(info), "{info}");
+        }
+    }
 
     #[test]
     fn packed_access_recovery_keeps_its_exact_cold_exit() {

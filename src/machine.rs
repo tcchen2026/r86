@@ -5736,6 +5736,58 @@ mod host_bus_tests {
 
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
     #[test]
+    fn jit_lazy_tables_reclaim_only_for_another_native_page() {
+        let make = || {
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            let mut bus = HostBus::new(0x10000);
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            for page in [1, 2] {
+                let start = page * 4096;
+                bus.ram[start..start + 3].copy_from_slice(&[0x40, 0xeb, 0xfd]); // INC; loop
+            }
+            for page in 3..16 {
+                let start = page * 4096;
+                bus.ram[start..start + 2].copy_from_slice(&[0x0f, 0x31]); // interpreted RDTSC
+            }
+            (cpu, bus)
+        };
+        let (mut expected, mut reference_bus) = make();
+        let (mut actual, mut native_bus) = make();
+        let mut engine = crate::x86::jit::runtime::Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut runs = alloc::vec![(0x1000, 128)];
+        for page in 3..16 {
+            runs.extend(core::iter::repeat_n((page * 4096, 1), 8));
+        }
+        runs.extend([(0x2000, 128), (0x1000, 128)]);
+        let mut steps = 0;
+        for (index, (eip, budget)) in runs.iter().copied().enumerate() {
+            expected.eip = eip;
+            actual.eip = eip;
+            let reference =
+                Interpreter::run_batch(&mut expected, &mut reference_bus, steps, budget);
+            let native = engine
+                .run_batch(&mut actual, &mut native_bus, steps, budget)
+                .unwrap();
+            assert_eq!(native, reference);
+            assert_eq!(actual.regs, expected.regs);
+            assert_eq!(actual.eip, expected.eip);
+            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+            assert_eq!(actual.tsc(), expected.tsc());
+            assert_eq!(native_bus.ram, reference_bus.ram);
+            if index < runs.len() - 2 {
+                assert_eq!(engine.stats.table_clears, 0, "cold pages consumed a table");
+            }
+            steps += native.ran;
+        }
+        assert_eq!(engine.stats.table_clears, 2);
+        assert_eq!(engine.stats.capacity_clears, 0);
+        assert!(engine.stats.native_steps > 300);
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
     fn jit_capacity_reclamation_rewatches_the_block_being_published() {
         let make = || {
             let mut cpu = Cpu::new();
@@ -6803,12 +6855,11 @@ mod host_bus_tests {
                         if mode == 3 || mode == 4 {
                             assert_eq!(actual.regs[0], 0xaabb_ccdd);
                         } else if mode == 5 {
-                            let value = if opcode & 2 != 0 || (operand16 && opcode & 1 == 0) {
-                                // OUT leaves EAX unchanged. The existing
-                                // interpreter rejects 66-prefixed byte I/O
-                                // before dispatch; retain that stop behavior.
+                            let value = if opcode & 2 != 0 {
+                                // OUT leaves EAX unchanged.
                                 0xaabb_ccdd
                             } else if opcode & 1 == 0 {
+                                // Byte IN ignores an operand-size prefix.
                                 0xaabb_ccff
                             } else if operand16 {
                                 0xaabb_ffff

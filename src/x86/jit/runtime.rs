@@ -36,7 +36,7 @@
 //! interpreter HardMMU counters. Unpaged EL1 blocks use
 //! the shared software qualification, with the mode included in their code key.
 
-use super::code::{CodeArena, CodeError, CodeHandle, ENTRY_TABLES, TableIndex};
+use super::code::{CodeArena, CodeError, CodeHandle, ENTRY_TABLES, TableIndex, cache_limits};
 use super::validity::CodeContent;
 use super::{
     compile, decode,
@@ -83,15 +83,72 @@ impl Hasher for PageHasher {
     }
 }
 
+// With a reduced table pool, cold-only pages keep 2 bits per byte instead of a
+// native dispatch table. Promotion preserves admission/negative entries and
+// drops this 1 KiB allocation.
+enum PageEntries {
+    Cold(Box<[u8; PAGE_BYTES / 4]>),
+    Native(TableIndex),
+}
+
+impl PageEntries {
+    fn get(&self, arena: &CodeArena, offset: usize) -> u32 {
+        match self {
+            Self::Cold(visits) => u32::from((visits[offset / 4] >> ((offset % 4) * 2)) & 3),
+            Self::Native(table) => arena.entries(*table)[offset],
+        }
+    }
+
+    fn set(&mut self, arena: &mut CodeArena, offset: usize, entry: u32) {
+        match self {
+            Self::Cold(visits) => {
+                debug_assert!(entry <= COLD);
+                let shift = (offset % 4) * 2;
+                visits[offset / 4] =
+                    (visits[offset / 4] & !(3 << shift)) | ((entry as u8) << shift);
+            }
+            Self::Native(table) => arena.entries_mut(*table)[offset] = entry,
+        }
+    }
+
+    fn native(&self) -> Option<TableIndex> {
+        match self {
+            Self::Cold(_) => None,
+            Self::Native(table) => Some(*table),
+        }
+    }
+
+    fn promote(&mut self, arena: &mut CodeArena) -> TableIndex {
+        match self {
+            Self::Native(table) => *table,
+            Self::Cold(visits) => {
+                let table = arena.allocate_entries();
+                for (offset, word) in arena.entries_mut(table).iter_mut().enumerate() {
+                    *word = u32::from((visits[offset / 4] >> ((offset % 4) * 2)) & 3);
+                }
+                *self = Self::Native(table);
+                table
+            }
+        }
+    }
+
+    fn clear(&mut self, arena: &mut CodeArena) {
+        match self {
+            Self::Cold(visits) => visits.fill(0),
+            Self::Native(table) => arena.entries_mut(*table).fill(0),
+        }
+    }
+}
+
 struct CompiledPage {
     version: u64,
     content: Option<Box<CodeContent>>,
-    // Stable arena table; live links can address every possible x86 byte entry.
+    // Once promoted, live links address a stable arena table for every x86 byte.
     // Zero is unseen, one is interpreted, two/three count cold visits; larger
     // values are signed byte offsets from the table's RX address. Code precedes
     // metadata in the same bounded mapping, so native displacements are negative
     // and cannot collide with sentinels. Cold entries use ordinary semantics.
-    entries: TableIndex,
+    entries: PageEntries,
     // Native-PC metadata retains its associated emitted body address.
     #[cfg(target_os = "linux")]
     faults: Vec<(usize, Box<[super::memory::FaultSite]>)>,
@@ -101,7 +158,14 @@ struct CompiledPage {
 }
 
 impl CompiledPage {
-    fn new(version: u64, entries: TableIndex) -> Self {
+    fn new(version: u64, arena: &mut CodeArena) -> Self {
+        // Full pools (large hosts, EL1) keep a table per visited page, so pages
+        // without native code still dispatch through links.
+        let entries = if arena.table_capacity() < ENTRY_TABLES {
+            PageEntries::Cold(Box::new([0; PAGE_BYTES / 4]))
+        } else {
+            PageEntries::Native(arena.allocate_entries())
+        };
         Self {
             version,
             content: None,
@@ -116,7 +180,7 @@ impl CompiledPage {
 
     fn invalidate(&mut self, version: u64, arena: &mut CodeArena) {
         self.version = version;
-        arena.entries_mut(self.entries).fill(0);
+        self.entries.clear(arena);
         #[cfg(target_os = "linux")]
         self.faults.clear();
         self.pending_edges.clear();
@@ -124,7 +188,9 @@ impl CompiledPage {
             Some(content) => {
                 content.clear();
             }
-            None => self.content = Some(CodeContent::new()),
+            // Cold-only pages can simply restart admission after a write.
+            None if self.entries.native().is_some() => self.content = Some(CodeContent::new()),
+            None => {}
         }
     }
 }
@@ -329,20 +395,20 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Result<Self, String> {
-        // The firmware workload repeatedly outgrew 32 MiB, recompiling more
-        // than 1 GiB cumulatively. Reserve 128 MiB; pages are committed only as
-        // published, and both executable bytes and metadata remain bounded.
-        // This sizing choice does not establish a sufficient working set for
-        // long-lived guests. Either this arena or the 4096-page metadata limit
-        // below reclaims everything; measure recompilation under process/page
-        // churn before choosing finer-grained reclamation. Validity must remain
-        // correct regardless of whether an entire boot fits in the cache.
-        Self::with_capacity(128 * 1024 * 1024)
+        // Small Linux hosts trade more whole-cache clears for bounded memory.
+        // EL1 keeps its fixed 128 MiB code / 4096-table allocation.
+        let (bytes, tables) = cache_limits();
+        Self::with_limits(bytes, tables)
     }
 
+    #[cfg(test)]
     pub(crate) fn with_capacity(bytes: usize) -> Result<Self, String> {
-        let mut arena =
-            CodeArena::new(bytes).map_err(|error| format!("JIT code mapping: {error:?}"))?;
+        Self::with_limits(bytes, ENTRY_TABLES)
+    }
+
+    pub(crate) fn with_limits(bytes: usize, tables: usize) -> Result<Self, String> {
+        let mut arena = CodeArena::with_limits(bytes, tables)
+            .map_err(|error| format!("JIT code mapping: {error:?}"))?;
         let entry = Self::publish_entry(&mut arena)?;
         Ok(Self {
             arena,
@@ -446,7 +512,14 @@ impl Engine {
                 )
                 .expect("write requested R86_JIT_DUMP diagnostic");
         }
-        let result = format!("jit: {:?}\n", self.stats);
+        let result = format!(
+            "jit: {:?}\njit cache: code_used={} tables_used={} code_capacity={} table_capacity={}\n",
+            self.stats,
+            self.arena.used_bytes(),
+            self.arena.tables_used(),
+            self.arena.capacity(),
+            self.arena.table_capacity(),
+        );
         #[cfg(feature = "jit-profile")]
         {
             let mut ranked: Vec<_> = self
@@ -712,59 +785,61 @@ impl Engine {
                         self.stats.content_changes += 1;
                     }
                 }
-                let entry = self.arena.entries(page.entries)[offset];
+                let entry = page.entries.get(&self.arena, offset);
                 if entry == INTERPRET || entry > COLD {
                     #[cfg(feature = "jit-profile")]
                     if entry == INTERPRET {
                         self.unsupported[usize::from(page.opcodes[offset])] += 1;
                     }
-                    let entries = self.arena.entries_pointer(page.entries);
-                    self.link(
-                        linear.0,
-                        version,
-                        version_ptr,
-                        entries,
-                        global,
-                        recheck,
-                        hit,
-                    );
-                    return Ok((entry > COLD).then_some(NativeBlock {
-                        body: relative_entry(entries, entry),
-                    }));
+                    if let Some(table) = page.entries.native() {
+                        let entries = self.arena.entries_pointer(table);
+                        self.link(
+                            linear.0,
+                            version,
+                            version_ptr,
+                            entries,
+                            global,
+                            recheck,
+                            hit,
+                        );
+                        return Ok((entry > COLD).then_some(NativeBlock {
+                            body: relative_entry(entries, entry),
+                        }));
+                    }
+                    return Ok(None);
                 }
-                // Admission reuses this table and word without another lookup.
-                // No mutation or arena reclamation can occur before their use.
-                (page.entries, entry)
+                (&mut page.entries, entry)
             } else {
                 if self.pages.len() >= ENTRY_TABLES {
                     self.stats.table_clears += 1;
-                    // Bound the second-level tables to 64 MiB, alongside the bounded
-                    // native arena. Negative entries need no per-instruction allocation.
+                    // Bound all page metadata, including cold-only pages, even
+                    // when neither native pool is full. Reclaim everything.
                     self.clear(bus)?;
                     (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
                 }
                 let page = self
                     .pages
                     .entry(key)
-                    .or_insert_with(|| CompiledPage::new(version, self.arena.allocate_entries()));
-                // allocate_entries zeroes every word of this new page's table.
-                (page.entries, 0)
+                    .or_insert_with(|| CompiledPage::new(version, &mut self.arena));
+                (&mut page.entries, 0)
             };
         if entry < COLD {
             // Compilation and publication cost are part of a cold boot. Wait
             // for a third visit before emitting a block; cold passes retain
             // ordinary interpretation and architectural fetch behavior.
-            self.arena.entries_mut(page_entries)[offset] = entry.max(1) + 1;
-            let entries = self.arena.entries_pointer(page_entries);
-            self.link(
-                linear.0,
-                version,
-                version_ptr,
-                entries,
-                global,
-                recheck,
-                hit,
-            );
+            page_entries.set(&mut self.arena, offset, entry.max(1) + 1);
+            if let Some(table) = page_entries.native() {
+                let entries = self.arena.entries_pointer(table);
+                self.link(
+                    linear.0,
+                    version,
+                    version_ptr,
+                    entries,
+                    global,
+                    recheck,
+                    hit,
+                );
+            }
             return Ok(None);
         }
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
@@ -812,6 +887,13 @@ impl Engine {
                 self.block_facts,
             )
             .map_err(|error| format!("JIT compiler at {:#x}: {error:?}", cpu.eip))?;
+            if self.arena.tables_used() == self.arena.table_capacity()
+                && self.pages[&key].entries.native().is_none()
+            {
+                self.stats.table_clears += 1;
+                self.clear(bus)?;
+                (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+            }
             let entry = match self.arena.publish_block(&mut code) {
                 Err(CodeError::Capacity) => {
                     self.stats.capacity_clears += 1;
@@ -853,7 +935,7 @@ impl Engine {
         let page = self
             .pages
             .entry(key)
-            .or_insert_with(|| CompiledPage::new(version, self.arena.allocate_entries()));
+            .or_insert_with(|| CompiledPage::new(version, &mut self.arena));
         if let Some(content) = &mut page.content {
             // A negative decision depends on at most one architectural
             // instruction. Keeping its first 15 bytes unchanged cannot make an
@@ -866,12 +948,12 @@ impl Engine {
             };
             content.record(offset, bus.jit_code_bytes(backing, used));
         }
-        let entries = self.arena.entries_pointer(page.entries);
-        self.arena.entries_mut(page.entries)[offset] = native.map_or(INTERPRET, |block| {
-            i32::try_from(block.body as isize - entries as isize)
-                .expect("bounded relative native entry") as u32
-        });
         if let Some(block) = native {
+            let table = page.entries.promote(&mut self.arena);
+            let entries = self.arena.entries_pointer(table);
+            let entry = i32::try_from(block.body as isize - entries as isize)
+                .expect("bounded relative native entry") as u32;
+            self.arena.entries_mut(table)[offset] = entry;
             #[cfg(target_os = "linux")]
             page.faults.push((block.body, _faults.into_boxed_slice()));
             page.pending_edges.extend(
@@ -879,22 +961,27 @@ impl Engine {
                     .into_iter()
                     .map(|edge| (block.body + edge.native_offset as usize, edge.target_offset)),
             );
+        } else {
+            page.entries.set(&mut self.arena, offset, INTERPRET);
         }
-        // Every entry on this page has the same mapping/content validity.
-        // A target is published once per version, so a resolved edge needs
-        // no backlink/unpatch machinery: invalidation retires its source too.
-        for index in (0..page.pending_edges.len()).rev() {
-            let (source, offset) = page.pending_edges[index];
-            let target = self.arena.entries(page.entries)[usize::from(offset)];
-            if target > COLD {
-                let patched = self
-                    .arena
-                    .patch_branch(source, relative_entry(entries, target));
-                page.pending_edges.swap_remove(index);
-                self.stats.linked_edges += u64::from(patched);
-            } else if target == INTERPRET {
-                // This version can never gain native code for that opcode.
-                page.pending_edges.swap_remove(index);
+        if let Some(table) = page.entries.native() {
+            let entries = self.arena.entries_pointer(table);
+            // Every entry on this page has the same mapping/content validity.
+            // A target is published once per version, so a resolved edge needs
+            // no backlink/unpatch machinery: invalidation retires its source too.
+            for index in (0..page.pending_edges.len()).rev() {
+                let (source, offset) = page.pending_edges[index];
+                let target = self.arena.entries(table)[usize::from(offset)];
+                if target > COLD {
+                    let patched = self
+                        .arena
+                        .patch_branch(source, relative_entry(entries, target));
+                    page.pending_edges.swap_remove(index);
+                    self.stats.linked_edges += u64::from(patched);
+                } else if target == INTERPRET {
+                    // This version can never gain native code for that opcode.
+                    page.pending_edges.swap_remove(index);
+                }
             }
         }
         #[cfg(feature = "jit-profile")]
@@ -908,15 +995,18 @@ impl Engine {
                 self.unsupported[opcode] += 1;
             }
         }
-        self.link(
-            linear.0,
-            version,
-            version_ptr,
-            entries,
-            global,
-            recheck,
-            hit,
-        );
+        if let Some(table) = page.entries.native() {
+            let entries = self.arena.entries_pointer(table);
+            self.link(
+                linear.0,
+                version,
+                version_ptr,
+                entries,
+                global,
+                recheck,
+                hit,
+            );
+        }
         Ok(native)
     }
 
@@ -1201,5 +1291,38 @@ impl Engine {
             ran,
             stop: BatchStop::Budget,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_page_promotion_preserves_admission_and_negative_entries() {
+        let mut arena = CodeArena::with_limits(64 * 1024, 1).unwrap();
+        let mut page = CompiledPage::new(1, &mut arena);
+        for offset in 0..PAGE_BYTES {
+            page.entries.set(&mut arena, offset, (offset % 4) as u32);
+        }
+        assert_eq!(arena.tables_used(), 0);
+        assert!(page.entries.native().is_none());
+        let table = page.entries.promote(&mut arena);
+        assert_eq!(arena.tables_used(), 1);
+        let pointer = arena.entries_pointer(table);
+        for offset in 0..PAGE_BYTES {
+            // Both aliases expose the same packed-state expansion to dispatch.
+            assert_eq!(page.entries.get(&arena, offset), (offset % 4) as u32);
+            assert_eq!(unsafe { pointer.add(offset).read() }, (offset % 4) as u32);
+        }
+        page.invalidate(2, &mut arena);
+        assert!(arena.entries(table).iter().all(|&entry| entry == 0));
+        assert_eq!(arena.tables_used(), 1);
+        let mut cold = CompiledPage::new(1, &mut arena);
+        cold.entries.set(&mut arena, 4095, INTERPRET);
+        cold.invalidate(2, &mut arena);
+        assert_eq!(cold.entries.get(&arena, 4095), 0);
+        assert!(cold.content.is_none());
+        assert_eq!(arena.tables_used(), 1);
     }
 }
