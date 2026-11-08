@@ -13,13 +13,17 @@ use super::ui::{
 };
 use crate::catalog::{self, CATALOG, FreeOs, Job, Media};
 use crate::guest_os::{self, OsPreset, PRESETS};
+use crate::media::ImageKind;
 use crate::vm_store::{self, Vm};
+use crate::ws_frontend::Import;
 
 pub struct Ctx {
     pub library: PathBuf,
     pub share: PathBuf,
-    pub cache: PathBuf,
-    pub home: PathBuf,
+    /// Where the disk image chooser starts.
+    pub vhd: PathBuf,
+    /// Where CD image choosers start; catalog downloads are kept here.
+    pub iso: PathBuf,
     /// Largest guest memory offered, in MiB (half the host RAM).
     pub memory_limit: u32,
     /// The chord that opens the in-VM menu, for hints.
@@ -440,12 +444,10 @@ impl View for Settings {
                 self.vm.memory,
                 guest_os::by_name(&self.vm.os),
             ))),
-            Field::Cd => Nav::Push(Box::new(Browser::new(
-                "Choose a CD image",
-                &ctx.home,
-                &["iso"],
-                Some("No disc"),
-            ))),
+            Field::Cd => Nav::Push(Box::new(
+                Browser::new("Choose a CD image", &ctx.iso, &["iso"], Some("No disc"))
+                    .with_import(ImageKind::Cd, &ctx.iso),
+            )),
             Field::Boot => {
                 self.vm.boot_order = if self.vm.boot_order == "cdrom" {
                     "disk"
@@ -680,7 +682,7 @@ impl Wizard {
             Source::Free => {
                 let os = self.free.unwrap();
                 self.pending = Pending::Job;
-                let job = catalog::install(os, vm, ctx.share.clone(), ctx.cache.clone());
+                let job = catalog::install(os, vm, ctx.share.clone(), ctx.iso.clone());
                 return Nav::Push(Box::new(Progress::new(os.title, job)));
             }
             Source::Iso if let Some(os_id) = self.windows_setup() => {
@@ -746,12 +748,20 @@ impl View for Wizard {
                     return Nav::Stay;
                 }
                 self.pending = Pending::Media;
-                let (title, exts): (&str, &[&str]) = if self.source == Source::Iso {
-                    ("Choose a CD image", &["iso"])
+                let (title, kind, dir, exts): (&str, _, _, &[&str]) = if self.source == Source::Iso
+                {
+                    ("Choose a CD image", ImageKind::Cd, &ctx.iso, &["iso"])
                 } else {
-                    ("Choose a disk image", &["vhd", "img", "raw"])
+                    (
+                        "Choose a disk image",
+                        ImageKind::Disk,
+                        &ctx.vhd,
+                        &["vhd", "img", "raw"],
+                    )
                 };
-                Nav::Push(Box::new(Browser::new(title, &ctx.home, exts, None)))
+                Nav::Push(Box::new(
+                    Browser::new(title, dir, exts, None).with_import(kind, dir),
+                ))
             }
             Step::Free => {
                 let os = &CATALOG[selected];
@@ -940,9 +950,13 @@ impl View for Picker {
 
 // ---------------------------------------------------------------- Browser
 
-struct Entry {
-    path: Option<PathBuf>,
-    directory: bool,
+enum Entry {
+    /// The `none` choice, such as "No disc".
+    None,
+    /// Receive the image from a browser on the same Wi-Fi.
+    Import,
+    Directory(PathBuf),
+    File(PathBuf),
 }
 
 /// Pick a file with one of `extensions`; pops `Reply::Path` (or `NoFile`).
@@ -951,6 +965,8 @@ pub struct Browser {
     directory: PathBuf,
     extensions: &'static [&'static str],
     none: Option<&'static str>,
+    /// What "Upload over Wi-Fi" receives, and where it is saved.
+    import: Option<(ImageKind, PathBuf)>,
     entries: Vec<Entry>,
     menu: Menu,
 }
@@ -967,11 +983,19 @@ impl Browser {
             directory: start.to_path_buf(),
             extensions,
             none,
+            import: None,
             entries: Vec::new(),
             menu: Menu::new(Vec::new()),
         };
         browser.load();
         browser
+    }
+
+    /// Offers "Upload over Wi-Fi" first, saving a `kind` image in `dir`.
+    pub fn with_import(mut self, kind: ImageKind, dir: &Path) -> Self {
+        self.import = Some((kind, dir.to_path_buf()));
+        self.load();
+        self
     }
 
     fn load(&mut self) {
@@ -999,35 +1023,28 @@ impl Browser {
         files.sort_by_key(|(name, ..)| name.to_lowercase());
         let mut items = Vec::new();
         self.entries.clear();
+        if self.import.is_some() {
+            items.push(Item::new("Upload over Wi-Fi").color(GOOD));
+            self.entries.push(Entry::Import);
+        }
         if let Some(label) = self.none {
             items.push(Item::new(label).color(MUTED));
-            self.entries.push(Entry {
-                path: None,
-                directory: false,
-            });
+            self.entries.push(Entry::None);
         }
         if let Some(parent) = self.directory.parent() {
             items.push(Item::new("..").detail("up").color(MUTED));
-            self.entries.push(Entry {
-                path: Some(parent.to_path_buf()),
-                directory: true,
-            });
+            self.entries.push(Entry::Directory(parent.to_path_buf()));
         }
         for (name, path) in dirs {
             items.push(Item::new(format!("{name}/")).color(ACCENT_TEXT));
-            self.entries.push(Entry {
-                path: Some(path),
-                directory: true,
-            });
+            self.entries.push(Entry::Directory(path));
         }
         for (name, path, size) in files {
             items.push(Item::new(name).detail(megabytes((size + (1 << 19)) >> 20)));
-            self.entries.push(Entry {
-                path: Some(path),
-                directory: false,
-            });
+            self.entries.push(Entry::File(path));
         }
-        self.menu = Menu::new(items);
+        let selected = self.menu.selected;
+        self.menu = Menu::new(items).select(selected);
     }
 }
 
@@ -1051,7 +1068,7 @@ impl View for Browser {
         };
         c.text(6, area.y + 3, &shown, MUTED, Font::Small);
         // The note gets its own line below the list instead of covering it.
-        let empty = self.entries.iter().all(|e| e.directory || e.path.is_none());
+        let empty = !self.entries.iter().any(|e| matches!(e, Entry::File(_)));
         let list = Rect {
             y: area.y + 12,
             h: area.h - if empty { 24 } else { 12 },
@@ -1072,22 +1089,120 @@ impl View for Browser {
         }
         match key {
             UiKey::Back => Nav::Pop(None),
-            UiKey::Enter => {
-                let Some(entry) = self.entries.get(self.menu.selected) else {
-                    return Nav::Stay;
-                };
-                match (&entry.path, entry.directory) {
-                    (None, _) => Nav::Pop(Some(Reply::NoFile)),
-                    (Some(path), true) => {
-                        self.directory = path.clone();
-                        self.load();
-                        Nav::Stay
-                    }
-                    (Some(path), false) => Nav::Pop(Some(Reply::Path(path.clone()))),
+            UiKey::Enter => match self.entries.get(self.menu.selected) {
+                Some(Entry::None) => Nav::Pop(Some(Reply::NoFile)),
+                Some(Entry::Import) => {
+                    let (kind, dir) = self.import.as_ref().unwrap();
+                    Nav::Push(Box::new(WifiImport::new(*kind, dir)))
                 }
-            }
+                Some(Entry::Directory(path)) => {
+                    self.directory = path.clone();
+                    self.menu = Menu::new(Vec::new());
+                    self.load();
+                    Nav::Stay
+                }
+                Some(Entry::File(path)) => Nav::Pop(Some(Reply::Path(path.clone()))),
+                None => Nav::Stay,
+            },
             _ => Nav::Stay,
         }
+    }
+
+    fn reply(&mut self, reply: Option<Reply>, _ctx: &Ctx) -> Nav {
+        match reply {
+            // The received image is the choice.
+            Some(Reply::Path(path)) => Nav::Pop(Some(Reply::Path(path))),
+            _ => Nav::Stay,
+        }
+    }
+}
+
+/// Receives a disk or CD image from a browser on the same Wi-Fi, through the
+/// console page in import mode; pops with the saved image.
+struct WifiImport {
+    kind: ImageKind,
+    import: Result<Import, String>,
+}
+
+impl WifiImport {
+    fn new(kind: ImageKind, dir: &Path) -> Self {
+        let import = super::session::console_listener()
+            .and_then(|listener| Import::new(listener, kind, dir.to_path_buf()));
+        Self { kind, import }
+    }
+}
+
+impl View for WifiImport {
+    fn draw(&mut self, c: &mut Canvas, _ctx: &Ctx) {
+        c.fill(BG);
+        let what = match self.kind {
+            ImageKind::Cd => "CD image",
+            ImageKind::Disk => "disk image",
+        };
+        ui::header(c, "Upload over Wi-Fi", what);
+        let import = match &self.import {
+            Ok(import) => import,
+            Err(err) => {
+                let area = ui::body(c);
+                let text = Rect {
+                    x: 8,
+                    y: area.y + 8,
+                    w: area.w - 16,
+                    h: area.h - 16,
+                };
+                c.paragraph(text, err, TEXT, Font::Small);
+                ui::footer(c, "Esc: back");
+                return;
+            }
+        };
+        match import.url() {
+            Some(url) => {
+                c.text_centered(30, "On a phone or computer on the same", TEXT, Font::Small);
+                c.text_centered(40, "Wi-Fi, open", TEXT, Font::Small);
+                c.text_centered(58, url.trim_end_matches('/'), ACCENT, Font::Normal);
+            }
+            None => {
+                c.text_centered(40, "This device is not on a network.", TEXT, Font::Small);
+                c.text_centered(52, "Connect it to Wi-Fi.", MUTED, Font::Small);
+            }
+        }
+        match import.progress() {
+            None => c.text_centered(90, &format!("and send a {what}."), MUTED, Font::Small),
+            Some((name, received, size)) => {
+                c.text_centered(88, &ui::clip(name, 36), TEXT, Font::Small);
+                let bar = Rect {
+                    x: 40,
+                    y: 102,
+                    w: c.width - 80,
+                    h: 6,
+                };
+                c.rect(bar, PANEL);
+                let done = (bar.w as u64 * received / size.max(1)) as i32;
+                c.rect(Rect { w: done, ..bar }, ACCENT);
+                let text = format!("{} of {} MB", received >> 20, size >> 20);
+                c.text_centered(116, &text, MUTED, Font::Small);
+            }
+        }
+        ui::footer(c, "Esc: cancel");
+    }
+
+    fn key(&mut self, key: UiKey, _ctx: &Ctx) -> Nav {
+        // Leaving drops the server and any unfinished image.
+        match list_key(key) {
+            UiKey::Back => Nav::Pop(None),
+            _ => Nav::Stay,
+        }
+    }
+
+    fn tick(&mut self, _ctx: &Ctx) -> Nav {
+        match self.import.as_mut().ok().and_then(Import::poll) {
+            Some(path) => Nav::Pop(Some(Reply::Path(path))),
+            None => Nav::Stay,
+        }
+    }
+
+    fn animated(&self) -> bool {
+        true
     }
 }
 
@@ -1414,7 +1529,7 @@ impl View for VmOverlay {
                     self.cd = true;
                     Nav::Push(Box::new(Browser::new(
                         "Insert a CD image",
-                        &ctx.home,
+                        &ctx.iso,
                         &["iso"],
                         Some("Eject"),
                     )))

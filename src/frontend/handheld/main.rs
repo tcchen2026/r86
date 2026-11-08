@@ -45,21 +45,18 @@ use lcd::{Framebuffer, Keyboard};
 use screens::{Ctx, Home, Message, Outcome, Stack};
 use session::End;
 
-const USAGE: &str =
-    "usage: r86-handheld [--fb PATH] [--input PATH]... [--library DIR] [--share DIR]
-                    [--cache DIR] [--home DIR]
+const USAGE: &str = "usage: r86-handheld [--fb PATH] [--input PATH]... [--data DIR] [--share DIR]
 
 --fb       framebuffer device; a regular file acts as a 320x170 RGB565 panel for
            host testing (default: /dev/fb_lcd or an ST7789 in /proc/fb, else
            full screen through the system's libSDL2, else /dev/fb0)
 --input    evdev device, repeatable (default: every keyboard in /proc/bus/input/devices)
---library  VM folder (default: ~/r86-VMs)
+--data     r86's folder (default: ~/r86): VMs/ holds the VMs; the disk and CD
+           choosers start in vhd/ and iso/; catalog downloads go to iso/
 --share    firmware and bundled images (default: beside the executable or ../share/r86)
---cache    downloads (default: $XDG_CACHE_HOME/r86 or ~/.cache/r86)
---home     where file choosers start (default: $HOME)
 
 The handheld-sdl build shows a desktop window instead of --fb/--input and
-keeps its library, cache and share folders under ./tmp/handheld.";
+keeps its data and share folders under ./tmp/handheld.";
 
 fn main() -> ExitCode {
     match run() {
@@ -74,20 +71,16 @@ fn main() -> ExitCode {
 struct Options {
     fb: Option<PathBuf>,
     inputs: Vec<PathBuf>,
-    library: Option<PathBuf>,
+    data: Option<PathBuf>,
     share: Option<PathBuf>,
-    cache: Option<PathBuf>,
-    home: Option<PathBuf>,
 }
 
 fn options() -> Result<Options, String> {
     let mut options = Options {
         fb: None,
         inputs: Vec::new(),
-        library: None,
+        data: None,
         share: None,
-        cache: None,
-        home: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -99,10 +92,8 @@ fn options() -> Result<Options, String> {
         match arg.as_str() {
             "--fb" => options.fb = Some(value()?),
             "--input" => options.inputs.push(value()?),
-            "--library" => options.library = Some(value()?),
+            "--data" => options.data = Some(value()?),
             "--share" => options.share = Some(value()?),
-            "--cache" => options.cache = Some(value()?),
-            "--home" => options.home = Some(value()?),
             _ => return Err(USAGE.into()),
         }
     }
@@ -147,32 +138,23 @@ fn open_device(options: &Options) -> Result<Box<dyn Device>, String> {
 
 fn run() -> Result<(), String> {
     let options = options()?;
-    let data = PathBuf::from("tmp/handheld");
-    let user_home = std::env::var_os("HOME").map(PathBuf::from);
-    let home = match (&options.home, SIMULATOR) {
+    let simulator = PathBuf::from("tmp/handheld");
+    let data = match (&options.data, SIMULATOR) {
         (Some(dir), _) => dir.clone(),
-        (None, true) => std::env::current_dir().map_err(|err| err.to_string())?,
-        (None, false) => user_home.clone().ok_or("HOME is not set")?,
-    };
-    let library = match (&options.library, SIMULATOR) {
-        (Some(dir), _) => dir.clone(),
-        (None, true) => data.join("r86-VMs"),
-        (None, false) => vm_store::default_root()?,
+        (None, true) => simulator.clone(),
+        (None, false) => {
+            PathBuf::from(std::env::var_os("HOME").ok_or("HOME is not set")?).join("r86")
+        }
     };
     let share = match (&options.share, SIMULATOR) {
         (Some(dir), _) => dir.clone(),
-        (None, true) => data.join("share"),
+        (None, true) => simulator.join("share"),
         (None, false) => vm_store::firmware_dir()?,
     };
-    let cache = match (&options.cache, SIMULATOR) {
-        (Some(dir), _) => dir.clone(),
-        (None, true) => data.join("cache"),
-        (None, false) => std::env::var_os("XDG_CACHE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| user_home.map(|home| home.join(".cache")))
-            .ok_or("HOME is not set")?
-            .join("r86"),
-    };
+    let (library, vhd, iso) = (data.join("VMs"), data.join("vhd"), data.join("iso"));
+    for dir in [&library, &vhd, &iso] {
+        fs::create_dir_all(dir).map_err(|err| format!("Cannot create {}: {err}", dir.display()))?;
+    }
     device::install_stop_signals();
     let mut device = open_device(&options)?;
     let (width, height) = device.size();
@@ -180,8 +162,8 @@ fn run() -> Result<(), String> {
     let ctx = Ctx {
         library,
         share,
-        cache,
-        home,
+        vhd,
+        iso,
         memory_limit: memory_limit(),
         menu_keys: device.menu_keys(),
         help: device.help(),

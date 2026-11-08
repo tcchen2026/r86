@@ -1,8 +1,8 @@
 #!/bin/sh
 # Installs the app beside its firmware and complete DOS kit, plus the launcher.
-# APPLaunch starts apps as the desktop user without a terminal; the wrapper
-# keeps VMs, downloads and the log in that user's ~/r86 (the package's own
-# directory is root-owned and replaced on upgrade).
+# APPLaunch starts apps as the desktop user without a terminal; r86 keeps its
+# VMs, disk and CD images and the wrapper its log in that user's ~/r86 (the
+# package's own directory is root-owned and replaced on upgrade).
 set -eu
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 app=$STAGE$APP_INSTALL_DIR
@@ -13,7 +13,6 @@ cat >"$STAGE$INSTALL_PREFIX/bin/$PKG_NAME" <<WRAPPER
 #!/bin/sh
 data=\$HOME/r86
 mkdir -p "\$data"
-exec $APP_INSTALL_DIR/r86-handheld --library "\$data/VMs" --cache "\$data/cache" "\$@" \\
-    >"\$data/r86.log" 2>&1
+exec $APP_INSTALL_DIR/r86-handheld --data "\$data" "\$@" >"\$data/r86.log" 2>&1
 WRAPPER
 chmod 0755 "$STAGE$INSTALL_PREFIX/bin/$PKG_NAME"

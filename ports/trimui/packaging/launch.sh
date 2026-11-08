@@ -1,7 +1,7 @@
 #!/bin/sh
 # MainUI runs this with the screen released and returns when it exits.
-# The app and its data (VMs, downloads, the log in /mnt/SDCARD/r86) stay on
-# the SD card; file choosers start there.
+# The app and its data (VMs, disk and CD images, the log in /mnt/SDCARD/r86)
+# stay on the SD card.
 cd "$(dirname "$0")"
 data=/mnt/SDCARD/r86
 mkdir -p "$data"
@@ -11,6 +11,5 @@ echo 1 >/tmp/stay_awake
 for cpu in 0 4; do
     echo performance >/sys/devices/system/cpu/cpu$cpu/cpufreq/scaling_governor
 done
-./r86-handheld --library "$data/VMs" --cache "$data/cache" --home /mnt/SDCARD \
-    >"$data/r86.log" 2>&1
+./r86-handheld --data "$data" >"$data/r86.log" 2>&1
 rm -f /tmp/stay_awake

@@ -121,7 +121,7 @@ pub fn run(
     let mut machine = vm.machine(&ctx.share, HANDHELD_VGA_BIOS)?;
     let remote = if remote {
         machine.power_off()?;
-        Some(start_remote(&vm.directory)?)
+        Some(start_remote(&ctx.iso)?)
     } else {
         None
     };
@@ -728,7 +728,7 @@ impl Session<'_> {
                     remote.close(&mut self.machine);
                     self.notify("Remote management stopped");
                 } else {
-                    match start_remote(&self.vm.directory) {
+                    match start_remote(&self.ctx.iso) {
                         Ok(mut remote) => {
                             remote.set_running(&self.machine, true);
                             self.remote = Some(remote);
@@ -748,20 +748,19 @@ impl Session<'_> {
     }
 }
 
-/// Listens on the home Wi-Fi; anyone on that network can use the console.
-fn start_remote(vm_directory: &Path) -> Result<Remote, String> {
-    let listener = REMOTE_PORTS
+/// The console's port on the home Wi-Fi, for remote management and imports;
+/// anyone on that network can use it.
+pub fn console_listener() -> Result<TcpListener, String> {
+    REMOTE_PORTS
         .clone()
         .find_map(|port| TcpListener::bind(("0.0.0.0", port)).ok())
-        .ok_or("No free network port (8086-8095).")?;
-    // Discs from the browser are saved beside the VM, like a CD chosen here.
-    let remote = Remote::new(
-        listener,
-        SLICE_STEPS,
-        None,
-        false,
-        Some(vm_directory.to_path_buf()),
-    )?;
+        .ok_or_else(|| "No free network port (8086-8095).".into())
+}
+
+/// Discs from the browser are saved in `iso_dir`, beside the others.
+fn start_remote(iso_dir: &Path) -> Result<Remote, String> {
+    let listener = console_listener()?;
+    let remote = Remote::new(listener, SLICE_STEPS, None, false, Some(iso_dir.into()))?;
     // The device log also gets the address, for setups without a view of the panel.
     eprintln!("r86-handheld: remote management at {}", remote.url());
     Ok(remote)

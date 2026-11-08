@@ -4,7 +4,7 @@
 //! Logs use caller-owned offsets, so readers never consume each other's data.
 use super::disk_files;
 use super::keys::{InputKey, inject_input_key, parse_named_key};
-use super::media::{Image, MEDIA_LIMIT, Upload};
+use super::media::{Image, ImageKind, MEDIA_LIMIT, Upload};
 use super::protocol::*;
 use super::ws;
 use r86::devices::{Ps2ButtonState, Viewer};
@@ -191,7 +191,7 @@ struct Service {
     upload: Option<Upload>,
     /// Name of the disc inserted through this server, if any.
     media_name: Option<String>,
-    /// Where uploaded discs are saved (the handheld's VM folder); None keeps
+    /// Where uploaded discs are saved (the handheld VM's tmp folder); None keeps
     /// them in memory.
     save_dir: Option<PathBuf>,
     /// A disc this server inserted or ejected, until the owner takes it.
@@ -1333,33 +1333,7 @@ impl Remote {
                     .map_err(|e| format!("failed to open websocket record {path}: {e}"))
             })
             .transpose()?;
-        let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-        let (tx, rx) = mpsc::sync_channel(64);
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = stop.clone();
-        // Workers own only sockets and bounded messages, never the machine.
-        std::thread::spawn(move || {
-            let active = Arc::new(AtomicUsize::new(0));
-            for (id, stream) in listener.incoming().enumerate() {
-                if stopping.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Ok(stream) = stream else {
-                    break;
-                };
-                if active.load(Ordering::Relaxed) >= 32 {
-                    continue;
-                }
-                active.fetch_add(1, Ordering::Relaxed);
-                let active = active.clone();
-                let tx = tx.clone();
-                std::thread::spawn(move || {
-                    let _ = connection(stream, id, &tx);
-                    let _ = tx.send(Request::Disconnect(id));
-                    active.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-        });
+        let (rx, port, stop) = listen(listener)?;
         let mut service = Service::new();
         service.jobs = jobs;
         service.save_dir = save_dir;
@@ -1538,11 +1512,193 @@ impl Remote {
 
 impl Drop for Remote {
     fn drop(&mut self) {
-        // Dropping the service closes every client's reply channel; wake the
-        // accept loop so it sees the stop flag.
-        self.stop.store(true, Ordering::Relaxed);
-        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        // Dropping the service closes every client's reply channel.
+        stop_listening(&self.stop, self.port);
     }
+}
+
+/// The console page without a machine: receives one disk or CD image from a
+/// browser for the handheld's New VM wizard and saves it in `dir`, named as
+/// in media.rs. Same page, port range and transport as `Remote`.
+#[allow(dead_code)] // The handheld's; r86-run has no wizard.
+pub struct Import {
+    rx: mpsc::Receiver<Request>,
+    port: u16,
+    stop: Arc<AtomicBool>,
+    kind: ImageKind,
+    dir: PathBuf,
+    clients: BTreeMap<usize, mpsc::SyncSender<Reply>>,
+    /// The image arriving and its announced size.
+    upload: Option<(Upload, u64)>,
+    saved: Option<PathBuf>,
+}
+
+impl Import {
+    pub fn new(listener: TcpListener, kind: ImageKind, dir: PathBuf) -> Result<Self, String> {
+        let (rx, port, stop) = listen(listener)?;
+        Ok(Self {
+            rx,
+            port,
+            stop,
+            kind,
+            dir,
+            clients: BTreeMap::new(),
+            upload: None,
+            saved: None,
+        })
+    }
+
+    /// The page's address on the local network, if this device has one.
+    pub fn url(&self) -> Option<String> {
+        lan_address().map(|host| format!("http://{host}:{}/", self.port))
+    }
+
+    /// The image arriving: its name, bytes received and size.
+    pub fn progress(&self) -> Option<(&str, u64, u64)> {
+        let (upload, size) = self.upload.as_ref()?;
+        Some((&upload.name, upload.progress().0, *size))
+    }
+
+    /// Handles queued requests; returns the saved image once a browser has
+    /// sent all of it.
+    pub fn poll(&mut self) -> Option<PathBuf> {
+        while let Ok(request) = self.rx.try_recv() {
+            self.handle(request);
+        }
+        self.saved.take()
+    }
+
+    fn handle(&mut self, request: Request) {
+        let (id, text) = match request {
+            Request::Connect(id, reply) => {
+                self.clients.insert(id, reply);
+                let hello = format!(
+                    "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"client_id\":{id},\"import\":\"{}\"}}",
+                    self.kind.name()
+                );
+                (id, Ok(hello))
+            }
+            Request::Disconnect(id) => {
+                self.clients.remove(&id);
+                if self
+                    .upload
+                    .as_ref()
+                    .is_some_and(|(upload, _)| upload.owner == id)
+                {
+                    self.upload = None;
+                }
+                return;
+            }
+            Request::Command(id, message) => (id, self.command(id, &message)),
+            Request::Data(id, data) => (id, self.data(id, &data)),
+        };
+        let text = text.unwrap_or_else(|error| error_json(0, &error));
+        if let Some(client) = self.clients.get(&id) {
+            let _ = client.try_send(Reply::text(text));
+        }
+    }
+
+    fn command(&mut self, id: usize, message: &str) -> Result<String, String> {
+        let mine = self
+            .upload
+            .as_ref()
+            .is_some_and(|(upload, _)| upload.owner == id);
+        match json_string(message, "cmd")?.as_deref() {
+            Some("import-begin") => {
+                if self.upload.is_some() && !mine {
+                    return Err("Another browser is sending an image.".into());
+                }
+                let name = json_string(message, "name")?.unwrap_or_default();
+                let size = json_u64(message, "size")?.ok_or("import-begin missing size")?;
+                let upload = match self.kind {
+                    ImageKind::Cd => Upload::iso(id, &name, size, Some(&self.dir))?,
+                    ImageKind::Disk => Upload::disk(id, &name, size, &self.dir)?,
+                };
+                self.upload = Some((upload, size));
+                Ok("{\"type\":\"import\",\"ok\":true}".to_string())
+            }
+            Some("import-end") if mine => {
+                let (upload, _) = self.upload.take().unwrap();
+                let Image::File(_, path) = upload.finish(Some(&self.dir))? else {
+                    unreachable!("imports are saved")
+                };
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                let reply = format!(
+                    "{{\"type\":\"import\",\"ok\":true,\"name\":\"{}\"}}",
+                    json_escape(&name)
+                );
+                self.saved = Some(path);
+                Ok(reply)
+            }
+            Some("import-end") => Err("No image is being sent.".into()),
+            Some("import-cancel") => {
+                if mine {
+                    self.upload = None;
+                }
+                Ok("{\"type\":\"import\",\"ok\":true}".to_string())
+            }
+            _ => Err("This page only receives an image: no VM is running.".into()),
+        }
+    }
+
+    fn data(&mut self, id: usize, data: &[u8]) -> Result<String, String> {
+        let (upload, _) = self
+            .upload
+            .as_mut()
+            .filter(|(upload, _)| upload.owner == id)
+            .ok_or("No image is being sent.")?;
+        upload.write(data)?;
+        Ok(format!(
+            "{{\"type\":\"import-data\",\"ok\":true,\"received\":{}}}",
+            upload.progress().0
+        ))
+    }
+}
+
+impl Drop for Import {
+    fn drop(&mut self) {
+        stop_listening(&self.stop, self.port);
+    }
+}
+
+/// Accepts page and WebSocket connections on `listener`; each socket gets its
+/// own worker thread, which owns only the socket and bounded messages.
+fn listen(
+    listener: TcpListener,
+) -> Result<(mpsc::Receiver<Request>, u16, Arc<AtomicBool>), String> {
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    let (tx, rx) = mpsc::sync_channel(64);
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    std::thread::spawn(move || {
+        let active = Arc::new(AtomicUsize::new(0));
+        for (id, stream) in listener.incoming().enumerate() {
+            if stopping.load(Ordering::Relaxed) {
+                break;
+            }
+            let Ok(stream) = stream else {
+                break;
+            };
+            if active.load(Ordering::Relaxed) >= 32 {
+                continue;
+            }
+            active.fetch_add(1, Ordering::Relaxed);
+            let active = active.clone();
+            let tx = tx.clone();
+            std::thread::spawn(move || {
+                let _ = connection(stream, id, &tx);
+                let _ = tx.send(Request::Disconnect(id));
+                active.fetch_sub(1, Ordering::Relaxed);
+            });
+        }
+    });
+    Ok((rx, port, stop))
+}
+
+/// Wakes the accept loop so it sees the stop flag.
+fn stop_listening(stop: &AtomicBool, port: u16) {
+    stop.store(true, Ordering::Relaxed);
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
 }
 
 /// The address other devices reach this host at: the source address of the
@@ -1734,4 +1890,129 @@ fn connection(
     socket.shutdown();
     let _ = reader_thread.join();
     result
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    /// A browser reduced to what the import page sends.
+    struct Browser(TcpStream);
+
+    impl Browser {
+        fn connect(port: u16) -> Self {
+            let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            socket
+                .write_all(
+                    b"GET /ws HTTP/1.1\r\nHost: r86\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+                      Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+                )
+                .unwrap();
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                head.push(byte[0]);
+            }
+            assert!(head.starts_with(b"HTTP/1.1 101"));
+            Self(socket)
+        }
+
+        fn send(&mut self, opcode: u8, payload: &[u8]) {
+            let mut frame = vec![0x80 | opcode];
+            match payload.len() {
+                len @ 0..126 => frame.push(0x80 | len as u8),
+                len => {
+                    frame.push(0x80 | 126);
+                    frame.extend((len as u16).to_be_bytes());
+                }
+            }
+            // A zero mask leaves the payload unchanged.
+            frame.extend([0; 4]);
+            frame.extend(payload);
+            self.0.write_all(&frame).unwrap();
+        }
+
+        fn call(&mut self, opcode: u8, payload: &[u8]) -> String {
+            self.send(opcode, payload);
+            self.recv()
+        }
+
+        fn recv(&mut self) -> String {
+            let mut head = [0; 2];
+            self.0.read_exact(&mut head).unwrap();
+            let len = match head[1] & 0x7f {
+                126 => {
+                    let mut len = [0; 2];
+                    self.0.read_exact(&mut len).unwrap();
+                    usize::from(u16::from_be_bytes(len))
+                }
+                len => usize::from(len),
+            };
+            let mut payload = vec![0; len];
+            self.0.read_exact(&mut payload).unwrap();
+            String::from_utf8(payload).unwrap()
+        }
+    }
+
+    /// Runs `browse` against `import`, polling it as the wizard does.
+    fn serve(import: &mut Import, browse: impl FnOnce(u16) + Send + 'static) -> Option<PathBuf> {
+        let browser = std::thread::spawn({
+            let port = import.port;
+            move || browse(port)
+        });
+        let mut saved = None;
+        while !browser.is_finished() {
+            saved = saved.or(import.poll());
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        browser.join().unwrap();
+        // Let the disconnect arrive.
+        std::thread::sleep(Duration::from_millis(20));
+        saved.or(import.poll())
+    }
+
+    #[test]
+    fn import_saves_one_image_and_drops_an_abandoned_one() {
+        let dir = std::env::temp_dir().join(format!("r86-import-{}", std::process::id()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut import = Import::new(listener, ImageKind::Disk, dir.clone()).unwrap();
+        let saved = serve(&mut import, |port| {
+            let mut browser = Browser::connect(port);
+            assert!(browser.recv().contains("\"import\":\"disk\""));
+            let begin = r#"{"cmd":"import-begin","name":"My Disk.IMG","size":1024}"#;
+            assert!(browser.call(1, begin.as_bytes()).contains("\"ok\":true"));
+            assert!(browser.call(2, &[0x55; 512]).contains("\"received\":512"));
+            assert!(browser.call(2, &[0x55; 512]).contains("\"received\":1024"));
+            let end = browser.call(1, br#"{"cmd":"import-end"}"#);
+            assert!(end.contains("\"name\":\"My Disk-"), "{end}");
+        });
+        let saved = saved.expect("the wizard gets the image");
+        assert_eq!(fs::read(&saved).unwrap(), [0x55; 1024]);
+        let name = saved.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("My Disk-") && name.ends_with(".img"),
+            "{name}"
+        );
+
+        // A browser that leaves mid-image leaves nothing behind.
+        let abandoned = serve(&mut import, |port| {
+            let mut browser = Browser::connect(port);
+            browser.recv();
+            let begin = r#"{"cmd":"import-begin","name":"half.vhd","size":1024}"#;
+            assert!(browser.call(1, begin.as_bytes()).contains("\"ok\":true"));
+            browser.call(2, &[1; 512]);
+        });
+        assert!(abandoned.is_none());
+        let files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(files, [saved]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

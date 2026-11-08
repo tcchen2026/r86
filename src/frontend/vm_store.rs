@@ -33,12 +33,6 @@ pub struct Vm {
     pub notes: String,
 }
 
-pub fn default_root() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join("r86-VMs"))
-        .ok_or_else(|| "The home directory is unavailable. Set HOME.".into())
-}
-
 /// The directory holding bios.bin and vgabios-stdvga.bin: beside the
 /// executable, or `../share/r86` for packaged installs.
 pub fn firmware_dir() -> Result<PathBuf, String> {

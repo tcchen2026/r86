@@ -89,6 +89,13 @@
   #f-status.err { color: var(--bad); }
   .muted { color: var(--muted); font-size: 12px; }
   [hidden] { display: none !important; }
+  /* Import mode: the device's New VM wizard waits for one image. */
+  body.import header > :not(h1):not(#status), body.import main { display: none; }
+  #import { margin: 12vh auto 0; max-width: 440px; padding: 0 20px; text-align: center; }
+  #import h2 { font-size: 20px; margin: 0 0 8px; }
+  #import label.button { display: inline-block; margin: 18px 0 8px; padding: 9px 18px;
+    border-color: var(--accent); color: var(--accent); }
+  #import-result { margin-top: 18px; }
   @media (max-width: 800px) {
     main { flex-direction: column; }
     aside { width: auto; height: 35vh; border-left: 0; border-top: 1px solid var(--line); }
@@ -124,6 +131,13 @@
   <button id="upload-cancel">Cancel</button>
 </div>
 <div id="drop">Drop an ISO, files or folders to insert them as a CD</div>
+<section id="import" hidden>
+  <h2 id="import-title"></h2>
+  <div class="muted" id="import-hint"></div>
+  <label class="button">Choose a file…<input id="import-pick" type="file" hidden></label>
+  <div class="muted">or drop it on this page</div>
+  <div id="import-result"></div>
+</section>
 <main>
   <div id="left">
     <div id="wrap">
@@ -253,6 +267,8 @@ function drop(reason) {
   inflight = null; queue = []; pendingJson = null; mouse = null;
   held.clear();
   for (const r of pending) if (r) r.reject(new Error(reason));
+  // The wizard closes its page once it has the image.
+  if (imported) { $("dot").classList.remove("on"); $("state").textContent = "sent"; return; }
   if (wasReady) note(reason, true);
   const delay = Math.min(5000, 500 * 2 ** retry++);
   setUi(false);
@@ -275,6 +291,7 @@ setInterval(() => {
 
 function online(id, hello) {
   retry = 0;
+  if (hello.import) { showImport(hello.import); return; }
   serialPre.textContent = ""; eventsPre.textContent = "";
   frameGen = undefined; serialNext = 0; eventNext = 0;
   decoder = new TextDecoder();
@@ -662,6 +679,66 @@ picked($("pick-iso"));
 picked($("pick-files"), "FILES");
 picked($("pick-dir"));
 
+// --- Import: with no VM running, the device's New VM wizard asks for one disk
+// or CD image. The device saves it and the wizard continues with it.
+const IMPORTS = {
+  iso: { title: "Send a CD image", accept: ".iso", exts: /\.iso$/i },
+  disk: { title: "Send a disk image", accept: ".vhd,.img,.raw", exts: /\.(vhd|img|raw)$/i },
+};
+let importing = null, imported = false;
+
+function showImport(kind) {
+  importing = IMPORTS[kind];
+  document.body.classList.add("import");
+  document.title = `r86 · ${importing.title}`;
+  $("import").hidden = false;
+  $("import-title").textContent = importing.title;
+  $("import-hint").textContent =
+    `Choose a ${importing.accept.replaceAll(",", ", ")} file. The device saves it for the new VM.`;
+  $("import-pick").accept = importing.accept;
+  $("drop").textContent = "Drop the image to send it";
+  $("dot").classList.add("on");
+  $("state").textContent = "ready";
+}
+
+async function importImage(file) {
+  if (!file || uploading || imported) return;
+  if (!importing.exts.test(file.name)) {
+    $("import-result").textContent = `Choose a ${importing.accept.replaceAll(",", ", ")} file.`;
+    return;
+  }
+  const job = uploading = { cancelled: false, call: null };
+  $("upload").hidden = false;
+  $("import-result").textContent = "";
+  try {
+    const call = job.call = await mediaSocket();
+    await call({ cmd: "import-begin", name: file.name, size: file.size });
+    for (let at = 0; at < file.size; at += CHUNK) {
+      if (job.cancelled) throw new Error("Cancelled.");
+      await call(await file.slice(at, at + CHUNK).arrayBuffer());
+      const done = Math.min(at + CHUNK, file.size);
+      $("upload-text").textContent =
+        `${file.name} · ${(done / 2 ** 20).toFixed(1)} of ${(file.size / 2 ** 20).toFixed(1)} MiB`;
+      $("upload-bar").value = done / file.size;
+    }
+    $("upload-text").textContent = `saving ${file.name}`;
+    const json = await call({ cmd: "import-end" });
+    imported = true;
+    $("import-result").textContent = `Saved as ${json.name}. Continue on the device.`;
+  } catch (e) {
+    $("import-result").textContent = e.message;
+  } finally {
+    // Closing the connection discards an unfinished image.
+    job.call?.close();
+    uploading = null;
+    $("upload").hidden = true;
+  }
+}
+$("import-pick").onchange = () => {
+  importImage($("import-pick").files[0]);
+  $("import-pick").value = "";
+};
+
 // --- Power state. While off, the screen area shows the hard disk's files.
 let poweredOff = false;
 function showPower(off) {
@@ -856,6 +933,7 @@ addEventListener("drop", async e => {
   const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);
   const items = [];
   for (const entry of entries) await collect(entry, "", items);
+  if (importing) { importImage(items.find(i => !i.dir)?.file); return; }
   if (uploading) { note("an upload is already running", true); return; }
   if (poweredOff) { copyToDisk(items); return; }
   if (!mediaInfo?.drive) { note("CD: this VM has no CD drive", true); return; }

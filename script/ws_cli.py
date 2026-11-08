@@ -236,8 +236,28 @@ parent directories appear automatically. After ``media-begin`` (iso) or each
 is one request, answered by ``{"type":"media-data","ok":true,"received":N}``.
 The built disc has ISO 9660 level-1 names for DOS (MSCDEX) and Joliet names
 for Windows. Uploads stay in host memory, up to ``limit`` bytes. The
-handheld instead saves each inserted disc in the VM's folder as NAME.iso (an
-ISO image streams there while uploading) and keeps it as the VM's CD setting.
+handheld instead saves each inserted disc in its iso/ folder as
+NAME-XXXXXXXX.iso, XXXXXXXX being the start of its SHA-1 (an ISO image streams
+there while uploading), and keeps it as the VM's CD setting.
+
+Import mode
+-----------
+
+With no VM running, the handheld's New VM wizard receives one disk or CD image
+through the same page and port. Its hello has ``"import": "iso"`` or
+``"import": "disk"`` instead of ``capabilities``, and only these requests work:
+
+    {"cmd":"import-begin", "name": NAME, "size": BYTES}
+    {"cmd":"import-end"}
+    {"cmd":"import-cancel"}
+
+After ``import-begin``, send exactly BYTES bytes as binary frames, each answered
+by ``{"type":"import-data","ok":true,"received":N}``. ``import-end`` replies
+``{"type":"import","ok":true,"name":SAVED}``. A CD image is whole 2048-byte
+sectors; a disk image is a .vhd, .img or .raw file of whole 512-byte sectors.
+The device saves it in its iso/ or vhd/ folder as NAME-XXXXXXXX.EXT, named as
+above, and the wizard continues with it. Disconnecting discards an unfinished
+image.
 
 ``media-insert`` completes the upload and changes the disc; the guest sees a
 medium change (UNIT ATTENTION). If the guest has locked the drive or a read is

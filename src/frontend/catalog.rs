@@ -135,8 +135,8 @@ impl Job {
 }
 
 /// Create `vm` (memory, name and library already set) with `os` installed
-/// or its CD attached. Downloads are cached in `cache` for reuse.
-pub fn install(os: &'static FreeOs, vm: Vm, share: PathBuf, cache: PathBuf) -> Job {
+/// or its CD attached. Downloaded CD images are kept in `iso_dir` for reuse.
+pub fn install(os: &'static FreeOs, vm: Vm, share: PathBuf, iso_dir: PathBuf) -> Job {
     spawn(move |worker| {
         let mut vm = vm;
         match &os.media {
@@ -148,11 +148,11 @@ pub fn install(os: &'static FreeOs, vm: Vm, share: PathBuf, cache: PathBuf) -> J
                 zip_sha256,
                 iso,
             } => {
-                fs::create_dir_all(&cache)
-                    .map_err(|err| format!("Cannot create {}: {err}", cache.display()))?;
-                let iso_path = cache.join(iso);
+                fs::create_dir_all(&iso_dir)
+                    .map_err(|err| format!("Cannot create {}: {err}", iso_dir.display()))?;
+                let iso_path = iso_dir.join(iso);
                 if !iso_path.is_file() {
-                    let zip_path = cache.join(zip);
+                    let zip_path = iso_dir.join(zip);
                     if !zip_path.is_file() {
                         worker.stage("Downloading", *zip_size);
                         download(url, &zip_path, worker)?;
