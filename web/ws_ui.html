@@ -754,7 +754,7 @@ function showPower(off) {
   if (off) loadDrives();
 }
 
-let drive = null, folder = [];
+let drive = null, folder = [], driveFree = {};
 const diskPath = parts => `${drive}:/${parts.join("/")}`;
 function fstatus(text, error = false) {
   $("f-status").textContent = text;
@@ -776,6 +776,7 @@ async function loadDrives() {
   const box = $("drives");
   box.textContent = "";
   if (!json) return;
+  driveFree = Object.fromEntries(json.drives.map(d => [d.letter, d.free]));
   for (const d of json.drives) {
     const b = document.createElement("button");
     b.textContent = `${d.letter}:${d.fat ? (d.label ? " " + d.label : "") : " (not FAT)"}`;
@@ -860,9 +861,13 @@ $("f-mkdir").onclick = async () => {
 // Copies items ([{ path, file }] / [{ path, dir }]) into the current folder.
 async function copyToDisk(items) {
   if (!drive || uploading || !items.length) return;
-  const job = uploading = { cancelled: false, call: null, choose: null };
   const total = items.reduce((n, i) => n + (i.file?.size ?? 0), 0);
-  let done = 0, count = 0;
+  if (total > (driveFree[drive] ?? Infinity)) {
+    fstatus(`${size(total)} will not fit: ${drive}: has ${size(driveFree[drive])} free.`, true);
+    return;
+  }
+  const job = uploading = { cancelled: false, call: null, choose: null };
+  let done = 0, count = 0, result = "", failed = false;
   $("upload").hidden = false;
   try {
     const call = job.call = await mediaSocket();
@@ -879,14 +884,17 @@ async function copyToDisk(items) {
       }
       count++;
     }
-    fstatus(`Copied ${count} files (${size(done)})`);
+    result = `Copied ${count} files (${size(done)})`;
   } catch (e) {
-    fstatus(`Copy stopped after ${count} files: ${e.message}`, !job.cancelled);
+    result = `Copy stopped after ${count} files: ${e.message}`;
+    failed = !job.cancelled;
   } finally {
     job.call?.close();
     uploading = null;
     $("upload").hidden = true;
-    loadDrives();
+    // The refreshed listing writes its own status; the result goes last.
+    await loadDrives();
+    fstatus(result, failed);
   }
 }
 for (const id of ["f-pick", "f-pick-dir"]) {

@@ -202,12 +202,19 @@ struct Service {
     jobs: bool,
 }
 
+/// A file being copied onto the powered-off VM's disk.
 struct FilePut {
     owner: usize,
     path: String,
     size: usize,
-    data: Vec<u8>,
+    received: usize,
+    /// Received bytes not yet written, at most FILE_BATCH plus one chunk.
+    pending: Vec<u8>,
 }
+
+/// Bytes a copy gathers before writing them: most files reach the guest disk
+/// in one pass, and bigger ones reopen the file once per batch, not per chunk.
+const FILE_BATCH: usize = 8 << 20;
 
 fn bus_diagnostics_json(machine: &Machine) -> String {
     let limit = r86::machine::BUS_PAGE_LOG_LIMIT;
@@ -994,16 +1001,30 @@ impl Service {
                 if self.file_put.as_ref().is_some_and(|put| put.owner != id) {
                     return Err("Another client is uploading a file.".into());
                 }
+                // A replaced copy of this client leaves no partial file.
+                if let Some(old) = self.file_put.take() {
+                    let _ = disk_files::delete(disk, &old.path);
+                }
+                // The file is written in batches as it arrives, never held
+                // whole in host memory (the handheld has little).
+                disk_files::create(disk, &path, size)?;
+                if size == 0 {
+                    disk.flush().map_err(|err| err.to_string())?;
+                    return Ok(Reply::text(
+                        "{\"type\":\"files-data\",\"ok\":true,\"received\":0,\"saved\":true}"
+                            .into(),
+                    ));
+                }
+                let size = size as usize;
                 self.file_put = Some(FilePut {
                     owner: id,
                     path,
-                    size: size as usize,
-                    data: Vec::new(),
+                    size,
+                    received: 0,
+                    pending: Vec::with_capacity(
+                        size.min(FILE_BATCH + ws::MAX_BINARY_FRAME as usize),
+                    ),
                 });
-                // An empty file has no data frames; save it now.
-                if size == 0 {
-                    return Ok(Reply::text(self.file_data(machine, &[])?));
-                }
                 ack("")
             }
             "files-mkdir" => {
@@ -1025,24 +1046,33 @@ impl Service {
 
     /// Appends upload data; the file is written when the last byte arrives.
     fn file_data(&mut self, machine: &mut Machine, data: &[u8]) -> Result<String, String> {
-        let put = self.file_put.as_mut().unwrap();
-        if put.data.len() + data.len() > put.size {
-            self.file_put = None;
-            return Err("More data than the announced file size.".into());
-        }
-        put.data.extend_from_slice(data);
-        let received = put.data.len();
-        if received < put.size {
-            return Ok(format!(
-                "{{\"type\":\"files-data\",\"ok\":true,\"received\":{received}}}"
-            ));
-        }
-        let put = self.file_put.take().unwrap();
+        let mut put = self.file_put.take().unwrap();
         if !machine.powered_off() {
             return Err("The VM was powered on; the file was not saved.".into());
         }
         let disk = machine.hdd_mut().ok_or("This VM has no hard disk.")?;
-        disk_files::write(disk, &put.path, &put.data)?;
+        put.received += data.len();
+        put.pending.extend_from_slice(data);
+        let received = put.received;
+        let written = if received > put.size {
+            Err("More data than the announced file size.".to_string())
+        } else if received == put.size || put.pending.len() >= FILE_BATCH {
+            let written = disk_files::append(disk, &put.path, &put.pending);
+            put.pending.clear();
+            written
+        } else {
+            Ok(())
+        };
+        if let Err(error) = written {
+            let _ = disk_files::delete(disk, &put.path);
+            return Err(error);
+        }
+        if received < put.size {
+            self.file_put = Some(put);
+            return Ok(format!(
+                "{{\"type\":\"files-data\",\"ok\":true,\"received\":{received}}}"
+            ));
+        }
         disk.flush().map_err(|err| err.to_string())?;
         Ok(format!(
             "{{\"type\":\"files-data\",\"ok\":true,\"received\":{received},\"saved\":true}}"
@@ -1053,7 +1083,12 @@ impl Service {
         if !machine.powered_off() {
             return Err("The VM is already on.".into());
         }
-        self.file_put = None;
+        // A copy cut short by power-on leaves no partial file in the guest.
+        if let Some(put) = self.file_put.take()
+            && let Some(disk) = machine.hdd_mut()
+        {
+            let _ = disk_files::delete(disk, &put.path);
+        }
         machine.reboot()?;
         self.frame = None;
         self.last_stop = "null".into();
@@ -1476,8 +1511,12 @@ impl Remote {
                 {
                     service.upload = None;
                 }
-                if service.file_put.as_ref().is_some_and(|put| put.owner == id) {
-                    service.file_put = None;
+                // An unfinished copy leaves no partial file behind.
+                if let Some(put) = service.file_put.take_if(|put| put.owner == id)
+                    && machine.powered_off()
+                    && let Some(disk) = machine.hdd_mut()
+                {
+                    let _ = disk_files::delete(disk, &put.path);
                 }
                 service.clients.remove(&id);
             }

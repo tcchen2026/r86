@@ -5,7 +5,7 @@
 //!
 //! Paths look like `C:/GAMES/PAL`; `\` also separates. Replies are JSON for the
 //! remote console (see script/ws_cli.py).
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
 use r86::disk::Disk;
 use r86::fat::{self, Partition};
@@ -86,8 +86,25 @@ pub fn read(disk: &mut Disk, path: &str) -> Result<Vec<u8>, String> {
     })
 }
 
-/// Creates or replaces a file, creating missing folders.
-pub fn write(disk: &mut Disk, path: &str, data: &[u8]) -> Result<(), String> {
+/// Creates or empties a file of `size` bytes to come, creating missing
+/// folders; fails at once when its drive lacks the space. `append` fills it,
+/// so an upload never waits in host memory.
+pub fn create(disk: &mut Disk, path: &str, size: u64) -> Result<(), String> {
+    let (letter, _) = split_path(path)?;
+    let volume = fat::volumes(disk)
+        .into_iter()
+        .find(|v| v.letter == letter && v.fat)
+        .ok_or_else(|| format!("No FAT drive {letter}:"))?;
+    let stats = fat::mount(disk, &volume)?
+        .stats()
+        .map_err(|err| err.to_string())?;
+    let free = u64::from(stats.free_clusters()) * u64::from(stats.cluster_size());
+    if size > free {
+        return Err(format!(
+            "Not enough space on {letter}: {} KB free.",
+            free >> 10
+        ));
+    }
     on_drive(disk, path, |root, _, parts| {
         let Some((name, folders)) = parts.split_last() else {
             return Err(io::Error::other("Missing file name"));
@@ -104,6 +121,15 @@ pub fn write(disk: &mut Disk, path: &str, data: &[u8]) -> Result<(), String> {
         }
         let mut file = dir.create_file(name)?;
         file.truncate()?;
+        file.flush()
+    })
+}
+
+/// Adds `data` to the end of a file made by `create`.
+pub fn append(disk: &mut Disk, path: &str, data: &[u8]) -> Result<(), String> {
+    on_drive(disk, path, |root, path, _| {
+        let mut file = root.open_file(path)?;
+        file.seek(SeekFrom::End(0))?;
         file.write_all(data)?;
         file.flush()
     })
@@ -250,6 +276,11 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn write(disk: &mut Disk, path: &str, data: &[u8]) -> Result<(), String> {
+        create(disk, path, data.len() as u64)?;
+        append(disk, path, data)
+    }
+
     fn fat16_disk() -> Disk {
         let mut image = vec![0; 32 << 20];
         fatfs::format_volume(
@@ -266,6 +297,26 @@ mod tests {
         let count = fs.stats().unwrap().free_clusters();
         fs.unmount().unwrap();
         count
+    }
+
+    #[test]
+    fn uploads_append_in_chunks_after_a_space_check() {
+        let mut disk = fat16_disk();
+        assert!(
+            create(&mut disk, "C:/BIG.BIN", 64 << 20)
+                .unwrap_err()
+                .starts_with("Not enough space on C:")
+        );
+        create(&mut disk, "C:/NEW/DATA.BIN", 3000).unwrap();
+        for chunk in [[1u8; 1000], [2; 1000], [3; 1000]] {
+            append(&mut disk, "C:/NEW/DATA.BIN", &chunk).unwrap();
+        }
+        let data = read(&mut disk, "C:/NEW/DATA.BIN").unwrap();
+        assert_eq!(data.len(), 3000);
+        assert!(data[..1000].iter().all(|&b| b == 1) && data[2000..].iter().all(|&b| b == 3));
+        // Creating again empties it for a new upload.
+        create(&mut disk, "C:/NEW/DATA.BIN", 10).unwrap();
+        assert!(read(&mut disk, "C:/NEW/DATA.BIN").unwrap().is_empty());
     }
 
     #[test]
