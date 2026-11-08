@@ -110,6 +110,9 @@ impl WebSocket {
     }
 
     pub fn read_message(&mut self) -> Result<Message, String> {
+        // Browsers split large messages into a first frame and continuation
+        // frames; control frames may come between them.
+        let mut message: Option<(u8, Vec<u8>)> = None;
         loop {
             let mut header = [0u8; 2];
             self.stream
@@ -121,9 +124,6 @@ impl WebSocket {
             let mut len = u64::from(header[1] & 0x7f);
             if header[0] & 0x70 != 0 || !masked {
                 return Err("invalid client websocket frame flags".to_string());
-            }
-            if !fin {
-                return Err("fragmented websocket frames are not supported".to_string());
             }
             if len == 126 {
                 let mut ext = [0u8; 2];
@@ -138,14 +138,27 @@ impl WebSocket {
                     .map_err(|err| format!("failed to read websocket length64: {err}"))?;
                 len = u64::from_be_bytes(ext);
             }
-            // Binary frames carry virtual-media upload chunks.
-            let limit = if opcode == 0x2 {
-                MAX_BINARY_FRAME
-            } else {
-                64 * 1024
+            let kind = match (opcode, &message) {
+                (0x0, Some((kind, _))) => *kind,
+                (0x0, None) => return Err("websocket continuation without a message".into()),
+                (0x1 | 0x2, None) => opcode,
+                (0x1 | 0x2, Some(_)) => return Err("websocket message interrupted".into()),
+                (0x8..=0xA, _) if fin && len <= 125 => opcode,
+                (0x8..=0xA, _) => return Err("invalid websocket control frame".into()),
+                (other, _) => return Err(format!("unsupported websocket opcode {other:#x}")),
             };
-            if len > limit || (opcode >= 8 && len > 125) {
-                return Err(format!("websocket frame too large: {len} bytes"));
+            // Binary messages carry virtual-media upload chunks.
+            let limit = match kind {
+                0x2 => MAX_BINARY_FRAME,
+                0x1 => 64 * 1024,
+                _ => 125,
+            };
+            let received = message.as_ref().map_or(0, |(_, data)| data.len() as u64);
+            if received + len > limit {
+                return Err(format!(
+                    "websocket message too large: {} bytes",
+                    received + len
+                ));
             }
             let mut mask = [0u8; 4];
             self.stream
@@ -160,21 +173,31 @@ impl WebSocket {
                 *byte ^= mask[index & 3];
             }
             match opcode {
-                0x1 => {
-                    let text = String::from_utf8(payload)
-                        .map_err(|err| format!("websocket text was not UTF-8: {err}"))?;
-                    return Ok(Message::Text(text));
-                }
-                0x2 => return Ok(Message::Binary(payload)),
                 0x8 => {
                     let _ = self.send_frame(0x8, &[]);
                     return Ok(Message::Close);
                 }
-                0x9 => {
-                    self.send_frame(0xA, &payload)?;
-                }
+                0x9 => self.send_frame(0xA, &payload)?,
                 0xA => {}
-                other => return Err(format!("unsupported websocket opcode {other:#x}")),
+                _ => {
+                    let data = match message.take() {
+                        Some((_, mut data)) => {
+                            data.extend_from_slice(&payload);
+                            data
+                        }
+                        None => payload,
+                    };
+                    if !fin {
+                        message = Some((kind, data));
+                        continue;
+                    }
+                    return match kind {
+                        0x1 => String::from_utf8(data)
+                            .map(Message::Text)
+                            .map_err(|err| format!("websocket text was not UTF-8: {err}")),
+                        _ => Ok(Message::Binary(data)),
+                    };
+                }
             }
         }
     }
@@ -529,6 +552,36 @@ fn sha256_digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragmented_messages_are_reassembled_around_control_frames() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut socket = WebSocket {
+            stream: listener.accept().unwrap().0,
+            write_lock: Arc::new(Mutex::new(())),
+        };
+        // Masked client frames; a zero mask leaves the payload as sent.
+        let frame = |head: u8, payload: &[u8]| {
+            let mut frame = vec![head, 0x80 | payload.len() as u8, 0, 0, 0, 0];
+            frame.extend_from_slice(payload);
+            frame
+        };
+        let mut bytes = frame(0x02, b"abc"); // binary, more to come
+        bytes.extend(frame(0x89, b"hi")); // ping between fragments
+        bytes.extend(frame(0x80, b"def")); // final continuation
+        bytes.extend(frame(0x01, "é".as_bytes()[..1].as_ref())); // text split mid-character
+        bytes.extend(frame(0x80, "é".as_bytes()[1..].as_ref()));
+        bytes.extend(frame(0x80, b"x")); // continuation without a message
+        client.write_all(&bytes).unwrap();
+        assert!(matches!(socket.read_message(), Ok(Message::Binary(data)) if data == b"abcdef"));
+        assert!(matches!(socket.read_message(), Ok(Message::Text(text)) if text == "é"));
+        assert!(socket.read_message().is_err());
+        // The ping was answered with its payload.
+        let mut pong = [0u8; 4];
+        client.read_exact(&mut pong).unwrap();
+        assert_eq!(pong, [0x8A, 2, b'h', b'i']);
+    }
 
     #[test]
     fn websocket_accept_matches_rfc_example() {
