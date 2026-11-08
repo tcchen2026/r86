@@ -1,0 +1,48 @@
+# Cargo build outputs (including alternate benchmark target directories).
+target/
+target-*/
+/web/dist/
+
+# Temporary benchmarks, boot artifacts, and downloaded guest media.
+tmp/
+*.iso
+*.iso.part
+
+# Writable guest disk images (bootsector fixtures remain tracked).
+*.vhd
+*.vhdx
+*.vmdk
+*.qcow2
+*.raw
+
+# Python caches and local virtual environments.
+__pycache__/
+*.py[cod]
+/.venv/
+/venv/
+
+# Compiler/configure scratch files.
+*.o
+/config-temp/
+/config.log
+
+# Editor/OS scratch files.
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Keep Cargo.lock, firmware ROMs, and bootsector fixtures tracked.
+
+# Local-only inputs: reference checkouts and boot media, guest tool sources,
+# and private development notes.
+/refs/
+/assets/*
+!/assets/freedos.json
+/private_docs/
+/private/
+
+# Don't include md files by default
+
+*.md
+!/README.md

@@ -1,0 +1,45 @@
+fatfs 0.3.6, MIT license (LICENSE.txt)
+Source: https://crates.io/api/v1/crates/fatfs/0.3.6/download
+Repository: https://github.com/rafalh/rust-fatfs
+Crate SHA256: 05669f8e7e2d7badc545c513710f0eba09c2fbef683eb859fd79c46c355048e0
+Verified against crates.io version metadata and the Cargo registry index on
+2026-11-07 by Verification Intern. All 31 archive files were preserved and
+verified unchanged before the Lead-approved unmodified planting baseline.
+The path dependency in Cargo.lock does not carry a registry checksum; the
+original archive checksum above identifies the source for these local changes.
+
+The r86 host dependency enables the existing chrono feature for current local
+timestamps on ordinary mounts. Reproducible disk planting passes its fixed time
+provider explicitly; no vendored time-provider code was changed.
+
+Local changes from 0.3.6:
+- boot_sector.rs: checked BPB metadata/FAT arithmetic, table capacity, FAT32
+  root/active-FAT validation, and the formatter's hidden-sector option.
+- file.rs: checked cluster offsets, file positions and seeks; malformed chains
+  and missing clusters return errors instead of panicking or ending silently.
+- fs.rs: checked cluster addressing, explicit hidden-sector format option,
+  cluster-count bounds passed to iterators, and backup FSInfo initialization
+  and updates inside the reserved region.
+- dir.rs: direct physical dot entries, checked directory-entry positions, and
+  a dedicated append writer for empty directories. It validates canonical 8.3
+  syntax; callers must ensure unique names and no concurrent directory changes.
+  Ordinary create operations retain collision checks and LFN support.
+- table.rs: data-cluster validation, reserved-number tail exclusion from
+  allocation/free-space statistics, and bounded full-chain iteration with read
+  errors propagated by free/truncate.
+
+Review context:
+https://github.com/rafalh/rust-fatfs/issues/123
+The append writer avoids repeated directory scans when planting a new tree.
+The existing next-free-cluster hint already supports sequential allocation and
+is retained; no separate allocation cache was added.
+https://github.com/rafalh/rust-fatfs/issues/56
+https://github.com/rafalh/rust-fatfs/issues/72
+The #56 arithmetic concern is present in 0.3.6. The #72 report links older
+code; 0.3.6 already computes the in-cluster offset with modulo. Local changes
+address the separate cluster-range and seek/error paths verified in this source.
+https://github.com/rafalh/rust-fatfs/issues/64
+The dirty-FAT/BPB long-name regression fixture checks directory attributes,
+physical dot entries, file contents and remount behavior. It does not establish
+a complete fix for the reported macOS/STM32 eject scenario. Existing dirty bits
+are preserved; these changes do not perform fsck or certify arbitrary images.

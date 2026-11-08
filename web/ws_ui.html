@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>r86</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #101012; --panel: #18181b; --line: #2a2a2f; --text: #e4e4e7;
+    --muted: #8b8b94; --accent: #5b9cff; --ok: #3fb950; --bad: #f85149;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 8px 12px; border-bottom: 1px solid var(--line);
+  }
+  h1 { font-size: 16px; margin: 0 10px 0 0; letter-spacing: .5px; }
+  button {
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--muted); }
+  button:disabled { opacity: .35; cursor: default; }
+  button.primary:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
+  #status { margin-left: auto; display: flex; align-items: center; gap: 8px;
+    color: var(--muted); font: 12px var(--mono); }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+  #dot.on { background: var(--ok); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; }
+  canvas {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    background: #000; outline: 1px solid var(--line); cursor: pointer;
+  }
+  canvas:focus { outline-color: var(--accent); }
+  #hint { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center;
+    color: var(--muted); font-size: 12px; pointer-events: none; }
+  #typebar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); }
+  #text { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; font: 13px var(--mono); }
+  #text:focus { outline: none; border-color: var(--accent); }
+  aside { width: min(440px, 40vw); display: flex; flex-direction: column;
+    border-left: 1px solid var(--line); }
+  #tabs { display: flex; border-bottom: 1px solid var(--line); }
+  #tabs button { border: 0; border-radius: 0; background: none; color: var(--muted);
+    padding: 8px 14px; border-bottom: 2px solid transparent; }
+  #tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  #tabs .grow { flex: 1; }
+  pre { flex: 1; margin: 0; padding: 10px 12px; overflow: auto; white-space: pre-wrap;
+    word-break: break-all; font: 12px/1.45 var(--mono); }
+  #events .err { color: var(--bad); }
+  #events .step { color: var(--muted); }
+  #media { display: flex; align-items: center; gap: 6px; }
+  #media-state { color: var(--muted); font: 12px var(--mono); max-width: 220px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  label.button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 11px; cursor: pointer; }
+  label.button:hover { border-color: var(--muted); }
+  label.button.off { opacity: .35; pointer-events: none; }
+  #upload { display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
+  #upload progress { flex: 1; height: 6px; }
+  #drop { position: fixed; inset: 0; display: none; place-items: center; z-index: 10;
+    font-size: 22px; background: rgba(91, 156, 255, .18); border: 3px dashed var(--accent);
+    pointer-events: none; }
+  body.dragging #drop { display: grid; }
+  #files { position: absolute; inset: 0; overflow: auto; padding: 12px 16px; }
+  #files .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
+  #drives button.on { border-color: var(--accent); color: var(--accent); }
+  #crumbs { font: 13px var(--mono); margin: 4px 0 8px; word-break: break-all; }
+  #crumbs a, #f-list a { color: var(--text); text-decoration: none; }
+  #crumbs a:hover, #f-list a:hover { color: var(--accent); }
+  #files table { width: 100%; border-collapse: collapse; }
+  #files td, #files th { padding: 5px 8px; border-bottom: 1px solid var(--line); text-align: left; }
+  #files th { color: var(--muted); font-weight: normal; }
+  #files .num { text-align: right; white-space: nowrap; color: var(--muted); }
+  #files td.acts { text-align: right; white-space: nowrap; }
+  #files td.acts button { padding: 2px 8px; font-size: 12px; }
+  #f-status { min-height: 1.4em; color: var(--muted); }
+  #f-status.err { color: var(--bad); }
+  .muted { color: var(--muted); font-size: 12px; }
+  [hidden] { display: none !important; }
+  @media (max-width: 800px) {
+    main { flex-direction: column; }
+    aside { width: auto; height: 35vh; border-left: 0; border-top: 1px solid var(--line); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>r86</h1>
+  <button id="poweron" class="primary" hidden>Power on</button>
+  <button id="resume" class="primary" disabled>Resume</button>
+  <button id="pause" disabled>Pause</button>
+  <button id="reset" disabled>Reset</button>
+  <button id="power" disabled title="ACPI power button: the guest shuts itself down">Shut down</button>
+  <button id="poweroff" disabled title="Cut power now, without warning the guest">Power off</button>
+  <span class="sep"></span>
+  <button id="cad" disabled>Ctrl+Alt+Del</button>
+  <button id="shot" title="Save the current screen as PNG">Screenshot</button>
+  <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
+  <span class="sep"></span>
+  <span id="media" title="Virtual CD: insert an ISO, or files and folders as a new disc. You can also drop them on this page.">
+    <span id="media-state">CD</span>
+    <label class="button off" id="pick-iso-label">ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
+    <label class="button off" id="pick-files-label">Files…<input id="pick-files" type="file" multiple hidden></label>
+    <label class="button off" id="pick-dir-label">Folder…<input id="pick-dir" type="file" webkitdirectory hidden></label>
+    <button id="eject" disabled>Eject</button>
+  </span>
+  <div id="status"><span id="dot"></span><span id="state">connecting</span></div>
+</header>
+<div id="upload" hidden>
+  <span id="upload-text"></span><progress id="upload-bar" max="1" value="0"></progress>
+  <button id="upload-retry" hidden>Retry</button>
+  <button id="upload-cancel">Cancel</button>
+</div>
+<div id="drop">Drop an ISO, files or folders to insert them as a CD</div>
+<main>
+  <div id="left">
+    <div id="wrap">
+      <canvas id="screen" width="720" height="400" tabindex="0"></canvas>
+      <div id="hint">Click the screen to capture keyboard and mouse. Esc releases the mouse.</div>
+      <div id="files" hidden>
+        <div class="bar">
+          <strong>Hard disk</strong><span id="drives"></span>
+          <span class="sep"></span>
+          <button id="f-up">Up</button>
+          <button id="f-mkdir">New folder</button>
+          <label class="button">Upload files<input id="f-pick" type="file" multiple hidden></label>
+          <label class="button">Upload a folder<input id="f-pick-dir" type="file" webkitdirectory hidden></label>
+          <button id="f-refresh">Refresh</button>
+        </div>
+        <div id="crumbs"></div>
+        <div id="f-status"></div>
+        <table>
+          <thead><tr><th>Name</th><th class="num">Size</th><th class="num">Modified</th><th></th></tr></thead>
+          <tbody id="f-list"></tbody>
+        </table>
+        <p class="muted">The VM is off, so its hard disk can be changed here; drop files or
+          folders on the page to copy them into this folder. DOS programs see the short 8.3
+          names (hover a name). Power on when done.</p>
+      </div>
+    </div>
+    <div id="typebar">
+      <input id="text" autocomplete="off" spellcheck="false" disabled
+             placeholder="Type text into the guest; Enter sends it with a newline">
+    </div>
+  </div>
+  <aside>
+    <div id="tabs">
+      <button data-tab="serial" class="active">Serial</button>
+      <button data-tab="events">Events</button>
+      <span class="grow"></span>
+      <button id="clear" title="Clear this panel">Clear</button>
+    </div>
+    <pre id="serial"></pre>
+    <pre id="events" hidden></pre>
+  </aside>
+</main>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const canvas = $("screen"), ctx = canvas.getContext("2d");
+const serialPre = $("serial"), eventsPre = $("events");
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// --- Connection: one request in flight; a reply is JSON plus, for a changed
+// frame, one binary message. The server closes the socket on pipelining.
+// Any close, stalled connect or stalled reply drops the socket and reconnects
+// with backoff; the next hello resyncs screen, serial and events from scratch.
+let ws = null, ready = false, session = 0;
+let retry = 0, retryTimer = 0, openedAt = 0;
+let queue = [], inflight = null, pendingJson = null, mouse = null;
+
+function request(msg) {
+  return new Promise((resolve, reject) => {
+    if (!ready) return reject(new Error("not connected"));
+    queue.push({ msg, resolve, reject });
+    pump();
+  });
+}
+
+function pump() {
+  if (inflight || !queue.length || !ready || ws.readyState !== WebSocket.OPEN) return;
+  inflight = queue.shift();
+  inflight.sentAt = performance.now();
+  if (inflight.msg === mouse) mouse = null;
+  ws.send(JSON.stringify(inflight.msg));
+}
+
+function finish(json, binary) {
+  const r = inflight;
+  inflight = null;
+  if (json.ok) r.resolve({ json, binary });
+  else r.reject(new Error(json.error || "request failed"));
+  pump();
+}
+
+function connect() {
+  clearTimeout(retryTimer);
+  retryTimer = 0;
+  const sock = openSocket();
+  ws = sock;
+  openedAt = performance.now();
+  const id = ++session;
+  sock.onclose = () => drop("disconnected");
+  sock.onmessage = e => {
+    if (typeof e.data !== "string") {
+      finish(pendingJson, e.data);
+      pendingJson = null;
+      return;
+    }
+    const json = JSON.parse(e.data);
+    if (!ready) {
+      ready = true;
+      online(id, json);
+      pump();
+    } else if (json.ok && (json.binary || (json.type === "frame" && json.changed))) {
+      pendingJson = json;
+    } else {
+      finish(json, null);
+    }
+  };
+}
+
+function openSocket() {
+  const url = new URL("/ws" + location.search, location.href);
+  url.protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const sock = new WebSocket(url);
+  sock.binaryType = "arraybuffer";
+  return sock;
+}
+
+function drop(reason) {
+  const sock = ws;
+  if (!sock) return;
+  ws = null;
+  sock.onclose = sock.onmessage = null;
+  sock.close();
+  const wasReady = ready;
+  ready = false;
+  session++;
+  const pending = [inflight, ...queue];
+  inflight = null; queue = []; pendingJson = null; mouse = null;
+  held.clear();
+  for (const r of pending) if (r) r.reject(new Error(reason));
+  if (wasReady) note(reason, true);
+  const delay = Math.min(5000, 500 * 2 ** retry++);
+  setUi(false);
+  $("state").textContent = `${reason} · retrying in ${(delay / 1000).toFixed(1)} s`;
+  retryTimer = setTimeout(connect, delay);
+}
+
+function reconnectNow() {
+  if (!ws && retryTimer) connect();
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) reconnectNow(); });
+window.addEventListener("online", reconnectNow);
+
+// A half-open TCP connection never reports close; time it out instead.
+setInterval(() => {
+  const now = performance.now();
+  if (ws && !ready && now - openedAt > 5000) drop("connect timed out");
+  else if (inflight && now - inflight.sentAt > 15000) drop("server not responding");
+}, 1000);
+
+function online(id, hello) {
+  retry = 0;
+  serialPre.textContent = ""; eventsPre.textContent = "";
+  frameGen = undefined; serialNext = 0; eventNext = 0;
+  decoder = new TextDecoder();
+  note(`connected, step ${hello.step}`);
+  setUi(true);
+  loop(id, 33, pollFrame);
+  loop(id, 250, pollLogs);
+  loop(id, 1000, pollStatus);
+}
+
+async function loop(id, interval, fn) {
+  while (id === session) {
+    const start = performance.now();
+    try { await fn(); } catch (e) { if (id === session) note(e.message, true); }
+    await sleep(Math.max(0, interval - (performance.now() - start)));
+  }
+}
+
+// --- Polling
+let frameGen, serialNext = 0, eventNext = 0, decoder = new TextDecoder();
+let running = false, lastStep = null, lastTime = 0;
+
+async function pollFrame() {
+  if (document.hidden) return;
+  const { json, binary } = await request({ cmd: "frame", since: frameGen });
+  frameGen = json.generation;
+  if (binary) draw(binary);
+}
+
+function draw(buffer) {
+  // Header <IHHQIIII: magic "R86F", version, type, step, width, height,
+  // stride, format (1 = R,G,B,A bytes).
+  const v = new DataView(buffer);
+  const width = v.getUint32(16, true), height = v.getUint32(20, true);
+  const stride = v.getUint32(24, true);
+  if (!width || !height) return;
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width; canvas.height = height;
+    fit();
+  }
+  const image = ctx.createImageData(width, height);
+  const row = width * 4;
+  if (stride === row) {
+    image.data.set(new Uint8Array(buffer, 32, row * height));
+  } else {
+    for (let y = 0; y < height; y++)
+      image.data.set(new Uint8Array(buffer, 32 + y * stride, row), y * row);
+  }
+  ctx.putImageData(image, 0, 0);
+}
+
+async function pollLogs() {
+  for (;;) {
+    const { json } = await request({ cmd: "logs", serial_from: serialNext, event_from: eventNext });
+    if (json.serial_next < serialNext) serialPre.textContent = "";
+    serialNext = json.serial_next;
+    if (json.serial_hex) appendSerial(json.serial_hex);
+    for (const ev of json.events) event(ev);
+    eventNext = json.event_next;
+    if (serialNext >= json.serial_len) return;
+  }
+}
+
+function appendSerial(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  const text = decoder.decode(bytes, { stream: true })
+    .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "").replace(/\r/g, "");
+  append(serialPre, document.createTextNode(text));
+}
+
+async function pollStatus() {
+  const { json } = await request({ cmd: "status" });
+  const now = performance.now();
+  let rate = "";
+  if (lastStep !== null && json.execution.running && json.step >= lastStep) {
+    rate = ` · ${((json.step - lastStep) / (now - lastTime) / 1000).toFixed(1)} M/s`;
+  }
+  lastStep = json.step; lastTime = now;
+  running = json.execution.running;
+  showPower(json.powered_off);
+  showMedia((await request({ cmd: "media" })).json);
+  const mode = `${json.vga.mode} ${json.vga.width}x${json.vga.height}`;
+  const run = json.powered_off ? "powered off" : json.execution.busy ? "busy" : running ? "running" : "paused";
+  $("state").textContent = `${run} · step ${json.step.toLocaleString("en-US")}${rate} · ${mode}`;
+  setUi(true);
+}
+
+// --- Log panels
+function append(pre, node) {
+  const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 4;
+  pre.append(node);
+  while (pre.textContent.length > 400000 && pre.firstChild) pre.firstChild.remove();
+  if (stick) pre.scrollTop = pre.scrollHeight;
+}
+
+function event(ev) {
+  const line = document.createElement("div");
+  if (ev.kind === "error" || ev.kind === "failure") line.className = "err";
+  const step = document.createElement("span");
+  step.className = "step";
+  step.textContent = `${ev.step} `;
+  line.append(step, `${ev.kind}: ${ev.message}`);
+  append(eventsPre, line);
+}
+
+function note(message, error = false) {
+  const line = document.createElement("div");
+  if (error) line.className = "err";
+  line.textContent = `ui: ${message}`;
+  append(eventsPre, line);
+  if (error) $("state").textContent = message;
+}
+
+for (const tab of document.querySelectorAll("#tabs [data-tab]")) {
+  tab.onclick = () => {
+    for (const t of document.querySelectorAll("#tabs [data-tab]")) {
+      t.classList.toggle("active", t === tab);
+      $(t.dataset.tab).hidden = t !== tab;
+    }
+  };
+}
+$("clear").onclick = () => { (serialPre.hidden ? eventsPre : serialPre).textContent = ""; };
+
+// --- Controls
+function setUi(on) {
+  $("dot").classList.toggle("on", on);
+  $("resume").disabled = !on || running;
+  $("pause").disabled = !on || !running;
+  for (const id of ["reset", "cad", "diag", "text"]) $(id).disabled = !on;
+  for (const id of ["power", "poweroff"]) $(id).disabled = !on || poweredOff;
+  $("resume").disabled ||= poweredOff;
+  if (!on) showMedia(null);
+}
+
+async function command(msg) {
+  try {
+    const { json } = await request(msg);
+    if (json.type === "execution") { running = json.running; setUi(ready); }
+    return json;
+  } catch (e) {
+    if (ready) note(`${msg.cmd}: ${e.message}`, true);
+  }
+}
+
+$("resume").onclick = () => command({ cmd: "resume" });
+$("pause").onclick = () => command({ cmd: "pause" });
+$("reset").onclick = () => command({ cmd: "reset" });
+$("power").onclick = () => command({ cmd: "power-button" });
+$("poweroff").onclick = () => {
+  if (confirm("Cut power now? Like pulling the plug, unsaved guest data is lost.")) command({ cmd: "power-off" });
+};
+$("poweron").onclick = () => command({ cmd: "power-on" });
+$("cad").onclick = () => {
+  for (const key of ["controlleft", "altleft", "delete"]) command({ cmd: "keydown", key });
+  for (const key of ["delete", "altleft", "controlleft"]) command({ cmd: "keyup", key });
+};
+$("shot").onclick = () => canvas.toBlob(blob => {
+  download(blob, `r86-${lastStep ?? 0}.png`);
+});
+$("diag").onclick = async () => {
+  const json = await command({ cmd: "diagnostics" });
+  if (json) download(new Blob([JSON.stringify(json, null, 2)]), `r86-diagnostics-${json.step}.json`);
+};
+
+function download(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+$("text").onkeydown = e => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  const text = e.target.value + "\n";
+  e.target.value = "";
+  command({ cmd: "type", text });
+};
+
+// --- Screen sizing: scale to fit, crisp pixels when enlarged.
+function fit() {
+  const box = $("wrap").getBoundingClientRect();
+  const scale = Math.min((box.width - 24) / canvas.width, (box.height - 48) / canvas.height);
+  canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
+  canvas.style.height = `${Math.floor(canvas.height * scale)}px`;
+  canvas.style.imageRendering = scale >= 1 ? "pixelated" : "auto";
+}
+new ResizeObserver(fit).observe($("wrap"));
+
+// --- Keyboard: KeyboardEvent.code to r86 PS/2 key names.
+const KEYS = {
+  ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  BracketLeft: "leftbracket", BracketRight: "rightbracket",
+  Quote: "apostrophe", Backquote: "grave",
+};
+const NAMES = new Set(("enter space backspace tab escape shiftleft shiftright controlleft " +
+  "controlright altleft altright metaleft metaright capslock numlock scrolllock home end " +
+  "pageup pagedown insert delete minus equal backslash semicolon comma period slash " +
+  "numpadenter numpaddivide numpadmultiply numpadsubtract numpadadd numpaddecimal").split(" "));
+
+function keyName(code) {
+  if (KEYS[code]) return KEYS[code];
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(code))) return m[1].toLowerCase();
+  if ((m = /^Digit(\d)$/.exec(code))) return m[1];
+  if ((m = /^(Numpad\d|F(?:[1-9]|1[0-2]))$/.exec(code))) return m[1].toLowerCase();
+  const name = code.toLowerCase();
+  return NAMES.has(name) ? name : null;
+}
+
+const held = new Set();
+function key(e, down) {
+  const name = keyName(e.code);
+  if (!name || !ready) return;
+  e.preventDefault();
+  if (down) held.add(name);
+  else if (!held.delete(name)) return;
+  command({ cmd: down ? "keydown" : "keyup", key: name });
+}
+function releaseKeys() {
+  for (const name of held) command({ cmd: "keyup", key: name });
+  held.clear();
+}
+canvas.addEventListener("keydown", e => key(e, true));
+canvas.addEventListener("keyup", e => key(e, false));
+canvas.addEventListener("blur", releaseKeys);
+window.addEventListener("blur", releaseKeys);
+
+// --- Mouse: relative PS/2 motion under pointer lock; moves are coalesced
+// while waiting in the queue.
+const BUTTONS = ["left", "middle", "right"];
+canvas.addEventListener("click", () => {
+  canvas.focus();
+  if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+});
+canvas.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("pointerlockchange", () => {
+  $("hint").hidden = document.pointerLockElement === canvas;
+});
+// Movement is in CSS pixels; convert to guest pixels so the guest pointer
+// tracks the hand as the screen is shown scaled. Fractions carry over.
+let carryX = 0, carryY = 0;
+canvas.addEventListener("mousemove", e => {
+  if (document.pointerLockElement !== canvas || !ready) return;
+  carryX += e.movementX * canvas.width / canvas.clientWidth;
+  carryY += e.movementY * canvas.height / canvas.clientHeight;
+  const dx = Math.trunc(carryX), dy = Math.trunc(carryY);
+  carryX -= dx; carryY -= dy;
+  if (!dx && !dy) return;
+  if (mouse) { mouse.dx += dx; mouse.dy += dy; return; }
+  mouse = { cmd: "mouse-move", dx, dy };
+  command(mouse);
+});
+for (const [type, down] of [["mousedown", true], ["mouseup", false]]) {
+  canvas.addEventListener(type, e => {
+    if (document.pointerLockElement !== canvas || !BUTTONS[e.button] || !ready) return;
+    command({ cmd: "mouse-button", button: BUTTONS[e.button], down });
+  });
+}
+
+// --- Virtual media. Uploads use their own connection, one request at a
+// time, so the screen keeps updating. 1 MiB binary frames carry the data.
+const CHUNK = 1 << 20;
+let mediaInfo = null, uploading = null;
+
+function showMedia(info) {
+  mediaInfo = info;
+  const drive = !!info?.drive;
+  let text = "CD: —";
+  if (info && !drive) text = "no CD drive";
+  else if (info?.upload && !info.upload.mine) text = "CD: another client is uploading";
+  else if (info?.inserted) text = `CD: ${info.name ?? "disc inserted"}${info.locked ? " (locked)" : ""}`;
+  else if (info) text = "CD: empty";
+  $("media-state").textContent = text;
+  $("media-state").title = text;
+  const can = drive && !uploading;
+  for (const id of ["pick-iso-label", "pick-files-label", "pick-dir-label"]) $(id).classList.toggle("off", !can);
+  $("eject").disabled = !can || !info.inserted;
+}
+
+function mediaSocket() {
+  return new Promise((resolve, reject) => {
+    const sock = openSocket();
+    let waiting = null, open = false;
+    const call = msg => new Promise((res, rej) => {
+      waiting = { res, rej };
+      sock.send(msg instanceof ArrayBuffer ? msg : JSON.stringify(msg));
+    });
+    call.close = () => sock.close();
+    sock.onmessage = e => {
+      const json = JSON.parse(e.data);
+      if (!open) { open = true; resolve(call); return; }
+      const w = waiting;
+      waiting = null;
+      if (w) json.ok ? w.res(json) : w.rej(new Error(json.error || "request failed"));
+    };
+    sock.onclose = () => {
+      if (!open) reject(new Error("cannot connect"));
+      waiting?.rej(new Error("connection lost"));
+      waiting = null;
+    };
+  });
+}
+
+// items: [{ path: "DIR/NAME.EXT", file }] and [{ path: "DIR", dir: true }].
+// A single .iso file is inserted as it is; anything else becomes a new disc.
+async function insertMedia(items, label) {
+  const files = items.filter(i => !i.dir);
+  if (!files.length || uploading) return;
+  const iso = items.length === 1 && /\.iso$/i.test(files[0].path);
+  const total = files.reduce((n, i) => n + i.file.size, 0);
+  if (mediaInfo && total > mediaInfo.limit) {
+    note(`virtual media is limited to ${mediaInfo.limit >> 20} MiB`, true);
+    return;
+  }
+  const job = uploading = { cancelled: false, call: null, choose: null };
+  showMedia(mediaInfo);
+  $("upload").hidden = false;
+  let done = 0;
+  const progress = text => {
+    $("upload-text").textContent = text;
+    $("upload-bar").value = total ? done / total : 1;
+  };
+  try {
+    const call = job.call = await mediaSocket();
+    const name = iso ? files[0].path.split("/").pop() : label;
+    await call(iso ? { cmd: "media-begin", kind: "iso", name, size: files[0].file.size }
+                   : { cmd: "media-begin", kind: "files", name });
+    for (const item of items) {
+      if (item.dir) { await call({ cmd: "media-dir", path: item.path }); continue; }
+      if (!iso) await call({ cmd: "media-file", path: item.path, size: item.file.size });
+      for (let at = 0; at < item.file.size; at += CHUNK) {
+        if (job.cancelled) throw new Error("cancelled");
+        await call(await item.file.slice(at, at + CHUNK).arrayBuffer());
+        done += Math.min(CHUNK, item.file.size - at);
+        progress(`${item.path} · ${(done / 2 ** 20).toFixed(1)} of ${(total / 2 ** 20).toFixed(1)} MiB`);
+      }
+    }
+    progress(iso ? `inserting ${name}` : `building ${name} (${files.length} files)`);
+    // The server keeps a refused upload (drive locked or busy) for a retry.
+    for (;;) {
+      try { showMedia(await call({ cmd: "media-insert" })); break; } catch (e) {
+        if (e.message === "connection lost") throw e;
+        $("upload-text").textContent = e.message;
+        $("upload-retry").hidden = false;
+        const retry = await new Promise(choose => { job.choose = choose; });
+        $("upload-retry").hidden = true;
+        if (!retry) throw new Error("cancelled");
+      }
+    }
+    note(`CD inserted: ${name}`);
+  } catch (e) {
+    note(`CD: ${e.message}`, !job.cancelled);
+  } finally {
+    // Closing the upload connection discards an unfinished upload.
+    job.call?.close();
+    uploading = null;
+    $("upload").hidden = true;
+    showMedia(mediaInfo);
+  }
+}
+
+$("upload-cancel").onclick = () => {
+  if (!uploading) return;
+  uploading.cancelled = true;
+  uploading.choose?.(false);
+};
+$("upload-retry").onclick = () => uploading?.choose?.(true);
+$("eject").onclick = async () => {
+  const json = await command({ cmd: "media-eject" });
+  if (json) showMedia(json);
+};
+function picked(input, label) {
+  input.onchange = () => {
+    const files = [...input.files];
+    const items = files.map(file => ({ path: file.webkitRelativePath || file.name, file }));
+    const top = files[0]?.webkitRelativePath?.split("/")[0];
+    insertMedia(items, label ?? top ?? "FILES");
+    input.value = "";
+  };
+}
+picked($("pick-iso"));
+picked($("pick-files"), "FILES");
+picked($("pick-dir"));
+
+// --- Power state. While off, the screen area shows the hard disk's files.
+let poweredOff = false;
+function showPower(off) {
+  if (off === poweredOff) return;
+  poweredOff = off;
+  $("poweron").hidden = !off;
+  $("files").hidden = !off;
+  canvas.hidden = off;
+  $("hint").hidden = off || document.pointerLockElement === canvas;
+  $("drop").textContent = off ? "Drop files or folders to copy them to the hard disk"
+                              : "Drop an ISO, files or folders to insert them as a CD";
+  setUi(ready);
+  if (off) loadDrives();
+}
+
+let drive = null, folder = [];
+const diskPath = parts => `${drive}:/${parts.join("/")}`;
+function fstatus(text, error = false) {
+  $("f-status").textContent = text;
+  $("f-status").className = error ? "err" : "";
+}
+function size(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB"];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return `${n.toFixed(n < 10 ? 1 : 0)} ${units[i]}`;
+}
+async function files(msg) {
+  try { return (await request(msg)).json; } catch (e) { fstatus(e.message, true); }
+}
+
+async function loadDrives() {
+  const json = await files({ cmd: "files-drives" });
+  const box = $("drives");
+  box.textContent = "";
+  if (!json) return;
+  for (const d of json.drives) {
+    const b = document.createElement("button");
+    b.textContent = `${d.letter}:${d.fat ? (d.label ? " " + d.label : "") : " (not FAT)"}`;
+    b.title = d.fat ? (d.error || `${d.type}, ${size(d.free)} free of ${size(d.total)}`) : "Cannot be opened here";
+    b.disabled = !d.fat || !!d.error;
+    b.dataset.letter = d.letter;
+    b.onclick = () => { drive = d.letter; folder = []; listFolder(); };
+    box.append(b);
+  }
+  if (!json.drives.some(d => d.letter === drive && d.fat && !d.error)) {
+    drive = json.drives.find(d => d.fat && !d.error)?.letter ?? null;
+    folder = [];
+  }
+  listFolder();
+}
+
+async function listFolder() {
+  for (const b of $("drives").children) b.classList.toggle("on", b.dataset.letter === drive);
+  const crumbs = $("crumbs");
+  crumbs.textContent = "";
+  $("f-list").textContent = "";
+  if (!drive) { fstatus("This disk has no FAT drive.", true); return; }
+  [`${drive}:`, ...folder].forEach((name, i) => {
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = `${name}/`;
+    a.onclick = e => { e.preventDefault(); folder = folder.slice(0, i); listFolder(); };
+    crumbs.append(a);
+  });
+  $("f-up").disabled = !folder.length;
+  const json = await files({ cmd: "files-list", path: diskPath(folder) });
+  if (!json) return;
+  const items = json.items.sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+  for (const item of items) {
+    const tr = $("f-list").insertRow();
+    const a = document.createElement("a");
+    a.href = "#";
+    a.textContent = (item.dir ? "\u{1F4C1} " : "") + item.name;
+    a.title = item.short;
+    a.onclick = e => {
+      e.preventDefault();
+      if (item.dir) { folder.push(item.name); listFolder(); } else fetchFile(item);
+    };
+    tr.insertCell().append(a);
+    Object.assign(tr.insertCell(), { className: "num", textContent: item.dir ? "" : size(item.size) });
+    Object.assign(tr.insertCell(), { className: "num", textContent: item.date });
+    const acts = tr.insertCell();
+    acts.className = "acts";
+    for (const [label, fn] of [["Rename", renameItem], ["Delete", deleteItem]]) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.onclick = () => fn(item);
+      acts.append(b, " ");
+    }
+  }
+  fstatus(`${items.length} items`);
+}
+
+async function fetchFile(item) {
+  fstatus(`Reading ${item.name}`);
+  try {
+    const { binary } = await request({ cmd: "files-get", path: diskPath([...folder, item.name]) });
+    download(new Blob([binary]), item.name);
+    fstatus(`Saved ${item.name}`);
+  } catch (e) { fstatus(e.message, true); }
+}
+async function renameItem(item) {
+  const to = prompt("New name", item.name);
+  if (to && to !== item.name && await files({ cmd: "files-rename", path: diskPath([...folder, item.name]), to })) listFolder();
+}
+async function deleteItem(item) {
+  const what = item.dir ? `the folder "${item.name}" and everything in it` : `"${item.name}"`;
+  if (confirm(`Delete ${what}?`) && await files({ cmd: "files-delete", path: diskPath([...folder, item.name]) })) loadDrives();
+}
+$("f-up").onclick = () => { folder.pop(); listFolder(); };
+$("f-refresh").onclick = loadDrives;
+$("f-mkdir").onclick = async () => {
+  const name = prompt("Folder name");
+  if (name && await files({ cmd: "files-mkdir", path: diskPath([...folder, name]) })) listFolder();
+};
+
+// Copies items ([{ path, file }] / [{ path, dir }]) into the current folder.
+async function copyToDisk(items) {
+  if (!drive || uploading || !items.length) return;
+  const job = uploading = { cancelled: false, call: null, choose: null };
+  const total = items.reduce((n, i) => n + (i.file?.size ?? 0), 0);
+  let done = 0, count = 0;
+  $("upload").hidden = false;
+  try {
+    const call = job.call = await mediaSocket();
+    for (const item of items) {
+      const path = diskPath([...folder, ...item.path.split("/")]);
+      if (item.dir) { await call({ cmd: "files-mkdir", path }).catch(() => {}); continue; }
+      await call({ cmd: "files-put", path, size: item.file.size });
+      for (let at = 0; at < item.file.size; at += CHUNK) {
+        if (job.cancelled) throw new Error("cancelled");
+        await call(await item.file.slice(at, at + CHUNK).arrayBuffer());
+        done += Math.min(CHUNK, item.file.size - at);
+        $("upload-text").textContent = `${item.path} · ${(done / 2 ** 20).toFixed(1)} of ${(total / 2 ** 20).toFixed(1)} MiB`;
+        $("upload-bar").value = total ? done / total : 1;
+      }
+      count++;
+    }
+    fstatus(`Copied ${count} files (${size(done)})`);
+  } catch (e) {
+    fstatus(`Copy stopped after ${count} files: ${e.message}`, !job.cancelled);
+  } finally {
+    job.call?.close();
+    uploading = null;
+    $("upload").hidden = true;
+    loadDrives();
+  }
+}
+for (const id of ["f-pick", "f-pick-dir"]) {
+  $(id).onchange = e => {
+    copyToDisk([...e.target.files].map(file => ({ path: file.webkitRelativePath || file.name, file })));
+    e.target.value = "";
+  };
+}
+
+// Walk dropped folders through the FileSystemEntry API, keeping empty ones.
+async function collect(entry, prefix, out) {
+  const path = prefix + entry.name;
+  if (entry.isFile) {
+    out.push({ path, file: await new Promise((ok, fail) => entry.file(ok, fail)) });
+    return;
+  }
+  const reader = entry.createReader();
+  let empty = true;
+  for (;;) {
+    const batch = await new Promise((ok, fail) => reader.readEntries(ok, fail));
+    if (!batch.length) break;
+    empty = false;
+    for (const child of batch) await collect(child, path + "/", out);
+  }
+  if (empty) out.push({ path, dir: true });
+}
+
+let dragDepth = 0;
+const dragsFiles = e => e.dataTransfer?.types?.includes("Files");
+addEventListener("dragenter", e => {
+  if (!dragsFiles(e)) return;
+  e.preventDefault();
+  if (++dragDepth === 1) document.body.classList.add("dragging");
+});
+addEventListener("dragleave", e => {
+  if (dragsFiles(e) && --dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
+});
+addEventListener("dragover", e => { if (dragsFiles(e)) e.preventDefault(); });
+addEventListener("drop", async e => {
+  if (!dragsFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  document.body.classList.remove("dragging");
+  const entries = [...e.dataTransfer.items].map(i => i.webkitGetAsEntry?.()).filter(Boolean);
+  const items = [];
+  for (const entry of entries) await collect(entry, "", items);
+  if (uploading) { note("an upload is already running", true); return; }
+  if (poweredOff) { copyToDisk(items); return; }
+  if (!mediaInfo?.drive) { note("CD: this VM has no CD drive", true); return; }
+  const label = entries.length === 1 && entries[0].isDirectory ? entries[0].name : "FILES";
+  insertMedia(items, label);
+});
+
+setUi(false);
+$("state").textContent = "connecting";
+connect();
+</script>
+</body>
+</html>

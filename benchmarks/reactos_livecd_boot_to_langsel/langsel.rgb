@@ -1,0 +1,10 @@
+# x y red green blue; headless r86/QEMU and the r86 SDL viewport.
+100 75 16 69 135
+200 200 240 240 240
+500 400 240 240 240
+614 340 23 130 199
+614 377 23 130 199
+471 436 23 109 187
+# Cancel's lower border and final glyph reject the earlier Next-only frame.
+625 456 175 175 175
+604 448 7 7 7

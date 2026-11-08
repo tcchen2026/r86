@@ -1,0 +1,4 @@
+[target.aarch64-unknown-none]
+# EL1 executes at its actual IPA. Rust vtables/function pointers in rodata
+# need the same addresses; merely adding a load bias to PC is insufficient.
+rustflags = ["-C", "link-arg=--image-base=0x100200000"]

@@ -1,0 +1,42 @@
+# Copy bios.bin and vgabios-stdvga.bin beside the executable before running.
+# cargo run --release --bin r86-run -- --config r86.example.toml
+# Explicit CLI options override this file regardless of --config's position.
+# Explicit relative paths use the process working directory.
+
+# Default: BIOS boot, an empty CD-ROM drive, no hard disk, CLI frontend.
+mem-mib = 128
+steps = 5_000_000
+clock = "realtime"
+# iso = "/path/to/installation.iso"
+# hdd = "/path/to/disk.vhd"
+# hdd-writable = true
+# boot-order = "cdrom"
+# no-cdrom = true
+
+# Optional firmware overrides; otherwise use the executable's directory.
+# bios = "firmware/seabios/bios.bin"
+# vga-bios = "firmware/seabios/vgabios-stdvga.bin"
+
+# Direct Linux boot requires both external files; --iso alone always uses BIOS.
+# boot-linux-kernel = "/path/to/vmlinuz"
+# boot-linux-initrd = "/path/to/initrd.gz"
+# host-decompress-kernel = true
+
+# Terminal on Unix: Ctrl+] then q exits, Ctrl+] then r reboots.
+# term = true
+# steps = 0
+
+# SDL requires --features sdl2-frontend. CLI has no SDL dependency.
+# sdl2 = true
+# sdl2-scale = 1
+# CLI can switch SDL off again with --sdl2=false.
+
+# JIT is the default on ARM64 Linux; other hosts use the interpreter.
+# cpu-engine = "interp"
+
+# Strings use standard TOML quoting; repeated options accept arrays.
+# These TinyCore overlays require an explicit ISO or external Linux images.
+# bootlocal-command = ["echo R86_BOOTLOCAL_OK"]
+# expect-serial = "R86_BOOTLOCAL_OK"
+# serial-input = "echo hello\n"
+# initrd-file = ["/tmp/example.txt:tmp/example.txt:644"]

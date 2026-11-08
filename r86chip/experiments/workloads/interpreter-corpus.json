@@ -1,0 +1,56 @@
+{
+  "version": 1,
+  "frozen_before": "raw interpreter implementation",
+  "target_retired_native_per_completed_x86": 20,
+  "ram_bytes": 134217728,
+  "engine": "one Rust interpreter; JIT disabled; original bytes fetched/decoded each execution",
+  "clock": "deterministic instruction-clock",
+  "assets": {
+    "refs/TinyCore-current.iso": "0539cbcadc241e529c368ffefb2dd63676ea09f2b7a49706f61b81f83889223d",
+    "refs/ReactOS.iso": "ed048117879a9651c5a721d04a94447f37704fdb82770ce20936468c2cf9a56e",
+    "refs/qemu/pc-bios/bios.bin": "8244f3e5eaca828cc0a6a963f1fad15d68d8d3c0b5c80b8451b3067a85f14ae1",
+    "refs/qemu/pc-bios/vgabios-stdvga.bin": "651513519f9e0d5b99d3b051a8f5c68db69e987339b59a441d371068c34c146b",
+    "r86chip/experiments/workloads/bootlocal-lua.sh": "97d15f98e05ce98ee0fb5f05f4fecc9a156911510393825af7139cb240fdd084",
+    "r86chip/experiments/workloads/verify.lua": "704d045f26cd1e0ae44931c9749048eea05d794745618c7b34aae9db674edb59",
+    "benchmarks/reactos_livecd_boot_to_langsel/langsel.rgb": "a97e1f4b08fb3c7a05a178c7945a35b54a8f1b68db494e26df8dcffe8d6bb2c1",
+    "r86chip/experiments/lua_assets.py": "5b8d1a7bf502565b96c8bc98c7bed48c6d7010b5395fe0f53c517247f82dcd88"
+  },
+  "workloads": [
+    {
+      "name": "tinycore-boot",
+      "boot": "existing host-decompressed direct kernel with Lua overlay",
+      "start": "first guest instruction",
+      "end": "first complete R86_CHIP_TINYCORE_OK serial marker",
+      "kind": "kernel and userspace startup"
+    },
+    {
+      "name": "tinycore-lua",
+      "boot": "continuation of tinycore-boot, same machine",
+      "start": "immediately after tinycore-boot endpoint",
+      "end": "first complete R86_CHIP_LUA_OK serial marker",
+      "kind": "real i386 Lua, shell subprocess, file I/O, kernel/user transitions"
+    },
+    {
+      "name": "reactos-boot",
+      "boot": "unchanged ReactOS ISO through pinned BIOS and standard VGA ROM; no input",
+      "start": "first guest instruction after firmware reset",
+      "end": "complete 800x600 language/keyboard selection dialog; existing benchmark endpoint signature",
+      "kind": "NT-style kernel and user GUI startup; report real/16-bit/protected32 subcounts"
+    }
+  ],
+  "counting": {
+    "numerator": "all retired native words in interval, including entry/exit, services, fallback, time and devices",
+    "denominator": "completed guest instructions; REP completion once, no fault retries or halted polling",
+    "aggregate": "sum numerator / sum denominator; also report every workload separately",
+    "additional": [
+      "CPL/mode split",
+      "REP elements and resumable chunks",
+      "faults/retries/halted polls",
+      "hardware TLB services and software fallbacks",
+      "RTL cycles and mapped resources",
+      "reset-to-end native/guest totals; native startup separately"
+    ],
+    "endpoint_rule": "record native and completed-guest counters at precise guest observation boundaries; do not reuse firmware polling-interval step counts",
+    "validation": "full guest state/memory and serial/frame endpoint versus shared interpreter; ISS/RTL same native binary"
+  }
+}

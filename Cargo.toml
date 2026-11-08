@@ -1,0 +1,147 @@
+[package]
+name = "r86"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+default-run = "r86-run"
+autobins = false
+
+[features]
+default = ["host", "jit"]
+host = ["machine", "bus-instruction-context", "dep:flate2", "dep:toml", "dep:libc", "dep:fatfs", "dep:chrono"]
+machine = ["dep:font8x8"]
+web-frontend = ["machine"]
+wasm-jit = ["web-frontend", "jit"]
+# Attribute unclaimed bus accesses to the current x86 instruction. Firmware can
+# opt in; otherwise no diagnostic address is written on every instruction.
+bus-instruction-context = ["machine"]
+sdl2-frontend = ["host", "dep:sdl2"]
+# Linux handheld frontend: framebuffer/evdev (M5Stack CardputerZero), or the
+# system's libSDL2 loaded at run time (TrimUI and other SDL2 firmwares).
+handheld-frontend = ["host", "toml/display"]
+# The same app in a desktop window with ./tmp/handheld data, for trying it
+# without the device.
+handheld-sdl = ["handheld-frontend"]
+monitor = []
+kvm = ["host", "monitor", "dep:libc"]
+jit = ["dep:hashbrown", "dep:dlmalloc"]
+# Compilation timing and unsupported-opcode counts, excluded from timing builds.
+jit-profile = ["jit"]
+# Standalone, non-production FPGA instruction-set experiment.
+r86chip = ["jit"]
+# Compile the same x86 interpreter with chip arithmetic/translation primitives.
+# This selects code at build time; there is no second x86 execution loop.
+r86chip-native = ["r86chip", "machine"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"], optional = true }
+fatfs = { version = "=0.3.6", path = "vendor/fatfs", default-features = false, features = ["std", "alloc", "chrono"], optional = true }
+flate2 = { version = "1.0", default-features = false, features = ["rust_backend"], optional = true }
+font8x8 = { version = "0.3.1", default-features = false, optional = true }
+toml = { version = "1.1.2", default-features = false, features = ["std", "parse", "serde"], optional = true }
+sdl2 = { version = "0.37", optional = true }
+
+[dev-dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[target.'cfg(target_os = "none")'.dependencies]
+hashbrown = { version = "0.17.1", default-features = false, optional = true }
+dlmalloc = { version = "0.2.14", default-features = false, optional = true }
+
+[target.'cfg(target_os = "horizon")'.dependencies]
+hashbrown = { version = "0.17.1", default-features = false, optional = true }
+
+[[bin]]
+name = "r86-run"
+path = "src/frontend/cli.rs"
+required-features = ["host"]
+
+[[bin]]
+name = "r86-handheld"
+path = "src/frontend/handheld/main.rs"
+required-features = ["handheld-frontend"]
+
+[[bin]]
+name = "r86-web"
+path = "src/frontend/web.rs"
+required-features = ["web-frontend"]
+test = false
+bench = false
+
+[[bin]]
+name = "r86chip-sim"
+path = "r86chip/sim/main.rs"
+required-features = ["r86chip"]
+
+[[bin]]
+name = "r86chip-machine"
+path = "r86chip/firmware/machine.rs"
+required-features = ["machine"]
+test = false
+bench = false
+
+[[bin]]
+name = "r86-kvm"
+path = "src/kvm/main.rs"
+required-features = ["kvm"]
+
+[[bin]]
+name = "rust_monitor_smoke"
+path = "src/monitor/bin/rust_monitor_smoke.rs"
+required-features = ["monitor"]
+
+[[bin]]
+name = "x86_monitor_smoke"
+path = "src/monitor/bin/x86_monitor_smoke.rs"
+required-features = ["monitor"]
+
+[[bin]]
+name = "hardmmu_paged_monitor_smoke"
+path = "src/monitor/bin/hardmmu_paged_monitor_smoke.rs"
+required-features = ["monitor"]
+
+[[bin]]
+name = "tinycore_monitor_smoke"
+path = "src/monitor/bin/tinycore_monitor_smoke.rs"
+required-features = ["monitor"]
+
+[[bin]]
+name = "machine_monitor_smoke"
+path = "src/monitor/bin/machine_monitor_smoke.rs"
+required-features = ["monitor", "machine"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[[example]]
+name = "kvm_timeout_smoke"
+required-features = ["kvm"]
+
+[[example]]
+name = "kvm_speculation_smoke"
+required-features = ["kvm"]
+
+[[example]]
+name = "reactos_boot_benchmark"
+path = "benchmarks/reactos_livecd_boot_to_langsel/boot.rs"
+required-features = ["host"]
+
+[[example]]
+name = "softmmu_boot_benchmark"
+path = "benchmarks/tinycore_boot/softmmu_boot.rs"
+required-features = ["host"]
+
+[[example]]
+name = "reactos_hard_benchmark"
+path = "benchmarks/reactos_livecd_boot_to_langsel/hard_boot.rs"
+required-features = ["kvm"]
+
+[[bin]]
+name = "reactos_monitor_benchmark"
+path = "benchmarks/reactos_livecd_boot_to_langsel/monitor.rs"
+required-features = ["monitor", "machine", "jit"]

@@ -1,0 +1,1283 @@
+Modifications to tiny386 (https://github.com/hchunhui/tiny386) at
+d47748e2b2d84597365c681e9e09c989cbce97c1. The patched code is under the
+tiny386 license:
+
+    Copyright (c) 2024-2025, Chunhui He
+    All rights reserved.
+
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions are
+    met:
+
+      * Redistributions of source code must retain the above copyright
+        notice, this list of conditions and the following disclaimer.
+
+      * Redistributions in binary form must reproduce the above copyright
+        notice, this list of conditions and the following disclaimer in
+        the documentation and/or other materials provided with the
+        distribution.
+
+      * Neither the name of the copyright holder nor the names of its
+        contributors may be used to endorse or promote products derived
+        from this software without specific prior written permission.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+    A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+    HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+    SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+    LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+    DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+    THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+    (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+    OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+diff --git a/Makefile b/Makefile
+index 4e2b0b5..6ed5b9d 100644
+--- a/Makefile
++++ b/Makefile
+@@ -103,7 +103,7 @@ PROGS_ = tiny386 tiny386_headless wifikbd initnet
+ PROGS_win32 = tiny386 tiny386_headless wifikbd
+ PROGS = ${PROGS_${PLAT}}
+ 
+-SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
++SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c fdc.c
+ SRCS += ${FMOPL_${USE_FMOPL}}
+ SRCS += ${CPUABS_${USE_CPUABS}}
+ SRCS += pc.c
+@@ -114,7 +114,7 @@ SRCS += osd/microui.c osd/osd.c
+ 
+ OBJS = ${SRCS:.c=.o}
+ 
+-.PHONY: all clean dep prepare
++.PHONY: all clean dep prepare test
+ .SUFFIXES: .c
+ .c.o:
+ 	@/bin/echo -e " \e[1;32mCC\e[0m\t\e[1;37m$<\e[0m \e[1;32m->\e[0m \e[1;37m$@\e[0m"
+@@ -126,7 +126,25 @@ win32:
+ 	make -C . PLAT=win32
+ 
+ clean:
+-	rm -f ${OBJS} .depends ${PROGS}
++	rm -f ${OBJS} .depends ${PROGS} tests/fdc_test tests/i386_cpuid_test tests/ide_atapi_test tests/uart_test
++
++tests/fdc_test: tests/fdc_test.c fdc.c fdc.h
++	${CC} ${CFLAGS} -o $@ tests/fdc_test.c fdc.c ${LIBS}
++
++tests/i386_cpuid_test: tests/i386_cpuid_test.c i386.c i386.h fpu.c fpu.h
++	${CC} ${CFLAGS} -o $@ tests/i386_cpuid_test.c i386.c fpu.c ${LIBS}
++
++tests/ide_atapi_test: tests/ide_atapi_test.c ide.c ide.h pci.c pci.h
++	${CC} ${CFLAGS} -o $@ tests/ide_atapi_test.c ide.c pci.c ${LIBS}
++
++tests/uart_test: tests/uart_test.c misc.c misc.h
++	${CC} ${CFLAGS} -o $@ tests/uart_test.c misc.c ${LIBS}
++
++test: tests/fdc_test tests/i386_cpuid_test tests/ide_atapi_test tests/uart_test
++	./tests/fdc_test
++	./tests/i386_cpuid_test
++	./tests/ide_atapi_test
++	./tests/uart_test
+ 
+ prepare: fmopl.inc
+ 
+diff --git a/fdc.c b/fdc.c
+new file mode 100644
+index 0000000..105b2fa
+--- /dev/null
++++ b/fdc.c
+@@ -0,0 +1,260 @@
++#include "fdc.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#define FDC_MSR_RQM  0x80
++#define FDC_MSR_DIO  0x40
++#define FDC_MSR_BUSY 0x10
++
++struct FDCState {
++	uint8_t dor;
++	uint8_t dsr;
++	uint8_t ccr;
++	uint8_t command[9];
++	uint8_t command_len;
++	uint8_t command_needed;
++	uint8_t result[16];
++	uint8_t result_pos;
++	uint8_t result_len;
++	uint8_t reset_sense;
++	uint8_t status0;
++	uint8_t cylinder[4];
++	uint8_t config;
++	uint8_t pretrk;
++	int irq;
++	void *pic;
++	void (*set_irq)(void *pic, int irq, int level);
++};
++
++static void fdc_clear_transfer(FDCState *fdc)
++{
++	fdc->command_len = 0;
++	fdc->command_needed = 0;
++	fdc->result_pos = 0;
++	fdc->result_len = 0;
++}
++
++static void fdc_pulse_irq(FDCState *fdc)
++{
++	if (!(fdc->dor & 0x08))
++		return;
++	fdc->set_irq(fdc->pic, fdc->irq, 1);
++	fdc->set_irq(fdc->pic, fdc->irq, 0);
++}
++
++static void fdc_reset(FDCState *fdc)
++{
++	fdc_clear_transfer(fdc);
++	fdc->reset_sense = 4;
++	fdc->status0 = 0xc0;
++	memset(fdc->cylinder, 0, sizeof(fdc->cylinder));
++	fdc_pulse_irq(fdc);
++}
++
++static void fdc_set_result(FDCState *fdc, const uint8_t *bytes, int len)
++{
++	memcpy(fdc->result, bytes, len);
++	fdc->result_pos = 0;
++	fdc->result_len = len;
++	fdc->command_len = 0;
++	fdc->command_needed = 0;
++}
++
++static int fdc_command_size(uint8_t command)
++{
++	switch (command & 0x1f) {
++	case 0x03: return 3; /* specify */
++	case 0x04: return 2; /* sense drive status */
++	case 0x05: case 0x06: case 0x09: case 0x0c:
++	case 0x11: case 0x19: case 0x1d:
++		return 9;
++	case 0x07: return 2; /* recalibrate */
++	case 0x08: return 1; /* sense interrupt status */
++	case 0x0a: return 2; /* read ID */
++	case 0x0d: return 6; /* format track */
++	case 0x0e: return 1; /* dump registers */
++	case 0x0f: return 3; /* seek */
++	case 0x10: return 1; /* version */
++	case 0x12: return 2; /* perpendicular mode */
++	case 0x13: return 4; /* configure */
++	case 0x14: return 1; /* unlock */
++	default: return 1;
++	}
++}
++
++static void fdc_absent_media_result(FDCState *fdc)
++{
++	uint8_t drive = fdc->command[1] & 3;
++	uint8_t result[7] = {
++		(uint8_t)(0x48 | drive), 0x04, 0,
++		fdc->command[2], fdc->command[3], fdc->command[4],
++		fdc->command[5]
++	};
++
++	fdc_set_result(fdc, result, sizeof(result));
++	fdc_pulse_irq(fdc);
++}
++
++static void fdc_execute_command(FDCState *fdc)
++{
++	uint8_t command = fdc->command[0];
++	uint8_t base = command & 0x1f;
++	uint8_t result[10];
++	uint8_t drive;
++	switch (base) {
++	case 0x03: /* specify */
++	case 0x12: /* perpendicular mode */
++		fdc_clear_transfer(fdc);
++		break;
++	case 0x04: /* sense drive status */
++		result[0] = (fdc->command[1] & 7) | 0x10;
++		fdc_set_result(fdc, result, 1);
++		break;
++	case 0x05: case 0x06: case 0x09: case 0x0a:
++	case 0x0c: case 0x0d: case 0x11: case 0x19: case 0x1d:
++		fdc_absent_media_result(fdc);
++		break;
++	case 0x07: /* recalibrate */
++		drive = fdc->command[1] & 3;
++		fdc->cylinder[drive] = 0;
++		fdc->status0 = 0x70 | drive;
++		fdc_clear_transfer(fdc);
++		fdc_pulse_irq(fdc);
++		break;
++	case 0x08: /* sense interrupt status */
++		if (fdc->reset_sense) {
++			drive = 4 - fdc->reset_sense--;
++			result[0] = 0xc0 | drive;
++			result[1] = fdc->cylinder[drive];
++			fdc_set_result(fdc, result, 2);
++		} else if ((fdc->status0 & 0x80) == 0) {
++			drive = fdc->status0 & 3;
++			result[0] = fdc->status0;
++			result[1] = fdc->cylinder[drive];
++			fdc->status0 = 0x80;
++			fdc_set_result(fdc, result, 2);
++		} else {
++			result[0] = 0x80;
++			fdc_set_result(fdc, result, 1);
++		}
++		break;
++	case 0x0e: /* dump registers */
++		memcpy(result, fdc->cylinder, 4);
++		result[4] = 0xdf;
++		result[5] = 0x02;
++		result[6] = 0;
++		result[7] = 0;
++		result[8] = fdc->config;
++		result[9] = fdc->pretrk;
++		fdc_set_result(fdc, result, 10);
++		break;
++	case 0x0f: /* seek */
++		drive = fdc->command[1] & 3;
++		fdc->cylinder[drive] = fdc->command[2];
++		fdc->status0 = 0x70 | drive;
++		fdc_clear_transfer(fdc);
++		fdc_pulse_irq(fdc);
++		break;
++	case 0x10: /* version */
++		result[0] = 0x90;
++		fdc_set_result(fdc, result, 1);
++		break;
++	case 0x13: /* configure */
++		fdc->config = fdc->command[2];
++		fdc->pretrk = fdc->command[3];
++		fdc_clear_transfer(fdc);
++		break;
++	case 0x14: /* unlock */
++		result[0] = 0;
++		fdc_set_result(fdc, result, 1);
++		break;
++	default:
++		result[0] = 0x80;
++		fdc_set_result(fdc, result, 1);
++		break;
++	}
++}
++
++FDCState *fdc_init(int irq, void *pic,
++		   void (*set_irq)(void *pic, int irq, int level))
++{
++	FDCState *fdc = calloc(1, sizeof(*fdc));
++
++	fdc->dor = 0x0c;
++	fdc->status0 = 0x80;
++	fdc->irq = irq;
++	fdc->pic = pic;
++	fdc->set_irq = set_irq;
++	return fdc;
++}
++
++uint8_t fdc_ioport_read(FDCState *fdc, uint16_t addr)
++{
++	switch (addr & 7) {
++	case 0: return 0;
++	case 1: return 0;
++	case 2: return fdc->dor;
++	case 3: return 0x20;
++	case 4:
++		if (fdc->result_pos < fdc->result_len)
++			return FDC_MSR_RQM | FDC_MSR_DIO | FDC_MSR_BUSY;
++		if (fdc->command_len)
++			return FDC_MSR_RQM | FDC_MSR_BUSY;
++		return FDC_MSR_RQM;
++	case 5:
++		if (fdc->result_pos < fdc->result_len) {
++			uint8_t value = fdc->result[fdc->result_pos++];
++			if (fdc->result_pos == fdc->result_len) {
++				fdc->result_pos = 0;
++				fdc->result_len = 0;
++			}
++			return value;
++		}
++		return 0xff;
++	case 7: return 0x80; /* no media */
++	default: return 0xff;
++	}
++}
++
++void fdc_ioport_write(FDCState *fdc, uint16_t addr, uint8_t val)
++{
++	switch (addr & 7) {
++	case 2: {
++		int was_enabled = fdc->dor & 0x04;
++		fdc->dor = val;
++		if (!(val & 0x04)) {
++			fdc_clear_transfer(fdc);
++			fdc->reset_sense = 0;
++			fdc->status0 = 0x80;
++			fdc->set_irq(fdc->pic, fdc->irq, 0);
++		} else if (!was_enabled) {
++			fdc_reset(fdc);
++		}
++		break;
++	}
++	case 3:
++		break;
++	case 4:
++		fdc->dsr = val & 0x7f;
++		if (val & 0x80)
++			fdc_reset(fdc);
++		break;
++	case 5:
++		if (fdc->result_pos < fdc->result_len)
++			break;
++		if (!fdc->command_len) {
++			fdc->command[0] = val;
++			fdc->command_len = 1;
++			fdc->command_needed = fdc_command_size(val);
++		} else if (fdc->command_len < sizeof(fdc->command)) {
++			fdc->command[fdc->command_len++] = val;
++		}
++		if (fdc->command_len >= fdc->command_needed)
++			fdc_execute_command(fdc);
++		break;
++	case 7:
++		fdc->ccr = val & 3;
++		break;
++	}
++}
+diff --git a/fdc.h b/fdc.h
+new file mode 100644
+index 0000000..db3cd83
+--- /dev/null
++++ b/fdc.h
+@@ -0,0 +1,13 @@
++#ifndef FDC_H
++#define FDC_H
++
++#include <stdint.h>
++
++typedef struct FDCState FDCState;
++
++FDCState *fdc_init(int irq, void *pic,
++		   void (*set_irq)(void *pic, int irq, int level));
++uint8_t fdc_ioport_read(FDCState *fdc, uint16_t addr);
++void fdc_ioport_write(FDCState *fdc, uint16_t addr, uint8_t val);
++
++#endif /* FDC_H */
+diff --git a/i386.c b/i386.c
+index db323f5..a51a474 100644
+--- a/i386.c
++++ b/i386.c
+@@ -3770,6 +3770,7 @@ static bool verrw_helper(CPUI386 *cpu, int sel, int wr, int *zf)
+ 		REGi(2) = 0x100; \
+ 		REGi(1) = 0; \
+ 		if (cpu->fpu) REGi(2) |= 1; \
++		if (cpu->gen > 4) REGi(2) |= 0x10; \
+ 		if (cpu->gen > 5) REGi(2) |= 0x8820; \
+ 		if (cpu->gen > 5 && cpu->fpu) { \
+ 			REGi(2) |= CPUID_SIMD_FEATURE; \
+diff --git a/ide.c b/ide.c
+index 9e29961..ddb68f5 100644
+--- a/ide.c
++++ b/ide.c
+@@ -377,6 +377,7 @@ struct IDEIFState {
+     IDEState *drives[2];
+     /* 0x3f6 command */
+     uint8_t cmd;
++    uint8_t irq_pending;
+ };
+ 
+ static void ide_sector_read_cb(void *opaque, int ret);
+@@ -471,7 +472,7 @@ static void ide_atapi_identify(IDEState *s)
+     stw(tab + 48, 1); /* dword I/O (XXX: should not be set on CDROM) */
+     stw(tab + 49, 1 << 9); /* LBA supported, no DMA */
+     stw(tab + 53, 3); /* words 64-70, 54-58 valid */
+-    stw(tab + 63, 0x103); /* DMA modes XXX: may be incorrect */
++    stw(tab + 63, 0); /* no DMA: the PIIX bus-master engine is probe-only */
+     stw(tab + 64, 1); /* PIO modes */
+     stw(tab + 65, 0xb4); /* minimum DMA multiword tx cycle time */
+     stw(tab + 66, 0xb4); /* recommended DMA multiword tx cycle time */
+@@ -504,12 +505,26 @@ static void ide_abort_command(IDEState *s)
+     s->error = ABRT_ERR;
+ }
+ 
+-static void ide_set_irq(IDEState *s) 
++static void ide_update_irq(IDEIFState *ide_if)
++{
++    int level = ide_if->irq_pending &&
++        !(ide_if->cmd & IDE_CMD_DISABLE_IRQ);
++
++    ide_if->set_irq(ide_if->pic, ide_if->irq, level);
++}
++
++static void ide_clear_irq(IDEIFState *ide_if)
++{
++    ide_if->irq_pending = 0;
++    ide_update_irq(ide_if);
++}
++
++static void ide_set_irq(IDEState *s)
+ {
+     IDEIFState *ide_if = s->ide_if;
+-    if (!(ide_if->cmd & IDE_CMD_DISABLE_IRQ)) {
+-        ide_if->set_irq(ide_if->pic, ide_if->irq, 1);
+-    }
++
++    ide_if->irq_pending = 1;
++    ide_update_irq(ide_if);
+ }
+ 
+ /* prepare data transfer and tell what to do after */
+@@ -1020,9 +1035,7 @@ static void ide_atapi_cmd_reply_end(IDEState *s)
+     if (s->packet_transfer_size <= 0) {
+         /* end of transfer */
+         ide_transfer_stop2(s);
+-        s->status = READY_STAT | SEEK_STAT;
+-        s->nsector = (s->nsector & ~7) | ATAPI_INT_REASON_IO | ATAPI_INT_REASON_CD;
+-        ide_set_irq(s);
++        ide_atapi_cmd_ok(s);
+ #ifdef DEBUG_IDE_ATAPI
+         printf("status=0x%x\n", s->status);
+ #endif
+@@ -1065,6 +1078,8 @@ static void ide_atapi_cmd_reply_end(IDEState *s)
+                 if (byte_count_limit & 1)
+                     byte_count_limit--;
+                 size = byte_count_limit;
++                if (s->lba != -1 && size >= s->cd_sector_size)
++                    size -= size % s->cd_sector_size;
+             }
+             s->lcyl = size;
+             s->hcyl = size >> 8;
+@@ -1505,7 +1520,6 @@ static void idecd_exec_cmd(IDEState *s, int val)
+         s->status = READY_STAT | SEEK_STAT;
+         s->nsector = 1;
+         ide_transfer_start2(s, 0, ATAPI_PACKET_SIZE, ide_atapi_cmd);
+-        ide_set_irq(s);
+         break;
+     case WIN_PIDENTIFY:
+         ide_atapi_identify(s);
+@@ -1570,6 +1584,7 @@ void ide_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+     default:
+     case 7:
+         /* command */
++        ide_clear_irq(s1);
+         if (s) {
+             if (s->drive_kind != IDE_CD)
+                 ide_exec_cmd(s, val);
+@@ -1614,7 +1629,7 @@ uint32_t ide_ioport_read(void *opaque, uint32_t addr)
+         default:
+         case 7:
+             ret = s->status;
+-            s1->set_irq(s1->pic, s1->irq, 0);
++            ide_clear_irq(s1);
+             break;
+         }
+     }
+@@ -1652,6 +1667,7 @@ void ide_cmd_write(void *opaque, uint32_t val)
+ #endif
+     if (!(s1->cmd & IDE_CMD_RESET) && (val & IDE_CMD_RESET)) {
+         /* low to high */
++        ide_clear_irq(s1);
+         for(i = 0; i < 2; i++) {
+             s = s1->drives[i];
+             if (s) {
+@@ -1670,6 +1686,7 @@ void ide_cmd_write(void *opaque, uint32_t val)
+         }
+     }
+     s1->cmd = val;
++    ide_update_irq(s1);
+ }
+ 
+ void ide_data_writew(void *opaque, uint32_t val)
+@@ -2382,7 +2399,10 @@ PCIDevice *piix3_ide_init(PCIBus *pci_bus, int devfn)
+ {
+     PCIDevice *d;
+     d = pci_register_device(pci_bus, "PIIX3 IDE", devfn, 0x8086, 0x7010, 0x00, 0x0101);
+-    pci_device_set_config8(d, 0x09, 0x00); /* ISA IDE ports, no DMA */
++    pci_device_set_config8(d, PCI_CLASS_PROG, 0x80); /* legacy ports, bus master capable */
++    pci_device_set_config16(d, PCI_STATUS, 0x0280); /* medium DEVSEL, fast back-to-back */
++    pci_device_set_config16(d, PCI_SUBSYSTEM_VENDOR_ID, 0x1af4);
++    pci_device_set_config16(d, PCI_SUBSYSTEM_ID, 0x1100);
+     return d;
+ }
+ 
+diff --git a/misc.c b/misc.c
+index 78026b7..633c35f 100644
+--- a/misc.c
++++ b/misc.c
+@@ -88,6 +88,7 @@ struct U8250 {
+ 	uint8_t lcr;
+ 	uint8_t ier;
+ 	uint8_t mcr;
++	uint8_t scr;
+ 	uint8_t ioready;
+ 	int out_fd;
+ 	uint8_t in;
+@@ -202,7 +203,12 @@ uint8_t u8250_reg_read(U8250 *uart, int off)
+ 		val = uart->ier;
+ 		break;
+ 	case 2:
+-		val = (uart->ier & uart->ioready) ? 0 : 1;
++		if (uart->ier & uart->ioready & 1)
++			val = 0x04;
++		else if (uart->ier & uart->ioready & 2)
++			val = 0x02;
++		else
++			val = 0x01;
+ 		break;
+ 	case 3:
+ 		val = uart->lcr;
+@@ -218,7 +224,9 @@ uint8_t u8250_reg_read(U8250 *uart, int off)
+ 		/* MSR = carrier detect, no ring, data ready, clear to send. */
+ 		val = 0xb0;
+ 		break;
+-		/* no scratch register, so we should be detected as a plain 8250. */
++	case 7:
++		val = uart->scr;
++		break;
+ 	default:
+ 		val = 0;
+ 	}
+@@ -262,6 +270,9 @@ void u8250_reg_write(U8250 *uart, int off, uint8_t val)
+ 	case 4:
+ 		uart->mcr = val;
+ 		break;
++	case 7:
++		uart->scr = val;
++		break;
+ 	}
+ }
+ 
+diff --git a/pc.c b/pc.c
+index bb9472f..d98a83a 100644
+--- a/pc.c
++++ b/pc.c
+@@ -132,10 +132,61 @@ void pcmalloc_init(void *ptr, long len);
+ #define pcmalloc_init(ptr, len)
+ #endif
+ 
++static bool pci_ide_bm_port(PC *pc, int addr, unsigned int *offset)
++{
++	if (!pc->pci_ide_bm_enabled)
++		return false;
++	*offset = (uword)addr - pc->pci_ide_bm_addr;
++	return *offset < 16;
++}
++
++static u8 pci_ide_bm_read8(PC *pc, unsigned int offset)
++{
++	unsigned int channel = offset >> 3;
++
++	switch (offset & 7) {
++	case 0:
++		return pc->pci_ide_bm_command[channel];
++	case 2:
++		return pc->pci_ide_bm_status[channel];
++	case 4: case 5: case 6: case 7:
++		return pc->pci_ide_bm_prdt[channel] >> ((offset & 3) * 8);
++	default:
++		return 0xff;
++	}
++}
++
++static void pci_ide_bm_write8(PC *pc, unsigned int offset, u8 val)
++{
++	unsigned int channel = offset >> 3;
++	unsigned int shift;
++
++	switch (offset & 7) {
++	case 0:
++		/* The attached drives advertise PIO only, so DMA never starts. */
++		pc->pci_ide_bm_command[channel] = val & 0x09;
++		break;
++	case 2:
++		pc->pci_ide_bm_status[channel] =
++			(val & 0x60) |
++			(pc->pci_ide_bm_status[channel] & ~val & 0x06);
++		break;
++	case 4: case 5: case 6: case 7:
++		shift = (offset & 3) * 8;
++		pc->pci_ide_bm_prdt[channel] &= ~(0xffU << shift);
++		pc->pci_ide_bm_prdt[channel] |= (u32)val << shift;
++		break;
++	}
++}
++
+ static u8 pc_io_read(void *o, int addr)
+ {
+ 	PC *pc = o;
+ 	u8 val;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset))
++		return pci_ide_bm_read8(pc, offset);
+ 
+ 	switch(addr) {
+ 	case 0x20: case 0x21: case 0xa0: case 0xa1:
+@@ -176,6 +227,9 @@ static u8 pc_io_read(void *o, int addr)
+ 	case 0x3f6:
+ 		val = ide_status_read(pc->ide);
+ 		return val;
++	case 0x3f0: case 0x3f1: case 0x3f2: case 0x3f3:
++	case 0x3f4: case 0x3f5: case 0x3f7:
++		return fdc_ioport_read(pc->fdc, addr);
+ 	case 0x376:
+ 		val = ide_status_read(pc->ide2);
+ 		return val;
+@@ -267,6 +321,11 @@ static u16 pc_io_read16(void *o, int addr)
+ {
+ 	PC *pc = o;
+ 	u16 val;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset) && offset <= 14)
++		return pci_ide_bm_read8(pc, offset) |
++		       ((u16)pci_ide_bm_read8(pc, offset + 1) << 8);
+ 
+ 	switch(addr) {
+ 	case 0x1ce: case 0x1cf:
+@@ -299,6 +358,14 @@ static u32 pc_io_read32(void *o, int addr)
+ {
+ 	PC *pc = o;
+ 	u32 val;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset) && offset <= 12)
++		return pci_ide_bm_read8(pc, offset) |
++		       ((u32)pci_ide_bm_read8(pc, offset + 1) << 8) |
++		       ((u32)pci_ide_bm_read8(pc, offset + 2) << 16) |
++		       ((u32)pci_ide_bm_read8(pc, offset + 3) << 24);
++
+ 	switch(addr) {
+ 	case 0x1f0:
+ 		val = ide_data_readl(pc->ide);
+@@ -340,10 +407,20 @@ static int pc_io_read_string(void *o, int addr, uint8_t *buf, int size, int coun
+ static void pc_io_write(void *o, int addr, u8 val)
+ {
+ 	PC *pc = o;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset)) {
++		pci_ide_bm_write8(pc, offset, val);
++		return;
++	}
++
+ 	switch(addr) {
+ 	case 0x80: case 0xed:
+ 		/* used by linux, for io delay */
+ 		return;
++	case 0x279: case 0xa79:
++		/* ISA PnP address/write-data ports with no cards attached. */
++		return;
+ 	case 0x20: case 0x21: case 0xa0: case 0xa1:
+ 		i8259_ioport_write(pc->pic, addr, val);
+ 		return;
+@@ -375,6 +452,10 @@ static void pc_io_write(void *o, int addr, u8 val)
+ 	case 0x3f6:
+ 		ide_cmd_write(pc->ide, val);
+ 		return;
++	case 0x3f0: case 0x3f1: case 0x3f2: case 0x3f3:
++	case 0x3f4: case 0x3f5: case 0x3f7:
++		fdc_ioport_write(pc->fdc, addr, val);
++		return;
+ 	case 0x376:
+ 		ide_cmd_write(pc->ide2, val);
+ 		return;
+@@ -486,6 +567,14 @@ static void pc_io_write(void *o, int addr, u8 val)
+ static void pc_io_write16(void *o, int addr, u16 val)
+ {
+ 	PC *pc = o;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset) && offset <= 14) {
++		pci_ide_bm_write8(pc, offset, val);
++		pci_ide_bm_write8(pc, offset + 1, val >> 8);
++		return;
++	}
++
+ 	switch(addr) {
+ 	case 0x1f0:
+ 		ide_data_writew(pc->ide, val);
+@@ -522,6 +611,14 @@ static void pc_io_write16(void *o, int addr, u16 val)
+ static void pc_io_write32(void *o, int addr, u32 val)
+ {
+ 	PC *pc = o;
++	unsigned int offset;
++
++	if (pci_ide_bm_port(pc, addr, &offset) && offset <= 12) {
++		for (int i = 0; i < 4; i++)
++			pci_ide_bm_write8(pc, offset + i, val >> (i * 8));
++		return;
++	}
++
+ 	switch(addr) {
+ 	case 0x1f0:
+ 		ide_data_writel(pc->ide, val);
+@@ -619,9 +716,21 @@ static void set_pci_vga_bar(void *opaque, int bar_num, uint32_t addr, bool enabl
+ 				 NULL);
+ }
+ 
++static void set_pci_ide_bar(void *opaque, int bar_num, uint32_t addr, bool enabled)
++{
++	PC *pc = opaque;
++
++	if (bar_num != 4)
++		return;
++	pc->pci_ide_bm_addr = addr;
++	pc->pci_ide_bm_enabled = enabled;
++}
++
+ static u8 iomem_read8(void *iomem, uword addr)
+ {
+ 	PC *pc = iomem;
++	if (pc->bios_size && addr >= (uword)(0 - pc->bios_size))
++		return pc->phys_mem[addr + 0x100000U];
+ 	uword vga_addr2 = pc->pci_vga_ram_addr;
+ 	if (addr >= vga_addr2) {
+ 		addr -= vga_addr2;
+@@ -636,6 +745,8 @@ static u8 iomem_read8(void *iomem, uword addr)
+ static void iomem_write8(void *iomem, uword addr, u8 val)
+ {
+ 	PC *pc = iomem;
++	if (pc->bios_size && addr >= (uword)(0 - pc->bios_size))
++		return;
+ 	uword vga_addr2 = pc->pci_vga_ram_addr;
+ 	if (addr >= vga_addr2) {
+ 		addr -= vga_addr2;
+@@ -723,6 +834,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
+ 		cpu_enable_fpu(pc->cpu);
+ 	pc->bios = conf->bios;
+ 	pc->vga_bios = conf->vga_bios;
++	pc->bios_size = 0;
+ 	pc->linuxstart = conf->linuxstart;
+ 	if (!pc->bios) pc->bios = "bios.bin";
+ 	if (!pc->vga_bios) pc->vga_bios = "vgabios.bin";
+@@ -742,6 +854,7 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
+ 	cb->pic_read_irq = read_irq;
+ 
+ 	pc->pit = i8254_init(0, pc->pic, set_irq);
++	pc->fdc = fdc_init(6, pc->pic, set_irq);
+ 	pc->serial = u8250_init(4, pc->pic, set_irq);
+ 	pc->cmos = cmos_init(conf->mem_size, 8, pc->pic, set_irq);
+ 	pc->ide = ide_allocate(14, pc->pic, set_irq);
+@@ -772,6 +885,13 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
+ 	int piix3_devfn;
+ 	pc->i440fx = i440fx_init(&pc->pcibus, &piix3_devfn);
+ 	pc->pci_ide = piix3_ide_init(pc->pcibus, piix3_devfn + 1);
++	pc->pci_ide_bm_addr = 0;
++	pc->pci_ide_bm_enabled = false;
++	memset(pc->pci_ide_bm_command, 0, sizeof(pc->pci_ide_bm_command));
++	memset(pc->pci_ide_bm_status, 0, sizeof(pc->pci_ide_bm_status));
++	memset(pc->pci_ide_bm_prdt, 0, sizeof(pc->pci_ide_bm_prdt));
++	pci_register_bar(pc->pci_ide, 4, 16, PCI_ADDRESS_SPACE_IO,
++			 pc, set_pci_ide_bar);
+ 
+ 	pc->phys_mem = mem;
+ 	pc->phys_mem_size = conf->mem_size;
+@@ -872,7 +992,7 @@ void mixer_callback (void *opaque, uint8_t *stream, int free)
+ void load_bios_and_reset(PC *pc)
+ {
+ 	if (pc->bios && pc->bios[0])
+-		load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
++		pc->bios_size = load_rom(pc->phys_mem, pc->bios, 0x100000, 1);
+ 	if (pc->vga_bios && pc->vga_bios[0])
+ 		load_rom(pc->phys_mem, pc->vga_bios, 0xc0000, 0);
+ 	if (pc->kernel && pc->kernel[0]) {
+diff --git a/pc.h b/pc.h
+index 2569f98..965db92 100644
+--- a/pc.h
++++ b/pc.h
+@@ -21,6 +21,7 @@
+ #include "i8257.h"
+ #include "sb16.h"
+ #include "pcspk.h"
++#include "fdc.h"
+ #include "pci.h"
+ #include "ini.h"
+ 
+@@ -46,6 +47,7 @@ typedef struct {
+ 	CPU *cpu;
+ 	PicState2 *pic;
+ 	PITState *pit;
++	FDCState *fdc;
+ 	U8250 *serial;
+ 	CMOS *cmos;
+ 	IDEIFState *ide, *ide2;
+@@ -71,6 +73,11 @@ typedef struct {
+ 	I440FXState *i440fx;
+ 	PCIBus *pcibus;
+ 	PCIDevice *pci_ide;
++	uword pci_ide_bm_addr;
++	bool pci_ide_bm_enabled;
++	u8 pci_ide_bm_command[2];
++	u8 pci_ide_bm_status[2];
++	u32 pci_ide_bm_prdt[2];
+ 	PCIDevice *pci_vga;
+ 	uword pci_vga_ram_addr;
+ 
+@@ -79,6 +86,7 @@ typedef struct {
+ 	// non-owning strings
+ 	const char *bios;
+ 	const char *vga_bios;
++	uword bios_size;
+ 
+ 	u8 port92;
+ 	int shutdown_state;
+diff --git a/pci.c b/pci.c
+index 500d620..ca5082e 100644
+--- a/pci.c
++++ b/pci.c
+@@ -477,7 +477,7 @@ int pci_add_capability(PCIDevice *d, const uint8_t *buf, int size)
+ 
+ struct I440FXState {
+     PCIBus *pci_bus;
+-//    PCIDevice *pci_dev;
++    PCIDevice *pci_dev;
+     PCIDevice *piix3_dev;
+     uint32_t config_reg;
+     uint8_t pic_irq_state[16];
+@@ -553,7 +553,7 @@ I440FXState *i440fx_init(PCIBus **pbus, int *ppiix3_devfn)
+ {
+     I440FXState *s;
+     PCIBus *b;
+-//    PCIDevice *d;
++    PCIDevice *d;
+     int i;
+     
+     s = pcmalloc(sizeof(*s));
+@@ -574,11 +574,11 @@ I440FXState *i440fx_init(PCIBus **pbus, int *ppiix3_devfn)
+ //                        DEVIO_SIZE32);
+ //    cpu_register_device(port_map, 0xcfc, 4, s, i440fx_read_data, i440fx_write_data, 
+ //                        DEVIO_SIZE8 | DEVIO_SIZE16 | DEVIO_SIZE32);
+-//    d = pci_register_device(b, "i440FX", 0, 0x8086, 0x1237, 0x02, 0x0600);
+-//    put_le16(&d->config[PCI_SUBSYSTEM_VENDOR_ID], 0x1af4); /* Red Hat, Inc. */
+-//    put_le16(&d->config[PCI_SUBSYSTEM_ID], 0x1100); /* QEMU virtual machine */
++    d = pci_register_device(b, "i440FX", 0, 0x8086, 0x1237, 0x02, 0x0600);
++    put_le16(&d->config[PCI_SUBSYSTEM_VENDOR_ID], 0x1af4); /* Red Hat, Inc. */
++    put_le16(&d->config[PCI_SUBSYSTEM_ID], 0x1100); /* QEMU virtual machine */
+     
+-//    s->pci_dev = d;
++    s->pci_dev = d;
+     s->pci_bus = b;
+ 
+     s->piix3_dev = pci_register_device(b, "PIIX3", 8, 0x8086, 0x7000,
+diff --git a/tests/fdc_test.c b/tests/fdc_test.c
+new file mode 100644
+index 0000000..3f22194
+--- /dev/null
++++ b/tests/fdc_test.c
+@@ -0,0 +1,68 @@
++#include <assert.h>
++#include <stdint.h>
++
++#include "fdc.h"
++
++struct IrqLog {
++	int rises;
++	int falls;
++	int last_irq;
++};
++
++static void set_irq(void *opaque, int irq, int level)
++{
++	struct IrqLog *log = opaque;
++	log->last_irq = irq;
++	if (level)
++		log->rises++;
++	else
++		log->falls++;
++}
++
++static void command(FDCState *fdc, const uint8_t *bytes, int len)
++{
++	for (int i = 0; i < len; i++)
++		fdc_ioport_write(fdc, 0x3f5, bytes[i]);
++}
++
++int main(void)
++{
++	struct IrqLog irq = {0};
++	FDCState *fdc = fdc_init(6, &irq, set_irq);
++	const uint8_t configure[] = {0x13, 0, 0x30, 0};
++	const uint8_t version[] = {0x10};
++	const uint8_t sense[] = {0x08};
++	const uint8_t read_id[] = {0x0a, 0};
++
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0x80);
++	command(fdc, configure, sizeof(configure));
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0x80);
++	command(fdc, version, sizeof(version));
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0xd0);
++	assert(fdc_ioport_read(fdc, 0x3f5) == 0x90);
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0x80);
++
++	fdc_ioport_write(fdc, 0x3f2, 0);
++	fdc_ioport_write(fdc, 0x3f2, 0x0c);
++	assert(irq.rises == 1);
++	assert(irq.falls >= 1);
++	assert(irq.last_irq == 6);
++	for (int drive = 0; drive < 4; drive++) {
++		command(fdc, sense, sizeof(sense));
++		assert(fdc_ioport_read(fdc, 0x3f4) == 0xd0);
++		assert(fdc_ioport_read(fdc, 0x3f5) == (0xc0 | drive));
++		assert(fdc_ioport_read(fdc, 0x3f5) == 0);
++	}
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0x80);
++
++	command(fdc, read_id, sizeof(read_id));
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0xd0);
++	assert(fdc_ioport_read(fdc, 0x3f5) == 0x48);
++	assert(fdc_ioport_read(fdc, 0x3f5) == 0x04);
++	for (int i = 0; i < 5; i++)
++		(void)fdc_ioport_read(fdc, 0x3f5);
++	assert(fdc_ioport_read(fdc, 0x3f4) == 0x80);
++	assert(irq.rises == 2);
++
++	return 0;
++}
+diff --git a/tests/i386_cpuid_test.c b/tests/i386_cpuid_test.c
+new file mode 100644
+index 0000000..c386b92
+--- /dev/null
++++ b/tests/i386_cpuid_test.c
+@@ -0,0 +1,45 @@
++#include <assert.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "i386.h"
++
++void *pcmalloc(long size)
++{
++	return calloc(1, size);
++}
++
++int main(void)
++{
++	static const uint8_t code[] = {
++		0xb8, 0x01, 0x00, 0x00, 0x00, /* mov eax, 1 */
++		0x0f, 0xa2,                   /* cpuid */
++		0xa3, 0x00, 0x01, 0x00, 0x00, /* mov [0x100], eax */
++		0x89, 0x1d, 0x04, 0x01, 0x00, 0x00, /* mov [0x104], ebx */
++		0x89, 0x0d, 0x08, 0x01, 0x00, 0x00, /* mov [0x108], ecx */
++		0x89, 0x15, 0x0c, 0x01, 0x00, 0x00, /* mov [0x10c], edx */
++		0xf4, /* hlt */
++	};
++	uint8_t *memory = calloc(1, 1024 * 1024);
++	CPU_CB *cb;
++	CPUI386 *cpu;
++	uint32_t feature_edx;
++
++	assert(memory != NULL);
++	memcpy(memory, code, sizeof(code));
++	cpu = cpui386_new(6, (char *)memory, 1024 * 1024, &cb);
++	assert(cpu != NULL);
++	cpui386_enable_fpu(cpu);
++	cpui386_reset_pm(cpu, 0);
++	cpui386_step(cpu, 16);
++
++	memcpy(&feature_edx, memory + 0x10c, sizeof(feature_edx));
++	assert(feature_edx & (1U << 0)); /* FPU */
++	assert(feature_edx & (1U << 4)); /* TSC */
++	assert(feature_edx & (1U << 8)); /* CMPXCHG8B */
++
++	cpui386_delete(cpu);
++	free(memory);
++	return 0;
++}
+diff --git a/tests/ide_atapi_test.c b/tests/ide_atapi_test.c
+new file mode 100644
+index 0000000..2019a4f
+--- /dev/null
++++ b/tests/ide_atapi_test.c
+@@ -0,0 +1,254 @@
++#define _POSIX_C_SOURCE 200809L
++
++#include <assert.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "ide.h"
++#include "pci.h"
++
++#define CD_SECTOR_SIZE 2048
++#define TEST_SECTORS 40
++#define READ_SECTORS 34
++
++struct BarLog {
++	uint32_t address;
++	int enabled;
++};
++
++struct IrqLog {
++	int level;
++	int rises;
++};
++
++void *pcmalloc(long size)
++{
++	return calloc(1, size);
++}
++
++static void set_irq(void *opaque, int irq, int level)
++{
++	struct IrqLog *log = opaque;
++
++	(void)irq;
++	if (level && !log->level)
++		log->rises++;
++	log->level = level;
++}
++
++static void set_bar(void *opaque, int bar_num, uint32_t address, bool enabled)
++{
++	struct BarLog *log = opaque;
++
++	assert(bar_num == 4);
++	log->address = address;
++	log->enabled = enabled;
++}
++
++static void pci_select(I440FXState *host, int devfn, int offset)
++{
++	i440fx_write_addr(host, 0, 0x80000000U | (devfn << 8) | offset, 2);
++}
++
++static void test_pci_layout(void)
++{
++	struct BarLog bar = {0};
++	I440FXState *host;
++	PCIBus *bus;
++	PCIDevice *ide;
++	int piix3_devfn;
++	uint32_t value;
++
++	host = i440fx_init(&bus, &piix3_devfn);
++	assert(host != NULL);
++	assert(piix3_devfn == 8);
++
++	pci_select(host, 0, 0);
++	assert(i440fx_read_data(host, 0, 2) == 0x12378086U);
++
++	ide = piix3_ide_init(bus, piix3_devfn + 1);
++	assert(ide != NULL);
++	pci_register_bar(ide, 4, 16, PCI_ADDRESS_SPACE_IO, &bar, set_bar);
++
++	pci_select(host, piix3_devfn + 1, 8);
++	value = i440fx_read_data(host, 0, 2);
++	assert((value & 0xffffff00U) == 0x01018000U);
++
++	pci_select(host, piix3_devfn + 1, 0x20);
++	i440fx_write_data(host, 0, 0xc001, 2);
++	pci_select(host, piix3_devfn + 1, PCI_COMMAND);
++	i440fx_write_data(host, 0, PCI_COMMAND_IO, 1);
++	assert(bar.enabled);
++	assert(bar.address == 0xc000);
++}
++
++static void write_test_image(int fd)
++{
++	uint8_t sector[CD_SECTOR_SIZE];
++	FILE *file = fdopen(fd, "wb");
++
++	assert(file != NULL);
++	for (int sector_no = 0; sector_no < TEST_SECTORS; sector_no++) {
++		for (int i = 0; i < CD_SECTOR_SIZE; i++)
++			sector[i] = (uint8_t)(sector_no * 17 + i * 29);
++		assert(fwrite(sector, 1, sizeof(sector), file) == sizeof(sector));
++	}
++	assert(fclose(file) == 0);
++}
++
++static void test_atapi_long_pio_read(void)
++{
++	char path[] = "/tmp/tiny386-atapi-test-XXXXXX";
++	uint8_t packet[12] = {0x28, 0, 0, 0, 0, 0, 0, 0, READ_SECTORS, 0, 0, 0};
++	uint8_t *output = malloc(READ_SECTORS * CD_SECTOR_SIZE);
++	IDEIFState *ide;
++	struct IrqLog irq = {0};
++	size_t output_pos = 0;
++	uint16_t phases[2];
++	int phase_count = 0;
++	int fd = mkstemp(path);
++
++	assert(fd >= 0);
++	assert(output != NULL);
++	write_test_image(fd);
++
++	ide = ide_allocate(14, &irq, set_irq);
++	assert(ide != NULL);
++	assert(ide_attach_cd(ide, 0, path) == 0);
++	ide_ioport_write(ide, 6, 0xa0);
++	ide_ioport_write(ide, 1, 0);
++	ide_ioport_write(ide, 4, 0xff);
++	ide_ioport_write(ide, 5, 0xff);
++	ide_ioport_write(ide, 7, 0xa0);
++	assert(irq.rises == 0);
++	for (int i = 0; i < 12; i += 2)
++		ide_data_writew(ide, packet[i] | ((uint16_t)packet[i + 1] << 8));
++	assert(irq.rises == 1);
++
++	while (output_pos < READ_SECTORS * CD_SECTOR_SIZE) {
++		uint16_t byte_count;
++		size_t phase_pos = 0;
++
++		assert(ide_ioport_read(ide, 7) & 0x08);
++		byte_count = ide_ioport_read(ide, 4);
++		byte_count |= (uint16_t)ide_ioport_read(ide, 5) << 8;
++		assert(byte_count > 0);
++		assert((byte_count & 1) == 0);
++		assert(phase_count < 2);
++		phases[phase_count++] = byte_count;
++		while (phase_pos < byte_count) {
++			int words = ide_data_read_string(ide,
++				output + output_pos + phase_pos, 2,
++				(byte_count - phase_pos) / 2);
++			assert(words > 0);
++			phase_pos += words * 2;
++		}
++		output_pos += byte_count;
++	}
++
++	assert((ide_ioport_read(ide, 7) & 0x09) == 0);
++	assert(phase_count == 2);
++	assert(phases[0] == 31 * CD_SECTOR_SIZE);
++	assert(phases[1] == 3 * CD_SECTOR_SIZE);
++	for (int sector_no = 0; sector_no < READ_SECTORS; sector_no++) {
++		for (int i = 0; i < CD_SECTOR_SIZE; i++) {
++			uint8_t expected = (uint8_t)(sector_no * 17 + i * 29);
++			assert(output[sector_no * CD_SECTOR_SIZE + i] == expected);
++		}
++	}
++
++	free(output);
++	assert(unlink(path) == 0);
++}
++
++static void test_atapi_nien_pending_irq(void)
++{
++	char path[] = "/tmp/tiny386-atapi-irq-test-XXXXXX";
++	uint8_t packet[12] = {0x25};
++	IDEIFState *ide;
++	struct IrqLog irq = {0};
++	int fd = mkstemp(path);
++
++	assert(fd >= 0);
++	write_test_image(fd);
++	ide = ide_allocate(14, &irq, set_irq);
++	assert(ide != NULL);
++	assert(ide_attach_cd(ide, 0, path) == 0);
++	ide_ioport_write(ide, 6, 0xa0);
++
++	ide_cmd_write(ide, 0x02);
++	ide_ioport_write(ide, 7, 0xa0);
++	for (int i = 0; i < 12; i += 2)
++		ide_data_writew(ide, packet[i] | ((uint16_t)packet[i + 1] << 8));
++	assert(irq.level == 0);
++	assert(irq.rises == 0);
++
++	ide_cmd_write(ide, 0x00);
++	assert(irq.level == 1);
++	assert(irq.rises == 1);
++	assert(ide_status_read(ide) & 0x08);
++	assert(irq.level == 1);
++	assert(ide_ioport_read(ide, 7) & 0x08);
++	assert(irq.level == 0);
++
++	ide_cmd_write(ide, 0x02);
++	ide_ioport_write(ide, 7, 0xa0);
++	for (int i = 0; i < 12; i += 2)
++		ide_data_writew(ide, packet[i] | ((uint16_t)packet[i + 1] << 8));
++	assert(irq.level == 0);
++	ide_cmd_write(ide, 0x06);
++	ide_cmd_write(ide, 0x00);
++	assert(irq.level == 0);
++	assert(irq.rises == 1);
++
++	assert(unlink(path) == 0);
++}
++
++static void test_atapi_success_clears_error(void)
++{
++	char path[] = "/tmp/tiny386-atapi-error-test-XXXXXX";
++	uint8_t bad_packet[12] = {0xff};
++	uint8_t sense_packet[12] = {0x03, 0, 0, 0, 18};
++	IDEIFState *ide;
++	struct IrqLog irq = {0};
++	int fd = mkstemp(path);
++
++	assert(fd >= 0);
++	write_test_image(fd);
++	ide = ide_allocate(14, &irq, set_irq);
++	assert(ide != NULL);
++	assert(ide_attach_cd(ide, 0, path) == 0);
++	ide_ioport_write(ide, 6, 0xa0);
++
++	ide_ioport_write(ide, 7, 0xa0);
++	for (int i = 0; i < 12; i += 2)
++		ide_data_writew(ide,
++			bad_packet[i] | ((uint16_t)bad_packet[i + 1] << 8));
++	assert(ide_ioport_read(ide, 7) & 0x01);
++	assert(ide_ioport_read(ide, 1) == 0x50);
++
++	ide_ioport_write(ide, 4, 18);
++	ide_ioport_write(ide, 5, 0);
++	ide_ioport_write(ide, 7, 0xa0);
++	for (int i = 0; i < 12; i += 2)
++		ide_data_writew(ide,
++			sense_packet[i] | ((uint16_t)sense_packet[i + 1] << 8));
++	for (int i = 0; i < 9; i++)
++		(void)ide_data_readw(ide);
++	assert((ide_ioport_read(ide, 7) & 0x01) == 0);
++	assert(ide_ioport_read(ide, 1) == 0);
++
++	assert(unlink(path) == 0);
++}
++
++int main(void)
++{
++	test_pci_layout();
++	test_atapi_long_pio_read();
++	test_atapi_nien_pending_irq();
++	test_atapi_success_clears_error();
++	return 0;
++}
+diff --git a/tests/uart_test.c b/tests/uart_test.c
+new file mode 100644
+index 0000000..5638942
+--- /dev/null
++++ b/tests/uart_test.c
+@@ -0,0 +1,26 @@
++#include <assert.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#include "misc.h"
++
++static void set_irq(void *opaque, int irq, int level)
++{
++	(void)opaque;
++	(void)irq;
++	(void)level;
++}
++
++int main(void)
++{
++	U8250 *uart = u8250_init(4, NULL, set_irq);
++
++	assert(uart != NULL);
++	u8250_reg_write(uart, 1, 2);
++	assert(u8250_reg_read(uart, 2) == 2);
++	u8250_reg_write(uart, 7, 0x5a);
++	assert(u8250_reg_read(uart, 7) == 0x5a);
++	u8250_reg_write(uart, 7, 0xa5);
++	assert(u8250_reg_read(uart, 7) == 0xa5);
++	return 0;
++}

@@ -1,0 +1,16 @@
+Initialize the PM timer and APM shutdown port from the supplied FADT. The QEMU
+path otherwise depends on a recognized PCI PM chipset setting these globals,
+even though it has already accepted the platform's ACPI tables. Reuse the same
+table discovery used by SeaBIOS's coreboot, CSM and Xen paths.
+
+--- a/src/fw/paravirt.c
++++ b/src/fw/paravirt.c
+@@ -309,7 +309,7 @@
+         RsdpAddr = find_acpi_rsdp();
+ 
+         if (RsdpAddr) {
+-            acpi_dsdt_parse();
++            find_acpi_features();
+             virtio_mmio_setup_acpi();
+             return;
+         }
