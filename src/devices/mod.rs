@@ -1,3 +1,4 @@
+pub mod ne2000;
 pub(crate) mod pic;
 pub(crate) mod pit;
 // Common PC device-clock units; the machine selects wall time or instruction time.

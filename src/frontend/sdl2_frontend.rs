@@ -10,7 +10,11 @@ use super::{GuestStepStatus, Machine, Sdl2Options, print_machine_stop};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 
-pub fn run(machine: &mut Machine, options: Sdl2Options) -> Result<(), String> {
+pub fn run(
+    machine: &mut Machine,
+    options: Sdl2Options,
+    network: &mut Option<r86::network::UserNetwork>,
+) -> Result<(), String> {
     let sdl = sdl2::init().map_err(|err| format!("failed to initialize SDL2: {err}"))?;
     let video = sdl
         .video()
@@ -93,12 +97,20 @@ pub fn run(machine: &mut Machine, options: Sdl2Options) -> Result<(), String> {
         {
             None
         } else {
+            if let Some(net) = network {
+                net.poll(machine).map_err(|e| format!("network: {e}"))?;
+            }
             Some(machine.run_steps(budget)?)
         };
         if let Some(report) = report {
             if let Some(status) = report.stop {
                 match status {
-                    GuestStepStatus::Halted => std::thread::sleep(machine.halted_wait_duration()),
+                    GuestStepStatus::Halted => {
+                        let wait = machine.halted_wait_duration();
+                        std::thread::sleep(
+                            network.as_ref().map_or(wait, |net| net.limit_wait(wait)),
+                        );
+                    }
                     _ => {
                         print_machine_stop(machine, &status);
                         render(

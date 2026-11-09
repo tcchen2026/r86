@@ -258,6 +258,9 @@ pub struct PciConfig {
     ide_slave_timing: u8,
     vga_command: u16,
     vga_bar0: u32,
+    pub net_present: bool,
+    net_command: u16,
+    net_bar0: u32,
 }
 
 impl PciConfig {
@@ -272,6 +275,9 @@ impl PciConfig {
             // without PCI firmware setup. Guests can subsequently disable it.
             vga_command: 3,
             vga_bar0: 0xe000_0000,
+            net_present: false,
+            net_command: 1,
+            net_bar0: 0xc101,
         }
     }
 
@@ -336,6 +342,10 @@ impl PciConfig {
         // IDE has legacy PIO ports and a BM BAR with interrupt status;
         // VGA has I/O/memory decode, no bus master, IRQ or capability list.
         match (dev, func, reg) {
+            (3, 0, 0x04) if self.net_present => {
+                self.net_command = merge(u32::from(self.net_command)) as u16 & 1
+            }
+            (3, 0, 0x10) if self.net_present => self.net_bar0 = (merge(self.net_bar0) & !31) | 1,
             (1, 1, 0x04) => self.ide_command = merge(u32::from(self.ide_command)) as u16 & 5,
             (1, 1, 0x20) => {
                 self.ide_bus_master_bar4 = (merge(self.ide_bus_master_bar4) & !15) | 1;
@@ -363,6 +373,15 @@ impl PciConfig {
 
     pub fn vga_lfb_base(&self) -> u64 {
         u64::from(self.vga_bar0 & 0xff00_0000)
+    }
+
+    pub fn net_port(&self, port: u16) -> Option<u8> {
+        if !self.net_present || self.net_command & 1 == 0 {
+            return None;
+        }
+        let base = self.net_bar0 & !31;
+        let offset = u32::from(port).checked_sub(base)?;
+        (base != 0 && offset < 32).then_some(offset as u8)
     }
 
     pub fn vga_mem_enabled(&self) -> bool {
@@ -415,6 +434,9 @@ impl PciConfig {
                 _ => 0,
             },
             (1, 0) => match offset {
+                // Fixed board wiring, matching SeaBIOS piix_isa_bridge_setup.
+                0x60 | 0x61 => 10,
+                0x62 | 0x63 => 11,
                 0x00 => 0x86,
                 0x01 => 0x80,
                 0x02 => 0x00,
@@ -476,6 +498,18 @@ impl PciConfig {
                 0x2f => 0x11,
                 0x3c => 0x00,
                 0x3d => 0x00,
+                _ => 0,
+            },
+            (3, 0) if self.net_present => match offset {
+                0 => 0xec,
+                1 => 0x10,
+                2 => 0x29,
+                3 => 0x80,
+                4 => self.net_command as u8,
+                0x0b => 2,
+                0x10..=0x13 => (self.net_bar0 >> ((offset - 0x10) * 8)) as u8,
+                0x3c => crate::devices::ne2000::IRQ,
+                0x3d => 1,
                 _ => 0,
             },
             _ => 0xff,

@@ -32,7 +32,11 @@ DefinitionBlock ("", "DSDT", 1, "R86   ", "R86PC   ", 1)
                 DWordMemory (ResourceProducer, PosDecode, MinFixed, MaxFixed,
                     NonCacheable, ReadWrite, 0, 0xE0000000, 0xFEBFFFFF, 0, 0x1EC00000)
             })
-            Name (_PRT, Package () { Package () { 0x0001FFFF, Zero, Zero, 14 } })
+            Name (_PRT, Package () {
+                Package () { 0x0001FFFF, Zero, Zero, 14 },
+                // PCI slot 3 INTA -> PIIX PIRQC -> level IRQ11.
+                Package () { 0x0003FFFF, Zero, Zero, 11 }
+            })
             Device (ISA)
             {
                 Name (_ADR, 0x00010000)

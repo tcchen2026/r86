@@ -29,11 +29,13 @@ fn kind(key: &str) -> Option<Kind> {
             Kind::Number
         }
         "serial-input" | "serial-input-file" | "serial-command" | "bootlocal-command"
-        | "initrd-file" | "initrd-tree" => Kind::Repeated,
+        | "initrd-file" | "initrd-tree" | "net-forward" => Kind::Repeated,
         "create-vhd" | "iso" | "bootsector" | "boot-linux-kernel" | "boot-linux-initrd"
         | "bios" | "vga-bios" | "hdd" | "firmware-display" | "cmdline" | "serial-input-after"
         | "expect-serial" | "dump-initrd" | "dump-prepared-iso" | "ws-listen" | "ws-record"
-        | "replay" | "expect-frame-hash" | "cpu-engine" | "boot-order" | "clock" => Kind::Text,
+        | "net" | "replay" | "expect-frame-hash" | "cpu-engine" | "boot-order" | "clock" => {
+            Kind::Text
+        }
         _ => return None,
     })
 }

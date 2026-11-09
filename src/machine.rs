@@ -8,6 +8,7 @@ pub use bus_diagnostics::{BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning};
 use clock::{Clock, TICKS_PER_SECOND};
 
 use crate::acpi::Acpi;
+use crate::devices::ne2000::{IRQ as NET_IRQ, Ne2000};
 use crate::devices::pic::Pic;
 #[cfg(test)]
 use crate::devices::pit::CLOCK_DIVISOR as PIT_OSCILLATOR_DIVISOR;
@@ -714,6 +715,28 @@ impl Machine {
             .ide
             .flush_disks()
             .map_err(|error| error.to_string())
+    }
+
+    /// Attach the fixed PCI RTL8029 before boot. Host networking is separate.
+    pub fn attach_network(&mut self) {
+        self.bus.net = Some(Ne2000::default());
+        self.bus.pci.net_present = true;
+        let elcr = self.bus.pic.read(0x4d1);
+        self.bus.pic.write(0x4d1, elcr | (1 << (NET_IRQ - 8)));
+        self.bus.sync_net_irq();
+    }
+
+    /// External input at a frontend slice boundary. False means keep queued.
+    pub fn receive_network_frame(&mut self, frame: &[u8]) -> bool {
+        let accepted = self.bus.net.as_mut().is_some_and(|nic| nic.receive(frame));
+        self.bus.sync_net_irq();
+        accepted
+    }
+
+    pub fn take_network_transmit(&mut self) -> Option<Vec<u8>> {
+        let frame = self.bus.net.as_mut()?.take_transmit();
+        self.bus.sync_net_irq();
+        frame
     }
 
     pub fn queue_serial_input(&mut self, bytes: &[u8]) {
@@ -2259,6 +2282,7 @@ pub(crate) struct HostBus {
     pic: Pic,
     ide: IdeBus,
     pci: PciConfig,
+    net: Option<Ne2000>,
     fw_cfg: FwCfgDevice,
     // COM1 is a 16450-style console: host input is queued and TX completes
     // immediately. FCR is absent; the queue is not an advertised UART FIFO.
@@ -2322,6 +2346,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             pic,
             ide,
             pci,
+            net,
             fw_cfg,
             serial,
             serial_rx,
@@ -2365,6 +2390,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             .field("pic", pic)
             .field("ide", ide)
             .field("pci", pci)
+            .field("net", net)
             .field("fw_cfg", fw_cfg)
             .field("serial", serial)
             .field("serial_rx", serial_rx)
@@ -2592,6 +2618,7 @@ impl HostBus {
                 IdeBus::new_absent()
             },
             pci: PciConfig::new(),
+            net: None,
             fw_cfg: if firmware_mode {
                 FwCfgDevice::new_qemu_with_display(size, display)
             } else {
@@ -2654,6 +2681,11 @@ impl HostBus {
         // disk images or RAM. Pending transfers and controller state are reset.
         core::mem::swap(&mut fresh.ide, &mut self.ide);
         fresh.ide.reset();
+        if self.net.is_some() {
+            fresh.net = Some(Ne2000::default());
+            fresh.pci.net_present = true;
+            fresh.pic.write(0x4d1, 1 << (NET_IRQ - 8));
+        }
         core::mem::swap(&mut fresh.fw_cfg, &mut self.fw_cfg);
         fresh.fw_cfg.reset();
         fresh.serial = core::mem::take(&mut self.serial);
@@ -2702,7 +2734,12 @@ impl HostBus {
         self.drive_irq(15, self.ide.irq_asserted(IdeIrq::Secondary));
     }
 
+    fn sync_net_irq(&mut self) {
+        self.drive_irq(NET_IRQ, self.net.as_ref().is_some_and(Ne2000::irq));
+    }
+
     fn sync_device_irqs(&mut self) {
+        self.sync_net_irq();
         self.sync_ide_irqs();
         self.drive_irq(4, self.serial_irq_asserted());
         self.drive_irq(6, self.fdc.irq_asserted());
@@ -4710,6 +4747,12 @@ impl Bus for HostBus {
     }
 
     fn io_read_u8(&mut self, port: u16) -> Result<u8, MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 1))
+        {
+            self.sync_net_irq();
+            return Ok(value as u8);
+        }
         if let Some(value) = self.acpi.read(port, self.device_ticks()) {
             self.drive_irq(9, self.acpi.irq());
             return Ok(value);
@@ -4779,6 +4822,12 @@ impl Bus for HostBus {
     }
 
     fn io_read_u16(&mut self, port: u16) -> Result<u16, MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 2))
+        {
+            self.sync_net_irq();
+            return Ok(value as u16);
+        }
         if self.pci.ide_port_enabled(port)
             && let Some(value) = self.ide.read_u16(port)
         {
@@ -4811,6 +4860,12 @@ impl Bus for HostBus {
     }
 
     fn io_read_u32(&mut self, port: u16) -> Result<u32, MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 4))
+        {
+            self.sync_net_irq();
+            return Ok(value as u32);
+        }
         if self.pci.ide_port_enabled(port)
             && let Some(value) = self.ide.read_u32(port)
         {
@@ -4837,6 +4892,15 @@ impl Bus for HostBus {
     }
 
     fn io_write_u8(&mut self, port: u16, value: u8) -> Result<(), MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && self
+                .net
+                .as_mut()
+                .is_some_and(|nic| nic.write(offset, 1, value as u32))
+        {
+            self.sync_net_irq();
+            return Ok(());
+        }
         self.set_attention();
         if self.acpi.write(port, value, self.device_ticks()) {
             self.drive_irq(9, self.acpi.irq());
@@ -4939,6 +5003,15 @@ impl Bus for HostBus {
     }
 
     fn io_write_u16(&mut self, port: u16, value: u16) -> Result<(), MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && self
+                .net
+                .as_mut()
+                .is_some_and(|nic| nic.write(offset, 2, value as u32))
+        {
+            self.sync_net_irq();
+            return Ok(());
+        }
         self.set_attention();
         if self.pci.ide_port_enabled(port) && self.ide.write_u16(port, value) {
             self.sync_ide_irqs();
@@ -4978,6 +5051,15 @@ impl Bus for HostBus {
     }
 
     fn io_write_u32(&mut self, port: u16, value: u32) -> Result<(), MemError> {
+        if let Some(offset) = self.pci.net_port(port)
+            && self
+                .net
+                .as_mut()
+                .is_some_and(|nic| nic.write(offset, 4, value as u32))
+        {
+            self.sync_net_irq();
+            return Ok(());
+        }
         self.set_attention();
         if self.pci.ide_port_enabled(port) && self.ide.write_u32(port, value) {
             self.sync_ide_irqs();
@@ -13861,5 +13943,44 @@ mod pci_decode_cache_tests {
                 "old RAM opcodes must not survive the OUT"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod network_board_tests {
+    use super::*;
+    fn config(bus: &mut HostBus, addr: u32) -> u32 {
+        bus.io_write_u32(0xcf8, addr).unwrap();
+        bus.io_read_u32(0xcfc).unwrap()
+    }
+    #[test]
+    fn network_pci_bar_decode_and_level_irq() {
+        let mut machine = Machine::new_firmware(2 << 20, FirmwareDisplay::Serial).unwrap();
+        assert_eq!(config(&mut machine.bus, 0x8000_1800), u32::MAX);
+        machine.attach_network();
+        let bus = &mut machine.bus;
+        assert_eq!(config(bus, 0x8000_1800), 0x8029_10ec);
+        assert_eq!(config(bus, 0x8000_1808), 0x0200_0000);
+        assert_eq!(config(bus, 0x8000_183c), 0x10b);
+        assert_eq!(bus.io_read_u8(0x4d1).unwrap() & 8, 8);
+        config(bus, 0x8000_1810);
+        bus.io_write_u32(0xcfc, u32::MAX).unwrap();
+        assert_eq!(bus.io_read_u32(0xcfc).unwrap(), 0xffff_ffe1);
+        assert_eq!(bus.io_read_u8(0xd000).unwrap(), 0xff);
+        bus.io_write_u32(0xcfc, 0xd001).unwrap();
+        assert_eq!(bus.io_read_u8(0xd000).unwrap(), 0x21);
+        bus.io_write_u8(0xd00f, 0x40).unwrap(); // unmask remote DMA completion
+        bus.io_write_u8(0xd000, 0x0a).unwrap(); // zero-length DMA
+        assert!(bus.pic.line(NET_IRQ));
+        bus.io_write_u8(0xd007, 0x40).unwrap();
+        assert!(!bus.pic.line(NET_IRQ));
+        config(bus, 0x8000_1804);
+        bus.io_write_u16(0xcfc, 0).unwrap();
+        assert_eq!(bus.io_read_u8(0xd000).unwrap(), 0xff);
+        bus.io_write_u16(0xcfc, 1).unwrap();
+        assert_eq!(bus.io_read_u8(0xd000).unwrap(), 0x0a);
+        config(bus, 0x8000_1810);
+        bus.io_write_u32(0xcfc, 0x1_d001).unwrap();
+        assert_eq!(bus.io_read_u8(0xd000).unwrap(), 0xff); // high BAR cannot alias
     }
 }

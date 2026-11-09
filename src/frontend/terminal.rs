@@ -135,6 +135,7 @@ pub fn run(
     machine: &mut Machine,
     steps: u64,
     do_not_exit_when_poweroff: bool,
+    network: &mut Option<r86::network::UserNetwork>,
 ) -> Result<(), String> {
     let terminal = Terminal::open()?;
     let deadline = if steps == 0 {
@@ -197,10 +198,18 @@ pub fn run(
             inject(machine, key);
         }
         if !machine.powered_off() {
+            if let Some(net) = network {
+                net.poll(machine).map_err(|e| format!("network: {e}"))?;
+            }
             let report = machine.run_steps((deadline - machine.step_count()).min(250_000))?;
             if let Some(status) = report.stop {
                 match status {
-                    GuestStepStatus::Halted => std::thread::sleep(machine.halted_wait_duration()),
+                    GuestStepStatus::Halted => {
+                        let wait = machine.halted_wait_duration();
+                        std::thread::sleep(
+                            network.as_ref().map_or(wait, |net| net.limit_wait(wait)),
+                        );
+                    }
                     GuestStepStatus::Stopped { message, .. } => return Err(message),
                     GuestStepStatus::PoweredOff if !do_not_exit_when_poweroff => return Ok(()),
                     GuestStepStatus::PoweredOff => taps.clear(),

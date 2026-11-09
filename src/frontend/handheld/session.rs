@@ -94,6 +94,7 @@ struct Modifiers {
 struct Session<'a> {
     vm: Vm,
     machine: Machine,
+    network: r86::network::UserNetwork,
     ctx: &'a Ctx,
     view: View,
     crop: Crop,
@@ -139,6 +140,8 @@ pub fn run(
         vm.iso = None;
     }
     let mut machine = vm.machine(&ctx.share, HANDHELD_VGA_BIOS)?;
+    let network = r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?;
+    machine.attach_network();
     let remote = if remote {
         machine.power_off()?;
         Some(start_remote(&ctx.iso)?)
@@ -160,6 +163,7 @@ pub fn run(
         reset_count: machine.reset_count(),
         vm,
         machine,
+        network,
         view,
         crop,
         ctx,
@@ -265,13 +269,18 @@ impl Session<'_> {
                 continue;
             }
             self.remote_shown = None;
+            self.network
+                .poll(&mut self.machine)
+                .map_err(|e| format!("network: {e}"))?;
             let report = match &mut self.remote {
                 Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
                 None => self.machine.run_steps(SLICE_STEPS)?,
             };
             let mut idle = None;
             match report.stop {
-                Some(GuestStepStatus::Halted) => idle = Some(self.machine.halted_wait_duration()),
+                Some(GuestStepStatus::Halted) => {
+                    idle = Some(self.network.limit_wait(self.machine.halted_wait_duration()))
+                }
                 // Remote management keeps a powered-off VM; see held_by_remote.
                 Some(GuestStepStatus::PoweredOff) if self.remote.is_some() => self.redraw = true,
                 Some(GuestStepStatus::PoweredOff) => return Ok(End::PoweredOff),

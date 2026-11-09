@@ -43,6 +43,9 @@ pub mod iso9660;
 pub mod linux_boot;
 #[cfg(feature = "machine")]
 pub mod machine;
+#[cfg(feature = "host")]
+#[path = "frontend/network.rs"]
+pub mod network;
 #[cfg(feature = "machine")]
 #[path = "pc_devices.rs"]
 mod run_devices;

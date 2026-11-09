@@ -1776,6 +1776,7 @@ pub fn serve_ws(
     slice_steps: u64,
     record_path: Option<&str>,
     machine: &mut Machine,
+    network: &mut Option<r86::network::UserNetwork>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| format!("web server {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
@@ -1833,6 +1834,9 @@ pub fn serve_ws(
             })
             .min(slice_steps);
         let reset_count = machine.reset_count();
+        if let Some(net) = network {
+            net.poll(machine).map_err(|e| format!("network: {e}"))?;
+        }
         let result = machine.run_steps(budget);
         service.after_run(machine, &result, reset_count);
         match result {
@@ -1857,7 +1861,8 @@ pub fn serve_ws(
                     println!("guest powered off after {} steps", machine.step_count());
                 }
                 if matches!(report.stop, Some(GuestStepStatus::Halted)) {
-                    std::thread::sleep(machine.halted_wait_duration());
+                    let wait = machine.halted_wait_duration();
+                    std::thread::sleep(network.as_ref().map_or(wait, |net| net.limit_wait(wait)));
                 }
             }
             Err(error) => {
