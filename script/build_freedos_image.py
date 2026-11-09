@@ -41,6 +41,8 @@ Provenance is written to assets/freedos.json and provenance.json in the zip.
 Windows media is supplied separately; no Microsoft files are included.
 
 Usage: python3 script/build_freedos_image.py [--share-dir tmp/freedos/share]
+The published kit is a GitHub Release asset (tag freedos-kit-<first 8 hex>);
+assets/freedos-kit.sha256 pins it. Update the pin when uploading a new kit.
 Downloads stay in tmp/freedos/dl and tmp/downloads/{fdkernel,freedos-boot,ecm}.
 """
 
@@ -205,6 +207,7 @@ SET TEMP=C:\FREEDOS\TEMP
 SET TMP=C:\FREEDOS\TEMP
 SET LANG=EN
 SET TZ=UTC
+SET BLASTER=A220 I5 D1 H5 T6
 SET OS_NAME=FreeDOS
 SET OS_VERSION=1.4
 SET DIRCMD=/O:GNE /Y
