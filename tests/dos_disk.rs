@@ -1,10 +1,13 @@
 #![cfg(feature = "host")]
 //! Read the public installer's output using an independent, read-only FAT walk.
 //! Synthetic boot code checks byte preservation; real boot checks use the kit.
+use flate2::write::DeflateEncoder;
+use flate2::{Compression, Crc};
 use r86::disk::Disk;
 use r86::dos_disk;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,7 +48,77 @@ impl Kit {
         fs::create_dir_all(self.0.join("dos").join(profile).join(name)).unwrap();
     }
 
+    /// Packs dos/ into dos.zip in host directory order, with directories as
+    /// members; odd-sized files are deflated and the rest stored.
+    fn pack(&self) {
+        fn walk(dir: &Path, prefix: &str, members: &mut Vec<(String, Option<Vec<u8>>)>) {
+            for child in fs::read_dir(dir).unwrap() {
+                let child = child.unwrap();
+                let name = format!("{prefix}{}", child.file_name().to_str().unwrap());
+                if child.file_type().unwrap().is_dir() {
+                    members.push((format!("{name}/"), None));
+                    walk(&child.path(), &format!("{name}/"), members);
+                } else {
+                    members.push((name, Some(fs::read(child.path()).unwrap())));
+                }
+            }
+        }
+        let mut members = Vec::new();
+        walk(&self.0.join("dos"), "", &mut members);
+        let (mut zip, mut central) = (Vec::new(), Vec::new());
+        for (name, data) in &members {
+            let data = data.as_deref().unwrap_or_default();
+            let mut crc = Crc::new();
+            crc.update(data);
+            let deflate = data.len() % 2 == 1;
+            let packed = if deflate {
+                let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+                encoder.write_all(data).unwrap();
+                encoder.finish().unwrap()
+            } else {
+                data.to_vec()
+            };
+            let common = [
+                &[20, 0, 0, 0][..],
+                &u16::from(deflate as u8 * 8).to_le_bytes(),
+                &[0; 4],
+                &crc.sum().to_le_bytes(),
+                &(packed.len() as u32).to_le_bytes(),
+                &(data.len() as u32).to_le_bytes(),
+                &(name.len() as u16).to_le_bytes(),
+                &[0, 0],
+            ]
+            .concat();
+            let offset = zip.len() as u32;
+            zip.extend([&b"PK\x03\x04"[..], &common, name.as_bytes(), &packed].concat());
+            central.extend(
+                [
+                    &b"PK\x01\x02\x14\0"[..],
+                    &common,
+                    &[0; 10],
+                    &offset.to_le_bytes(),
+                    name.as_bytes(),
+                ]
+                .concat(),
+            );
+        }
+        let count = (members.len() as u16).to_le_bytes();
+        let end = [
+            &b"PK\x05\x06\0\0\0\0"[..],
+            &count,
+            &count,
+            &(central.len() as u32).to_le_bytes(),
+            &(zip.len() as u32).to_le_bytes(),
+            &[0, 0],
+        ]
+        .concat();
+        zip.extend(central);
+        zip.extend(end);
+        fs::write(self.0.join("dos.zip"), zip).unwrap();
+    }
+
     fn install(&self, name: &str, size: u64, profile: &str) -> (PathBuf, u64) {
+        self.pack();
         let path = self.0.join(name);
         let mut updates = Vec::new();
         dos_disk::create(&path, size, profile, &self.0, |done, total| {
@@ -64,6 +137,7 @@ impl Kit {
     }
 
     fn rejected(&self, size: u64, profile: &str, text: &str) {
+        self.pack();
         let path = self.0.join("rejected.vhd");
         let error = dos_disk::create(&path, size, profile, &self.0, |_, _| {
             panic!("preflight failure must not report write progress")
@@ -436,6 +510,7 @@ fn existing_destination_and_invalid_templates_are_untouched() {
     let kit = Kit::new();
     let path = kit.0.join("existing.vhd");
     fs::write(&path, b"keep this file").unwrap();
+    kit.pack();
     assert!(
         dos_disk::create(&path, 8, "win31", &kit.0, |_, _| {})
             .unwrap_err()
@@ -463,15 +538,33 @@ fn logical_sectors_are_reproducible_despite_host_file_order() {
     }
 }
 
-#[cfg(unix)]
 #[test]
-fn kit_symlinks_are_rejected_before_destination_creation() {
-    use std::os::unix::fs::symlink;
+fn damaged_and_unsupported_kit_members_are_reported() {
     let kit = Kit::new();
-    symlink("KERNEL.SYS", kit.0.join("dos/base/LINK.SYS")).unwrap();
-    kit.rejected(8, "win31", "links");
-    fs::remove_file(kit.0.join("dos/base/LINK.SYS")).unwrap();
-    fs::remove_dir(kit.0.join("dos/win31")).unwrap();
-    symlink("base", kit.0.join("dos/win31")).unwrap();
-    kit.rejected(8, "win31", "not a link");
+    kit.file("base", "ODD.TXT", b"deflated because odd");
+    kit.pack();
+    let zip = kit.0.join("dos.zip");
+    let bytes = fs::read(&zip).unwrap();
+    let central = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"PK\x01\x02")
+        .map(|(at, _)| at)
+        .find(|&at| bytes[at + 46..].starts_with(b"base/ODD.TXT"))
+        .unwrap();
+    let create = |name: &str| {
+        let error = dos_disk::create(&kit.0.join(name), 8, "win31", &kit.0, |_, _| {}).unwrap_err();
+        let _ = fs::remove_file(kit.0.join(name));
+        error
+    };
+    let mut damaged = bytes.clone();
+    damaged[central + 16] ^= 1; // the CRC
+    fs::write(&zip, &damaged).unwrap();
+    assert!(create("crc.vhd").contains("ODD.TXT: CRC mismatch"));
+    let mut unsupported = bytes;
+    unsupported[central + 10] = 12; // bzip2
+    fs::write(&zip, &unsupported).unwrap();
+    let error = create("method.vhd");
+    assert!(error.contains("unsupported compression"), "{error}");
+    assert!(!kit.0.join("method.vhd").exists());
 }

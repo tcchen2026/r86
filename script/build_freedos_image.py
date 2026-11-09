@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Assemble the FreeDOS setup kit consumed by r86's Rust disk planter.
 
-Output: SHARE/dos/base contains the full FreeDOS package tree, tools and games,
-with kernel 2046 and corrected ECM SHARE. The freedos, win31, win95, win98 and winme
-directories contain only startup/setup overlays. The planter merges base with
+Output: SHARE/dos.zip holds the kit. Its base/ contains the full FreeDOS package
+tree, tools and games, with kernel 2046 and corrected ECM SHARE. The freedos,
+win31, win95, win98 and winme folders contain only startup/setup overlays. The planter merges base with
 one overlay and creates the selected disk; Python does not format filesystems.
 boot/ contains verified MBR, FAT16 and FAT32 templates for the planter to patch.
 
@@ -37,7 +37,7 @@ arm64 Linux. Original archives, documentation and licenses are retained; the
 SHARE executable's sole decoded-byte correction is recorded with its source patch.
 It enlarges SHARE's 64-byte private stack, smaller than its verified 92-byte
 ordinary INT 2F handler path, to 512 bytes.
-Provenance is written to assets/freedos.json and SHARE/dos/provenance.json.
+Provenance is written to assets/freedos.json and provenance.json in the zip.
 Windows media is supplied separately; no Microsoft files are included.
 
 Usage: python3 script/build_freedos_image.py [--share-dir tmp/freedos/share]
@@ -910,6 +910,21 @@ def write_tree(tree, destination):
     return {"files": len(entries), "tree_sha256": sha256("\n".join(entries).encode("ascii"))}
 
 
+def pack(stage, destination):
+    """Write the staged kit as one deflated zip: sorted members, fixed dates."""
+    partial = destination.with_name(destination.name + ".part")
+    with zipfile.ZipFile(partial, "w") as archive:
+        for path in sorted(stage.rglob("*")):
+            name = path.relative_to(stage).as_posix()
+            if path.is_dir():
+                archive.writestr(zipfile.ZipInfo(name + "/", STAMP), b"")
+            else:
+                info = zipfile.ZipInfo(name, STAMP)
+                info.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(info, path.read_bytes(), compresslevel=9)
+    os.replace(partial, destination)
+
+
 def boot_code(liteusb):
     """Extract the release MBR bootstrap and FAT16 sector without formatting."""
     with zipfile.ZipFile(liteusb) as z, z.open(IMG_MEMBER) as f:
@@ -963,12 +978,10 @@ def ensure_iso(livecd, cache):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--share-dir", type=Path, default=ROOT / "tmp" / "freedos" / "share",
-                    help="parent of the generated dos/ kit directory")
+                    help="directory of the generated dos.zip kit")
     args = ap.parse_args()
     share_dir = args.share_dir.resolve()
-    kit = share_dir / "dos"
-    if kit.is_symlink() or (kit.exists() and not (kit / "provenance.json").is_file()):
-        die(f"{kit}: refusing to replace a directory without kit provenance")
+    kit = share_dir / "dos.zip"
     share_dir.mkdir(parents=True, exist_ok=True)
     cache = ROOT / "tmp" / "freedos" / "dl"
     kernel_cache = ROOT / "tmp" / "downloads" / "fdkernel"
@@ -1174,9 +1187,7 @@ REM Bundled SeaBIOS/VGA: fixed frame below DA000; scan shadow RAM for UMBs.
         }
         provenance = json.dumps(record, indent=2) + "\n"
         (stage / "provenance.json").write_text(provenance)
-        if kit.exists():
-            shutil.rmtree(kit)
-        os.replace(stage, kit)
+        pack(stage, kit)
         MANIFEST.parent.mkdir(parents=True, exist_ok=True)
         MANIFEST.write_text(provenance)
     print(f"{kit}: {base_record['files']} shared FreeDOS files")

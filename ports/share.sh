@@ -7,9 +7,9 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 app=$1
 install -D -m 0644 "$root/firmware/seabios/bios.bin" "$app/bios.bin"
 install -m 0644 "$root/firmware/seabios/vgabios-handheld.bin" "$app/"
-mkdir -p "$app/dos"
-# Keep guest files, boot templates, corresponding sources and provenance together.
-cp -R "$root/tmp/freedos/share/dos/." "$app/dos/"
+# One archive keeps guest files, boot templates, corresponding sources and
+# provenance together.
+install -m 0644 "$root/tmp/freedos/share/dos.zip" "$app/"
 
 licenses=$app/licenses
 install -D -m 0644 "$root/LICENSE" "$licenses/r86/LICENSE"

@@ -1,14 +1,17 @@
-//! Plant a bundled DOS tree in a new, sparse VHD using the shared FAT adapter.
-//! Guest sectors and DOS dates are deterministic; the VHD container has its
-//! own creation time and identity. The kit supplies FreeDOS bootstrap code.
+//! Plant the bundled DOS kit, `share/dos.zip`, in a new, sparse VHD using the
+//! shared FAT adapter. Guest sectors and DOS dates are deterministic; the VHD
+//! container has its own creation time and identity. The kit supplies FreeDOS
+//! bootstrap code.
 
 use crate::disk::{Disk, MAX_SECTORS};
 use crate::fat::{self, Partition, Volume};
 use fatfs::{Dir, FatType, FormatVolumeOptions};
+use flate2::Crc;
+use flate2::read::DeflateDecoder;
 use std::collections::BTreeMap;
 use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 const MIB: u64 = 1024 * 1024;
 const PART_START: u32 = 63;
@@ -17,26 +20,139 @@ const ROOT_ENTRIES: usize = 512;
 const CHUNK: usize = 64 * 1024;
 const SERIAL: u32 = 0x5238_3644;
 
-struct Source {
-    path: PathBuf,
-    size: Option<u32>, // None is a directory.
+/// A stored or deflated file in the kit archive.
+#[derive(Clone, Copy)]
+struct Member {
+    header: u64,
+    deflated: bool,
+    packed: u64,
+    size: u32,
+    crc: u32,
 }
 
 struct Entry {
     name: String,
-    source: Source,
+    member: Option<Member>, // None is a directory.
     children: Vec<usize>,
 }
 
-fn directory(path: &Path) -> Result<(), String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err(format!(
-            "{}: expected a directory, not a link",
-            path.display()
-        ));
+fn le16(bytes: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([bytes[at], bytes[at + 1]])
+}
+
+fn le32(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+}
+
+/// The kit as a zip archive: stored or deflated members, no ZIP64 or
+/// encryption. Directory members end in '/'; folders may also be implied.
+struct Kit {
+    file: File,
+    members: BTreeMap<String, Member>,
+}
+
+impl Kit {
+    fn open(path: &Path) -> Result<Self, String> {
+        let fail = |what: &dyn std::fmt::Display| format!("{}: {what}", path.display());
+        let mut file = File::open(path).map_err(|e| fail(&e))?;
+        let len = file.metadata().map_err(|e| fail(&e))?.len();
+        let mut end = vec![0; len.min(22 + 0xffff) as usize];
+        file.seek(SeekFrom::End(-(end.len() as i64)))
+            .and_then(|_| file.read_exact(&mut end))
+            .map_err(|e| fail(&e))?;
+        let at = (0..end.len().saturating_sub(21))
+            .rev()
+            .find(|&i| end[i..i + 4] == *b"PK\x05\x06")
+            .ok_or_else(|| fail(&"not a zip archive"))?;
+        let eocd = &end[at..];
+        let (count, size, offset) = (le16(eocd, 10), le32(eocd, 12), le32(eocd, 16));
+        if le16(eocd, 4) != 0 || le16(eocd, 6) != 0 || count == 0xffff || offset == u32::MAX {
+            return Err(fail(&"multi-part and ZIP64 archives are not supported"));
+        }
+        if u64::from(offset) + u64::from(size) > len {
+            return Err(fail(&"truncated central directory"));
+        }
+        let mut directory = vec![0; size as usize];
+        file.seek(SeekFrom::Start(offset.into()))
+            .and_then(|_| file.read_exact(&mut directory))
+            .map_err(|e| fail(&e))?;
+        let mut members = BTreeMap::new();
+        let mut at = 0;
+        for _ in 0..count {
+            let header = directory
+                .get(at..at + 46)
+                .filter(|h| h[..4] == *b"PK\x01\x02")
+                .ok_or_else(|| fail(&"damaged central directory"))?;
+            let name_end = at + 46 + usize::from(le16(header, 28));
+            let name = directory
+                .get(at + 46..name_end)
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .filter(|name| name.is_ascii())
+                .ok_or_else(|| fail(&"damaged or non-ASCII member name"))?
+                .to_owned();
+            let (flags, method) = (le16(header, 8), le16(header, 10));
+            if flags & 1 != 0 || !matches!(method, 0 | 8) {
+                return Err(fail(&format!(
+                    "{name}: encrypted or unsupported compression"
+                )));
+            }
+            let member = Member {
+                header: le32(header, 42).into(),
+                deflated: method == 8,
+                packed: le32(header, 20).into(),
+                size: le32(header, 24),
+                crc: le32(header, 16),
+            };
+            at = name_end + usize::from(le16(header, 30)) + usize::from(le16(header, 32));
+            if members.insert(name.clone(), member).is_some() {
+                return Err(fail(&format!("{name}: duplicate member")));
+            }
+        }
+        Ok(Self { file, members })
     }
-    Ok(())
+
+    /// Passes a member's bytes to `sink` a chunk at a time, then checks its CRC.
+    fn copy(
+        &mut self,
+        name: &str,
+        member: Member,
+        chunk: &mut [u8],
+        mut sink: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let damaged = |what: &dyn std::fmt::Display| format!("DOS kit {name}: {what}");
+        let mut header = [0; 30];
+        self.file
+            .seek(SeekFrom::Start(member.header))
+            .and_then(|_| self.file.read_exact(&mut header))
+            .map_err(|e| damaged(&e))?;
+        if header[..4] != *b"PK\x03\x04" {
+            return Err(damaged(&"bad local header"));
+        }
+        let skip = i64::from(le16(&header, 26)) + i64::from(le16(&header, 28));
+        self.file
+            .seek(SeekFrom::Current(skip))
+            .map_err(|e| damaged(&e))?;
+        let packed = (&mut self.file).take(member.packed);
+        let mut data: Box<dyn Read + '_> = if member.deflated {
+            Box::new(DeflateDecoder::new(packed))
+        } else {
+            Box::new(packed)
+        };
+        let mut crc = Crc::new();
+        let mut remaining = member.size as usize;
+        while remaining != 0 {
+            let len = remaining.min(chunk.len());
+            data.read_exact(&mut chunk[..len])
+                .map_err(|e| damaged(&e))?;
+            crc.update(&chunk[..len]);
+            sink(&chunk[..len])?;
+            remaining -= len;
+        }
+        if crc.sum() != member.crc {
+            return Err(damaged(&"CRC mismatch"));
+        }
+        Ok(())
+    }
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
@@ -55,86 +171,76 @@ fn validate_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_tree(path: &Path, prefix: &str, tree: &mut BTreeMap<String, Source>) -> Result<(), String> {
-    directory(path)?;
-    for child in fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))? {
-        let child = child.map_err(|e| e.to_string())?;
-        let path = child.path();
-        let name = child.file_name();
-        let name = name
-            .to_str()
-            .ok_or_else(|| format!("{}: expected an ASCII DOS name", path.display()))?;
-        validate_name(name)?;
-        let key = format!("{prefix}{}", name.to_ascii_uppercase());
-        let meta = fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let size = if meta.is_file() {
-            Some(
-                u32::try_from(meta.len())
-                    .map_err(|_| format!("{}: exceeds 4 GiB", path.display()))?,
-            )
-        } else if meta.is_dir() {
-            None
-        } else {
-            return Err(format!(
-                "{}: links and special files are not supported",
-                path.display()
-            ));
-        };
-        if tree
-            .insert(
-                key.clone(),
-                Source {
-                    path: path.clone(),
-                    size,
-                },
-            )
-            .is_some()
-        {
-            return Err(format!("{key}: duplicate DOS name"));
+/// The kit folder `folder/` by upper-case DOS path; None marks a directory.
+fn read_tree(kit: &Kit, folder: &str) -> Result<BTreeMap<String, Option<Member>>, String> {
+    let prefix = format!("{folder}/");
+    let mut tree = BTreeMap::new();
+    let mut found = false;
+    for (name, &member) in kit
+        .members
+        .range(prefix.clone()..)
+        .take_while(|(name, _)| name.starts_with(&prefix))
+    {
+        found = true;
+        let path = &name[prefix.len()..];
+        let (path, directory) = path.strip_suffix('/').map_or((path, false), |p| (p, true));
+        if path.is_empty() {
+            continue;
         }
-        if size.is_none() {
-            read_tree(&path, &format!("{key}/"), tree)?;
+        let parts: Vec<_> = path.split('/').collect();
+        let mut key = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            validate_name(part)?;
+            if !key.is_empty() {
+                key.push('/');
+            }
+            key.push_str(&part.to_ascii_uppercase());
+            let file = !directory && i + 1 == parts.len();
+            match tree.get(&key) {
+                Some(None) if !file => {}
+                Some(_) => return Err(format!("{key}: duplicate DOS name")),
+                None => {
+                    tree.insert(key.clone(), file.then_some(member));
+                }
+            }
         }
     }
-    Ok(())
+    if !found {
+        return Err(format!("DOS kit has no {prefix} folder"));
+    }
+    Ok(tree)
 }
 
-fn entries(kit: &Path, os_id: &str) -> Result<Vec<Entry>, String> {
-    let mut base = BTreeMap::new();
-    let mut overlay = BTreeMap::new();
-    read_tree(&kit.join("base"), "", &mut base)?;
-    read_tree(&kit.join(os_id), "", &mut overlay)?;
-    for (name, source) in overlay {
+fn entries(kit: &Kit, os_id: &str) -> Result<Vec<Entry>, String> {
+    let mut base = read_tree(kit, "base")?;
+    for (name, member) in read_tree(kit, os_id)? {
         if let Some(old) = base.get(&name) {
-            if old.size.is_some() != source.size.is_some() {
+            if old.is_some() != member.is_some() {
                 return Err(format!("{name}: overlay changes file/directory type"));
             }
         }
-        base.insert(name, source);
+        base.insert(name, member);
     }
     let kernel = base
         .remove("KERNEL.SYS")
         .ok_or("DOS kit has no KERNEL.SYS")?;
-    if !matches!(kernel.size, Some(1..)) {
+    if !matches!(kernel, Some(Member { size: 1.., .. })) {
         return Err("DOS kit KERNEL.SYS must be a nonempty file".into());
     }
     let mut result = vec![Entry {
         name: String::new(),
-        source: Source {
-            path: kit.to_owned(),
-            size: None,
-        },
+        member: None,
         children: Vec::new(),
     }];
     let mut indices = BTreeMap::from([(String::new(), 0)]);
-    for (path, source) in std::iter::once(("KERNEL.SYS".into(), kernel)).chain(base) {
+    for (path, member) in std::iter::once(("KERNEL.SYS".into(), kernel)).chain(base) {
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", &path));
         let parent = indices[parent];
         let index = result.len();
         result[parent].children.push(index);
         result.push(Entry {
             name: name.to_owned(),
-            source,
+            member,
             children: Vec::new(),
         });
         indices.insert(path, index);
@@ -153,8 +259,8 @@ fn clusters_needed(entries: &[Entry], cluster_bytes: u32, fat32: bool) -> u64 {
         .iter()
         .enumerate()
         .map(|(index, entry)| {
-            let bytes = if let Some(size) = entry.source.size {
-                u64::from(size)
+            let bytes = if let Some(member) = entry.member {
+                u64::from(member.size)
             } else if index == 0 && !fat32 {
                 return 0; // FAT16 reserves its fixed root outside the cluster pool.
             } else {
@@ -167,20 +273,20 @@ fn clusters_needed(entries: &[Entry], cluster_bytes: u32, fat32: bool) -> u64 {
         .sum()
 }
 
-fn template(path: &Path) -> Result<[u8; 512], String> {
-    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if !meta.is_file() || meta.len() != 512 {
-        return Err(format!(
-            "{}: expected a 512-byte boot template",
-            path.display()
-        ));
-    }
+fn template(kit: &mut Kit, name: &str) -> Result<[u8; 512], String> {
+    let member = kit
+        .members
+        .get(name)
+        .copied()
+        .filter(|member| member.size == 512)
+        .ok_or_else(|| format!("DOS kit {name}: expected a 512-byte boot template"))?;
     let mut bytes = [0; 512];
-    File::open(path)
-        .and_then(|mut f| f.read_exact(&mut bytes))
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    kit.copy(name, member, &mut [0; 512], |data| {
+        bytes.copy_from_slice(data);
+        Ok(())
+    })?;
     if bytes[510..] != [0x55, 0xaa] {
-        return Err(format!("{}: missing boot signature", path.display()));
+        return Err(format!("DOS kit {name}: missing boot signature"));
     }
     Ok(bytes)
 }
@@ -244,6 +350,7 @@ struct CopyProgress<'a, F> {
 }
 
 fn write_tree<F: FnMut(u64, u64)>(
+    kit: &mut Kit,
     directory: Dir<'_, Partition<'_>>,
     entries: &[Entry],
     parent: usize,
@@ -257,39 +364,28 @@ fn write_tree<F: FnMut(u64, u64)>(
         .map_err(|e| format!("opening empty DOS directory: {e}"))?;
     for &index in &entries[parent].children {
         let entry = &entries[index];
-        let path = &entry.source.path;
-        if let Some(size) = entry.source.size {
-            let mut source = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if source.metadata().map_err(|e| e.to_string())?.len() != u64::from(size) {
-                return Err(format!("{}: kit file changed size", path.display()));
-            }
+        let name = &entry.name;
+        if let Some(member) = entry.member {
             let mut target = directory
-                .create_file(&entry.name)
-                .map_err(|e| format!("creating {}: {e}", path.display()))?;
-            let mut remaining = size as usize;
-            while remaining != 0 {
-                let len = remaining.min(chunk.len());
-                source
-                    .read_exact(&mut chunk[..len])
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                .create_file(name)
+                .map_err(|e| format!("creating {name}: {e}"))?;
+            kit.copy(name, member, chunk, |data| {
                 target
-                    .write_all(&chunk[..len])
-                    .map_err(|e| format!("writing {}: {e}", path.display()))?;
-                remaining -= len;
-                progress.done += len as u64;
+                    .write_all(data)
+                    .map_err(|e| format!("writing {name}: {e}"))?;
+                progress.done += data.len() as u64;
                 if progress.done < progress.total {
                     (progress.callback)(progress.done, progress.total);
                 }
-            }
+                Ok(())
+            })?;
             // Report directory-entry write errors instead of relying on Drop.
-            target
-                .flush()
-                .map_err(|e| format!("closing {}: {e}", path.display()))?;
+            target.flush().map_err(|e| format!("closing {name}: {e}"))?;
         } else {
             let child = directory
-                .create_dir(&entry.name)
-                .map_err(|e| format!("creating {}: {e}", path.display()))?;
-            write_tree(child, entries, index, chunk, progress)?;
+                .create_dir(name)
+                .map_err(|e| format!("creating {name}: {e}"))?;
+            write_tree(kit, child, entries, index, chunk, progress)?;
         }
     }
     directory
@@ -297,16 +393,16 @@ fn write_tree<F: FnMut(u64, u64)>(
         .map_err(|e| format!("closing DOS directory: {e}"))
 }
 
-/// Create an exact-size VHD from `share/dos/base` plus the selected overlay.
+/// Create an exact-size VHD from the kit's `base/` plus the selected overlay.
 /// `freedos`, `win31`, and `win95` use FAT16 (3..=2047 MiB); `win98` and `winme`
 /// use FAT32 (33..=131072 MiB). The kit must also fit. Generic `dos` is rejected.
 ///
-/// Names, links, templates and source sizes are checked before creating the
-/// destination, which must not exist. Exact capacity is checked against the
-/// formatted filesystem; an insufficient-capacity result removes the new disk.
-/// Kit files must remain unchanged until completion. Other I/O failures can
+/// Names, templates and sizes are checked before creating the destination,
+/// which must not exist. Exact capacity is checked against the formatted
+/// filesystem; an insufficient-capacity result removes the new disk. File data
+/// is checked against its CRC while copying. That and other I/O failures can
 /// leave an incomplete destination for the caller to remove. Progress counts
-/// source file bytes copied; completion follows unmount and a durable flush.
+/// file bytes copied; completion follows unmount and a durable flush.
 /// The callback does not support cancellation.
 pub fn create(
     path: &Path,
@@ -336,27 +432,28 @@ pub fn create(
     }
     let sectors = (size_mib * 2048) as u32;
     let partition_sectors = sectors / CYLINDER * CYLINDER - PART_START;
-    let kit = share.join("dos");
-    directory(&kit)?;
-    directory(&kit.join("boot"))?;
+    let mut kit = Kit::open(&share.join("dos.zip"))?;
     let mbr = mbr(
-        template(&kit.join("boot/mbr.bin"))?,
+        template(&mut kit, "boot/mbr.bin")?,
         partition_sectors,
         fat32,
     );
-    let boot = template(&kit.join(if fat32 {
-        "boot/fat32.bin"
-    } else {
-        "boot/fat16.bin"
-    }))?;
+    let boot = template(
+        &mut kit,
+        if fat32 {
+            "boot/fat32.bin"
+        } else {
+            "boot/fat16.bin"
+        },
+    )?;
     let entries = entries(&kit, os_id)?;
     if !fat32 && directory_slots(&entries[0], true) > ROOT_ENTRIES {
         return Err("FAT16 root directory exceeds 512 entries".into());
     }
     let total: u64 = entries
         .iter()
-        .filter_map(|e| e.source.size)
-        .map(u64::from)
+        .filter_map(|e| e.member)
+        .map(|member| u64::from(member.size))
         .sum();
     if total > u64::from(partition_sectors) * 512 {
         return Err("DOS kit does not fit the selected disk size".into());
@@ -421,7 +518,14 @@ pub fn create(
         callback: &mut progress,
     };
     let mut chunk = vec![0; CHUNK];
-    write_tree(filesystem.root_dir(), &entries, 0, &mut chunk, &mut copied)?;
+    write_tree(
+        &mut kit,
+        filesystem.root_dir(),
+        &entries,
+        0,
+        &mut chunk,
+        &mut copied,
+    )?;
     filesystem
         .unmount()
         .map_err(|e| format!("unmounting DOS disk: {e}"))?;
