@@ -41,8 +41,8 @@ def main() -> None:
         )
         # SeaBIOS's release version mechanism suppresses host/time suffixes.
         (source / ".version").write_text(VERSION + "\n", encoding="ascii")
-        # The handheld VGA BIOS adds the CardputerZero's 320x170 VBE mode; it is
-        # built last so the patch never reaches the standard ROMs.
+        # The handheld VGA BIOS adds VBE modes sized for the CardputerZero's
+        # LCD; it is built last so the patch never reaches the standard ROMs.
         for config, target, filename, patch in (
             ("bios", "bios.bin", "bios.bin", None),
             ("vga", "vgabios.bin", "vgabios-stdvga.bin", None),

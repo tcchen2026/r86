@@ -31,8 +31,8 @@ use crate::ws_frontend::Remote;
 const SLICE_STEPS: u64 = 200_000;
 const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 const TOAST: Duration = Duration::from_secs(4);
-/// The standard VGA BIOS plus a 320x170 RGB565 VBE mode (1A0h) matching the
-/// CardputerZero panel; see firmware/seabios/handheld-modes.patch.
+/// The standard VGA BIOS plus 640x340 (twice the CardputerZero panel) and
+/// 300x200 RGB565 VBE modes; see firmware/seabios/handheld-modes.patch.
 const HANDHELD_VGA_BIOS: &str = "vgabios-handheld.bin";
 /// Remote management listens on the first free port.
 const REMOTE_PORTS: std::ops::RangeInclusive<u16> = 8086..=8095;
