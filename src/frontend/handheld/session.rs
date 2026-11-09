@@ -23,6 +23,7 @@ use super::osk::Osk;
 use super::screens::{Action, Ctx, Outcome, OverlayLabels, Stack, VmOverlay};
 use super::text80;
 use super::ui::{self, BLACK, Canvas, Font, Rect, TEXT};
+use crate::guest_os;
 use crate::keys::{InputKey, inject_input_key};
 use crate::vm_store::{self, Vm};
 use crate::ws_frontend::Remote;
@@ -64,6 +65,24 @@ impl View {
     }
 }
 
+/// The rows the integer view shows of a graphics frame taller than the panel.
+#[derive(Clone, Copy)]
+enum Crop {
+    Upper,
+    Middle,
+    Lower,
+}
+
+impl Crop {
+    fn label(self) -> &'static str {
+        match self {
+            Crop::Upper => "upper",
+            Crop::Middle => "middle",
+            Crop::Lower => "lower",
+        }
+    }
+}
+
 #[derive(Default)]
 struct Modifiers {
     fn_key: bool,
@@ -77,6 +96,7 @@ struct Session<'a> {
     machine: Machine,
     ctx: &'a Ctx,
     view: View,
+    crop: Crop,
     /// Keys this frontend holds down in the guest, by evdev code.
     held: Vec<(u16, InputKey)>,
     buttons: Ps2ButtonState,
@@ -130,11 +150,18 @@ pub fn run(
         "integer" => View::Integer,
         _ => View::Aspect,
     };
+    // Windows keeps its taskbar at the bottom.
+    let crop = if guest_os::by_name(&vm.os).id.starts_with("win") {
+        Crop::Lower
+    } else {
+        Crop::Middle
+    };
     let mut session = Session {
         reset_count: machine.reset_count(),
         vm,
         machine,
         view,
+        crop,
         ctx,
         held: Vec::new(),
         buttons: Ps2ButtonState::default(),
@@ -412,9 +439,11 @@ impl Session<'_> {
         self.native_text = false;
         let shown = self.render_rgba();
         let (w, h) = self.frame;
-        // Frames no wider than the panel are cropped in the middle; wider
-        // ones follow the text cursor or the pointer.
+        // Frames no wider than the panel are centred; wider ones follow the
+        // text cursor or the pointer. Text follows the cursor down too, while
+        // graphics show the chosen crop.
         let follow = self.view == View::Integer && w > self.guest.width;
+        let text = info.mode == RenderMode::Text;
         let focus = if follow {
             self.focus(w, h)
         } else {
@@ -460,9 +489,15 @@ impl Session<'_> {
                 };
                 let (fx, fy) = focus;
                 let (vw, vh) = ((c.width / k).min(w), (c.height / k).min(h));
+                let y = match self.crop {
+                    _ if text => (fy - vh / 2).clamp(0, h - vh),
+                    Crop::Upper => 0,
+                    Crop::Middle => (h - vh) / 2,
+                    Crop::Lower => h - vh,
+                };
                 let from = Rect {
                     x: (fx - vw / 2).clamp(0, w - vw),
-                    y: (fy - vh / 2).clamp(0, h - vh),
+                    y,
                     w: vw,
                     h: vh,
                 };
@@ -497,6 +532,7 @@ impl Session<'_> {
         OverlayLabels {
             name: self.vm.name.clone(),
             view: self.view.label(),
+            crop: (self.view == View::Integer && !device.guest_layer()).then(|| self.crop.label()),
             display: device.hdmi(),
             cd: self.vm.iso.as_ref().map(|iso| {
                 iso.file_name()
@@ -705,6 +741,15 @@ impl Session<'_> {
                 if device.hdmi() != Some(true) {
                     self.render_guest();
                 }
+                close = false;
+            }
+            Action::CycleCrop => {
+                self.crop = match self.crop {
+                    Crop::Upper => Crop::Middle,
+                    Crop::Middle => Crop::Lower,
+                    Crop::Lower => Crop::Upper,
+                };
+                self.render_guest();
                 close = false;
             }
             Action::Display => {

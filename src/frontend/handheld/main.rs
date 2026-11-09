@@ -100,7 +100,8 @@ fn options() -> Result<Options, String> {
     Ok(options)
 }
 
-/// Offer at most half of host RAM to a guest.
+/// Offer a guest host RAM less 128 MiB for the host system and r86 itself
+/// (192 MiB on the CardputerZero's 352 MiB).
 fn memory_limit() -> u32 {
     let total_kib = fs::read_to_string("/proc/meminfo")
         .ok()
@@ -109,7 +110,7 @@ fn memory_limit() -> u32 {
             line.split_whitespace().nth(1)?.parse::<u64>().ok()
         })
         .unwrap_or(1 << 20);
-    ((total_kib / 1024 / 2) as u32).max(16)
+    ((total_kib / 1024).saturating_sub(128) as u32).max(16)
 }
 
 /// The desktop simulator keeps everything under ./tmp/handheld.
@@ -162,6 +163,12 @@ fn run() -> Result<(), String> {
         (None, true) => simulator.join("share"),
         (None, false) => vm_store::firmware_dir()?,
     };
+    // vm.toml reads relative paths against the VM's folder, so the disks and
+    // discs it stores from these folders need absolute paths.
+    let absolute = |dir: PathBuf| {
+        std::path::absolute(&dir).map_err(|err| format!("Cannot resolve {}: {err}", dir.display()))
+    };
+    let (data, share) = (absolute(data)?, absolute(share)?);
     let (library, vhd, iso) = (data.join("VMs"), data.join("vhd"), data.join("iso"));
     for dir in [&library, &vhd, &iso] {
         fs::create_dir_all(dir).map_err(|err| format!("Cannot create {}: {err}", dir.display()))?;

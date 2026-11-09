@@ -45,6 +45,7 @@ pub enum Reply {
 pub enum Action {
     Resume,
     CycleView,
+    CycleCrop,
     Display,
     CtrlAltDel,
     Cd(Option<PathBuf>),
@@ -1443,13 +1444,32 @@ impl View for Progress {
 pub struct VmOverlay {
     labels: Rc<RefCell<OverlayLabels>>,
     menu: Menu,
+    /// What each menu row does, in order.
+    entries: Vec<OverlayEntry>,
     cd: bool,
+}
+
+#[derive(Clone, Copy)]
+enum OverlayEntry {
+    Resume,
+    View,
+    Crop,
+    Display,
+    CtrlAltDel,
+    Cd,
+    Remote,
+    Help,
+    PowerButton,
+    Reset,
+    TurnOff,
 }
 
 #[derive(Default)]
 pub struct OverlayLabels {
     pub name: String,
     pub view: &'static str,
+    /// Present while the integer view crops the guest on the LCD.
+    pub crop: Option<&'static str>,
     /// Present only on an LCD device with an HDMI connector.
     pub display: Option<bool>,
     pub cd: Option<String>,
@@ -1462,6 +1482,7 @@ impl VmOverlay {
         let mut overlay = Self {
             labels,
             menu: Menu::new(Vec::new()),
+            entries: Vec::new(),
             cd: false,
         };
         overlay.rebuild();
@@ -1474,22 +1495,32 @@ impl VmOverlay {
             l.cd.as_deref()
                 .map_or("empty".to_string(), |c| ui::clip(c, 16));
         let selected = self.menu.selected;
-        let mut items = vec![
-            Item::new("Resume").color(GOOD),
-            Item::new("View").detail(l.view),
+        let mut rows = vec![
+            (OverlayEntry::Resume, Item::new("Resume").color(GOOD)),
+            (OverlayEntry::View, Item::new("View").detail(l.view)),
         ];
-        if let Some(hdmi) = l.display {
-            items.push(Item::new("Display").detail(if hdmi { "HDMI" } else { "LCD" }));
+        if let Some(crop) = l.crop {
+            rows.push((OverlayEntry::Crop, Item::new("Crop").detail(crop)));
         }
-        items.extend([
-            Item::new("Send Ctrl+Alt+Del"),
-            Item::new("CD").detail(cd),
-            Item::new("Remote management").detail(if l.remote.is_some() { "on" } else { "off" }),
-            Item::new("Help"),
-            Item::new("Power button"),
-            Item::new("Reset"),
-            Item::new("Turn off now").color(BAD),
+        if let Some(hdmi) = l.display {
+            let detail = if hdmi { "HDMI" } else { "LCD" };
+            rows.push((OverlayEntry::Display, Item::new("Display").detail(detail)));
+        }
+        let remote = if l.remote.is_some() { "on" } else { "off" };
+        rows.extend([
+            (OverlayEntry::CtrlAltDel, Item::new("Send Ctrl+Alt+Del")),
+            (OverlayEntry::Cd, Item::new("CD").detail(cd)),
+            (
+                OverlayEntry::Remote,
+                Item::new("Remote management").detail(remote),
+            ),
+            (OverlayEntry::Help, Item::new("Help")),
+            (OverlayEntry::PowerButton, Item::new("Power button")),
+            (OverlayEntry::Reset, Item::new("Reset")),
+            (OverlayEntry::TurnOff, Item::new("Turn off now").color(BAD)),
         ]);
+        let (entries, items) = rows.into_iter().unzip();
+        self.entries = entries;
         self.menu = Menu::new(items).select(selected);
     }
 }
@@ -1527,18 +1558,15 @@ impl View for VmOverlay {
         if self.menu.key(key) {
             return Nav::Stay;
         }
-        let display = self.labels.borrow().display.is_some();
-        if key == UiKey::Enter && display && self.menu.selected == 2 {
-            return Nav::Action(Action::Display);
-        }
-        let selected = self.menu.selected - usize::from(display && self.menu.selected > 2);
         match key {
             UiKey::Back => Nav::Action(Action::Resume),
-            UiKey::Enter => match selected {
-                0 => Nav::Action(Action::Resume),
-                1 => Nav::Action(Action::CycleView),
-                2 => Nav::Action(Action::CtrlAltDel),
-                3 => {
+            UiKey::Enter => match self.entries[self.menu.selected] {
+                OverlayEntry::Resume => Nav::Action(Action::Resume),
+                OverlayEntry::View => Nav::Action(Action::CycleView),
+                OverlayEntry::Crop => Nav::Action(Action::CycleCrop),
+                OverlayEntry::Display => Nav::Action(Action::Display),
+                OverlayEntry::CtrlAltDel => Nav::Action(Action::CtrlAltDel),
+                OverlayEntry::Cd => {
                     self.cd = true;
                     Nav::Push(Box::new(Browser::new(
                         "Insert a CD image",
@@ -1547,11 +1575,11 @@ impl View for VmOverlay {
                         Some("Eject"),
                     )))
                 }
-                4 => Nav::Action(Action::Remote),
-                5 => Nav::Push(Box::new(Help)),
-                6 => Nav::Action(Action::PowerButton),
-                7 => Nav::Action(Action::Reset),
-                _ => Nav::Push(Box::new(Confirm::new(
+                OverlayEntry::Remote => Nav::Action(Action::Remote),
+                OverlayEntry::Help => Nav::Push(Box::new(Help)),
+                OverlayEntry::PowerButton => Nav::Action(Action::PowerButton),
+                OverlayEntry::Reset => Nav::Action(Action::Reset),
+                OverlayEntry::TurnOff => Nav::Push(Box::new(Confirm::new(
                     "Turn off now?",
                     "Like pulling the plug: unsaved work in the guest is lost. Prefer the power button.".into(),
                     "Turn off",
