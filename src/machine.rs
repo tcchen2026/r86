@@ -6218,7 +6218,10 @@ mod host_bus_tests {
             (SegmentReg::Gs, 0x65),
         ] {
             for cpl in [0, 3] {
-                for memory in [false, true] {
+                for source in 0..4 {
+                    let memory = source == 1;
+                    let stack = source >= 2;
+                    let operand16 = source == 2;
                     let ldt = matches!(segment, SegmentReg::Fs | SegmentReg::Gs);
                     let selector = 0x10 | cpl | if ldt { 4 } else { 0 };
                     let make = || {
@@ -6258,7 +6261,21 @@ mod host_bus_tests {
                             write_ram_u32(&mut bus, 0x5000 + page * 4, backing | 7);
                         }
                         let mut code = vec![0x40]; // INC's flags must survive the helper or a miss.
-                        if memory {
+                        if stack {
+                            if operand16 {
+                                code.push(0x66);
+                            }
+                            code.extend_from_slice(match segment {
+                                SegmentReg::Es => &[0x07][..],
+                                SegmentReg::Ds => &[0x1f][..],
+                                SegmentReg::Fs => &[0x0f, 0xa1][..],
+                                SegmentReg::Gs => &[0x0f, 0xa9][..],
+                                _ => unreachable!(),
+                            });
+                            // Reuse the same selector on each loop without
+                            // changing flags or issuing a stack write.
+                            code.extend([0x8d, 0x64, 0x24, if operand16 { 0xfe } else { 0xfc }]);
+                        } else if memory {
                             // Source uses SS even while the destination DS/ES/FS/GS changes.
                             code.extend([0x36, 0x66, 0x8e, 2 | (segment as u8) << 3]);
                         } else {
@@ -6283,7 +6300,7 @@ mod host_bus_tests {
                     let (mut actual, mut native_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                     let mut steps = 0;
-                    for phase in 0..14 {
+                    for phase in 0..15 {
                         // Reload the same selector after editing its descriptor.
                         // The successor already has direct links under the old
                         // flat proof; neither selector equality nor a stale view
@@ -6295,19 +6312,22 @@ mod host_bus_tests {
                             (&mut actual, &mut native_bus),
                         ] {
                             cpu.eip = 0x1000;
+                            cpu.regs[4] = 0x8ffe;
                             cpu.cr2 = 0xdead_beef;
                             cpu.regs[1] = 0xbeef_0000 | u32::from(if null { 0 } else { selector });
                             if phase == 13 {
                                 cpu.regs[1] |= 3; // RPL3 cannot load a DPL0 data segment.
                             }
                             write_ram_u32(bus, 0xa000, cpu.regs[1]);
+                            bus.ram[0xbffe..0xc000]
+                                .copy_from_slice(&(cpu.regs[1] as u16).to_le_bytes());
                             let base = if phase == 1 { 0x200u32 } else { 0 };
                             let high = match phase {
-                                2 => 0x00cf_9100,  // Read-only data: loading succeeds, store faults.
-                                3 => 0x0040_9300,  // Byte-granular limit below ESI.
-                                6 => 0x00cf_8900,  // System descriptor is not a data segment.
-                                7 => 0x00cf_1300,  // Not present.
-                                10 => 0x00cf_9200, // Unset descriptor A requires ordinary semantics.
+                                2 => 0x00cf_9100,       // Read-only data: loading succeeds, store faults.
+                                3 => 0x0040_9300,       // Byte-granular limit below ESI.
+                                6 => 0x00cf_8900,       // System descriptor is not a data segment.
+                                7 => 0x00cf_1300,       // Not present.
+                                10 | 14 => 0x00cf_9200, // Unset descriptor A requires ordinary semantics.
                                 _ => 0x00cf_9300,
                             } | if phase == 13 { 0 } else { u32::from(cpl) << 13 };
                             let offset = if split { 0xffc } else { 0x10 };
@@ -6325,6 +6345,16 @@ mod host_bus_tests {
                             if (8..=11).contains(&phase) {
                                 write_ram_u32(bus, 0x501c, if phase <= 9 { 0 } else { 0x9000 | 7 });
                                 write_ram_u32(bus, 0x5008, if phase == 9 { 0 } else { 0xa000 | 7 });
+                                write_ram_u32(
+                                    bus,
+                                    0x5020,
+                                    if stack && phase == 9 { 0 } else { 0xb000 | 7 },
+                                );
+                                cpu.invalidate_translation_context();
+                            }
+                            if phase == 14 {
+                                cpu.cr0 |= crate::x86::cpu::CR0_WP;
+                                write_ram_u32(bus, 0x501c, 0x9000 | 5);
                                 cpu.invalidate_translation_context();
                             }
                         }
@@ -6336,7 +6366,7 @@ mod host_bus_tests {
                             .unwrap();
                         assert_eq!(
                             native, reference,
-                            "{segment:?} cpl={cpl} memory={memory} phase={phase}"
+                            "{segment:?} cpl={cpl} source={source} phase={phase}"
                         );
                         assert_eq!(actual.regs, expected.regs);
                         assert_eq!(actual.eip, expected.eip);
@@ -6362,8 +6392,19 @@ mod host_bus_tests {
                                 // A memory source faults before the descriptor fetch.
                                 assert_eq!(
                                     actual.cr2,
-                                    if memory && phase == 9 { 0x2000 } else { 0x7010 }
+                                    if phase == 9 && stack {
+                                        0x8ffe
+                                    } else if phase == 9 && memory {
+                                        0x2000
+                                    } else {
+                                        0x7010
+                                    }
                                 );
+                            }
+                            if phase == 14 {
+                                assert_eq!(actual.cr2, 0x7015);
+                                assert_eq!(actual.regs[4], 0x8ffe);
+                                assert_eq!(native_bus.ram[0x9015] & 1, 0);
                             }
                         }
                         if phase >= 6 && phase != 10 {
@@ -6372,6 +6413,113 @@ mod host_bus_tests {
                         steps += native.ran;
                     }
                     assert!(engine.stats.linked_edges > 0);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_segment_pushes_store_only_a_word_and_commit_esp_after_faults() {
+        for (segment, opcode) in [
+            (SegmentReg::Es, &[0x06][..]),
+            (SegmentReg::Ds, &[0x1e][..]),
+            (SegmentReg::Fs, &[0x0f, 0xa0][..]),
+            (SegmentReg::Gs, &[0x0f, 0xa8][..]),
+        ] {
+            for operand16 in [false, true] {
+                for user in [false, true] {
+                    for case in 0..5 {
+                        let make = || {
+                            let mut cpu = Cpu::new();
+                            cpu.enter_protected_flat(0x1000, 0);
+                            if user {
+                                cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::flat(11, 0xc0fb));
+                                cpu.set_seg_cache(SegmentReg::Ss, SegmentCache::flat(19, 0xc0f3));
+                            }
+                            if case == 3 {
+                                let mut ss = cpu.seg(SegmentReg::Ss);
+                                ss.flags &= !0x4000; // A 16-bit stack uses shared semantics.
+                                cpu.set_seg_cache(SegmentReg::Ss, ss);
+                            }
+                            cpu.set_seg_cache(
+                                segment,
+                                SegmentCache::new(if case == 4 { 0 } else { 0xbeef }, 0, 0, 0),
+                            );
+                            cpu.cr0 |= CR0_PG | crate::x86::cpu::CR0_WP;
+                            cpu.cr3 = 0x4000;
+                            let mut bus = HostBus::new(0x10000);
+                            bus.attention = false;
+                            bus.next_attention_step = u64::MAX;
+                            write_ram_u32(&mut bus, 0x4000, 0x5000 | 7);
+                            write_ram_u32(&mut bus, 0x5004, 0x3000 | 7);
+                            write_ram_u32(&mut bus, 0x5018, 0x8000 | if case == 2 { 5 } else { 7 });
+                            let mut code = vec![0x90];
+                            if operand16 {
+                                code.push(0x66);
+                            }
+                            code.extend_from_slice(opcode);
+                            code.push(0xf4);
+                            bus.ram[0x3000..0x3000 + code.len()].copy_from_slice(&code);
+                            (cpu, bus)
+                        };
+                        let (mut expected, mut expected_bus) = make();
+                        let (mut actual, mut actual_bus) = make();
+                        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+                        for round in 0..4 {
+                            let destination = if case == 1 { 0x6fff } else { 0x6ffe };
+                            let high = if case == 3 { 0x1234_0000 } else { 0 };
+                            let esp = high | (destination + if operand16 { 2 } else { 4 });
+                            for (cpu, bus) in [
+                                (&mut expected, &mut expected_bus),
+                                (&mut actual, &mut actual_bus),
+                            ] {
+                                cpu.eip = 0x1000;
+                                cpu.cr2 = 0xdead_beef;
+                                cpu.regs[4] = esp;
+                                cpu.replace_eflags(0x28d7);
+                                bus.ram[0x8ffc..0x9004].fill(0x5a);
+                            }
+                            let reference = Interpreter::run_batch(
+                                &mut expected,
+                                &mut expected_bus,
+                                round * 2,
+                                2,
+                            );
+                            let before = engine.stats.native_memory_writes;
+                            let result = engine
+                                .run_batch(&mut actual, &mut actual_bus, round * 2, 2)
+                                .unwrap();
+                            assert_eq!(
+                                result, reference,
+                                "segment={segment:?} operand16={operand16} user={user} case={case}"
+                            );
+                            assert_eq!(actual.regs, expected.regs);
+                            assert_eq!(actual.eip, expected.eip);
+                            assert_eq!(actual.effective_eflags(), 0x28d7);
+                            assert_eq!(actual.tsc(), expected.tsc());
+                            assert_eq!(actual.cr2, expected.cr2);
+                            assert_eq!(actual_bus.ram, expected_bus.ram);
+                            let faults = matches!(case, 1 | 2);
+                            assert_eq!(
+                                actual.regs[4],
+                                if faults { esp } else { high | destination }
+                            );
+                            assert_eq!(&actual_bus.ram[0x9000..0x9002], &[0x5a, 0x5a]);
+                            if !faults {
+                                assert_eq!(
+                                    &actual_bus.ram[0x8ffe..0x9000],
+                                    if case == 4 { &[0, 0] } else { &[0xef, 0xbe] }
+                                );
+                            }
+                            if round == 3 && matches!(case, 0 | 4) {
+                                assert_eq!(engine.stats.native_memory_writes, before + 1);
+                            }
+                            if case == 3 {
+                                assert_eq!(engine.stats.native_memory_writes, before);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -7130,6 +7278,9 @@ mod host_bus_tests {
             (&[0x83, 0xe8, 0xff, 0x83, 0xd2, 0, 0xf4], true), // SUB EAX,-1; ADC EDX,0; HLT.
             (&[0xa1, 0, 0x70, 0, 0, 0xf4], false),            // Unmapped load.
             (&[0xf3, 0xa4, 0xf4], false),                     // Copy three bytes, then fault.
+            (&[0xf2, 0xa6, 0xf4], false),                     // Compare three bytes, then fault.
+            (&[0x0f, 0xa0, 0xf4], true),                      // PUSH FS.
+            (&[0x0f, 0xa1, 0xf4], true),                      // POP null FS.
         ];
         for &(code, completes_natively) in cases {
             for flags in [2, 0x202] {
@@ -7169,6 +7320,9 @@ mod host_bus_tests {
                             cpu.eip = 0x1000;
                             cpu.halted = false;
                             cpu.regs = [0x2000, 4, 0, 0, 0x9800, 0, 0x6ffd, 0x8ffd];
+                            if code.starts_with(&[0x0f, 0xa1]) {
+                                cpu.regs[4] = 0x97fc;
+                            }
                             cpu.replace_eflags(flags);
                             cpu.restore_interrupt_shadow(shadowed);
                         }
@@ -7201,9 +7355,11 @@ mod host_bus_tests {
                         }
                         steps += result.ran;
                     }
-                    if code.starts_with(&[0xf3, 0xa4]) {
+                    if matches!(code.get(1), Some(0xa4 | 0xa6)) {
                         assert!(engine.stats.partial_repeats > 0);
-                        assert_eq!(&actual_bus.ram[0xaffd..0xb000], &[0x71, 0x82, 0x93]);
+                        if code[1] == 0xa4 {
+                            assert_eq!(&actual_bus.ram[0xaffd..0xb000], &[0x71, 0x82, 0x93]);
+                        }
                         assert_eq!(actual.cr2, 0x7000);
                     }
                 }
@@ -7348,7 +7504,7 @@ mod host_bus_tests {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
     #[test]
     fn jit_scalar_string_faults_preserve_indices_accumulator_and_flags() {
-        for opcode in [0xac, 0xad, 0xaa, 0xab, 0xae, 0xaf] {
+        for opcode in [0xa6, 0xac, 0xad, 0xaa, 0xab, 0xae, 0xaf] {
             for limit in [0x100, u32::MAX] {
                 let make = || {
                     let mut cpu = Cpu::new();
@@ -7407,7 +7563,10 @@ mod host_bus_tests {
     #[test]
     fn jit_repeated_strings_preserve_count_zero_conditions_and_tick_chunks() {
         for bits in [8u8, 16, 32] {
-            for opcode in [0xaa, 0xac, 0xae] {
+            for opcode in [0xa6, 0xaa, 0xac, 0xae] {
+                if opcode == 0xa6 && bits != 8 {
+                    continue;
+                }
                 for prefix in [0xf2, 0xf3] {
                     for count in [0, 1, 17, 1024, 4096, 4097] {
                         for backward in [false, true] {
@@ -7569,8 +7728,11 @@ mod host_bus_tests {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
     #[test]
     fn jit_repeated_strings_resume_page_misses_without_extending_attempt_budget() {
-        for opcode in [0xa4, 0xaa, 0xac, 0xae] {
+        for opcode in [0xa4, 0xa6, 0xaa, 0xac, 0xae] {
             for width in [1u32, 2, 4] {
+                if opcode == 0xa6 && width != 1 {
+                    continue;
+                }
                 for warm_all in [false, true] {
                     let make = || {
                         let mut cpu = Cpu::new();
@@ -7648,6 +7810,219 @@ mod host_bus_tests {
                     assert!(
                         engine.stats.native_memory_reads + engine.stats.native_memory_writes > 0
                     );
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_cmpsb_preserves_sub_flags_source_overrides_and_early_stops() {
+        for prefix in [None, Some(0xf2), Some(0xf3)] {
+            for (lhs, rhs) in [(0x80u8, 1u8), (0, 0xff), (0x10, 1), (0x55, 0x55)] {
+                for (segment, base) in [
+                    (SegmentReg::Ds, 0),
+                    (SegmentReg::Fs, 0x5000),
+                    (SegmentReg::Gs, 0),
+                ] {
+                    for backward in [false, true] {
+                        let make = || {
+                            let mut cpu = Cpu::new();
+                            cpu.enter_protected_flat(0x1000, 0);
+                            cpu.set_seg_cache(segment, SegmentCache::flat(0x18, 0xc093));
+                            let mut cache = cpu.seg(segment);
+                            cache.base = base;
+                            cpu.set_seg_cache(segment, cache);
+                            let mut bus = HostBus::new(0x10000);
+                            bus.attention = false;
+                            bus.next_attention_step = u64::MAX;
+                            let mut code = vec![0x90];
+                            if segment != SegmentReg::Ds {
+                                code.push(if segment == SegmentReg::Fs {
+                                    0x64
+                                } else {
+                                    0x65
+                                });
+                            }
+                            code.extend(prefix);
+                            code.extend([0xa6, 0xf4]);
+                            bus.ram[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+                            bus.ram[0x5f00..0x6100].fill(lhs);
+                            bus.ram[0x7f00..0x8100].fill(rhs);
+                            (cpu, bus)
+                        };
+                        let (mut expected, mut expected_bus) = make();
+                        let (mut actual, mut actual_bus) = make();
+                        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+                        for round in 0..4 {
+                            for cpu in [&mut expected, &mut actual] {
+                                cpu.eip = 0x1000;
+                                cpu.regs[1] = 17;
+                                cpu.regs[6] = 0x6000 - base;
+                                cpu.regs[7] = 0x8000;
+                                cpu.replace_eflags(0x28d7 | if backward { 0x400 } else { 0 });
+                            }
+                            let reference = Interpreter::run_batch(
+                                &mut expected,
+                                &mut expected_bus,
+                                round * 2,
+                                2,
+                            );
+                            let before = engine.stats.native_memory_reads;
+                            let result = engine
+                                .run_batch(&mut actual, &mut actual_bus, round * 2, 2)
+                                .unwrap();
+                            assert_eq!(result, reference);
+                            assert_eq!(actual.regs, expected.regs);
+                            assert_eq!(actual.eip, expected.eip);
+                            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+                            assert_eq!(actual.tsc(), expected.tsc());
+                            let done = if prefix == Some(if lhs == rhs { 0xf3 } else { 0xf2 }) {
+                                17
+                            } else {
+                                1
+                            };
+                            assert_eq!(
+                                actual.regs[1],
+                                if prefix.is_some() { 17 - done } else { 17 }
+                            );
+                            let delta = if backward {
+                                0u32.wrapping_sub(done)
+                            } else {
+                                done
+                            };
+                            assert_eq!(actual.regs[6], (0x6000 - base).wrapping_add(delta));
+                            assert_eq!(actual.regs[7], 0x8000u32.wrapping_add(delta));
+                            let difference = lhs.wrapping_sub(rhs);
+                            let flags = u32::from(lhs < rhs)
+                                | (u32::from(difference.count_ones() % 2 == 0) << 2)
+                                | (u32::from((lhs ^ rhs ^ difference) & 0x10 != 0) << 4)
+                                | (u32::from(difference == 0) << 6)
+                                | (u32::from(difference & 0x80 != 0) << 7)
+                                | (u32::from((lhs ^ rhs) & (lhs ^ difference) & 0x80 != 0) << 11);
+                            assert_eq!(actual.effective_eflags() & 0x8d5, flags);
+                            if round == 3 && (prefix.is_none() || (!backward && base == 0)) {
+                                assert_eq!(
+                                    engine.stats.native_memory_reads - before,
+                                    2 * u64::from(done)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_cmpsb_page_fault_order_privilege_and_partial_budget() {
+        // Unequal page offsets exercise each bound independently. The long
+        // case enters a present page with A clear after native progress; its
+        // shared tail must still stop at 4096 total elements in this one tick.
+        for prefix in [0xf2, 0xf3] {
+            for user in [false, true] {
+                for case in 0..7 {
+                    let make = || {
+                        let mut cpu = Cpu::new();
+                        cpu.enter_protected_flat(0x1000, 0);
+                        if user {
+                            cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::flat(11, 0xc0fb));
+                            for seg in [SegmentReg::Ds, SegmentReg::Es, SegmentReg::Ss] {
+                                cpu.set_seg_cache(seg, SegmentCache::flat(19, 0xc0f3));
+                            }
+                        }
+                        cpu.set_seg_cache(SegmentReg::Fs, cpu.seg(SegmentReg::Ds));
+                        cpu.cr0 |= CR0_PG;
+                        cpu.cr3 = 0x4000;
+                        let mut bus = HostBus::new(0x20000);
+                        bus.attention = false;
+                        bus.next_attention_step = u64::MAX;
+                        // Source override must also survive the shared tail.
+                        bus.ram[0x3000..0x3005].copy_from_slice(&[0x90, 0x64, prefix, 0xa6, 0xf4]);
+                        (cpu, bus)
+                    };
+                    let (mut expected, mut expected_bus) = make();
+                    let (mut actual, mut actual_bus) = make();
+                    let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+                    for round in 0..4 {
+                        for (cpu, bus) in [
+                            (&mut expected, &mut expected_bus),
+                            (&mut actual, &mut actual_bus),
+                        ] {
+                            cpu.eip = 0x1000;
+                            cpu.cr2 = 0xdead_beef;
+                            cpu.regs[1] = if case == 6 { 4100 } else { 17 };
+                            cpu.regs[6] = if case == 4 { 0x7000 } else { 0x6ffd };
+                            cpu.regs[7] = if case == 1 { 0xafff } else { 0xaffb };
+                            cpu.replace_eflags(0x28d7);
+                            cpu.invalidate_translation_context();
+                            write_ram_u32(bus, 0x4000, 0x5000 | 0x27);
+                            write_ram_u32(bus, 0x5004, 0x3000 | 0x27);
+                            write_ram_u32(bus, 0x5018, 0x8000 | 0x27);
+                            write_ram_u32(bus, 0x501c, if case == 6 { 0x9000 | 7 } else { 0 });
+                            write_ram_u32(
+                                bus,
+                                0x5028,
+                                0xc000 | if case == 3 { 0x23 } else { 0x27 },
+                            );
+                            write_ram_u32(bus, 0x502c, if case == 6 { 0xd000 | 7 } else { 0 });
+                            write_ram_u32(bus, 0x5030, if case == 6 { 0xe000 | 7 } else { 0 });
+                            bus.ram[0x8000..0xa000].fill(0x80);
+                            bus.ram[0xc000..0xf000].fill(if prefix == 0xf3 { 0x80 } else { 1 });
+                            if case == 2 || case == 5 {
+                                // Stop on the final source byte of this page.
+                                bus.ram[0xcffd] = if prefix == 0xf3 { 1 } else { 0x80 };
+                            }
+                            if case == 4 {
+                                cpu.set_seg_cache(SegmentReg::Es, SegmentCache::new(0, 0, 0, 0));
+                            }
+                            if case == 5 {
+                                // The next source is present but supervisor-only.
+                                write_ram_u32(bus, 0x501c, 0x9000 | 3);
+                            }
+                        }
+                        let reference =
+                            Interpreter::run_batch(&mut expected, &mut expected_bus, round * 2, 2);
+                        let before = engine.stats.native_memory_reads;
+                        let partial_before = engine.stats.partial_repeats;
+                        let result = engine
+                            .run_batch(&mut actual, &mut actual_bus, round * 2, 2)
+                            .unwrap();
+                        assert_eq!(
+                            result, reference,
+                            "prefix={prefix:x} user={user} case={case} round={round}"
+                        );
+                        assert_eq!(actual.regs, expected.regs);
+                        assert_eq!(actual.eip, expected.eip);
+                        assert_eq!(actual.cr2, expected.cr2);
+                        assert_eq!(actual.tsc(), expected.tsc());
+                        assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+                        assert_eq!(actual_bus.ram, expected_bus.ram);
+                        let done = match case {
+                            1 => 1,
+                            3 if user => 0,
+                            4 => 0,
+                            6 => 4096,
+                            _ => 3,
+                        };
+                        assert_eq!(actual.regs[1], if case == 6 { 4 } else { 17 - done });
+                        assert_eq!(
+                            actual.cr2,
+                            match case {
+                                1 => 0xb000,
+                                3 if user => 0xaffb,
+                                2 | 5 | 6 => 0xdead_beef,
+                                _ => 0x7000,
+                            }
+                        );
+                        if round == 3 && done != 0 {
+                            assert!(engine.stats.native_memory_reads > before);
+                            if !matches!(case, 2 | 5) {
+                                assert_eq!(engine.stats.partial_repeats, partial_before + 1);
+                            }
+                        }
+                    }
                 }
             }
         }

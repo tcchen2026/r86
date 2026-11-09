@@ -519,8 +519,9 @@ pub(crate) const MAX_STRING_REPEAT_UNITS_PER_STEP: u32 = 4096;
 /// completed elements or exposing an extra machine event boundary.
 ///
 /// This explicit ABI is only used by the optional translator. Control bytes are
-/// operation (MOVS=0, STOS=1, LODS=2, REPE SCAS=3, REPNE SCAS=4), element width,
-/// and source segment. Address size is 32 bits. Unknown tags are compiler bugs.
+/// operation (MOVS=0, STOS=1, LODS=2, REPE SCAS=3, REPNE SCAS=4,
+/// REPE CMPS=5, REPNE CMPS=6), element width, and source segment.
+/// Address size is 32 bits. Unknown tags are compiler bugs.
 #[cfg(feature = "jit")]
 #[derive(Default)]
 #[repr(C)]
@@ -581,8 +582,8 @@ impl Interpreter {
         ][(resume.control >> 16) as usize];
         debug_assert!(matches!(width, 1 | 2 | 4));
         debug_assert!(resume.completed < MAX_STRING_REPEAT_UNITS_PER_STEP);
-        cpu.segment_override = matches!(kind, 0 | 2).then_some(segment);
-        let prefix = if kind == 4 {
+        cpu.segment_override = matches!(kind, 0 | 2 | 5 | 6).then_some(segment);
+        let prefix = if matches!(kind, 4 | 6) {
             Prefix::Repne
         } else {
             Prefix::Rep
@@ -592,6 +593,7 @@ impl Interpreter {
             1 => stos,
             2 => lods,
             3 | 4 => scas,
+            5 | 6 => cmps,
             _ => panic!("invalid native REP operation"),
         };
         let result = execute(
@@ -2021,12 +2023,12 @@ impl Interpreter {
                             step_try!(movs(cpu, bus, prefix, 4, address16, start_eip, 0));
                         }
                     }
-                    0xa6 => step_try!(cmps(cpu, bus, prefix, 1, address16, start_eip)),
+                    0xa6 => step_try!(cmps(cpu, bus, prefix, 1, address16, start_eip, 0)),
                     0xa7 => {
                         if operand16 {
-                            step_try!(cmps(cpu, bus, prefix, 2, address16, start_eip));
+                            step_try!(cmps(cpu, bus, prefix, 2, address16, start_eip, 0));
                         } else {
-                            step_try!(cmps(cpu, bus, prefix, 4, address16, start_eip));
+                            step_try!(cmps(cpu, bus, prefix, 4, address16, start_eip, 0));
                         }
                     }
                     0xac => step_try!(lods(cpu, bus, prefix, 1, address16, start_eip, 0)),
@@ -6134,13 +6136,13 @@ fn cmps<B: Bus>(
     width: u8,
     address16: bool,
     eip: u32,
+    mut units: u32,
 ) -> Result<(), StepError> {
     let repeat = matches!(prefix, Prefix::Rep | Prefix::Repne);
     if repeat && string_count(cpu, address16) == 0 {
         return Ok(());
     }
 
-    let mut units = 0_u32;
     loop {
         let esi = string_index(cpu, Reg32::Esi, address16);
         let edi = string_index(cpu, Reg32::Edi, address16);

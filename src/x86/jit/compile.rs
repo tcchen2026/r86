@@ -184,7 +184,7 @@ pub(super) fn flags_written(op: Op) -> u32 {
         | Op::Compare { .. }
         | Op::Negate { .. }
         | Op::String {
-            kind: StringOp::Scan,
+            kind: StringOp::Scan | StringOp::Compare,
             ..
         }
         | Op::Exchange {
@@ -871,6 +871,7 @@ fn push(
     a: &mut Assembler,
     value: Reg,
     bits: u8,
+    stack_bytes: u16,
     site: &InstructionExit,
     faults: &mut Vec<FaultSite>,
     stack_offset: Option<u8>,
@@ -880,7 +881,7 @@ fn push(
     } else {
         soft::stack_guard(a, site.guard());
         let mut address = Address::stack();
-        address.displacement = 0u32.wrapping_sub(u32::from(bits / 8));
+        address.displacement = 0u32.wrapping_sub(u32::from(stack_bytes));
         soft::prepare(a, address, bits, true, site.guard()).access(a, value, true)
     };
     faults.push(FaultSite::new(
@@ -891,14 +892,7 @@ fn push(
         true,
     ));
     // ESP remains architecturally old if the recorded store faults.
-    a.add_sub_imm(
-        guest_reg(4),
-        guest_reg(4),
-        u16::from(bits / 8),
-        false,
-        true,
-        false,
-    );
+    a.add_sub_imm(guest_reg(4), guest_reg(4), stack_bytes, false, true, false);
 }
 
 fn condition_value(a: &mut Assembler, condition: u8) {
@@ -997,7 +991,7 @@ fn movs(
 
 /// The native loop and its shared interpreter tail together execute at most
 /// 4096 elements per attempted instruction. Check only the current page and
-/// commit each element before advancing. In particular SCAS may finish without
+/// commit each element before advancing. SCAS/CMPS may finish without
 /// touching the next page even with ECX=-1. A slow next access retains the exact
 /// completed count, so it neither replays RAM nor gets a second 4096-unit budget.
 /// Page bounds follow tiny386's string loops. Guest tick boundaries remain r86's
@@ -1027,6 +1021,13 @@ fn repeat_control(op: Op) -> Option<u32> {
                         4
                     }
                 }
+                StringOp::Compare => {
+                    if equal {
+                        5
+                    } else {
+                        6
+                    }
+                }
             },
             bits,
             segment,
@@ -1048,6 +1049,9 @@ fn repeat_access_counts(_a: &mut Assembler, _control: u32) {
             2,
         );
         a.add_sub(TMP, TMP, guest_reg(1), false, true, false);
+        if _control & 255 >= 5 {
+            a.add_sub(TMP, TMP, TMP, true, false, false);
+        }
         for (enabled, field) in [
             (_control & 255 != 1, offset_of!(Frame, memory_reads)),
             (_control & 255 <= 1, offset_of!(Frame, memory_writes)),
@@ -1069,6 +1073,8 @@ fn repeat_string(
     next_eip: u32,
 ) {
     let kind = control & 255;
+    let compare = kind >= 5;
+    let stop_equal = matches!(kind, 4 | 6);
     let bytes = (control >> 8) as u8;
     let bits = bytes * 8;
     let segment = [
@@ -1113,7 +1119,7 @@ fn repeat_string(
     a.b_cond(Cond::Ls, bounded);
     a.mov(units, TMP, false);
     a.bind(bounded);
-    if kind >= 3 {
+    if matches!(kind, 3 | 4) {
         read_register(
             a,
             LHS,
@@ -1127,7 +1133,11 @@ fn repeat_string(
     let page = a.label();
     a.bind(page);
     let address = Address {
-        base: Some(if kind == 0 || kind == 2 { 6 } else { 7 }),
+        base: Some(if kind == 0 || kind == 2 || compare {
+            6
+        } else {
+            7
+        }),
         index: None,
         scale: 0,
         displacement: 0,
@@ -1135,7 +1145,7 @@ fn repeat_string(
     };
     let access = soft::prepare_flat(a, address, bits, kind == 1, site.guard());
     access.pointer(a, pointer);
-    if kind == 0 {
+    if kind == 0 || compare {
         access.forward_units(a, TMP2);
         let destination = soft::prepare_flat(
             a,
@@ -1145,10 +1155,10 @@ fn repeat_string(
                 ..address
             },
             bits,
-            true,
+            kind == 0,
             site.guard(),
         );
-        destination.pointer(a, LHS);
+        destination.pointer(a, if compare { RESULT } else { LHS });
         destination.forward_units(a, page_units);
         a.add_sub(ZR, page_units, TMP2, false, true, true);
         let bounded = a.label();
@@ -1176,6 +1186,18 @@ fn repeat_string(
     ));
     if kind == 1 {
         a.load_store(false, guest_reg(0), pointer, 0, shift);
+    } else if compare {
+        a.load_store(true, LHS, pointer, 0, shift);
+        faults.push(FaultSite::new(
+            a.offset() as u32,
+            site.eip,
+            site.steps_before.into(),
+            bytes,
+            false,
+        ));
+        a.load_store(true, RHS, RESULT, 0, shift);
+        a.add_sub_imm(RESULT, RESULT, bytes.into(), true, false, false);
+        a.add_sub(ZR, LHS, RHS, false, true, true);
     } else {
         a.load_store(true, RHS, pointer, 0, shift);
         if kind == 0 {
@@ -1207,7 +1229,7 @@ fn repeat_string(
     a.add_sub_imm(pointer, pointer, bytes.into(), true, false, false);
     a.add_sub_imm(page_units, page_units, 1, false, true, false);
     if kind >= 3 {
-        a.b_cond(if kind == 4 { Cond::Eq } else { Cond::Ne }, compared);
+        a.b_cond(if stop_equal { Cond::Eq } else { Cond::Ne }, compared);
     }
     a.cbz(page_units, false, true, again);
     if kind >= 3 {
@@ -1222,12 +1244,12 @@ fn repeat_string(
     a.add_sub(guest_reg(1), guest_reg(1), TMP2, false, true, false);
     a.add_sub(units, units, TMP2, false, true, false);
     a.add_shifted(index, index, TMP2, shift, false);
-    if kind == 0 {
+    if kind == 0 || compare {
         a.add_shifted(source_index, source_index, TMP2, shift, false);
     }
     if kind >= 3 {
         alu(a, Alu::Cmp, bits, STATUS, (LHS, RHS, RESULT));
-        a.tbz(FLAGS, 30, kind == 4, finished);
+        a.tbz(FLAGS, 30, stop_equal, finished);
     }
     a.cbz(units, false, false, finished);
     a.b(page);
@@ -1237,7 +1259,7 @@ fn repeat_string(
     let next = a.label();
     a.cbz(guest_reg(1), false, false, next);
     if kind >= 3 {
-        a.tbz(FLAGS, 30, kind == 4, next);
+        a.tbz(FLAGS, 30, stop_equal, next);
     }
     a.mov_imm(LHS, site.eip.into(), false);
     a.bind(next);
@@ -1270,7 +1292,20 @@ fn emit_progress(a: &mut Assembler, _block: &Block, count: u16) {
                                     }
                             )
                     })
-                    .count(),
+                    .map(|i| {
+                        if matches!(
+                            i.op,
+                            Op::String {
+                                kind: StringOp::Compare,
+                                ..
+                            }
+                        ) {
+                            2
+                        } else {
+                            1
+                        }
+                    })
+                    .sum::<usize>(),
             ),
             (
                 offset_of!(Frame, memory_writes),
@@ -1293,7 +1328,7 @@ fn emit_progress(a: &mut Assembler, _block: &Block, count: u16) {
                 offset_of!(Frame, loaded_segments),
                 prefix
                     .iter()
-                    .filter(|i| matches!(i.op, Op::LoadSegment { .. }))
+                    .filter(|i| matches!(i.op, Op::LoadSegment { .. } | Op::PopSegment { .. }))
                     .count(),
             ),
         ] {
@@ -1496,6 +1531,40 @@ pub fn block(
                 read_value(&mut a, LHS, src, site.as_ref(), &mut faults);
                 soft::load_segment(&mut a, segment, site.as_ref().unwrap().miss);
             }
+            Op::PopSegment { segment, bits } => {
+                let site = site.as_ref().unwrap();
+                // All operand sizes read a selector word. Descriptor validation
+                // and any accessed-bit write precede the ESP commit.
+                read_stack(&mut a, LHS, 16, site, &mut faults, false);
+                soft::load_segment(&mut a, segment, site.miss);
+                a.add_sub_imm(
+                    guest_reg(4),
+                    guest_reg(4),
+                    u16::from(bits / 8),
+                    false,
+                    false,
+                    false,
+                );
+            }
+            Op::PushSegment { segment, bits } => {
+                a.load_store(
+                    true,
+                    RESULT,
+                    FRAME,
+                    (offset_of!(Frame, selectors) + segment as usize * 2) as u32,
+                    1,
+                );
+                // A dword slot reserves four bytes but stores only the selector.
+                push(
+                    &mut a,
+                    RESULT,
+                    16,
+                    u16::from(bits / 8),
+                    site.as_ref().unwrap(),
+                    &mut faults,
+                    None,
+                );
+            }
             Op::ReadSegment { dst, segment } => {
                 // Segment loads refresh these explicit selectors. r32 is
                 // zero-extended, r16 preserves its high half, memory stores 16
@@ -1628,6 +1697,7 @@ pub fn block(
                     &mut a,
                     RESULT,
                     bits,
+                    u16::from(bits / 8),
                     site.as_ref().unwrap(),
                     &mut faults,
                     push_offset,
@@ -1731,7 +1801,11 @@ pub fn block(
                 repeat: None,
             } => {
                 let site = site.as_ref().unwrap();
-                let index_reg = if kind == StringOp::Load { 6 } else { 7 };
+                let index_reg = if matches!(kind, StringOp::Load | StringOp::Compare) {
+                    6
+                } else {
+                    7
+                };
                 let address = Address {
                     base: Some(index_reg),
                     index: None,
@@ -1765,7 +1839,24 @@ pub fn block(
                         Some(site),
                         &mut faults,
                     );
-                    if kind == StringOp::Load {
+                    if kind == StringOp::Compare {
+                        a.mov(LHS, RHS, false);
+                        read_value(
+                            &mut a,
+                            RHS,
+                            Value::Memory {
+                                address: Address {
+                                    base: Some(7),
+                                    segment: crate::x86::cpu::SegmentReg::Es,
+                                    ..address
+                                },
+                                bits,
+                            },
+                            Some(site),
+                            &mut faults,
+                        );
+                        alu(&mut a, Alu::Cmp, bits, needed[index], (LHS, RHS, RESULT));
+                    } else if kind == StringOp::Load {
                         write_register(&mut a, accumulator, RHS);
                     } else {
                         read_register(&mut a, LHS, accumulator);
@@ -1787,6 +1878,9 @@ pub fn block(
                     false,
                     false,
                 );
+                if kind == StringOp::Compare {
+                    a.add_sub(guest_reg(7), guest_reg(7), TMP, false, false, false);
+                }
             }
             Op::Movs { bits, segment, .. } => movs(
                 &mut a,
@@ -2573,6 +2667,7 @@ pub fn block(
                     &mut a,
                     value,
                     bits,
+                    u16::from(bits / 8),
                     site.as_ref().unwrap(),
                     &mut faults,
                     push_offset,
@@ -2588,6 +2683,7 @@ pub fn block(
                     &mut a,
                     RESULT,
                     bits,
+                    u16::from(bits / 8),
                     site.as_ref().unwrap(),
                     &mut faults,
                     push_offset,
@@ -2649,7 +2745,7 @@ pub fn block(
     ) {
         a.mov(PC, LHS, false);
     }
-    if matches!(last.op, Op::LoadSegment { .. }) {
+    if matches!(last.op, Op::LoadSegment { .. } | Op::PopSegment { .. }) {
         a.mov(TMP2, LHS, false);
     }
     emit_progress(&mut a, block, count);
@@ -2667,7 +2763,7 @@ pub fn block(
             a.mov_imm(PC, last.next_eip.into(), false);
             a.b(done);
         }
-        Op::LoadSegment { .. } => {
+        Op::LoadSegment { .. } | Op::PopSegment { .. } => {
             // Dynamic segment state is refreshed; a changed specialization
             // must retire old links in the adapter before another block runs.
             a.mov_imm(PC, last.next_eip.into(), false);

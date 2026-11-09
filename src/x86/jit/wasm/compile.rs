@@ -137,7 +137,10 @@ fn supported(op: Op) -> bool {
             | Op::Exchange { .. }
             | Op::CompareExchange8 { .. }
             | Op::Movs { .. }
-            | Op::String { .. }
+            | Op::String {
+                kind: StringOp::Load | StringOp::Store | StringOp::Scan,
+                ..
+            }
     )
 }
 
@@ -1788,6 +1791,7 @@ impl Compiler<'_> {
                 match kind {
                     StringOp::Store => 1,
                     StringOp::Load => 2,
+                    StringOp::Compare => unreachable!("filtered by supported"),
                     StringOp::Scan => {
                         if equal {
                             3
@@ -2124,6 +2128,9 @@ impl Compiler<'_> {
     }
     fn instruction(&mut self, insn: Instruction) {
         match insn.op {
+            Op::Mmx { .. } | Op::PushSegment { .. } | Op::PopSegment { .. } => {
+                unreachable!("filtered by supported")
+            }
             Op::String {
                 repeat: Some(_), ..
             }
@@ -2165,6 +2172,7 @@ impl Compiler<'_> {
                     bits,
                 };
                 match kind {
+                    StringOp::Compare => unreachable!("filtered by supported"),
                     StringOp::Store => {
                         self.reg(accumulator);
                         self.code.store(bits, 0);

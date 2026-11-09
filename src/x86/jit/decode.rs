@@ -106,6 +106,7 @@ pub enum StringOp {
     Load,
     Store,
     Scan,
+    Compare,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,6 +159,14 @@ pub enum Op {
     LoadSegment {
         segment: SegmentReg,
         src: Value,
+    },
+    PushSegment {
+        segment: SegmentReg,
+        bits: u8,
+    },
+    PopSegment {
+        segment: SegmentReg,
+        bits: u8,
     },
     Mov {
         dst: Register,
@@ -320,16 +329,18 @@ impl Op {
             Self::Imul { lhs, rhs, .. } => lhs.is_memory() || rhs.is_memory(),
             Self::MemoryAlu { .. } | Self::Movs { .. } | Self::CompareExchange8 { .. } => true,
             Self::String {
-                kind: StringOp::Load | StringOp::Scan,
+                kind: StringOp::Load | StringOp::Scan | StringOp::Compare,
                 ..
             } => true,
             Self::Shift { dst, .. } => dst.is_memory(),
             Self::Exchange { dst, .. } => dst.is_memory(),
             Self::Push { src, .. } => src.is_memory(),
             Self::Call { target, .. } => target.is_memory(),
-            Self::Pop { .. } | Self::PopFlags { .. } | Self::Return { .. } | Self::Leave { .. } => {
-                true
-            }
+            Self::Pop { .. }
+            | Self::PopSegment { .. }
+            | Self::PopFlags { .. }
+            | Self::Return { .. }
+            | Self::Leave { .. } => true,
             _ => false,
         }
     }
@@ -369,6 +380,7 @@ impl Op {
                 }
                 | Self::PushFlags { .. }
                 | Self::Push { .. }
+                | Self::PushSegment { .. }
                 | Self::Call { .. }
         )
     }
@@ -544,10 +556,26 @@ impl Reader<'_> {
                 op => break op,
             }
         };
-        if repeat && !matches!(opcode, 0xa4 | 0xa5 | 0xaa..=0xaf) {
+        if repeat && !matches!(opcode, 0xa4..=0xa6 | 0xaa..=0xaf) {
             return None;
         }
         let op = match opcode {
+            0x06 | 0x1e => Op::PushSegment {
+                segment: if opcode == 0x06 {
+                    SegmentReg::Es
+                } else {
+                    SegmentReg::Ds
+                },
+                bits,
+            },
+            0x07 | 0x1f => Op::PopSegment {
+                segment: if opcode == 0x07 {
+                    SegmentReg::Es
+                } else {
+                    SegmentReg::Ds
+                },
+                bits,
+            },
             0xfc | 0xfd => Op::Direction {
                 backward: opcode == 0xfd,
             },
@@ -568,15 +596,16 @@ impl Reader<'_> {
             },
             0xfa => Op::ClearInterrupt,
             0xfb => Op::SetInterrupt,
-            0xaa..=0xaf => Op::String {
+            0xa6 | 0xaa..=0xaf => Op::String {
                 kind: match opcode & !1 {
+                    0xa6 => StringOp::Compare,
                     0xaa => StringOp::Store,
                     0xac => StringOp::Load,
                     _ => StringOp::Scan,
                 },
                 bits: if opcode & 1 == 0 { 8 } else { bits },
                 repeat: repeat.then_some(repeat_equal),
-                segment: if matches!(opcode, 0xac | 0xad) {
+                segment: if matches!(opcode, 0xa6 | 0xac | 0xad) {
                     segment.unwrap_or(SegmentReg::Ds)
                 } else {
                     SegmentReg::Es
@@ -932,6 +961,22 @@ impl Reader<'_> {
                 }
             }
             0x0f => match self.byte()? {
+                op @ (0xa0 | 0xa8) => Op::PushSegment {
+                    segment: if op == 0xa0 {
+                        SegmentReg::Fs
+                    } else {
+                        SegmentReg::Gs
+                    },
+                    bits,
+                },
+                op @ (0xa1 | 0xa9) => Op::PopSegment {
+                    segment: if op == 0xa1 {
+                        SegmentReg::Fs
+                    } else {
+                        SegmentReg::Gs
+                    },
+                    bits,
+                },
                 0x77 if bits == 32 => Op::Mmx {
                     opcode: 0x77,
                     reg: 0,
@@ -1159,6 +1204,7 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
             instruction.op,
             Op::Branch { .. }
                 | Op::LoadSegment { .. }
+                | Op::PopSegment { .. }
                 | Op::SetInterrupt
                 | Op::Return { .. }
                 | Op::IndirectJump { .. }
