@@ -272,6 +272,26 @@ unsafe extern "C" fn load_cached_segment(frame: *mut Frame, segment: u32, select
     }
 }
 
+/// Operands and CR0 were qualified by generated code. This helper cannot
+/// interpret, access guest memory/devices or inspect stale GPRs/flags/time.
+/// Stores call it only after their native access, including HardMMU recovery.
+pub(super) unsafe extern "C" fn execute_mmx(view: *mut View, control: u32, value: u64) {
+    // SAFETY: the invocation exclusively owns this CPU. Its scalar MMX array
+    // pointer is read only outside this helper, with no concurrent Rust borrow.
+    let fpu = unsafe { &mut (*(*view).cpu).fpu };
+    let opcode = control as u8;
+    let reg = (control >> 8) as u8;
+    match opcode {
+        0x77 => fpu.emms(),
+        0x7e | 0x7f => fpu.prepare_mmx(),
+        0x6e | 0x6f => fpu.set_mmx(reg, value),
+        _ => fpu.set_mmx(
+            reg,
+            crate::x86::interp::mmx_binary_result(opcode, fpu.mmx(reg), value),
+        ),
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct CodeStamp {
     version_ptr: *const u64,
@@ -1066,6 +1086,7 @@ impl Engine {
                     memory.bus = (bus as *mut HostBus).cast();
                     memory.refill = refill_data_translation as *const () as usize;
                     memory.load_segment = load_cached_segment as *const () as usize;
+                    memory.mmx = execute_mmx as *const () as usize;
                     frame.memory = (&mut memory as *mut View).cast();
                     // SAFETY: entry was emitted from these validated bytes;
                     // the exclusive frame and memory view outlive execution.

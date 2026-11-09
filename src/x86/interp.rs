@@ -8797,7 +8797,14 @@ fn mmx_binary_op<B: Bus>(
     let dst = (modrm >> 3) & 7;
     let lhs = cpu.fpu.mmx(dst);
     let rhs = read_mmx_rm_qword(cpu, bus, rm, eip)?;
-    let result = match opcode {
+    cpu.fpu.set_mmx(dst, mmx_binary_result(opcode, lhs, rhs));
+    Ok(())
+}
+
+/// Shared packed-integer semantics. Callers qualify the opcode and operands
+/// before committing MMX state; this function performs no guest access.
+pub(super) fn mmx_binary_result(opcode: u8, lhs: u64, rhs: u64) -> u64 {
+    match opcode {
         0x60 => mmx_punpcklbw(lhs, rhs),
         0x61 => mmx_punpcklwd(lhs, rhs),
         0x62 => mmx_punpckldq(lhs, rhs),
@@ -8843,9 +8850,7 @@ fn mmx_binary_op<B: Bus>(
         0xfd => mmx_paddw(lhs, rhs),
         0xfe => mmx_paddd(lhs, rhs),
         _ => unreachable!(),
-    };
-    cpu.fpu.set_mmx(dst, result);
-    Ok(())
+    }
 }
 
 fn mmx_shift_imm<B: Bus>(

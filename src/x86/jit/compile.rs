@@ -1451,6 +1451,47 @@ pub fn block(
         };
         match instruction.op {
             Op::Nop => {}
+            Op::Mmx { opcode, reg, rm } => {
+                let site = site.as_ref().unwrap();
+                soft::mmx_available(&mut a, site.miss);
+                if matches!(opcode, 0x7e | 0x7f) {
+                    // Qualify the complete write before reading its source.
+                    // In particular, a split qword exits before either dword.
+                    let access = if let Value::Memory { address, bits } = rm {
+                        Some(soft::prepare(&mut a, address, bits, true, site.guard()))
+                    } else {
+                        None
+                    };
+                    soft::read_mmx(&mut a, LHS, reg);
+                    match rm {
+                        Value::Memory { bits, .. } => {
+                            let offset = access.unwrap().access(&mut a, LHS, true);
+                            faults.push(FaultSite::new(
+                                offset,
+                                site.eip,
+                                site.steps_before.into(),
+                                bits / 8,
+                                true,
+                            ));
+                            soft::mmx(&mut a, opcode, reg, ZR);
+                        }
+                        Value::Register(dst) if opcode == 0x7e => {
+                            write_register(&mut a, dst, LHS);
+                            soft::mmx(&mut a, opcode, reg, ZR);
+                        }
+                        Value::Register(dst) => soft::mmx(&mut a, 0x6f, dst.index, LHS),
+                        Value::Immediate(_) => unreachable!(),
+                    }
+                } else {
+                    match rm {
+                        Value::Register(src) if src.bits == 64 => {
+                            soft::read_mmx(&mut a, LHS, src.index)
+                        }
+                        _ => read_value(&mut a, LHS, rm, Some(site), &mut faults),
+                    }
+                    soft::mmx(&mut a, opcode, reg, LHS);
+                }
+            }
             Op::LoadSegment { segment, src } => {
                 read_value(&mut a, LHS, src, site.as_ref(), &mut faults);
                 soft::load_segment(&mut a, segment, site.as_ref().unwrap().miss);

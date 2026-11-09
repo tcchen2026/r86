@@ -2,7 +2,8 @@
 //! keep details beside the code that enforces them, rather than in a second plan.
 //!
 //! The optional machine engine prioritizes 32-bit Windows hot paths. It executes
-//! guarded integer/memory blocks; other instructions use shared interpretation.
+//! guarded integer/memory blocks and MMX calls into shared semantic helpers;
+//! other instructions use shared interpretation.
 //! Boot success alone does not establish translation correctness, native support
 //! for the full ISA, or performance of sustained Windows XP applications.
 //!
@@ -71,7 +72,7 @@
 //! Native differential tests cover CPU/RAM/flags/budget behavior. Firmware shell
 //! input/reboot, independent oracle ROMs and sustained process/memory stress
 //! complement the two timed endpoints. Boot success does not establish XP
-//! application readiness. Remaining x87/MMX interpretation, whole-cache
+//! application readiness. Remaining x87 interpretation, MMX helper cost, whole-cache
 //! reclamation and compiler cost must be measured on the relevant workload.
 //! EL1 checks cover native reads and qualified SS stores/RMW, including exact
 //! fault recovery and fixed-step machine-state comparisons. Linux performance

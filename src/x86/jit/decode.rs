@@ -124,6 +124,13 @@ pub enum BranchCondition {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Op {
     Nop,
+    /// Unprefixed MMX. A 64-bit register operand names MM0..MM7; MOVD uses
+    /// a 32-bit GPR. Immediate shifts use the equivalent binary opcode/count.
+    Mmx {
+        opcode: u8,
+        reg: u8,
+        rm: Value,
+    },
     Direction {
         backward: bool,
     },
@@ -298,6 +305,7 @@ pub enum Op {
 impl Op {
     pub fn reads_memory(self) -> bool {
         match self {
+            Self::Mmx { opcode, rm, .. } => !matches!(opcode, 0x7e | 0x7f) && rm.is_memory(),
             Self::Mov { src, .. }
             | Self::ConditionalMove { src, .. }
             | Self::LoadSegment { src, .. }
@@ -329,7 +337,11 @@ impl Op {
     pub fn writes_memory(self) -> bool {
         matches!(
             self,
-            Self::Shift {
+            Self::Mmx {
+                opcode: 0x7e | 0x7f,
+                rm: Value::Memory { .. },
+                ..
+            } | Self::Shift {
                 dst: Value::Memory { .. },
                 ..
             } | Self::Exchange {
@@ -369,7 +381,8 @@ impl Op {
         self.accesses_memory()
             || matches!(
                 self,
-                Self::Divide { .. }
+                Self::Mmx { .. }
+                    | Self::Divide { .. }
                     | Self::ClearInterrupt
                     | Self::SetInterrupt
                     | Self::LoadSegment { .. }
@@ -919,6 +932,54 @@ impl Reader<'_> {
                 }
             }
             0x0f => match self.byte()? {
+                0x77 if bits == 32 => Op::Mmx {
+                    opcode: 0x77,
+                    reg: 0,
+                    rm: Value::Immediate(0),
+                },
+                opcode @ 0x71..=0x73 if bits == 32 => {
+                    let (rm, _, group) = self.read_modrm(64, segment)?;
+                    let reg = rm.register()?.index;
+                    let opcode = match (opcode, group) {
+                        (0x71..=0x73, 2) => opcode + 0x60,
+                        (0x71..=0x72, 4) => opcode + 0x70,
+                        (0x71..=0x73, 6) => opcode + 0x80,
+                        _ => return None,
+                    };
+                    Op::Mmx {
+                        opcode,
+                        reg,
+                        rm: Value::Immediate(u32::from(self.byte()?)),
+                    }
+                }
+                opcode @ (0x60..=0x6b
+                | 0x6e..=0x6f
+                | 0x74..=0x76
+                | 0x7e..=0x7f
+                | 0xd1..=0xd3
+                | 0xd5
+                | 0xd8..=0xd9
+                | 0xdb..=0xdd
+                | 0xdf
+                | 0xe1..=0xe2
+                | 0xe5
+                | 0xe8..=0xe9
+                | 0xeb..=0xed
+                | 0xef
+                | 0xf1..=0xf3
+                | 0xf5
+                | 0xf8..=0xfa
+                | 0xfc..=0xfe)
+                    if bits == 32 =>
+                {
+                    let width = if matches!(opcode, 0x6e | 0x7e) {
+                        32
+                    } else {
+                        64
+                    };
+                    let (rm, _, reg) = self.read_modrm(width, segment)?;
+                    Op::Mmx { opcode, reg, rm }
+                }
                 second @ 0xc8..=0xcf if bits == 32 => Op::ByteSwap {
                     dst: Register::encoded(second & 7, 32),
                 },
@@ -1117,6 +1178,33 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mmx_rejects_sse_prefixes_lock_and_invalid_shift_groups() {
+        for prefix in [0x66, 0xf2, 0xf3, 0xf0, 0x67] {
+            for instruction in [&[0x0f, 0x6f, 0xc1][..], &[0x0f, 0x77][..]] {
+                let mut bytes = vec![prefix];
+                bytes.extend_from_slice(instruction);
+                assert!(block(&bytes, 0, 1).instructions.is_empty());
+            }
+        }
+        for opcode in 0x71..=0x73 {
+            for group in 0..8 {
+                let valid = group == 2 || group == 6 || group == 4 && opcode != 0x73;
+                assert_eq!(
+                    !block(&[0x0f, opcode, 0xc0 | group << 3, 255], 0, 1)
+                        .instructions
+                        .is_empty(),
+                    valid
+                );
+                assert!(
+                    block(&[0x0f, opcode, group << 3, 1], 0, 1)
+                        .instructions
+                        .is_empty()
+                );
+            }
+        }
+    }
 
     #[test]
     fn lock_accepts_only_supported_memory_rmw_forms() {

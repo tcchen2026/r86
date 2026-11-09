@@ -66,6 +66,11 @@ pub struct View {
     pub bus: *mut core::ffi::c_void,
     pub refill: usize,
     pub load_segment: usize,
+    pub mmx: usize,
+    // Native code reads this scalar array through an explicit pointer, never
+    // Cpu/FpuState offsets. Only the MMX helper mutates FPU state during a call.
+    mmx_registers: *const u64,
+    mmx_disabled: u32,
     // One successful native refill, confined to this invocation. This also
     // admits framebuffer pointers, which must never enter the CPU's RAM cache.
     refill_bias: u64,
@@ -171,6 +176,9 @@ impl View {
             bus: core::ptr::null_mut(),
             refill: 0,
             load_segment: 0,
+            mmx: 0,
+            mmx_registers: core::ptr::addr_of_mut!(cpu.fpu.mm).cast(),
+            mmx_disabled: cpu.cr0 & (crate::x86::cpu::CR0_EM | crate::x86::cpu::CR0_TS),
             refill_bias: 0,
             refill_tags: 0,
         };
@@ -268,6 +276,40 @@ pub fn load_segment(a: &mut Assembler, segment: crate::x86::cpu::SegmentReg, mis
     a.add_sub_imm(SP, SP, 48, true, false, false);
     view_load(a, PERMISSIONS, offset_of!(View, permissions) as u32, 2);
     a.cbz(Reg::new(0), false, false, miss);
+}
+
+/// CR0 cannot change inside an invocation. Preserve interpreter fault priority
+/// by leaving before any operand access when EM or TS requires an exception.
+pub fn mmx_available(a: &mut Assembler, miss: Label) {
+    view_load(a, Reg::new(5), offset_of!(View, mmx_disabled) as u32, 2);
+    a.cbz(Reg::new(5), false, true, miss);
+}
+
+pub fn read_mmx(a: &mut Assembler, dst: Reg, index: u8) {
+    view_load(a, Reg::new(5), offset_of!(View, mmx_registers) as u32, 3);
+    a.load_store(true, dst, Reg::new(5), u32::from(index) * 8, 3);
+}
+
+/// All faultable operands have completed. The helper touches only FPU state;
+/// guest GPRs/time stay resident. No access-range proof crosses this call.
+pub fn mmx(a: &mut Assembler, opcode: u8, reg: u8, value: Reg) {
+    a.add_sub_imm(SP, SP, 48, true, true, false);
+    a.pair(false, FLAGS, PARITY, SP, 0, true);
+    a.pair(false, TABLE, STATE, SP, 16, true);
+    a.pair(false, AUXILIARY, PERMISSIONS, SP, 32, true);
+    a.mov(Reg::new(2), value, true);
+    a.mov_imm(
+        Reg::new(1),
+        u64::from(opcode) | (u64::from(reg) << 8),
+        false,
+    );
+    view_load(a, Reg::new(5), offset_of!(View, mmx) as u32, 3);
+    a.mov(Reg::new(0), VIEW, true);
+    a.blr(Reg::new(5));
+    a.pair(true, FLAGS, PARITY, SP, 0, true);
+    a.pair(true, TABLE, STATE, SP, 16, true);
+    a.pair(true, AUXILIARY, PERMISSIONS, SP, 32, true);
+    a.add_sub_imm(SP, SP, 48, true, false, false);
 }
 
 /// Compile-time facts valid only along one block's fallthrough path. A failed

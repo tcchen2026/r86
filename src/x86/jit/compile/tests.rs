@@ -9,6 +9,8 @@ use crate::x86::jit::{
 };
 use crate::x86::{BatchStop, Bus, Cpu, Interpreter, MemError, PhysAddr};
 
+mod mmx;
+
 struct Bytes(Vec<u8>);
 impl Bus for Bytes {
     fn probe_phys_write_u8(&mut self, addr: PhysAddr) -> Result<(), MemError> {
@@ -70,6 +72,7 @@ struct Fixture {
     entry: CodeHandle,
     body: usize,
     finish: usize,
+    recheck: usize,
 }
 
 #[test]
@@ -135,25 +138,28 @@ impl Fixture {
         let stubs = entry().unwrap();
         let entry = arena.publish(&stubs.words).unwrap();
         let mut code = block(decoded, None, 0).unwrap();
-        assert!(code.faults.is_empty(), "register-only compiler fixture");
         let body_handle = arena.publish_block(&mut code).unwrap();
         let body = arena.address(body_handle, 0).unwrap();
         let finish = arena.address(entry, stubs.return_offset).unwrap();
+        let recheck = arena.address(entry, stubs.recheck_offset).unwrap();
         Self {
             arena,
             entry,
             body,
             finish,
+            recheck,
         }
     }
 
     fn invoke(&self, frame: &mut Frame) {
         frame.native_entry = self.body;
-        // Register-only fixtures execute one block, with no link table.
+        // Fixtures execute one block, with no link table. Memory fixtures also
+        // supply an exclusive View with stable backing and helper pointers.
         frame.dispatch_entry = self.finish;
         frame.call_dispatch_entry = self.finish;
         frame.return_entry = self.finish;
-        // SAFETY: this fixture contains only locally compiled register operations
+        frame.recheck_entry = self.recheck;
+        // SAFETY: this fixture contains only locally compiled operations
         // with the shared frame ABI. All three entry addresses belong to its
         // live arena, which stays immutable during invocation.
         unsafe { self.arena.invoke(self.entry, frame).unwrap() };
