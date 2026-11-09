@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="465" viewBox="0 0 760 465" role="img" aria-labelledby="t d">
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="420" viewBox="0 0 760 420" role="img" aria-labelledby="t d">
 <title id="t">ReactOS 0.4.15 LiveCD boot time: r86, QEMU and tiny386</title>
 <desc id="d">Seconds from power-on to the language-selection dialog, lower is better. Raspberry Pi 5 with JIT: r86 30.0 s, QEMU TCG 82.0 s. Raspberry Pi 5 interpreter only: r86 212.1 s, QEMU TCTI 424.0 s. x86_64 PC interpreter only: r86 98.4 s, tiny386 120.1 s.</desc>
 <style>
@@ -17,7 +17,7 @@ svg { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781; --grid:
 .axis { stroke: var(--axis); stroke-width: 1; }
 .s1 { fill: var(--s1); } .s2 { fill: var(--s2); } .s3 { fill: var(--s3); }
 </style>
-<rect class="bg" width="760" height="465" rx="12"/>
+<rect class="bg" width="760" height="420" rx="12"/>
 <text class="title" x="20" y="34">ReactOS 0.4.15 LiveCD: power-on to language selection</text>
 <text class="sub" x="20" y="56">128 MiB guest. Seconds, lower is better.</text>
 <rect class="s1" x="20" y="72" width="10" height="10" rx="2"/><text class="label" x="36" y="81">r86</text>
@@ -25,7 +25,4 @@ svg { --surface:#fcfcfb; --ink:#0b0b0b; --ink2:#52514e; --muted:#898781; --grid:
 <rect class="s3" x="214" y="72" width="10" height="10" rx="2"/><text class="label" x="230" y="81">tiny386</text>
 <line class="axis" x1="180.0" y1="100" x2="180.0" y2="362"/><text class="tick" x="180.0" y="380" text-anchor="middle">0</text><line class="grid" x1="291.1" y1="100" x2="291.1" y2="362"/><text class="tick" x="291.1" y="380" text-anchor="middle">100</text><line class="grid" x1="402.2" y1="100" x2="402.2" y2="362"/><text class="tick" x="402.2" y="380" text-anchor="middle">200</text><line class="grid" x1="513.3" y1="100" x2="513.3" y2="362"/><text class="tick" x="513.3" y="380" text-anchor="middle">300</text><line class="grid" x1="624.4" y1="100" x2="624.4" y2="362"/><text class="tick" x="624.4" y="380" text-anchor="middle">400</text>
 <text class="group" x="20" y="114">Raspberry Pi 5 with JIT: r86 is 2.7× faster than QEMU</text><g><title>r86 JIT: 30.0 s</title><path class="s1" d="M180 124H209.3A4 4 0 0 1 213.3 128V140A4 4 0 0 1 209.3 144H180Z"/><text class="label" x="170" y="138" text-anchor="end">r86 JIT</text><text class="value" x="221.3" y="138">30.0 s</text></g><g><title>QEMU TCG: 82.0 s</title><path class="s2" d="M180 150H267.1A4 4 0 0 1 271.1 154V166A4 4 0 0 1 267.1 170H180Z"/><text class="label" x="170" y="164" text-anchor="end">QEMU TCG</text><text class="value" x="279.1" y="164">82.0 s</text></g><text class="group" x="20" y="204">Raspberry Pi 5, interpreter only: r86 is 2.0× faster than QEMU</text><g><title>r86 interpreter: 212.1 s</title><path class="s1" d="M180 214H411.7A4 4 0 0 1 415.7 218V230A4 4 0 0 1 411.7 234H180Z"/><text class="label" x="170" y="228" text-anchor="end">r86 interpreter</text><text class="value" x="423.7" y="228">212.1 s</text></g><g><title>QEMU TCTI: 424.0 s</title><path class="s2" d="M180 240H647.1A4 4 0 0 1 651.1 244V256A4 4 0 0 1 647.1 260H180Z"/><text class="label" x="170" y="254" text-anchor="end">QEMU TCTI</text><text class="value" x="659.1" y="254">424.0 s</text></g><text class="group" x="20" y="294">x86_64 PC, interpreter only: r86 is 1.2× faster than tiny386</text><g><title>r86 interpreter: 98.4 s</title><path class="s1" d="M180 304H285.4A4 4 0 0 1 289.4 308V320A4 4 0 0 1 285.4 324H180Z"/><text class="label" x="170" y="318" text-anchor="end">r86 interpreter</text><text class="value" x="297.4" y="318">98.4 s</text></g><g><title>tiny386: 120.1 s</title><path class="s3" d="M180 330H309.5A4 4 0 0 1 313.5 334V346A4 4 0 0 1 309.5 350H180Z"/><text class="label" x="170" y="344" text-anchor="end">tiny386</text><text class="value" x="321.5" y="344">120.1 s</text></g>
-<text class="note" x="20" y="408">JIT and tiny386 pairs: median of 7 boots, r86 on its deterministic clock. RPi interpreter pair: 2 boots, realtime.</text>
-<text class="note" x="20" y="425">QEMU JIT is native TCG; QEMU interpreter is TCTI; tiny386 was timed through its SDL window.</text>
-<text class="note" x="20" y="442">ReactOS-0.4.15-release-1-gdbb43bbaeb2. Raspberry Pi 5: Cortex-A76, 2.4 GHz.</text>
 </svg>
