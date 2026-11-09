@@ -7,6 +7,7 @@ use std::process::ExitCode;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use r86::audio_output::AudioOutput;
 use r86::devices::Ps2ButtonState;
 
 #[path = "config.rs"]
@@ -34,6 +35,7 @@ mod sdl2_frontend {
         _machine: &mut Machine,
         _options: Sdl2Options,
         _network: &mut Option<r86::network::UserNetwork>,
+        _audio: &mut r86::audio_output::AudioOutput,
     ) -> Result<(), String> {
         Err("SDL2 frontend was not compiled in; rebuild with --features sdl2-frontend".to_string())
     }
@@ -152,6 +154,20 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
 }
 
 fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
+    let mut audio = AudioOutput::new(args.audio_wav.as_deref(), args.sdl2)?;
+    if audio.enabled() {
+        machine.enable_audio();
+    }
+    let result = run_machine_output(args, machine, &mut audio);
+    let finished = audio.finish(machine);
+    result.and(finished)
+}
+
+fn run_machine_output(
+    args: Args,
+    machine: &mut Machine,
+    audio: &mut AudioOutput,
+) -> Result<(), String> {
     let mut delayed_serial_input =
         if args.serial_input_after.is_some() && !args.serial_input.is_empty() {
             Some(args.serial_input.clone())
@@ -247,6 +263,7 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
             args.ws_record.as_deref(),
             machine,
             &mut network,
+            audio,
         );
     }
     if args.sdl2 {
@@ -264,6 +281,7 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
                 },
             },
             &mut network,
+            audio,
         );
     }
     if args.term {
@@ -273,6 +291,7 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
             args.steps,
             args.do_not_exit_when_poweroff,
             &mut network,
+            audio,
         );
         #[cfg(not(unix))]
         return Err("--term requires a Unix terminal".to_string());
@@ -284,7 +303,8 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
     let mut serial_observed_len = 0usize;
     let mut input_after_matcher = args.serial_input_after.as_deref().map(ByteMatcher::new);
     let mut expect_matcher = args.expect_serial.as_deref().map(ByteMatcher::new);
-    let can_bulk_run = network.is_none()
+    let can_bulk_run = !audio.enabled()
+        && network.is_none()
         && !args.realtime_clock
         && replay.is_empty()
         && input_after_matcher.is_none()
@@ -302,7 +322,7 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
             if let Some(net) = &mut network {
                 net.poll(machine).map_err(|e| format!("network: {e}"))?;
             }
-            let budget = if network.is_some() {
+            let budget = if network.is_some() || audio.enabled() {
                 (deadline - machine.step_count()).min(250_000)
             } else {
                 deadline - machine.step_count()
@@ -315,6 +335,7 @@ fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
             } else {
                 machine.step_once()?
             };
+            audio.pump(machine)?;
             if !matches!(status, GuestStepStatus::Continue) {
                 if matches!(status, GuestStepStatus::Halted) {
                     if machine.uses_realtime_clock() {
@@ -792,6 +813,7 @@ struct Args {
     hdd_writable: bool,
     net: bool,
     net_forward: Vec<PortForward>,
+    audio_wav: Option<String>,
     do_not_exit_when_poweroff: bool,
     create_vhd: Option<String>,
     size_mib: Option<u64>,
@@ -851,6 +873,7 @@ impl Args {
         let mut hdd_writable = false;
         let mut net = false;
         let mut net_forward = Vec::new();
+        let mut audio_wav = None;
         let mut do_not_exit_when_poweroff = false;
         let mut create_vhd = None;
         let mut size_mib = None;
@@ -923,6 +946,7 @@ impl Args {
                 "--no-vga-bios" => vga_bios = None,
                 "--hdd" => hdd = Some(take_value(&mut args, "--hdd")?),
                 "--hdd-writable" => hdd_writable = true,
+                "--audio-wav" => audio_wav = Some(take_value(&mut args, "--audio-wav")?),
                 "--net" => {
                     net = match take_value(&mut args, "--net")?.as_str() {
                         "user" => true,
@@ -1145,6 +1169,7 @@ impl Args {
         Ok(Self {
             net,
             net_forward,
+            audio_wav,
             iso,
             no_cdrom,
             boot_order,
@@ -1232,7 +1257,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable] [--audio-wav PATH] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]

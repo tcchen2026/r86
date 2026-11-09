@@ -2,6 +2,7 @@
 //! device/interrupt boundaries, never by the ordinary instruction or RAM path.
 //! The instruction clock remains available for reproducible tests and replay.
 //! Both use the same oscillator units so devices have only one implementation.
+//! Slow ISA accesses add wait ticks to this clock, including deterministic mode.
 
 pub(super) use crate::devices::TICKS_PER_SECOND;
 #[cfg(any(
@@ -12,6 +13,7 @@ const POLL_INSTRUCTIONS: u64 = 8192;
 
 #[derive(Debug, Default)]
 pub(super) struct Clock {
+    io_ticks: u64,
     #[cfg(any(
         feature = "host",
         all(feature = "web-frontend", target_arch = "wasm32")
@@ -57,6 +59,7 @@ impl Clock {
     ))]
     pub fn realtime() -> Self {
         Self {
+            io_ticks: 0,
             realtime: Some(Realtime {
                 #[cfg(feature = "host")]
                 origin: std::time::Instant::now(),
@@ -91,9 +94,24 @@ impl Clock {
             all(feature = "web-frontend", target_arch = "wasm32")
         ))]
         if let Some(clock) = &mut self.realtime {
-            clock.ticks =
-                (clock.elapsed_ns() * u128::from(TICKS_PER_SECOND) / 1_000_000_000) as u64;
+            clock.ticks = clock
+                .ticks
+                .max((clock.elapsed_ns() * u128::from(TICKS_PER_SECOND) / 1_000_000_000) as u64);
         }
+    }
+
+    /// Account for a slow port transaction without sleeping or changing the
+    /// retired instruction count. Every device observes the same elapsed time.
+    pub fn io_wait(&mut self, ticks: u64) {
+        #[cfg(any(
+            feature = "host",
+            all(feature = "web-frontend", target_arch = "wasm32")
+        ))]
+        if let Some(clock) = &mut self.realtime {
+            clock.ticks = clock.ticks.saturating_add(ticks);
+            return;
+        }
+        self.io_ticks = self.io_ticks.saturating_add(ticks);
     }
 
     pub fn ticks(&self, instruction_step: u64) -> u64 {
@@ -104,7 +122,7 @@ impl Clock {
         if let Some(clock) = &self.realtime {
             return clock.ticks;
         }
-        instruction_step
+        instruction_step.saturating_add(self.io_ticks)
     }
 
     pub fn poll_step(&self, instruction_step: u64, device_deadline: u64) -> u64 {
@@ -115,8 +133,9 @@ impl Clock {
         if self.realtime.is_some() {
             return instruction_step.saturating_add(POLL_INSTRUCTIONS);
         }
-        let _ = instruction_step;
         device_deadline
+            .saturating_sub(self.io_ticks)
+            .max(instruction_step)
     }
 
     /// Fixed 1 GHz TSC in realtime mode. This is a clock frequency, not an

@@ -1,6 +1,10 @@
+pub mod audio;
+pub(crate) mod dma;
 pub mod ne2000;
+pub(crate) mod opl2;
 pub(crate) mod pic;
 pub(crate) mod pit;
+pub(crate) mod sb16;
 // Common PC device-clock units; the machine selects wall time or instruction time.
 pub(crate) const TICKS_PER_SECOND: u64 = 16 * 1_193_182;
 pub mod ps2;

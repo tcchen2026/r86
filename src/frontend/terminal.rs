@@ -136,6 +136,7 @@ pub fn run(
     steps: u64,
     do_not_exit_when_poweroff: bool,
     network: &mut Option<r86::network::UserNetwork>,
+    audio: &mut r86::audio_output::AudioOutput,
 ) -> Result<(), String> {
     let terminal = Terminal::open()?;
     let deadline = if steps == 0 {
@@ -202,6 +203,7 @@ pub fn run(
                 net.poll(machine).map_err(|e| format!("network: {e}"))?;
             }
             let report = machine.run_steps((deadline - machine.step_count()).min(250_000))?;
+            audio.pump(machine)?;
             if let Some(status) = report.stop {
                 match status {
                     GuestStepStatus::Halted => {

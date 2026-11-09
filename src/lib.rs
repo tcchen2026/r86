@@ -25,6 +25,9 @@ pub mod chipinterp;
 #[cfg(feature = "machine")]
 mod acpi;
 
+#[cfg(feature = "host")]
+#[path = "frontend/audio_output.rs"]
+pub mod audio_output;
 #[cfg(feature = "machine")]
 pub mod devices;
 #[cfg(feature = "machine")]

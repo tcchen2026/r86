@@ -3,11 +3,14 @@
 
 mod bus_diagnostics;
 mod clock;
+#[cfg(test)]
+mod sound_tests;
 use bus_diagnostics::BusDiagnostics;
 pub use bus_diagnostics::{BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning};
 use clock::{Clock, TICKS_PER_SECOND};
 
 use crate::acpi::Acpi;
+use crate::devices::audio::Sound;
 use crate::devices::ne2000::{IRQ as NET_IRQ, Ne2000};
 use crate::devices::pic::Pic;
 #[cfg(test)]
@@ -737,6 +740,24 @@ impl Machine {
         let frame = self.bus.net.as_mut()?.take_transmit();
         self.bus.sync_net_irq();
         frame
+    }
+
+    /// Enable fixed-rate stereo delivery; guest sound hardware is always present.
+    pub fn enable_audio(&mut self) {
+        self.bus.sound.enable(self.bus.clock.ticks(self.step));
+        self.bus.set_attention();
+    }
+
+    pub fn drain_audio(&mut self, out: &mut Vec<i16>) {
+        self.bus
+            .sound
+            .advance(self.bus.clock.ticks(self.step), &self.bus.ram);
+        self.bus.sound.drain(out);
+        self.bus.sync_sound_irq();
+    }
+
+    pub fn audio_dropped_frames(&self) -> u64 {
+        self.bus.sound.dropped_frames()
     }
 
     pub fn queue_serial_input(&mut self, bytes: &[u8]) {
@@ -2283,6 +2304,7 @@ pub(crate) struct HostBus {
     ide: IdeBus,
     pci: PciConfig,
     net: Option<Ne2000>,
+    sound: Sound,
     fw_cfg: FwCfgDevice,
     // COM1 is a 16450-style console: host input is queued and TX completes
     // immediately. FCR is absent; the queue is not an advertised UART FIFO.
@@ -2347,6 +2369,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             ide,
             pci,
             net,
+            sound,
             fw_cfg,
             serial,
             serial_rx,
@@ -2391,6 +2414,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             .field("ide", ide)
             .field("pci", pci)
             .field("net", net)
+            .field("sound", sound)
             .field("fw_cfg", fw_cfg)
             .field("serial", serial)
             .field("serial_rx", serial_rx)
@@ -2619,6 +2643,7 @@ impl HostBus {
             },
             pci: PciConfig::new(),
             net: None,
+            sound: Sound::default(),
             fw_cfg: if firmware_mode {
                 FwCfgDevice::new_qemu_with_display(size, display)
             } else {
@@ -2661,6 +2686,7 @@ impl HostBus {
     }
 
     fn reset(&mut self, step: u64) {
+        self.sound.advance(self.clock.ticks(step), &self.ram);
         let ram = core::mem::take(&mut self.ram);
         let mut frame_roles = core::mem::take(&mut self.frame_roles);
         frame_roles.fill(FrameRoleFlags::RAM);
@@ -2707,6 +2733,8 @@ impl HostBus {
         fresh.rtc_last_tick = ticks;
         fresh.acpi.reset_clock(ticks);
         fresh.pit = Pit::new(ticks);
+        core::mem::swap(&mut fresh.sound, &mut self.sound);
+        fresh.sound.reset(ticks);
         fresh.next_attention_step = step;
         *self = fresh;
     }
@@ -2724,6 +2752,7 @@ impl HostBus {
     }
 
     fn drive_irq(&mut self, irq: u8, high: bool) {
+        let high = high || (self.sound.irq() && self.sound.irq_mask() & (1 << irq) != 0);
         if self.pic.set_irq(irq, high) {
             self.set_attention();
         }
@@ -2738,7 +2767,14 @@ impl HostBus {
         self.drive_irq(NET_IRQ, self.net.as_ref().is_some_and(Ne2000::irq));
     }
 
+    fn sync_sound_irq(&mut self) {
+        for line in [5, 7, 9, 10] {
+            self.drive_irq(line, line == 9 && self.acpi.irq());
+        }
+    }
+
     fn sync_device_irqs(&mut self) {
+        self.sync_sound_irq();
         self.sync_net_irq();
         self.sync_ide_irqs();
         self.drive_irq(4, self.serial_irq_asserted());
@@ -2808,6 +2844,7 @@ impl HostBus {
             .min(self.rtc_next_tick)
             .min(self.acpi.next_event_step())
             .min(self.ide.next_event_step())
+            .min(self.sound.next_event())
     }
 
     fn refresh_interrupt_attention(&mut self, step: u64) {
@@ -2816,6 +2853,7 @@ impl HostBus {
         self.update_rtc(ticks);
         self.acpi.update(ticks);
         self.ide.advance(ticks);
+        self.sound.advance(ticks, &self.ram);
         self.sync_device_irqs();
         self.next_attention_step = self.clock.poll_step(step, self.next_device_event());
         // A level-triggered request needs one scan when it changes. If IF or
@@ -4747,6 +4785,14 @@ impl Bus for HostBus {
     }
 
     fn io_read_u8(&mut self, port: u16) -> Result<u8, MemError> {
+        if Sound::contains(port) {
+            self.clock.io_wait(Sound::io_wait_ticks(port));
+            self.sound.advance(self.device_ticks(), &self.ram);
+            let value = self.sound.read(port);
+            self.sync_sound_irq();
+            self.set_attention();
+            return Ok(value);
+        }
         if let Some(offset) = self.pci.net_port(port)
             && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 1))
         {
@@ -4772,7 +4818,7 @@ impl Bus for HostBus {
             return Ok(value);
         }
         match port {
-            0x00..=0x0f | 0x81..=0x8f | 0xc0..=0xdf | 0xf0..=0xff | 0x480..=0x48f => Ok(0),
+            0xf0..=0xff | 0x480..=0x48f => Ok(0),
             0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => {
                 self.set_attention();
                 Ok(self.pic.read(port))
@@ -4797,7 +4843,6 @@ impl Bus for HostBus {
                 self.drain_ps2_effects();
                 Ok(value)
             }
-            0x80..=0x8f => Ok(0),
             0x92 => Ok(self.port92),
             0x279 | 0xa79 => Ok(0),
             0x3f8..=0x3ff => Ok(self.serial_read(port)),
@@ -4892,6 +4937,14 @@ impl Bus for HostBus {
     }
 
     fn io_write_u8(&mut self, port: u16, value: u8) -> Result<(), MemError> {
+        if Sound::contains(port) {
+            self.clock.io_wait(Sound::io_wait_ticks(port));
+            self.sound.advance(self.device_ticks(), &self.ram);
+            self.sound.write(port, value);
+            self.sync_sound_irq();
+            self.set_attention();
+            return Ok(());
+        }
         if let Some(offset) = self.pci.net_port(port)
             && self
                 .net
@@ -4918,7 +4971,7 @@ impl Bus for HostBus {
             return Ok(());
         }
         match port {
-            0x00..=0x0f | 0x81..=0x8f | 0xc0..=0xdf | 0xf0..=0xff | 0x480..=0x48f => Ok(()),
+            0xf0..=0xff | 0x480..=0x48f => Ok(()),
             0x20 | 0x21 | 0xa0 | 0xa1 | 0x4d0 | 0x4d1 => {
                 self.pic.write(port, value);
                 Ok(())
@@ -4980,7 +5033,6 @@ impl Bus for HostBus {
                 Ok(())
             }
             0x512..=0x51f => Ok(()),
-            0x80..=0x8f => Ok(()),
             0x92 => {
                 // Reset is a pulse, not a latched register bit.
                 self.set_a20(value & 2 != 0);

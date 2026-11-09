@@ -1777,6 +1777,7 @@ pub fn serve_ws(
     record_path: Option<&str>,
     machine: &mut Machine,
     network: &mut Option<r86::network::UserNetwork>,
+    audio: &mut r86::audio_output::AudioOutput,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr).map_err(|e| format!("web server {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
@@ -1838,6 +1839,7 @@ pub fn serve_ws(
             net.poll(machine).map_err(|e| format!("network: {e}"))?;
         }
         let result = machine.run_steps(budget);
+        audio.pump(machine)?;
         service.after_run(machine, &result, reset_count);
         match result {
             Ok(report) => {

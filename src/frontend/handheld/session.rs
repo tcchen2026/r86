@@ -95,6 +95,7 @@ struct Session<'a> {
     vm: Vm,
     machine: Machine,
     network: r86::network::UserNetwork,
+    audio: r86::audio_output::AudioOutput,
     ctx: &'a Ctx,
     view: View,
     crop: Crop,
@@ -142,6 +143,10 @@ pub fn run(
     let mut machine = vm.machine(&ctx.share, HANDHELD_VGA_BIOS)?;
     let network = r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?;
     machine.attach_network();
+    let audio = r86::audio_output::AudioOutput::handheld();
+    if audio.enabled() {
+        machine.enable_audio();
+    }
     let remote = if remote {
         machine.power_off()?;
         Some(start_remote(&ctx.iso)?)
@@ -164,6 +169,7 @@ pub fn run(
         vm,
         machine,
         network,
+        audio,
         view,
         crop,
         ctx,
@@ -276,6 +282,7 @@ impl Session<'_> {
                 Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
                 None => self.machine.run_steps(SLICE_STEPS)?,
             };
+            self.audio.pump(&mut self.machine)?;
             let mut idle = None;
             match report.stop {
                 Some(GuestStepStatus::Halted) => {

@@ -14,6 +14,7 @@ pub fn run(
     machine: &mut Machine,
     options: Sdl2Options,
     network: &mut Option<r86::network::UserNetwork>,
+    audio: &mut r86::audio_output::AudioOutput,
 ) -> Result<(), String> {
     let sdl = sdl2::init().map_err(|err| format!("failed to initialize SDL2: {err}"))?;
     let video = sdl
@@ -102,6 +103,7 @@ pub fn run(
             }
             Some(machine.run_steps(budget)?)
         };
+        audio.pump(machine)?;
         if let Some(report) = report {
             if let Some(status) = report.stop {
                 match status {

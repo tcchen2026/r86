@@ -33,9 +33,8 @@ fn kind(key: &str) -> Option<Kind> {
         "create-vhd" | "iso" | "bootsector" | "boot-linux-kernel" | "boot-linux-initrd"
         | "bios" | "vga-bios" | "hdd" | "firmware-display" | "cmdline" | "serial-input-after"
         | "expect-serial" | "dump-initrd" | "dump-prepared-iso" | "ws-listen" | "ws-record"
-        | "net" | "replay" | "expect-frame-hash" | "cpu-engine" | "boot-order" | "clock" => {
-            Kind::Text
-        }
+        | "audio-wav" | "net" | "replay" | "expect-frame-hash" | "cpu-engine" | "boot-order"
+        | "clock" => Kind::Text,
         _ => return None,
     })
 }
