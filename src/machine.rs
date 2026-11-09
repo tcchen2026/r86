@@ -748,6 +748,11 @@ impl Machine {
         self.bus.set_attention();
     }
 
+    /// Stop delivery (muted output); the guest sees no difference.
+    pub fn disable_audio(&mut self) {
+        self.bus.sound.disable();
+    }
+
     pub fn drain_audio(&mut self, out: &mut Vec<i16>) {
         self.bus
             .sound

@@ -30,6 +30,10 @@ pub struct Vm {
     pub vga_bios: Option<PathBuf>,
     /// How graphics fill the screen: "aspect", "stretch" or "integer".
     pub scale: String,
+    /// Sound playback level in percent; 0 mutes.
+    pub volume: u8,
+    /// User-mode NAT networking (DHCP, DNS, outbound TCP).
+    pub network: bool,
     pub notes: String,
 }
 
@@ -143,6 +147,8 @@ impl Vm {
             bios: None,
             vga_bios: None,
             scale: "aspect".into(),
+            volume: 100,
+            network: true,
             notes: String::new(),
         }
     }
@@ -163,6 +169,9 @@ impl Vm {
         }
         if !matches!(self.scale.as_str(), "aspect" | "stretch" | "integer") {
             return Err("Unknown screen scaling.".into());
+        }
+        if self.volume > 100 {
+            return Err("Volume must be between 0 and 100.".into());
         }
         if self.disk.as_os_str().is_empty() {
             return Err("Choose a hard disk location.".into());
@@ -230,6 +239,14 @@ impl Vm {
                 None => "aspect".into(),
                 Some(_) => text("scale")?,
             },
+            volume: match table.get("volume") {
+                None => 100,
+                Some(_) => number("volume")?.try_into().map_err(|_| "Invalid volume")?,
+            },
+            network: match table.get("network") {
+                None => true,
+                Some(value) => value.as_bool().ok_or("Invalid network setting")?,
+            },
             notes: text("notes")?,
             directory,
         };
@@ -265,10 +282,12 @@ impl Vm {
             ("version", 1),
             ("memory-mib", u64::from(self.memory)),
             ("disk-mib", self.disk_mib),
+            ("volume", u64::from(self.volume)),
         ] {
             table.insert(key.into(), Value::Integer(value as i64));
         }
         table.insert("cdrom".into(), Value::Boolean(self.cdrom));
+        table.insert("network".into(), Value::Boolean(self.network));
         for (key, path) in [
             ("disk", Some(&self.disk)),
             ("iso", self.iso.as_ref()),
@@ -406,6 +425,8 @@ mod tests {
         vm.disk_mib = 8;
         vm.notes = "quotes \" and newlines\n中文".into();
         vm.scale = "integer".into();
+        vm.volume = 25;
+        vm.network = false;
         vm.create_blank().unwrap();
         let original = fs::read(&vm.disk).unwrap();
         assert!(vm.create_blank().is_err());
@@ -416,6 +437,7 @@ mod tests {
         assert_eq!(reopened.disk, vm.disk);
         assert_eq!(reopened.notes, vm.notes);
         assert_eq!(reopened.scale, "integer");
+        assert_eq!((reopened.volume, reopened.network), (25, false));
         assert!(reopened.iso.is_none());
         let lock = lock_vm(&vm.directory).unwrap();
         assert!(vm.save().is_err());

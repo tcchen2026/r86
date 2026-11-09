@@ -74,12 +74,21 @@ impl core::fmt::Debug for Sound {
 
 impl Sound {
     pub fn enable(&mut self, now: u64) {
+        if self.mixer.enabled {
+            return;
+        }
         self.mixer.enabled = true;
         self.mixer.epoch = now;
         self.mixer.frames = 0;
         self.mixer.queue.clear();
         self.mixer.gain = self.sb.gains(0x32);
         self.mixer.fm_gain = self.sb.gains(0x34);
+    }
+
+    /// Stop producing frames; DMA, IRQs and FM timers keep guest time.
+    pub fn disable(&mut self) {
+        self.mixer.enabled = false;
+        self.mixer.queue.clear();
     }
 
     pub fn reset(&mut self, now: u64) {

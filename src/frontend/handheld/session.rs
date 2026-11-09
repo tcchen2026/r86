@@ -94,7 +94,7 @@ struct Modifiers {
 struct Session<'a> {
     vm: Vm,
     machine: Machine,
-    network: r86::network::UserNetwork,
+    network: Option<r86::network::UserNetwork>,
     audio: r86::audio_output::AudioOutput,
     ctx: &'a Ctx,
     view: View,
@@ -141,12 +141,14 @@ pub fn run(
         vm.iso = None;
     }
     let mut machine = vm.machine(&ctx.share, HANDHELD_VGA_BIOS)?;
-    let network = r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?;
-    machine.attach_network();
-    let audio = r86::audio_output::AudioOutput::handheld();
-    if audio.enabled() {
-        machine.enable_audio();
-    }
+    let network = if vm.network {
+        machine.attach_network();
+        Some(r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
+    } else {
+        None
+    };
+    let mut audio = r86::audio_output::AudioOutput::handheld();
+    audio.set_volume(&mut machine, vm.volume);
     let remote = if remote {
         machine.power_off()?;
         Some(start_remote(&ctx.iso)?)
@@ -275,9 +277,11 @@ impl Session<'_> {
                 continue;
             }
             self.remote_shown = None;
-            self.network
-                .poll(&mut self.machine)
-                .map_err(|e| format!("network: {e}"))?;
+            if let Some(network) = &mut self.network {
+                network
+                    .poll(&mut self.machine)
+                    .map_err(|e| format!("network: {e}"))?;
+            }
             let report = match &mut self.remote {
                 Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
                 None => self.machine.run_steps(SLICE_STEPS)?,
@@ -286,7 +290,8 @@ impl Session<'_> {
             let mut idle = None;
             match report.stop {
                 Some(GuestStepStatus::Halted) => {
-                    idle = Some(self.network.limit_wait(self.machine.halted_wait_duration()))
+                    let wait = self.machine.halted_wait_duration();
+                    idle = Some(self.network.as_ref().map_or(wait, |n| n.limit_wait(wait)));
                 }
                 // Remote management keeps a powered-off VM; see held_by_remote.
                 Some(GuestStepStatus::PoweredOff) if self.remote.is_some() => self.redraw = true,
@@ -555,6 +560,7 @@ impl Session<'_> {
                     .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
             }),
             remote: self.remote.as_ref().map(Remote::url),
+            volume: self.vm.volume,
         }
     }
 
@@ -777,6 +783,20 @@ impl Session<'_> {
                     if device.hdmi() == Some(false) {
                         self.render_guest();
                     }
+                }
+                close = false;
+            }
+            Action::CycleVolume => {
+                // 100, 75, 50, 25, off, then back to 100.
+                let volume = self.vm.volume;
+                self.vm.volume = if volume == 0 {
+                    100
+                } else {
+                    (volume - 1) / 25 * 25
+                };
+                self.audio.set_volume(&mut self.machine, self.vm.volume);
+                if let Err(err) = self.vm.save_locked() {
+                    eprintln!("r86: cannot save the volume: {err}");
                 }
                 close = false;
             }

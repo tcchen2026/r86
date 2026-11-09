@@ -47,6 +47,8 @@ pub enum Action {
     CycleView,
     CycleCrop,
     Display,
+    /// Step the sound level down: 100, 75, 50, 25, off, 100.
+    CycleVolume,
     CtrlAltDel,
     Cd(Option<PathBuf>),
     PowerButton,
@@ -359,6 +361,8 @@ enum Field {
     Cd,
     Boot,
     Scale,
+    Sound,
+    Network,
 }
 
 struct Settings {
@@ -368,12 +372,14 @@ struct Settings {
 }
 
 impl Settings {
-    const FIELDS: [Field; 5] = [
+    const FIELDS: [Field; 7] = [
         Field::Os,
         Field::Memory,
         Field::Cd,
         Field::Boot,
         Field::Scale,
+        Field::Sound,
+        Field::Network,
     ];
 
     fn new(vm: Vm) -> Self {
@@ -408,6 +414,8 @@ impl Settings {
                 "integer" => "Integer scale",
                 _ => "Keep aspect",
             }),
+            Item::new("Sound").detail(volume_label(vm.volume)),
+            Item::new("Network").detail(if vm.network { "on" } else { "off" }),
         ];
         let selected = self.menu.selected;
         self.menu = Menu::new(items).select(selected);
@@ -466,6 +474,19 @@ impl View for Settings {
                     _ => "aspect",
                 }
                 .into();
+                self.save()
+            }
+            Field::Sound => {
+                let volume = self.vm.volume;
+                self.vm.volume = if volume == 0 {
+                    100
+                } else {
+                    (volume - 1) / 25 * 25
+                };
+                self.save()
+            }
+            Field::Network => {
+                self.vm.network = !self.vm.network;
                 self.save()
             }
         }
@@ -1437,6 +1458,15 @@ impl View for Progress {
     }
 }
 
+/// "100%" or "off".
+fn volume_label(volume: u8) -> String {
+    if volume == 0 {
+        "off".into()
+    } else {
+        format!("{volume}%")
+    }
+}
+
 // ---------------------------------------------------------------- In-VM menu
 
 /// The in-VM menu. The session owns the labels and updates them in place,
@@ -1455,6 +1485,7 @@ enum OverlayEntry {
     View,
     Crop,
     Display,
+    Sound,
     CtrlAltDel,
     Cd,
     Remote,
@@ -1475,6 +1506,8 @@ pub struct OverlayLabels {
     pub cd: Option<String>,
     /// The console address while remote management is on.
     pub remote: Option<String>,
+    /// Sound level in percent; 0 is muted.
+    pub volume: u8,
 }
 
 impl VmOverlay {
@@ -1508,6 +1541,10 @@ impl VmOverlay {
         }
         let remote = if l.remote.is_some() { "on" } else { "off" };
         rows.extend([
+            (
+                OverlayEntry::Sound,
+                Item::new("Sound").detail(volume_label(l.volume)),
+            ),
             (OverlayEntry::CtrlAltDel, Item::new("Send Ctrl+Alt+Del")),
             (OverlayEntry::Cd, Item::new("CD").detail(cd)),
             (
@@ -1565,6 +1602,7 @@ impl View for VmOverlay {
                 OverlayEntry::View => Nav::Action(Action::CycleView),
                 OverlayEntry::Crop => Nav::Action(Action::CycleCrop),
                 OverlayEntry::Display => Nav::Action(Action::Display),
+                OverlayEntry::Sound => Nav::Action(Action::CycleVolume),
                 OverlayEntry::CtrlAltDel => Nav::Action(Action::CtrlAltDel),
                 OverlayEntry::Cd => {
                     self.cd = true;
@@ -1622,7 +1660,7 @@ mod overlay_tests {
             }));
             let mut overlay = VmOverlay::new(labels);
             let extra = usize::from(display.is_some());
-            assert_eq!(overlay.menu.items.len(), 9 + extra);
+            assert_eq!(overlay.menu.items.len(), 10 + extra);
             if let Some(active) = display {
                 assert_eq!(overlay.menu.items[2].label, "Display");
                 assert_eq!(
@@ -1636,35 +1674,41 @@ mod overlay_tests {
                 ));
             }
             overlay.menu.selected = 2 + extra;
+            assert_eq!(overlay.menu.items[2 + extra].detail, "off");
+            assert!(matches!(
+                overlay.key(UiKey::Enter, &ctx),
+                Nav::Action(Action::CycleVolume)
+            ));
+            overlay.menu.selected = 3 + extra;
             assert!(matches!(
                 overlay.key(UiKey::Enter, &ctx),
                 Nav::Action(Action::CtrlAltDel)
             ));
-            overlay.menu.selected = 3 + extra;
+            overlay.menu.selected = 4 + extra;
             assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
             assert!(matches!(
                 overlay.reply(Some(Reply::NoFile), &ctx),
                 Nav::Action(Action::Cd(None))
             ));
-            overlay.menu.selected = 4 + extra;
+            overlay.menu.selected = 5 + extra;
             assert!(matches!(
                 overlay.key(UiKey::Enter, &ctx),
                 Nav::Action(Action::Remote)
             ));
-            overlay.menu.selected = 5 + extra;
+            overlay.menu.selected = 6 + extra;
             assert_eq!(overlay.menu.items[overlay.menu.selected].label, "Help");
             assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
-            overlay.menu.selected = 6 + extra;
+            overlay.menu.selected = 7 + extra;
             assert!(matches!(
                 overlay.key(UiKey::Enter, &ctx),
                 Nav::Action(Action::PowerButton)
             ));
-            overlay.menu.selected = 7 + extra;
+            overlay.menu.selected = 8 + extra;
             assert!(matches!(
                 overlay.key(UiKey::Enter, &ctx),
                 Nav::Action(Action::Reset)
             ));
-            overlay.menu.selected = 8 + extra;
+            overlay.menu.selected = 9 + extra;
             assert!(matches!(overlay.key(UiKey::Enter, &ctx), Nav::Push(_)));
             assert!(matches!(
                 overlay.reply(Some(Reply::Yes), &ctx),

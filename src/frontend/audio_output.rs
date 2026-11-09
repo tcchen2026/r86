@@ -11,6 +11,8 @@ pub struct AudioOutput {
     playback: Option<Playback>,
     samples: Vec<i16>,
     dropped: u64,
+    /// Playback level in percent; WAV capture is never scaled.
+    volume: u8,
 }
 
 impl AudioOutput {
@@ -27,6 +29,7 @@ impl AudioOutput {
             },
             samples: Vec::new(),
             dropped: 0,
+            volume: 100,
         })
     }
 
@@ -48,6 +51,18 @@ impl AudioOutput {
             playback,
             samples: Vec::new(),
             dropped: 0,
+            volume: 100,
+        }
+    }
+
+    /// Set the playback level. Muted playback without a WAV capture stops
+    /// the machine's mixer, so it costs nothing.
+    pub fn set_volume(&mut self, machine: &mut Machine, percent: u8) {
+        self.volume = percent.min(100);
+        if self.wav.is_some() || (self.playback.is_some() && self.volume > 0) {
+            machine.enable_audio();
+        } else {
+            machine.disable_audio();
         }
     }
 
@@ -68,7 +83,15 @@ impl AudioOutput {
             wav.write(&self.samples)
                 .map_err(|e| format!("audio WAV: {e}"))?;
         }
-        if let Some(playback) = &mut self.playback {
+        if let Some(playback) = &mut self.playback
+            && self.volume > 0
+        {
+            if self.volume < 100 {
+                let volume = i32::from(self.volume);
+                for sample in &mut self.samples {
+                    *sample = (i32::from(*sample) * volume / 100) as i16;
+                }
+            }
             playback.write(&self.samples)?;
         }
         Ok(())
