@@ -208,13 +208,7 @@ struct FilePut {
     path: String,
     size: usize,
     received: usize,
-    /// Received bytes not yet written, at most FILE_BATCH plus one chunk.
-    pending: Vec<u8>,
 }
-
-/// Bytes a copy gathers before writing them: most files reach the guest disk
-/// in one pass, and bigger ones reopen the file once per batch, not per chunk.
-const FILE_BATCH: usize = 8 << 20;
 
 fn bus_diagnostics_json(machine: &Machine) -> String {
     let limit = r86::machine::BUS_PAGE_LOG_LIMIT;
@@ -1005,7 +999,7 @@ impl Service {
                 if let Some(old) = self.file_put.take() {
                     let _ = disk_files::delete(disk, &old.path);
                 }
-                // The file is written in batches as it arrives, never held
+                // Each chunk is appended as it arrives; the file is never held
                 // whole in host memory (the handheld has little).
                 disk_files::create(disk, &path, size)?;
                 if size == 0 {
@@ -1021,9 +1015,6 @@ impl Service {
                     path,
                     size,
                     received: 0,
-                    pending: Vec::with_capacity(
-                        size.min(FILE_BATCH + ws::MAX_BINARY_FRAME as usize),
-                    ),
                 });
                 ack("")
             }
@@ -1044,7 +1035,7 @@ impl Service {
         })
     }
 
-    /// Appends upload data; the file is written when the last byte arrives.
+    /// Appends one chunk of upload data to the file on the guest disk.
     fn file_data(&mut self, machine: &mut Machine, data: &[u8]) -> Result<String, String> {
         let mut put = self.file_put.take().unwrap();
         if !machine.powered_off() {
@@ -1052,16 +1043,11 @@ impl Service {
         }
         let disk = machine.hdd_mut().ok_or("This VM has no hard disk.")?;
         put.received += data.len();
-        put.pending.extend_from_slice(data);
         let received = put.received;
         let written = if received > put.size {
             Err("More data than the announced file size.".to_string())
-        } else if received == put.size || put.pending.len() >= FILE_BATCH {
-            let written = disk_files::append(disk, &put.path, &put.pending);
-            put.pending.clear();
-            written
         } else {
-            Ok(())
+            disk_files::append(disk, &put.path, data)
         };
         if let Err(error) = written {
             let _ = disk_files::delete(disk, &put.path);

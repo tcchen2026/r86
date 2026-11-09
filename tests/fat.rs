@@ -51,6 +51,26 @@ fn formatted(kind: FatType) -> (Disk, Volume) {
 }
 
 #[test]
+fn partition_reads_see_every_write_to_a_cached_sector() {
+    let mut disk = Disk::memory(vec![0; 8 * 512], true);
+    let mut p = Partition::new(&mut disk, 1, 4).unwrap();
+    let mut read_at = |p: &mut Partition, at: u64| {
+        let mut byte = [0];
+        p.seek(SeekFrom::Start(at)).unwrap();
+        p.read_exact(&mut byte).unwrap();
+        byte[0]
+    };
+    assert_eq!(read_at(&mut p, 10), 0); // a small read caches its sector
+    p.seek(SeekFrom::Start(10)).unwrap();
+    p.write_all(&[7]).unwrap();
+    assert_eq!(read_at(&mut p, 10), 7);
+    p.seek(SeekFrom::Start(0)).unwrap();
+    p.write_all(&[9; 1024]).unwrap(); // whole sectors over the cached one
+    assert_eq!(read_at(&mut p, 10), 9);
+    assert_eq!(read_at(&mut p, 1030), 0);
+}
+
+#[test]
 fn partition_partial_io_preserves_neighbors_and_bounds() {
     let mut disk = Disk::memory(vec![0xa5; 5 * 512], true);
     {

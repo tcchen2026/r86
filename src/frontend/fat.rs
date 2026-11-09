@@ -29,6 +29,10 @@ pub struct Partition<'a> {
     start_lba: u64,
     length: u64,
     position: u64,
+    /// The last sector a partial access touched, as on disk. FAT and directory
+    /// entries are read a few bytes at a time, so walking a cluster chain reads
+    /// each sector many times; writes go through and keep this current.
+    cached: Option<(u64, [u8; SECTOR_SIZE])>,
 }
 
 fn io_error(error: DiskError) -> io::Error {
@@ -58,11 +62,25 @@ impl<'a> Partition<'a> {
             start_lba,
             length,
             position: 0,
+            cached: None,
         })
     }
 
     fn available(&self, requested: usize) -> usize {
         (self.length - self.position).min(requested as u64) as usize
+    }
+
+    /// One sector's bytes, from the cache or the disk.
+    fn sector(&mut self, sector: u64) -> io::Result<[u8; SECTOR_SIZE]> {
+        if let Some((cached, bytes)) = self.cached
+            && cached == sector
+        {
+            return Ok(bytes);
+        }
+        let mut bytes = [0; SECTOR_SIZE];
+        self.disk.read(sector, &mut bytes).map_err(io_error)?;
+        self.cached = Some((sector, bytes));
+        Ok(bytes)
     }
 }
 
@@ -82,8 +100,7 @@ impl Read for Partition<'_> {
             count
         } else {
             let count = count.min(SECTOR_SIZE - offset);
-            let mut bytes = [0; SECTOR_SIZE];
-            self.disk.read(sector, &mut bytes).map_err(io_error)?;
+            let bytes = self.sector(sector)?;
             buf[..count].copy_from_slice(&bytes[offset..offset + count]);
             count
         };
@@ -102,14 +119,21 @@ impl Write for Partition<'_> {
         let offset = self.position as usize % SECTOR_SIZE;
         let count = if offset == 0 && count >= SECTOR_SIZE {
             let count = count / SECTOR_SIZE * SECTOR_SIZE;
+            if self.cached.is_some_and(|(cached, _)| {
+                (sector..sector + (count / SECTOR_SIZE) as u64).contains(&cached)
+            }) {
+                self.cached = None;
+            }
             self.disk.write(sector, &buf[..count]).map_err(io_error)?;
             count
         } else {
             let count = count.min(SECTOR_SIZE - offset);
-            let mut bytes = [0; SECTOR_SIZE];
-            self.disk.read(sector, &mut bytes).map_err(io_error)?;
+            let mut bytes = self.sector(sector)?;
             bytes[offset..offset + count].copy_from_slice(&buf[..count]);
+            // Unknown contents if the write fails part way.
+            self.cached = None;
             self.disk.write(sector, &bytes).map_err(io_error)?;
+            self.cached = Some((sector, bytes));
             count
         };
         self.position += count as u64;
