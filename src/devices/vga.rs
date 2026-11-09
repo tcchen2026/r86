@@ -541,6 +541,42 @@ impl PcVga {
         true
     }
 
+    /// Bulk CPU copies (REP MOVS) into, out of and within the aperture.
+    pub fn lfb_write_bytes(&mut self, addr: u64, lfb_base: u64, bytes: &[u8]) -> bool {
+        let Some(range) = self.lfb_range(addr, lfb_base, bytes.len()) else {
+            return false;
+        };
+        self.mark_dirty_range(range.start, bytes.len());
+        self.vram[range].copy_from_slice(bytes);
+        true
+    }
+
+    pub fn lfb_read_bytes(&self, addr: u64, lfb_base: u64, out: &mut [u8]) -> bool {
+        let Some(range) = self.lfb_range(addr, lfb_base, out.len()) else {
+            return false;
+        };
+        out.copy_from_slice(&self.vram[range]);
+        true
+    }
+
+    pub fn lfb_copy_within(&mut self, src: u64, dst: u64, lfb_base: u64, len: usize) -> bool {
+        let (Some(from), Some(to)) = (
+            self.lfb_range(src, lfb_base, len),
+            self.lfb_range(dst, lfb_base, len),
+        ) else {
+            return false;
+        };
+        self.mark_dirty_range(to.start, len);
+        self.vram.copy_within(from, to.start);
+        true
+    }
+
+    fn lfb_range(&self, addr: u64, lfb_base: u64, len: usize) -> Option<core::ops::Range<usize>> {
+        let start = usize::try_from(addr.checked_sub(lfb_base)?).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= self.vram.len()).then_some(start..end)
+    }
+
     /// The allocation is fixed until its owning Machine is destroyed. Software
     /// JIT proofs expire before interpretation or device/event handling; a
     /// native-only dispatch can retain one within that exclusive batch.
@@ -1429,6 +1465,38 @@ fn rgb565_to_rgba(value: u16) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lfb_bulk_ranges_copy_bytes_and_dirty_only_destinations() {
+        const BASE: u64 = DEFAULT_LFB_BASE;
+        let mut vga = PcVga::new();
+        let bytes = [0x5a; 16];
+        assert!(vga.lfb_write_bytes(BASE + 0xff8, BASE, &bytes));
+        assert!(vga.dirty_page(0) && vga.dirty_page(1));
+        vga.clear_dirty();
+        let mut out = [0; 16];
+        assert!(vga.lfb_read_bytes(BASE + 0xff8, BASE, &mut out));
+        assert_eq!(out, bytes);
+        assert!(!vga.whole_frame_dirty());
+        assert!(vga.lfb_copy_within(BASE + 0xff8, BASE + 0x2ff8, BASE, 16));
+        assert!(vga.lfb_read_bytes(BASE + 0x2ff8, BASE, &mut out));
+        assert_eq!(out, bytes);
+        for page in 0..5 {
+            assert_eq!(vga.dirty_page(page), page == 2 || page == 3);
+        }
+        vga.clear_dirty();
+        for invalid in [BASE - 1, BASE + VRAM_SIZE as u64 - 7, u64::MAX] {
+            assert!(!vga.lfb_write_bytes(invalid, BASE, &[0; 8]));
+            assert!(!vga.lfb_read_bytes(invalid, BASE, &mut out[..8]));
+            assert!(!vga.lfb_copy_within(invalid, BASE + 0xff8, BASE, 8));
+            assert!(!vga.lfb_copy_within(BASE + 0xff8, invalid, BASE, 8));
+            assert!(!vga.whole_frame_dirty());
+        }
+        assert!(vga.lfb_write_bytes(BASE + VRAM_SIZE as u64, BASE, &[]));
+        assert!(!vga.whole_frame_dirty());
+        assert!(vga.lfb_read_bytes(BASE + 0xff8, BASE, &mut out));
+        assert_eq!(out, bytes);
+    }
 
     #[test]
     fn reset_reuses_vram_and_restores_registers_fonts_and_dirty_state() {

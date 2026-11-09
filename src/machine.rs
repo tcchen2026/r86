@@ -4328,30 +4328,69 @@ impl Bus for HostBus {
         else {
             return false;
         };
-        let (Some(src), Some(dst)) = (
-            self.fast_backing_index_for_len(src, len as usize),
-            self.fast_ram_index_for_len(dst, len as usize),
-        ) else {
-            return false;
-        };
-        // Distinct CPU addresses may share A20-gated or firmware backing.
-        !Self::phys_ranges_overlap(PhysAddr(src as u64), PhysAddr(dst as u64), len)
+        // The linear framebuffer is plain VRAM, so blits to, from and within
+        // it (GDI on a VBE driver) copy directly too.
+        match (
+            self.vga_lfb_enabled_contains(src, len),
+            self.vga_lfb_enabled_contains(dst, len),
+        ) {
+            (true, true) => !Self::phys_ranges_overlap(src, dst, len),
+            (true, false) => self.fast_ram_index_for_len(dst, len as usize).is_some(),
+            (false, true) => self.fast_backing_index_for_len(src, len as usize).is_some(),
+            (false, false) => {
+                let (Some(src), Some(dst)) = (
+                    self.fast_backing_index_for_len(src, len as usize),
+                    self.fast_ram_index_for_len(dst, len as usize),
+                ) else {
+                    return false;
+                };
+                // Distinct CPU addresses may share A20-gated or firmware backing.
+                !Self::phys_ranges_overlap(PhysAddr(src as u64), PhysAddr(dst as u64), len)
+            }
+        }
     }
 
     fn copy_phys_to_ram(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> Result<(), MemError> {
         if !self.phys_ram_copy_supported(src, dst, len) {
             return Err(MemError::OutOfRange { addr: dst });
         }
-        let src_index = self.backing_index_for_len(self.cpu_phys_addr(src), len as usize)?;
-        let dst_index = self.backing_index_for_len(self.cpu_phys_addr(dst), len as usize)?;
+        let (src, dst) = (self.cpu_phys_addr(src), self.cpu_phys_addr(dst));
+        let base = self.pci.vga_lfb_base();
+        let src_lfb = self.vga_lfb_enabled_contains(src, len);
+        let len = len as usize;
+        if self.vga_lfb_enabled_contains(dst, len as u32) {
+            let copied = if src_lfb {
+                self.vga
+                    .lfb_copy_within(src.as_u64(), dst.as_u64(), base, len)
+            } else {
+                let index = self.backing_index_for_len(src, len)?;
+                self.vga
+                    .lfb_write_bytes(dst.as_u64(), base, &self.ram[index..index + len])
+            };
+            return if copied {
+                Ok(())
+            } else {
+                Err(MemError::Mmio { addr: dst })
+            };
+        }
+        let dst_index = self.backing_index_for_len(dst, len)?;
         #[cfg(feature = "jit")]
-        self.jit_backing_write(dst_index, len as usize);
+        self.jit_backing_write(dst_index, len);
+        if src_lfb {
+            let out = &mut self.ram[dst_index..dst_index + len];
+            return if self.vga.lfb_read_bytes(src.as_u64(), base, out) {
+                Ok(())
+            } else {
+                Err(MemError::Mmio { addr: src })
+            };
+        }
+        let src_index = self.backing_index_for_len(src, len)?;
         // Ranges were validated as in-bounds and non-overlapping above.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 self.ram.as_ptr().add(src_index),
                 self.ram.as_mut_ptr().add(dst_index),
-                len as usize,
+                len,
             );
         }
         Ok(())
@@ -11489,6 +11528,175 @@ mod host_bus_tests {
         bus.write_phys_u8(PhysAddr(0xa0000), 0x5a).unwrap();
         bus.write_phys_u8(PhysAddr(0xb8000), b'V').unwrap();
         assert_eq!(bus.vga.text_byte(0), Some(b'V'));
+    }
+
+    #[test]
+    fn mmx_movq_legacy_vga_retains_read_latches_and_planar_writes() {
+        use crate::devices::vga::DEFAULT_LFB_BASE;
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        bus.ram[0x1000..0x1006].copy_from_slice(&[0x0f, 0x6f, 0x06, 0x0f, 0x7f, 0x07]);
+        bus.io_write_u16(0x3c4, 0x0604).unwrap();
+        bus.io_write_u16(0x3c4, 0x0f02).unwrap();
+        bus.io_write_u16(0x3ce, 0x0506).unwrap();
+        bus.io_write_u16(0x3ce, 0x0005).unwrap();
+        bus.io_write_u16(0x3ce, 0x0204).unwrap(); // Read plane 2; all four planes latch.
+        for i in 0..8 {
+            for plane in 0..4 {
+                assert!(bus.vga.lfb_write_u8(
+                    DEFAULT_LFB_BASE + (0x400 + i) * 4 + plane,
+                    DEFAULT_LFB_BASE,
+                    (plane * 0x10 + i) as u8,
+                ));
+            }
+        }
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        cpu.set_reg(Reg32::Esi, 0xa0400);
+        cpu.set_reg(Reg32::Edi, 0xa0800);
+        assert_eq!(
+            Interpreter::step(&mut cpu, &mut bus),
+            Ok(StepOutcome::Running)
+        );
+        assert_eq!(cpu.fpu.mmx(0), 0x2726_2524_2322_2120);
+        bus.io_write_u16(0x3ce, 0x0105).unwrap(); // Write mode 1 copies the last read's latches.
+        assert_eq!(
+            Interpreter::step(&mut cpu, &mut bus),
+            Ok(StepOutcome::Running)
+        );
+        for i in 0..8 {
+            for plane in 0..4 {
+                assert_eq!(
+                    bus.vga
+                        .lfb_read_u8(DEFAULT_LFB_BASE + (0x800 + i) * 4 + plane, DEFAULT_LFB_BASE,),
+                    Some((plane * 0x10 + 7) as u8)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rep_movsd_lfb_routes_preserve_data_registers_and_dirty_pages() {
+        for base in [0xe000_0000u32, 0xfd00_0000, 0x0100_0000] {
+            for (src_lfb, dst_lfb) in [(false, true), (true, false), (true, true)] {
+                let mut bus = HostBus::new_firmware(32 << 20).unwrap();
+                bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
+                bus.io_write_u32(0xcfc, base).unwrap();
+                bus.io_write_u32(0xcf8, 0x8000_1004).unwrap();
+                bus.io_write_u32(0xcfc, 2).unwrap();
+                bus.ram[0x1000..0x1002].copy_from_slice(&[0xf3, 0xa5]);
+                let src = if src_lfb { base + 0x1ff8 } else { 0x5ff8 };
+                let dst = if dst_lfb { base + 0x4ff8 } else { 0x8ff8 };
+                let data: Vec<u8> = (0..32).map(|i| (i * 7 + 3) as u8).collect();
+                for (i, &byte) in data.iter().enumerate() {
+                    bus.write_phys_u8(PhysAddr(u64::from(src) + i as u64), byte)
+                        .unwrap();
+                }
+                bus.vga.clear_dirty();
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1000, 0);
+                cpu.set_reg(Reg32::Esi, src);
+                cpu.set_reg(Reg32::Edi, dst);
+                cpu.set_reg(Reg32::Ecx, 8);
+                assert_eq!(
+                    Interpreter::step(&mut cpu, &mut bus),
+                    Ok(StepOutcome::Running)
+                );
+                for (i, &byte) in data.iter().enumerate() {
+                    assert_eq!(
+                        bus.read_phys_u8(PhysAddr(u64::from(dst) + i as u64))
+                            .unwrap(),
+                        byte
+                    );
+                }
+                assert_eq!(cpu.reg(Reg32::Esi), src + 32);
+                assert_eq!(cpu.reg(Reg32::Edi), dst + 32);
+                assert_eq!(cpu.reg(Reg32::Ecx), 0);
+                assert_eq!(cpu.eip, 0x1002);
+                for page in 0..6 {
+                    assert_eq!(
+                        bus.vga.dirty_page(page),
+                        dst_lfb && (page == 4 || page == 5)
+                    );
+                }
+                if dst_lfb && base == 0x0100_0000 {
+                    assert_eq!(&bus.ram[dst as usize..dst as usize + 32], &[0; 32]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rep_movsd_lfb_overlap_preserves_forward_order_and_a20_aliases() {
+        let base = 0xe000_0000u32;
+        for a20 in [true, false] {
+            let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+            bus.io_write_u8(0x92, if a20 { 2 } else { 0 }).unwrap();
+            bus.ram[0x1000..0x1002].copy_from_slice(&[0xf3, 0xa5]);
+            for i in 0..5 {
+                bus.write_phys_u32(PhysAddr(u64::from(base + 0x400 + i * 4)), i + 1)
+                    .unwrap();
+            }
+            bus.vga.clear_dirty();
+            let src = base + 0x400 + if a20 { 0 } else { 0x100000 };
+            let dst = base + 0x404;
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            cpu.set_reg(Reg32::Esi, src);
+            cpu.set_reg(Reg32::Edi, dst);
+            cpu.set_reg(Reg32::Ecx, 4);
+            assert_eq!(
+                Interpreter::step(&mut cpu, &mut bus),
+                Ok(StepOutcome::Running)
+            );
+            for i in 0..5 {
+                assert_eq!(
+                    bus.read_phys_u32(PhysAddr(u64::from(base + 0x400 + i * 4)))
+                        .unwrap(),
+                    1
+                );
+            }
+            assert_eq!(cpu.reg(Reg32::Esi), src + 16);
+            assert_eq!(cpu.reg(Reg32::Edi), dst + 16);
+            assert_eq!(cpu.reg(Reg32::Ecx), 0);
+            assert!(bus.vga.dirty_page(0));
+        }
+    }
+
+    #[test]
+    fn rep_movsd_lfb_decode_changes_reveal_underlying_ram() {
+        let old = 0x0100_0000u32;
+        let new = 0xfd00_0000u32;
+        let mut bus = HostBus::new_firmware(32 << 20).unwrap();
+        bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
+        bus.io_write_u32(0xcfc, old).unwrap();
+        bus.ram[0x1000..0x1002].copy_from_slice(&[0xf3, 0xa5]);
+        bus.ram[old as usize + 0x2000..old as usize + 0x2010].fill(0x77);
+        assert!(
+            bus.vga
+                .lfb_write_bytes(u64::from(old + 0x2000), u64::from(old), &[0x55; 16])
+        );
+        for (bar, enabled, source, expected) in [
+            (old, 0, old, 0x77),
+            (new, 2, old, 0x77),
+            (new, 2, new, 0x55),
+        ] {
+            bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
+            bus.io_write_u32(0xcfc, bar).unwrap();
+            bus.io_write_u32(0xcf8, 0x8000_1004).unwrap();
+            bus.io_write_u32(0xcfc, enabled).unwrap();
+            bus.vga.clear_dirty();
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            cpu.set_reg(Reg32::Esi, source + 0x2000);
+            cpu.set_reg(Reg32::Edi, 0x8000);
+            cpu.set_reg(Reg32::Ecx, 4);
+            assert_eq!(
+                Interpreter::step(&mut cpu, &mut bus),
+                Ok(StepOutcome::Running)
+            );
+            assert_eq!(&bus.ram[0x8000..0x8010], &[expected; 16]);
+            assert!(!bus.vga.whole_frame_dirty());
+        }
     }
 
     #[test]

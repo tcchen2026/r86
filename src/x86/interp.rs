@@ -8897,8 +8897,11 @@ fn read_mmx_mem_qword<B: Bus>(
     addr: MemAddr,
     eip: u32,
 ) -> Result<u64, StepError> {
-    let image: [u8; 8] = read_mem_bytes_at(cpu, bus, addr, 8, eip)?;
-    Ok(image_read_u64(&image, 0))
+    // Two dword reads use the translation cache; GDI blends move qwords.
+    let linear = mem_linear_checked(cpu, addr, 8, false, eip)?;
+    let low = read_linear_u32_data(cpu, bus, linear)?;
+    let high = read_linear_u32_data(cpu, bus, LinearAddr(linear.0.wrapping_add(4)))?;
+    Ok(u64::from(low) | (u64::from(high) << 32))
 }
 
 fn write_mmx_mem_qword<B: Bus>(
@@ -8908,9 +8911,12 @@ fn write_mmx_mem_qword<B: Bus>(
     value: u64,
     eip: u32,
 ) -> Result<(), StepError> {
-    let mut image = [0u8; 8];
-    image_write_u64(&mut image, 0, value);
-    write_mem_image_at(cpu, bus, addr, &image, 8, eip)
+    // As CMPXCHG8B: qualify all eight bytes, then commit two dwords.
+    let linear = mem_linear_checked(cpu, addr, 8, true, eip)?;
+    let low = probe_linear_write_bytes(cpu, bus, linear, 4)?;
+    let high = probe_linear_write_bytes(cpu, bus, LinearAddr(linear.0.wrapping_add(4)), 4)?;
+    write_probed_le(cpu, bus, low, 4, value as u32)?;
+    write_probed_le(cpu, bus, high, 4, (value >> 32) as u32)
 }
 
 fn mmx_byte(value: u64, lane: u8) -> u8 {
@@ -20140,6 +20146,96 @@ mod tests {
         assert_eq!(arithmetic.fpu.mmx(0), pack_words([0xffff, 0, 0xffff, 0]));
         let left_qword = run_mmx_shift_imm(0x73, 6, 0x0000_0000_0000_0001, 63);
         assert_eq!(left_qword.fpu.mmx(0), 0x8000_0000_0000_0000);
+    }
+
+    #[test]
+    fn mmx_movq_paged_qwords_preserve_split_bytes_and_segment_base() {
+        for offset in [0x80, 0xffb, 0xffc, 0xffe] {
+            let mut ram = Ram::new();
+            ram.cache_data = true;
+            ram.data[0x100..0x106].copy_from_slice(&[0x0f, 0x6f, 0x06, 0x0f, 0x7f, 0x07]);
+            map_test_page(&mut ram, 0, 0, TEST_PTE_PRESENT | TEST_PTE_WRITE);
+            map_test_page(&mut ram, 0x4000, 0x3000, TEST_PTE_PRESENT | TEST_PTE_WRITE);
+            map_test_page(&mut ram, 0x5000, 0, TEST_PTE_PRESENT | TEST_PTE_WRITE);
+            let physical = |i: usize| (0x3000 + offset + i) & 0x3fff;
+            let value = 0xfedc_ba98_7654_3210u64;
+            for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                ram.data[physical(i)] = byte;
+            }
+            let mut cpu = flat_cpu();
+            enable_test_paging(&mut cpu);
+            cpu.eip = 0x100;
+            cpu.set_seg_cache(
+                SegmentReg::Ds,
+                SegmentCache {
+                    base: 0x1000,
+                    ..cpu.seg(SegmentReg::Ds)
+                },
+            );
+            cpu.set_reg(Reg32::Esi, 0x3000 + offset as u32);
+            cpu.set_reg(Reg32::Edi, 0x3000 + offset as u32);
+            let flags = cpu.effective_eflags();
+            step_running(&mut cpu, &mut ram);
+            assert_eq!(cpu.fpu.mmx(0), value, "offset={offset:x}");
+            cpu.fpu.set_mmx(0, !value);
+            step_running(&mut cpu, &mut ram);
+            for (i, byte) in (!value).to_le_bytes().into_iter().enumerate() {
+                assert_eq!(ram.data[physical(i)], byte, "offset={offset:x} byte={i}");
+            }
+            assert_eq!(cpu.effective_eflags(), flags);
+            assert_eq!(cpu.eip, 0x106);
+        }
+    }
+
+    #[test]
+    fn mmx_movq_segment_and_high_page_faults_preserve_operand() {
+        for (store, high_flags, short_segment, error_code) in [
+            (false, 0, false, 0),
+            (true, 0, false, 2),
+            (true, TEST_PTE_PRESENT, false, 3),
+            (false, 0, true, 0),
+            (true, 0, true, 0),
+        ] {
+            let mut ram = Ram::new();
+            ram.cache_data = true;
+            ram.data[0x100..0x103].copy_from_slice(&[0x0f, if store { 0x7f } else { 0x6f }, 0x07]);
+            map_test_page(&mut ram, 0, 0, TEST_PTE_PRESENT | TEST_PTE_WRITE);
+            map_test_page(&mut ram, 0x4000, 0x3000, TEST_PTE_PRESENT | TEST_PTE_WRITE);
+            map_test_page(&mut ram, 0x5000, 0, high_flags);
+            ram.data[0x3ffc..0x4000].fill(0xa5);
+            ram.data[..4].fill(0x5a);
+            let mut cpu = flat_cpu();
+            enable_test_paging(&mut cpu);
+            cpu.cr0 |= CR0_WP;
+            cpu.cr2 = 0xdead_beef;
+            cpu.eip = 0x100;
+            cpu.set_seg_cache(
+                SegmentReg::Ds,
+                SegmentCache {
+                    base: 0x4000,
+                    limit: if short_segment { 0xfff } else { u32::MAX },
+                    ..cpu.seg(SegmentReg::Ds)
+                },
+            );
+            cpu.set_reg(Reg32::Edi, 0xffc);
+            cpu.fpu.set_mmx(0, 0x8877_6655_4433_2211);
+            if short_segment {
+                step_gp(&mut cpu, &mut ram, 0x100);
+                assert_eq!(cpu.cr2, 0xdead_beef);
+            } else {
+                assert_eq!(
+                    Interpreter::step(&mut cpu, &mut ram),
+                    Err(StepError::PageFault(mmu::PageFault {
+                        linear: LinearAddr(0x5000),
+                        code: error_code,
+                    }))
+                );
+                assert_eq!(cpu.cr2, 0x5000);
+            }
+            assert_eq!(&ram.data[0x3ffc..0x4000], &[0xa5; 4]);
+            assert_eq!(&ram.data[..4], &[0x5a; 4]);
+            assert_eq!(cpu.fpu.mmx(0), 0x8877_6655_4433_2211);
+        }
     }
 
     #[test]
