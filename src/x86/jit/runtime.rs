@@ -770,9 +770,13 @@ impl Engine {
             }
         }
         bus.instruction_address(linear.0);
-        // A miss remains an architectural fetch. Do not fill a future code page
-        // or mutate page-table A bits while merely exploring a possible block.
-        let Some(hit) = cpu.fetch_cache_lookup(linear) else {
+        // Reuse the shared resident-page proof for this instruction's fetch.
+        // It neither fills a future page nor performs A-bit/device/fault work;
+        // those cases still enter the interpreter at this exact instruction.
+        let Some(hit) = cpu
+            .fetch_cache_lookup(linear)
+            .or_else(|| crate::x86::mmu::try_resident_fetch_translation(cpu, bus, linear))
+        else {
             return Ok(None);
         };
         let global = cpu.fetch_translation_is_global(linear);
@@ -895,7 +899,11 @@ impl Engine {
                 opcode
             }
         };
-        let decoded = decode::block(bus.jit_code_bytes(backing, window), cpu.eip, 32);
+        // A shadow requires one complete instruction before the next attention
+        // boundary. Compile that entry with the existing one-instruction ABI;
+        // otherwise a longer block would be rejected on every shadowed visit.
+        let count = if cpu.interrupt_shadow() { 1 } else { 32 };
+        let decoded = decode::block(bus.jit_code_bytes(backing, window), cpu.eip, count);
         let (native, _faults, edges) = if decoded.instructions.is_empty() {
             (None, Vec::new(), Vec::new())
         } else {

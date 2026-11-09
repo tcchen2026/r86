@@ -7034,9 +7034,9 @@ mod host_bus_tests {
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
     #[test]
     fn jit_shadowed_native_entries_keep_one_instruction_and_partial_faults() {
-        // Single-instruction entries can run natively during a shadow; longer
-        // entries interpret their first instruction. Alternate ordinary reuse
-        // with shadowed visits, including a suffix consuming the first flags.
+        // Entries first compiled under a shadow contain one instruction.
+        // Alternate ordinary reuse with shadowed visits, including a suffix
+        // consuming the first instruction's flags.
         let cases: &[(&[u8], bool)] = &[
             (&[0xe8, 0xfb, 0x0f, 0, 0], true), // CALL 2000h.
             (&[0xff, 0xd0], true),             // CALL EAX.
@@ -7044,10 +7044,10 @@ mod host_bus_tests {
             (&[0xc2, 8, 0], true),
             (&[0xeb, 0], true),
             (&[0xa1, 0, 0x60, 0, 0, 0xf4], true),
-            (&[0xa1, 0, 0x60, 0, 0, 0x43, 0xf4], false),
-            (&[0x83, 0xe8, 0xff, 0x83, 0xd2, 0, 0xf4], false), // SUB EAX,-1; ADC EDX,0; HLT.
-            (&[0xa1, 0, 0x70, 0, 0, 0xf4], false),             // Unmapped load.
-            (&[0xf3, 0xa4, 0xf4], false),                      // Copy three bytes, then fault.
+            (&[0xa1, 0, 0x60, 0, 0, 0x43, 0xf4], true),
+            (&[0x83, 0xe8, 0xff, 0x83, 0xd2, 0, 0xf4], true), // SUB EAX,-1; ADC EDX,0; HLT.
+            (&[0xa1, 0, 0x70, 0, 0, 0xf4], false),            // Unmapped load.
+            (&[0xf3, 0xa4, 0xf4], false),                     // Copy three bytes, then fault.
         ];
         for &(code, completes_natively) in cases {
             for flags in [2, 0x202] {
@@ -8628,6 +8628,107 @@ mod host_bus_tests {
         }
         assert_eq!(actual.cr2, 0x2000);
         assert!(engine.stats.native_steps > 9000);
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_resident_fetch_reenters_after_interpretation_and_keeps_fault_order() {
+        for cpl in [0, 3] {
+            let make = || {
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1ffd, 0);
+                cpu.set_seg_cache(
+                    SegmentReg::Cs,
+                    SegmentCache::flat(8 | cpl, 0xc09b | (cpl << 5)),
+                );
+                cpu.cr0 |= CR0_PG;
+                cpu.cr3 = 0x4000;
+                let mut bus = HostBus::new(0x10000);
+                bus.attention = false;
+                // RDTSC; MOV EAX,imm32 across the code-page boundary; then a
+                // native load, INC EDX and JMP back to the interpreted RDTSC.
+                bus.ram[0x3ffd..0x4000].copy_from_slice(&[0x0f, 0x31, 0xb8]);
+                bus.ram[0x6000..0x6009]
+                    .copy_from_slice(&[0x78, 0x56, 0x34, 0x12, 0x8b, 0x0e, 0x42, 0xeb, 0xf4]);
+                bus.ram[0x7000..0x7009]
+                    .copy_from_slice(&[0xef, 0xbe, 0xad, 0xde, 0x8b, 0x0e, 0x42, 0xeb, 0xf4]);
+                write_ram_u32(&mut bus, 0x8000, 0x1234_abcd);
+                (cpu, bus)
+            };
+            let (mut expected, mut expected_bus) = make();
+            let (mut actual, mut actual_bus) = make();
+            let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+            let mut steps = 0;
+            for phase in 0..9 {
+                for _ in 0..if phase == 0 { 4 } else { 1 } {
+                    for budget in [0, 1, 2, 3, 6] {
+                        for attention in [false, true] {
+                            for bus in [&mut expected_bus, &mut actual_bus] {
+                                write_ram_u32(
+                                    bus,
+                                    0x4000,
+                                    if phase == 6 { 0x5023 } else { 0x5027 },
+                                );
+                                write_ram_u32(
+                                    bus,
+                                    0x5004,
+                                    match phase {
+                                        5 => 0x3023, // Supervisor execute page.
+                                        7 => 0x3007, // Missing A bit needs the walker.
+                                        _ => 0x3027,
+                                    },
+                                );
+                                write_ram_u32(
+                                    bus,
+                                    0x5008,
+                                    match phase {
+                                        2 | 7 => 0x6007,
+                                        3 => 0x7027, // Changed second code page.
+                                        4 => 0,      // Fault while fetching MOV's immediate.
+                                        _ => 0x6027,
+                                    },
+                                );
+                                write_ram_u32(bus, 0x5018, if phase == 8 { 0 } else { 0x8027 });
+                                bus.next_attention_step =
+                                    if attention { steps + 1 } else { u64::MAX };
+                            }
+                            for cpu in [&mut expected, &mut actual] {
+                                cpu.eip = 0x1ffd;
+                                cpu.regs = [0; 8];
+                                cpu.regs[6] = 0x6000;
+                                cpu.replace_eflags(0x202);
+                                cpu.invalidate_non_global_translations();
+                            }
+                            let before = engine.stats.native_steps;
+                            let reference = Interpreter::run_batch(
+                                &mut expected,
+                                &mut expected_bus,
+                                steps,
+                                budget,
+                            );
+                            let result = engine
+                                .run_batch(&mut actual, &mut actual_bus, steps, budget)
+                                .unwrap();
+                            assert_eq!(
+                                result, reference,
+                                "cpl={cpl} phase={phase} budget={budget} attention={attention}"
+                            );
+                            assert_eq!(actual.regs, expected.regs);
+                            assert_eq!(actual.eip, expected.eip);
+                            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+                            assert_eq!(actual.tsc(), expected.tsc());
+                            assert_eq!(actual.cr2, expected.cr2);
+                            assert_eq!(actual.interrupt_shadow(), expected.interrupt_shadow());
+                            assert_eq!(actual_bus.ram, expected_bus.ram);
+                            if phase == 1 && budget == 6 && !attention {
+                                assert_eq!(engine.stats.native_steps - before, 3);
+                            }
+                            steps += result.ran;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]

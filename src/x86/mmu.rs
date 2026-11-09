@@ -475,7 +475,49 @@ struct ResidentPage {
     phys: PhysAddr,
 }
 
-// One permission/A-D proof for the software refill and native fault refill.
+/// Qualify only the current execute page without fetching an instruction or
+/// changing guest state. Non-PAE execution has the same page permissions as a
+/// read; reuse the resident proof, leaving A-bit work and faults to the walker.
+/// Devices are excluded even when they offer a transient native data pointer.
+#[cfg(all(
+    feature = "jit",
+    any(
+        test,
+        all(
+            target_arch = "aarch64",
+            any(
+                all(feature = "host", target_os = "linux"),
+                all(feature = "monitor", feature = "machine", target_os = "none")
+            )
+        )
+    )
+))]
+pub(crate) fn try_resident_fetch_translation<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    linear: LinearAddr,
+) -> Option<crate::x86::cpu::FetchCacheHit> {
+    let page = if cpu.cr0 & CR0_PG != 0 {
+        Some(resident_page(cpu, bus, linear, false)?)
+    } else {
+        None
+    };
+    let phys = page
+        .as_ref()
+        .map_or(PhysAddr(u64::from(linear.0)), |p| p.phys);
+    let backing = bus.jit_page_table_source(phys)?;
+    let global = page
+        .as_ref()
+        .is_some_and(|p| cpu.cr4 & CR4_PGE != 0 && p.pte & (1 << 8) != 0);
+    cpu.fill_fetch_cache_with_backing(linear, phys, backing, global);
+    if let Some(page) = page {
+        cpu.record_fetch_recheck(linear, page.leaf, [page.pde, page.pte]);
+        cpu.translation_cache.walk_root = page.root.0 - u64::from(linear.0 >> 22) * 4;
+    }
+    Some(crate::x86::cpu::FetchCacheHit { phys, backing })
+}
+
+// One permission/A-D proof for data, execute and native fault refills.
 // Read only stable RAM words; no x86 state, guest memory or device effects.
 #[cfg(all(
     feature = "jit",
