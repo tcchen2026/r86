@@ -66,18 +66,6 @@ fn main() {
             "marker not reached"
         );
     }
-    #[cfg(feature = "monitor")]
-    if let Some(stem) = args.get(3) {
-        use std::io::Write as _;
-        let stem = std::path::Path::new(stem);
-        let cpu = r86::monitor::cpu_state_v1_from_cpu(machine.cpu(), machine.step_count());
-        std::fs::write(stem.with_extension("cpu"), format!("{cpu:?}\n")).unwrap();
-        std::fs::write(stem.with_extension("ram"), machine.ram()).unwrap();
-        let mut writer =
-            std::io::BufWriter::new(std::fs::File::create(stem.with_extension("devices")).unwrap());
-        writeln!(writer, "{:?}", machine.device_state_for_comparison()).unwrap();
-        writer.flush().unwrap();
-    }
     println!("softmmu.stop.steps={}", machine.step_count());
     println!("softmmu.stop.tsc={}", machine.cpu().tsc());
     println!("softmmu.stop.resets={}", machine.reset_count());

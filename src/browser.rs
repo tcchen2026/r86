@@ -1,7 +1,7 @@
 //! Browser-only imports. Binaryen Asyncify suspends the *existing* interpreter
 //! stack at `disk_io`; the JS host must not enter any Rust export until it has
 //! rewound that stack. There is no guest instruction replay or device retry.
-//! Native and monitor builds do not contain these imports or storage variants.
+//! Native and bare-metal builds do not contain these imports or storage variants.
 //!
 //! The JS host owns external storage. A write completes before returning;
 //! failures become ordinary IDE errors. The IndexedDB host will need to wait

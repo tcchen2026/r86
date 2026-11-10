@@ -1,5 +1,5 @@
 //! Sector storage used directly by the IDE controller. Memory disks also work
-//! in the no_std monitor; host files are never loaded wholesale into guest RAM.
+//! in no_std builds; host files are never loaded wholesale into guest RAM.
 use alloc::vec::Vec;
 use core::fmt;
 

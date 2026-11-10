@@ -674,10 +674,8 @@ impl Interpreter {
         all(
             feature = "jit",
             target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
+            feature = "host",
+            target_os = "linux"
         )
     ))]
     pub(crate) fn run_one<B: Bus>(cpu: &mut Cpu, bus: &mut B, start_step: u64) -> BatchResult {
@@ -11904,10 +11902,8 @@ fn mark_segment_accessed<B: Bus>(
     all(
         feature = "jit",
         target_arch = "aarch64",
-        any(
-            all(feature = "host", target_os = "linux"),
-            all(feature = "monitor", feature = "machine", target_os = "none")
-        )
+        feature = "host",
+        target_os = "linux"
     )
 ))]
 #[cfg_attr(all(feature = "wasm-jit", target_arch = "wasm32"), inline(never))]

@@ -38,7 +38,7 @@ FRNUM catches up arithmetically and no DMA event is scheduled.
 All DMA windows must fit RAM and exclude the VGA/ROM hole 0xa0000..0xfffff.
 Invalid windows set Host System Error and halt; invalid PID/oversized TDs set
 Host Controller Process Error. DMA bypasses A20 and notifies JIT code-page
-versions and monitor shadow writes before committing RAM. There is no DMA
+versions before committing RAM. There is no DMA
 to mapped framebuffer/device memory. Data toggle/wire retry is not simulated.
 
 Interrupts and tablet

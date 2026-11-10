@@ -1,5 +1,5 @@
 //! AArch64 data access qualification. This file owns segment/range checks and
-//! software TLB lowering; EL1 paged reads and SS stores use protected windows.
+//! software TLB lowering.
 //! The x86 decoder/ALU and precise exits do not choose a memory backend.
 //!
 //! A complete access requires current privilege, paging and segment permission.
@@ -22,10 +22,6 @@
 //!
 //! The host adapter supplies this view only for HostBus's stable pointer tokens,
 //! under exclusive machine ownership. It stays alive through the invocation.
-//! EL1 access misses use refill/retry or the recorded cold exit in `hard`, with
-//! this same instruction commit and FaultSite contract. SS stores/RMW require
-//! writable shadow leaves; other writes use software tokens. Both exclude live
-//! monitor page-table frames and watched code.
 
 use super::a64::{Assembler, Cond, LR, Label, Reg, SP, ZR};
 use super::decode::Address;
@@ -42,12 +38,6 @@ const FLAT_SEGMENT_PROOFS: u32 = {
         (1 << SegmentReg::Es as u32) | (1 << SegmentReg::Ss as u32) | (1 << SegmentReg::Ds as u32);
     segments | (segments << 8) | (1 << 6)
 };
-
-// A compiled EL1 block uses software data reads while guest paging is off.
-// This compile-time fact occupies an otherwise unused qualification bit and is
-// part of the runtime's full block key. It emits no per-access mode branch.
-#[cfg(all(feature = "monitor", target_os = "none"))]
-const SOFTWARE_READS: u32 = 1 << 31;
 
 #[repr(C)]
 pub struct View {
@@ -142,19 +132,10 @@ impl View {
     /// Only ordinary flat data/stack qualifications specialize code. FS/GS
     /// are often replaced for TLS; including them would split otherwise
     /// identical code and repeatedly discard links during task switches.
-    /// EL1 also keys the read lowering by CR0.PG. The adapter retires links
-    /// whenever one of these compiled facts changes.
+    /// The adapter retires links whenever one of these compiled facts changes.
     pub fn block_facts(cpu: &Cpu) -> u32 {
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
-        let facts = (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS;
-        #[cfg(all(feature = "monitor", target_os = "none"))]
-        let facts = facts
-            | if cpu.cr0 & crate::x86::cpu::CR0_PG == 0 {
-                SOFTWARE_READS
-            } else {
-                0
-            };
-        facts
+        (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS
     }
 
     pub fn new(cpu: &mut Cpu, rechecks: bool) -> Self {
@@ -190,13 +171,7 @@ impl View {
     /// including A/D and host dirty bookkeeping. A write proof also permits
     /// reads. Native execution cannot change its mapping context, code watches
     /// or device decode; recreating the view discards this proof before reentry.
-    #[cfg(all(
-        target_arch = "aarch64",
-        any(
-            all(feature = "host", target_os = "linux"),
-            all(feature = "monitor", feature = "machine", target_os = "none")
-        )
-    ))]
+    #[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
     pub(super) fn remember_refill(&mut self, tag: u32, write: bool, bias: u64) {
         if bias != 0 {
             self.refill_bias = bias;
@@ -518,23 +493,6 @@ fn prepare_access(
     let reasons: [Label; 4] = core::array::from_fn(|_| a.label());
     #[cfg(not(feature = "jit-profile"))]
     let reasons = [miss; 4];
-    // Hardware accesses keep segment and same-page qualification. SS reads
-    // and stores share the same alias; other stores keep software qualification.
-    #[cfg(all(
-        feature = "monitor",
-        feature = "machine",
-        target_arch = "aarch64",
-        target_os = "none"
-    ))]
-    let hard_read = (!write || address.segment == crate::x86::cpu::SegmentReg::Ss)
-        && guard.segments.get() & SOFTWARE_READS == 0;
-    #[cfg(all(
-        feature = "monitor",
-        feature = "machine",
-        target_arch = "aarch64",
-        target_os = "none"
-    ))]
-    let reasons = if hard_read { [miss; 4] } else { reasons };
     let segment = address.segment as u8;
     let permission_bit = segment + if based { 16 } else { 0 } + if write { 8 } else { 0 };
     guard.require(a, permission_bit, reasons[0]);
@@ -573,30 +531,6 @@ fn prepare_access(
     } else {
         offset
     };
-    #[cfg(all(
-        feature = "monitor",
-        feature = "machine",
-        target_arch = "aarch64",
-        target_os = "none"
-    ))]
-    if hard_read {
-        if bytes > 1 {
-            a.bitfield(TEMP, linear, 0, 11, false, false);
-            a.add_sub_imm(ZR, TEMP, 4096 - bytes, false, true, true);
-            a.b_cond(Cond::Hi, miss);
-        }
-        a.load_store(
-            true,
-            ENTRY,
-            FRAME,
-            offset_of!(Frame, hard_read_base) as u32,
-            3,
-        );
-        return Access {
-            log2_bytes: bytes.trailing_zeros() as u8,
-            linear,
-        };
-    }
     // A 16-byte row holds one bias and two exact 32-bit permission tags. The
     // read tag is the low half of X9; the write tag is compared with LSR #32.
     assert_eq!(size_of::<LinearTranslationCacheEntry>(), 16);

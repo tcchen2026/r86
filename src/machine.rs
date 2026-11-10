@@ -49,8 +49,8 @@ use alloc::{
 };
 use core::fmt::Write as _;
 
-/// Frontends enable the JIT by default only on ARM64 Linux; ARMv6K and
-/// monitor builds select it explicitly.
+/// Frontends enable the JIT by default only on ARM64 Linux; ARMv6K
+/// builds select it explicitly.
 pub const DEFAULT_JIT: bool = cfg!(all(
     feature = "jit",
     target_arch = "aarch64",
@@ -358,11 +358,7 @@ pub struct Machine {
     boot_image: Option<BootImage>,
     roms: Vec<(usize, Vec<u8>)>,
     #[cfg(any(
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-        ),
+        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
         all(feature = "jit", target_arch = "arm")
     ))]
     jit: Option<crate::x86::jit::runtime::Engine>,
@@ -371,15 +367,6 @@ pub struct Machine {
     #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
     wasm_jit: Option<crate::x86::jit::wasm::runtime::Engine>,
 }
-
-/// Hardware-only checks run by the explicit paged monitor smoke image.
-#[cfg(all(
-    feature = "jit-profile",
-    feature = "monitor",
-    target_arch = "aarch64",
-    target_os = "none"
-))]
-pub mod jit_checks;
 
 enum BootImage {
     Bios,
@@ -393,7 +380,7 @@ enum BootImage {
         host_decompress_initrd: bool,
         overlay_files: Vec<crate::initrd_overlay::InitrdFile>,
     },
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
+    #[cfg(not(feature = "host"))]
     Preloaded,
 }
 
@@ -408,8 +395,8 @@ impl Machine {
         )
     }
 
-    /// Runs the production PC against the monitor's preloaded RAM mapping.
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
+    /// Runs the production PC against RAM the bare-metal host preloaded.
+    #[cfg(not(feature = "host"))]
     pub fn from_preloaded(cpu: Cpu, ram: &'static mut [u8]) -> Self {
         let regions = PhysRegionMap::ram(ram.len() as u64).expect("RAM region map fits");
         let mut machine = Self::from_parts(
@@ -422,49 +409,18 @@ impl Machine {
         machine
     }
 
-    /// Complete a reset after the VMM has reloaded the original boot assets.
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
-    pub fn reboot_preloaded(&mut self, cpu: Cpu) {
-        assert!(matches!(self.boot_image, Some(BootImage::Preloaded)));
-        self.bus.reset(self.step);
-        self.cpu = cpu;
-        self.reset_shadow();
-        self.boots += 1;
-    }
-
     fn boot_reload_is_external(&self) -> bool {
-        #[cfg(all(feature = "monitor", not(feature = "host")))]
+        #[cfg(not(feature = "host"))]
         if matches!(self.boot_image, Some(BootImage::Preloaded)) {
             return true;
         }
         false
     }
 
-    fn reset_shadow(&mut self) {
-        #[cfg(feature = "monitor")]
-        if let Some(shadow) = self.bus.shadow.as_deref_mut() {
-            shadow.reset(&self.cpu);
-        }
-    }
-
     pub fn new_firmware(ram_bytes: usize, display: FirmwareDisplay) -> Result<Self, String> {
         Ok(Self::from_parts(
             Cpu::new(),
             HostBus::new_firmware_with_display(ram_bytes, display)?,
-            TraceMode::Off,
-            PerfMode::Disabled,
-        ))
-    }
-
-    /// Firmware PC with exclusive RAM owned by the monitor's fixed memslot.
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
-    pub fn from_firmware_ram(
-        ram: &'static mut [u8],
-        display: FirmwareDisplay,
-    ) -> Result<Self, String> {
-        Ok(Self::from_parts(
-            Cpu::new(),
-            HostBus::firmware_with_ram(ram, display)?,
             TraceMode::Off,
             PerfMode::Disabled,
         ))
@@ -547,32 +503,6 @@ impl Machine {
         self.bus.diagnostics.pending.pop_front()
     }
 
-    #[cfg(feature = "monitor")]
-    pub fn enable_hardmmu(
-        &mut self,
-        shadow: &'static mut crate::monitor::DefaultMonitorShadowRuntime,
-    ) {
-        shadow.reset(&self.cpu);
-        self.cpu.invalidate_translation_context();
-        self.bus.shadow = Some(shadow);
-    }
-
-    /// Complete deterministic device state for backend comparison. This text
-    /// is a diagnostic export, not a resumable snapshot or a Rust-layout ABI.
-    #[cfg(feature = "monitor")]
-    pub fn device_state_for_comparison(&self) -> impl core::fmt::Debug + '_ {
-        MachineDeviceState(&self.bus)
-    }
-
-    #[cfg(feature = "monitor")]
-    pub fn hardmmu_stats(&self) -> crate::monitor::MonitorShadowRuntimeStats {
-        self.bus
-            .shadow
-            .as_deref()
-            .map(|shadow| shadow.stats())
-            .unwrap_or_default()
-    }
-
     pub fn load_bios_rom(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.clear_jit_code()?;
         self.cpu.invalidate_translation_context();
@@ -611,7 +541,7 @@ impl Machine {
     /// host step counter and serial transcript span resets; CPU time restarts.
     pub fn reboot(&mut self) -> Result<(), String> {
         if self.boot_reload_is_external() {
-            return Err("preloaded boot assets must be restored by the VMM".into());
+            return Err("preloaded boot assets must be restored by the bare-metal host".into());
         }
         self.clear_jit_code()?;
         let image = self
@@ -655,10 +585,9 @@ impl Machine {
                 )?;
                 self.cpu.enter_protected_flat(boot.entry, boot.boot_params);
             }
-            #[cfg(all(feature = "monitor", not(feature = "host")))]
+            #[cfg(not(feature = "host"))]
             BootImage::Preloaded => unreachable!(),
         }
-        self.reset_shadow();
         self.boots += 1;
         Ok(())
     }
@@ -689,11 +618,6 @@ impl Machine {
         self.bus.attach_primary_cdrom(image);
     }
 
-    /// Immutable media mapped for the lifetime of this monitor invocation.
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
-    pub fn attach_primary_cdrom_borrowed(&mut self, image: &'static [u8]) {
-        self.bus.ide.attach_primary_master_cdrom_borrowed(image);
-    }
     pub fn attach_secondary_cdrom(&mut self, image: Vec<u8>) {
         self.bus.attach_secondary_cdrom(image);
     }
@@ -1025,11 +949,7 @@ impl Machine {
             boot_image: None,
             roms: Vec::new(),
             #[cfg(any(
-                all(
-                    feature = "jit",
-                    target_arch = "aarch64",
-                    any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-                ),
+                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
                 all(feature = "jit", target_arch = "arm")
             ))]
             jit: None,
@@ -1042,16 +962,12 @@ impl Machine {
         machine
     }
 
-    /// Select the optional ARM64 (Linux/EL1) or ARMv6K engine. Unsupported hosts fail explicitly;
+    /// Select the optional ARM64 Linux or ARMv6K engine. Unsupported hosts fail explicitly;
     /// selecting JIT must never silently select the interpreter instead.
     pub fn set_jit_enabled(&mut self, enabled: bool) -> Result<(), String> {
         self.clear_jit_code()?;
         #[cfg(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         ))]
         {
@@ -1063,16 +979,12 @@ impl Machine {
             Ok(())
         }
         #[cfg(not(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         )))]
         if enabled {
             Err(
-                "the JIT engine requires an ARM64 Linux, EL1 monitor or 32-bit ARM build with --features jit"
+                "the JIT engine requires an ARM64 Linux or 32-bit ARM build with --features jit"
                     .into(),
             )
         } else {
@@ -1118,11 +1030,7 @@ impl Machine {
             return format!("chipjit: {:?}\n", jit.stats);
         }
         #[cfg(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         ))]
         if let Some(jit) = &self.jit {
@@ -1149,11 +1057,7 @@ impl Machine {
             jit.clear(&mut self.bus);
         }
         #[cfg(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         ))]
         if let Some(jit) = &mut self.jit {
@@ -1301,11 +1205,7 @@ impl Machine {
             return Err("B1 JIT instruction tracing/perf diagnostics are not implemented".into());
         }
         #[cfg(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         ))]
         if self.jit.is_some()
@@ -1324,11 +1224,7 @@ impl Machine {
                     &mut self.step,
                     budget,
                     #[cfg(any(
-                        all(
-                            feature = "jit",
-                            target_arch = "aarch64",
-                            any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-                        ),
+                        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
                         all(feature = "jit", target_arch = "arm")
                     ))]
                     self.jit.as_mut(),
@@ -1444,11 +1340,7 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
     step: &mut u64,
     budget: u64,
     #[cfg(any(
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-        ),
+        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
         all(feature = "jit", target_arch = "arm")
     ))]
     mut jit: Option<&mut crate::x86::jit::runtime::Engine>,
@@ -1472,11 +1364,7 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
             Interpreter::run_batch(cpu, bus, *step, budget - ran)
         };
         #[cfg(any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         ))]
         let batch = if let Some(jit) = jit.as_deref_mut() {
@@ -1494,11 +1382,7 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
             all(feature = "wasm-jit", target_arch = "wasm32"),
             all(feature = "r86chip", target_arch = "riscv32"),
             any(
-                all(
-                    feature = "jit",
-                    target_arch = "aarch64",
-                    any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-                ),
+                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
                 all(feature = "jit", target_arch = "arm")
             )
         )))]
@@ -2377,8 +2261,6 @@ pub(crate) struct HostBus {
     ram: MachineRam,
     #[cfg(feature = "jit")]
     jit_code_pages: Option<crate::x86::jit::validity::CodePages>,
-    #[cfg(feature = "monitor")]
-    shadow: Option<&'static mut crate::monitor::DefaultMonitorShadowRuntime>,
     regions: PhysRegionMap<8>,
     frame_roles: Vec<FrameRoleFlags>,
     #[cfg_attr(not(test), allow(dead_code))]
@@ -2438,125 +2320,6 @@ pub(crate) struct HostBus {
     next_device_tick: u64,
 }
 
-#[cfg(feature = "monitor")]
-struct MachineDeviceState<'a>(&'a HostBus);
-#[cfg(feature = "monitor")]
-impl core::fmt::Debug for MachineDeviceState<'_> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Exhaustive destructuring makes new device fields a compile error
-        // until accounted for; RAM, derived MMU state and host diagnostics
-        // are separate from guest-visible device state.
-        let HostBus {
-            ram: _,
-            shadow: _,
-            #[cfg(feature = "jit")]
-                jit_code_pages: _,
-            regions,
-            frame_roles: _,
-            tracked_writes: _,
-            diagnostics: _,
-            firmware_mode,
-            acpi,
-            boot_order,
-            vga,
-            ioram_generation: _,
-            ps2,
-            pic,
-            ide,
-            pci,
-            net,
-            usb,
-            sound,
-            fw_cfg,
-            serial,
-            serial_dropped: _,
-            serial_rx,
-            serial_dll,
-            serial_dlh,
-            serial_ier,
-            serial_lcr,
-            serial_mcr,
-            serial_msr_delta,
-            serial_scratch,
-            serial_tx_interrupt,
-            pit,
-            port61,
-            port92,
-            cmos_index,
-            cmos_status_a,
-            cmos_status_b,
-            cmos_status_c,
-            cmos_alarm,
-            rtc_irq8,
-            rtc_next_tick,
-            rtc_last_tick,
-            rtc_periodic_epoch,
-            fdc,
-            reset_requested,
-            physical_mapping_changed,
-            last_cpu_shutdown: _,
-            current_step,
-            clock,
-            magic,
-            rtc_epoch_seconds,
-            rtc_epoch_tick,
-            rtc_frozen,
-            attention,
-            next_attention_step,
-            next_device_tick,
-        } = self.0;
-        f.debug_struct("PC")
-            .field("regions", regions)
-            .field("firmware_mode", firmware_mode)
-            .field("vga", vga)
-            .field("ps2", ps2)
-            .field("pic", pic)
-            .field("ide", ide)
-            .field("pci", pci)
-            .field("net", net)
-            .field("usb", usb)
-            .field("sound", sound)
-            .field("fw_cfg", fw_cfg)
-            .field("serial", serial)
-            .field("serial_rx", serial_rx)
-            .field("serial_dll", serial_dll)
-            .field("serial_dlh", serial_dlh)
-            .field("serial_ier", serial_ier)
-            .field("serial_lcr", serial_lcr)
-            .field("serial_mcr", serial_mcr)
-            .field("serial_msr_delta", serial_msr_delta)
-            .field("serial_scratch", serial_scratch)
-            .field("serial_tx_interrupt", serial_tx_interrupt)
-            .field("pit", pit)
-            .field("port61", port61)
-            .field("port92", port92)
-            .field("cmos_index", cmos_index)
-            .field("acpi", acpi)
-            .field("boot_order", boot_order)
-            .field("cmos_status_a", cmos_status_a)
-            .field("cmos_status_b", cmos_status_b)
-            .field("cmos_status_c", cmos_status_c)
-            .field("cmos_alarm", cmos_alarm)
-            .field("rtc_irq8", rtc_irq8)
-            .field("rtc_next_tick", rtc_next_tick)
-            .field("rtc_last_tick", rtc_last_tick)
-            .field("rtc_periodic_epoch", rtc_periodic_epoch)
-            .field("fdc", fdc)
-            .field("reset_requested", reset_requested)
-            .field("physical_mapping_changed", physical_mapping_changed)
-            .field("realtime_clock", &clock.is_realtime())
-            .field("magic", magic)
-            .field("rtc_epoch_seconds", rtc_epoch_seconds)
-            .field("rtc_epoch_tick", rtc_epoch_tick)
-            .field("rtc_frozen", rtc_frozen)
-            .field("current_step", current_step)
-            .field("attention", attention)
-            .field("next_attention_step", next_attention_step)
-            .field("next_device_tick", next_device_tick)
-            .finish()
-    }
-}
-
 impl HostBus {
     // PC open-bus semantics: no responder drives an all-ones read; writes
     // have no device side effects (also v86 io.js). This applies only at
@@ -2573,14 +2336,10 @@ impl HostBus {
     }
 
     // tiny386 changes memory mappings at PCI configuration writes. Our CPU
-    // caches hold direct backing pointers, so retire their proofs as well as
-    // monitor mappings at that same boundary; ordinary RAM hits stay unchanged.
+    // caches hold direct backing pointers, so retire their proofs at that
+    // same boundary; ordinary RAM hits stay unchanged.
     fn physical_mapping_changed(&mut self) {
         self.physical_mapping_changed = true;
-        #[cfg(feature = "monitor")]
-        if let Some(shadow) = self.shadow.as_deref_mut() {
-            shadow.flush_for_physical_map_change();
-        }
     }
 
     fn set_a20(&mut self, enabled: bool) {
@@ -2732,8 +2491,6 @@ impl HostBus {
             ram,
             #[cfg(feature = "jit")]
             jit_code_pages: None,
-            #[cfg(feature = "monitor")]
-            shadow: None,
             regions,
             frame_roles,
             tracked_writes: TrackedWriteStats::default(),
@@ -2812,10 +2569,6 @@ impl HostBus {
             vga,
             frame_roles,
         );
-        #[cfg(feature = "monitor")]
-        {
-            fresh.shadow = self.shadow.take();
-        }
         fresh.pci.firmware = core::mem::take(&mut self.pci.firmware);
         fresh.pci.firmware.reset();
         // Retain media and immutable firmware configuration without copying
@@ -2999,14 +2752,6 @@ impl HostBus {
                 #[cfg(feature = "jit")]
                 if let Some(pages) = self.jit_code_pages.as_mut() {
                     pages.write(addr as usize, usize::from(len));
-                }
-                #[cfg(feature = "monitor")]
-                if let Some(shadow) = self.shadow.as_deref_mut() {
-                    shadow.observe_phys_write(PhysWrite::new(
-                        WriteOrigin::Device,
-                        PhysAddr(u64::from(addr)),
-                        len,
-                    ));
                 }
                 #[cfg(test)]
                 {
@@ -3261,88 +3006,16 @@ impl HostBus {
     pub(crate) fn jit_rechecks_enabled(&self) -> bool {
         // PCI framebuffer decode may overlay ordinary RAM. Decline comparison
         // witnesses while any such overlay is possible; the shared walker owns
-        // that physical access. Monitor RAM has the same stable backing; its
-        // page-table/code write watches still deny writable probe results.
+        // that physical access. Code write watches still deny writable
+        // probe results.
         self.jit_code_pages.is_some()
             && self.port92 & 2 != 0
             && (!self.pci.vga_mem_enabled() || self.pci.vga_lfb_base() >= self.ram.len() as u64)
     }
 
-    #[cfg(all(
-        feature = "jit",
-        feature = "monitor",
-        target_arch = "aarch64",
-        target_os = "none"
-    ))]
-    pub(crate) fn jit_prepare_hard_reads(&mut self, cpu: &Cpu) -> u64 {
-        self.shadow
-            .as_deref_mut()
-            .expect("EL1 JIT requires shadow mappings")
-            .prepare_jit_reads(cpu)
-    }
-
-    /// Called only inside the native fault boundary with live x86 registers.
-    /// The shared probe reads control state and already-A/D RAM paging words;
-    /// it cannot raise a guest exception or change architectural/device state.
-    #[cfg(all(
-        feature = "jit",
-        feature = "monitor",
-        target_arch = "aarch64",
-        target_os = "none"
-    ))]
-    pub(crate) fn jit_refill_hard(&mut self, cpu: &Cpu, linear: LinearAddr, write: bool) -> bool {
-        let Some(translation) = mmu::try_resident_native_translation(cpu, self, linear, write)
-        else {
-            return false;
-        };
-        // A live block can retain software-qualified write ranges. Only use
-        // sources whose aliases were already revoked before this invocation:
-        // first discovery must leave through the precise exit and shared walk.
-        let shadow = self
-            .shadow
-            .as_deref()
-            .expect("EL1 JIT requires shadow mappings");
-        for index in 0..translation.page_table_frame_count() as usize {
-            if !shadow
-                .core
-                .frame_has_users(translation.page_table_frame(index).unwrap().frame)
-            {
-                return false;
-            }
-        }
-        let priv_ = mmu::AccessPriv::from_cpl(cpu.cpl());
-        self.after_linear_translate(
-            linear,
-            if write {
-                AccessKind::Write
-            } else {
-                AccessKind::Read
-            },
-            priv_,
-            cpu.cr0,
-            cpu.cr3,
-            cpu.cr4,
-            cpu.eflags,
-            translation,
-        );
-        let window = if priv_.is_user() {
-            crate::monitor::shadow::ShadowWindow::User
-        } else {
-            crate::monitor::shadow::ShadowWindow::Supervisor
-        };
-        self.shadow
-            .as_deref_mut()
-            .and_then(|shadow| shadow.descriptor_for(window, linear))
-            .is_some_and(|descriptor| !write || descriptor & (1 << 7) == 0)
-    }
-
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-        )
+        all(feature = "jit", target_arch = "aarch64", target_os = "linux")
     ))]
     pub(crate) fn jit_code_epoch(&self) -> u64 {
         self.jit_code_pages
@@ -3352,11 +3025,7 @@ impl HostBus {
 
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-        )
+        all(feature = "jit", target_arch = "aarch64", target_os = "linux")
     ))]
     pub(crate) fn jit_single_retired_version(&self, previous_epoch: u64) -> Option<*const u64> {
         self.jit_code_pages
@@ -3369,11 +3038,7 @@ impl HostBus {
         any(
             all(feature = "r86chip", target_arch = "riscv32"),
             any(
-                all(
-                    feature = "jit",
-                    target_arch = "aarch64",
-                    any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-                ),
+                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
                 all(feature = "jit", target_arch = "arm")
             )
         )
@@ -3389,11 +3054,7 @@ impl HostBus {
         any(
             all(feature = "r86chip", target_arch = "riscv32"),
             any(
-                all(
-                    feature = "jit",
-                    target_arch = "aarch64",
-                    any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-                ),
+                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
                 all(feature = "jit", target_arch = "arm")
             )
         )
@@ -3411,10 +3072,6 @@ impl HostBus {
         if promoted {
             cpu.translation_cache
                 .revoke_writable_aliases(self.ram.as_ptr() as u64 + (offset & !4095) as u64);
-            #[cfg(feature = "monitor")]
-            if let Some(shadow) = self.shadow.as_deref_mut() {
-                shadow.protect_native_writes(PhysFrame((offset >> 12) as u64));
-            }
         }
         (offset as u64, version, pages.version_ptr(offset >> 12))
     }
@@ -3429,11 +3086,7 @@ impl HostBus {
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
         any(
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                any(target_os = "linux", all(feature = "monitor", target_os = "none"))
-            ),
+            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
             all(feature = "jit", target_arch = "arm")
         )
     ))]
@@ -3560,10 +3213,6 @@ impl HostBus {
 
     #[inline]
     fn before_decoded_write(&mut self, write: PhysWrite) -> Result<(), MemError> {
-        #[cfg(feature = "monitor")]
-        if let Some(shadow) = self.shadow.as_deref_mut() {
-            shadow.observe_phys_write(write);
-        }
         if matches!(write.origin, WriteOrigin::Cpu | WriteOrigin::PageWalk)
             && self
                 .fast_ram_index_for_len(write.addr, usize::from(write.len))
@@ -3577,7 +3226,7 @@ impl HostBus {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "monitor"))]
+    #[cfg(test)]
     fn frame_index(&self, frame: PhysFrame) -> Option<usize> {
         let index = usize::try_from(frame.0).ok()?;
         if index < self.frame_roles.len() {
@@ -3588,7 +3237,6 @@ impl HostBus {
     }
 
     #[inline(always)]
-    #[cfg(any(test, feature = "monitor"))]
     #[cfg(test)]
     fn write_touches_page_table_frame(&self, write: PhysWrite) -> bool {
         if write.len == 0 {
@@ -4739,21 +4387,6 @@ impl Bus for HostBus {
         // are not INVLPG. This also keeps their RAM stores on the normal path.
         // v86 cpu.rs agrees. The standalone tlb_lifetime ROM checks remapping,
         // cached write permissions and Accessed-bit clearing.
-        // Retained HardMMU mappings still own physical table dependencies;
-        // keep their existing conservative write invalidation independently.
-        #[cfg(feature = "monitor")]
-        if self.shadow.is_some() {
-            let Some(index) = self.frame_index(frame) else {
-                return Err(MemError::OutOfRange { addr: frame.base() });
-            };
-            self.frame_roles[index].insert(FrameRoleFlags::from_page_table_role(role));
-            // Protection belongs to live address-space dependencies, not to a
-            // permanent "was once a table" bit. Rediscovery after retirement
-            // must again revoke any writable aliases before admitting a map.
-            let shadow = self.shadow.as_deref_mut().unwrap();
-            shadow.protect_native_writes(frame);
-            return Ok(shadow.core.track_frame(frame));
-        }
         let _ = (frame, role);
         Ok(false)
     }
@@ -4785,174 +4418,6 @@ impl Bus for HostBus {
         Ok(())
     }
 
-    #[cfg(feature = "monitor")]
-    fn after_linear_translate(
-        &mut self,
-        linear: LinearAddr,
-        access: AccessKind,
-        priv_: mmu::AccessPriv,
-        cr0: u32,
-        cr3: u32,
-        cr4: u32,
-        eflags: u32,
-        translation: mmu::Translation,
-    ) {
-        // Read fills preserve their permissions; native stores require a
-        // completed write walk and the same code/table exclusion as soft tokens.
-        #[cfg(feature = "jit")]
-        let write = access == AccessKind::Write && self.jit_code_pages.is_some();
-        #[cfg(not(feature = "jit"))]
-        let write = false;
-        if (access != AccessKind::Read && !write) || self.shadow.is_none() || self.port92 & 2 == 0 {
-            return;
-        }
-        let base = PhysAddr(translation.phys.0 & !4095);
-        let ordinary_ram_page = self.classify_phys_kind(base, 4096) == PhysRegionKind::Ram
-            && self.fast_ram_index_for_len(base, 4096).is_some();
-        if write && (!ordinary_ram_page || !self.cached_write_translation_allowed(base)) {
-            return;
-        }
-        let block_base = PhysAddr(translation.phys.0 & !0x1f_ffff);
-        let ordinary_ram_block = ordinary_ram_page
-            && matches!(
-                translation.page_size,
-                mmu::TranslationPageSize::Size2M | mmu::TranslationPageSize::Size4M
-            )
-            && self.classify_phys_kind(block_base, 0x20_0000) == PhysRegionKind::Ram
-            && self.fast_ram_index_for_len(block_base, 0x20_0000).is_some();
-        // Reported video pages and PAM shadow reads are side-effect-free.
-        // Decode changes retire these native mappings before guest access.
-        let read_page = if ordinary_ram_page {
-            Some(crate::monitor::abi::X86_RAM_IPA_BASE + base.0)
-        } else {
-            self.ioram_page(base, false).map(|token| {
-                let offset = token.0.wrapping_sub(self.ram.as_ptr() as u64);
-                if offset < self.ram.len() as u64 {
-                    crate::monitor::abi::X86_RAM_IPA_BASE + offset
-                } else {
-                    token.0
-                }
-            })
-        };
-        if let Some(shadow) = self.shadow.as_deref_mut() {
-            shadow.after_linear_translate_backing(
-                read_page,
-                ordinary_ram_block,
-                write,
-                linear,
-                access,
-                priv_,
-                cr0,
-                cr3,
-                cr4,
-                eflags,
-                translation,
-            );
-        }
-    }
-
-    #[cfg(feature = "monitor")]
-    fn after_control_register_write(&mut self, index: u8, old: u32, new: u32) {
-        if let Some(shadow) = self.shadow.as_deref_mut() {
-            shadow.flush_for_control_write(index, old, new);
-        }
-    }
-
-    #[cfg(feature = "monitor")]
-    fn after_invlpg(&mut self, linear: LinearAddr) {
-        if let Some(shadow) = self.shadow.as_deref_mut() {
-            shadow.flush_for_invlpg(linear);
-        }
-    }
-
-    #[cfg(feature = "monitor")]
-    fn try_native_read_linear_u8(
-        &mut self,
-        linear: LinearAddr,
-        access: AccessKind,
-        priv_: mmu::AccessPriv,
-        cr0: u32,
-        cr3: u32,
-        cr4: u32,
-        eflags: u32,
-    ) -> crate::x86::mem::NativeRead<u8> {
-        use crate::x86::mem::NativeRead;
-        if self.port92 & 2 == 0 {
-            return NativeRead::Unsupported;
-        }
-        self.shadow
-            .as_deref_mut()
-            .map_or(NativeRead::Unsupported, |shadow| {
-                shadow.try_native_read_linear_u8(linear, access, priv_, cr0, cr3, cr4, eflags)
-            })
-    }
-
-    #[cfg(feature = "monitor")]
-    fn native_read_backing(
-        &mut self,
-        linear: LinearAddr,
-        priv_: mmu::AccessPriv,
-    ) -> Option<(BackingToken, mmu::TranslationPageSize)> {
-        let (phys, page_size) = self
-            .shadow
-            .as_deref_mut()?
-            .native_hit_translation(linear, priv_)?;
-        // Device mappings never become persistent CPU RAM tokens. They depend
-        // on PCI decode and retain only the hardware shadow's shorter lifetime.
-        if phys.0 >= self.ram.len() as u64 {
-            return None;
-        }
-        Some((
-            BackingToken(self.ram.as_ptr().wrapping_add(phys.0 as usize) as u64),
-            page_size,
-        ))
-    }
-
-    #[cfg(feature = "monitor")]
-    fn try_native_read_linear_u16(
-        &mut self,
-        linear: LinearAddr,
-        access: AccessKind,
-        priv_: mmu::AccessPriv,
-        cr0: u32,
-        cr3: u32,
-        cr4: u32,
-        eflags: u32,
-    ) -> crate::x86::mem::NativeRead<u16> {
-        use crate::x86::mem::NativeRead;
-        if self.port92 & 2 == 0 {
-            return NativeRead::Unsupported;
-        }
-        self.shadow
-            .as_deref_mut()
-            .map_or(NativeRead::Unsupported, |shadow| {
-                shadow.try_native_read_linear_u16(linear, access, priv_, cr0, cr3, cr4, eflags)
-            })
-    }
-
-    #[cfg(feature = "monitor")]
-    #[inline(always)]
-    fn try_native_read_linear_u32(
-        &mut self,
-        linear: LinearAddr,
-        access: AccessKind,
-        priv_: mmu::AccessPriv,
-        cr0: u32,
-        cr3: u32,
-        cr4: u32,
-        eflags: u32,
-    ) -> crate::x86::mem::NativeRead<u32> {
-        use crate::x86::mem::NativeRead;
-        if self.port92 & 2 == 0 {
-            return NativeRead::Unsupported;
-        }
-        self.shadow
-            .as_deref_mut()
-            .map_or(NativeRead::Unsupported, |shadow| {
-                shadow.try_native_read_linear_u32(linear, access, priv_, cr0, cr3, cr4, eflags)
-            })
-    }
-
     fn linear_translation_cache_enabled(&self) -> bool {
         true
     }
@@ -4981,10 +4446,6 @@ impl Bus for HostBus {
                 cpu.invalidate_translation_context();
             } else {
                 cpu.invalidate_ioram_translations();
-            }
-            #[cfg(feature = "monitor")]
-            if let Some(shadow) = self.shadow.as_deref_mut() {
-                shadow.flush_for_physical_map_change();
             }
             self.ioram_generation = generation;
         }
@@ -5027,9 +4488,7 @@ impl Bus for HostBus {
     }
 
     // Ordinary PTE stores are not architectural TLB invalidations. The shared
-    // software caches retain their entries until eviction/CRx/INVLPG, as in
-    // SoftMMU. before_phys_write independently retires affected shadow leaves;
-    // that hardware-cache policy must not expire unrelated CPU/code mappings.
+    // software caches retain their entries until eviction/CRx/INVLPG.
 
     #[inline(always)]
     fn cached_ram_write_needs_fetch_invalidation(&self) -> bool {
@@ -5054,11 +4513,6 @@ impl Bus for HostBus {
             .is_some_and(|pages| index < self.frame_roles.len() && pages.watched(index))
         {
             return false;
-        }
-        #[cfg(feature = "monitor")]
-        if let Some(shadow) = self.shadow.as_deref() {
-            return index < self.frame_roles.len()
-                && !shadow.core.frame_has_users(PhysFrame(index as u64));
         }
         index < self.frame_roles.len()
     }
@@ -11905,390 +11359,6 @@ mod host_bus_tests {
         cpu.cr0 = CR0_PE | CR0_PG;
         cpu.cr3 = cr3;
         cpu
-    }
-
-    #[cfg(feature = "monitor")]
-    #[test]
-    fn shared_shadow_framebuffer_reads_follow_pci_decode_without_ram_tokens() {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                use crate::monitor::shadow::ShadowWindow;
-                use crate::monitor::{
-                    DefaultMonitorShadowRuntime, MONITOR_SHADOW_L3_TABLES,
-                    MonitorShadowStage1Tables,
-                };
-                let tables = Box::leak(Box::new(MonitorShadowStage1Tables::<
-                    MONITOR_SHADOW_L3_TABLES,
-                >::new()));
-                let shadow = Box::leak(Box::new(DefaultMonitorShadowRuntime::new(tables)));
-                let mut machine =
-                    Machine::new_firmware(2 * 1024 * 1024, FirmwareDisplay::Vga).unwrap();
-                machine.cpu = paging_cpu(0x1000);
-                write_ram_u32(&mut machine.bus, 0x1000, 0x2007);
-                write_ram_u32(&mut machine.bus, 0x2010, 0xfd00_0005);
-                machine.bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
-                machine.bus.io_write_u32(0xcfc, 0xfd00_0000).unwrap();
-                machine.bus.io_write_u32(0xcf8, 0x8000_1004).unwrap();
-                machine.bus.io_write_u32(0xcfc, 2).unwrap();
-                machine.enable_hardmmu(shadow);
-                for priv_ in [mmu::AccessPriv::Supervisor, mmu::AccessPriv::User] {
-                    for value in [0x1234_5678, 0x8765_4321] {
-                        machine
-                            .bus
-                            .write_phys_u32(PhysAddr(0xfd00_0020), value)
-                            .unwrap();
-                        assert_eq!(
-                            mmu::read_linear_u32_at_cpl(
-                                &mut machine.cpu,
-                                &mut machine.bus,
-                                LinearAddr(0x4020),
-                                AccessKind::Read,
-                                if priv_.is_user() { 3 } else { 0 },
-                            )
-                            .unwrap(),
-                            value
-                        );
-                        let window = if priv_.is_user() {
-                            ShadowWindow::User
-                        } else {
-                            ShadowWindow::Supervisor
-                        };
-                        let descriptor = machine
-                            .bus
-                            .shadow
-                            .as_deref_mut()
-                            .unwrap()
-                            .descriptor_for(window, LinearAddr(0x4000))
-                            .unwrap();
-                        let backing = machine.bus.vga.direct_page(0xfd00_0000, false).unwrap();
-                        assert_eq!(backing as usize & 4095, 0);
-                        assert_eq!(descriptor & 0x0000_ffff_ffff_f000, backing as u64);
-                        assert_ne!(descriptor & (1 << 7), 0, "read-only mapping");
-                        assert!(
-                            machine
-                                .bus
-                                .native_read_backing(LinearAddr(0x4020), priv_)
-                                .is_none()
-                        );
-                        assert!(
-                            machine
-                                .cpu
-                                .cached_read_translation(LinearAddr(0x4020), priv_.is_user())
-                                .is_none()
-                        );
-                    }
-                }
-                // Both writes relocate the aperture. Rewriting the same BAR
-                // value need not evict a still-valid hardware mapping.
-                for command in [0xfc00_0000, 0xfb00_0000] {
-                    machine.bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
-                    machine.bus.io_write_u32(0xcfc, command).unwrap();
-                    for window in [ShadowWindow::Supervisor, ShadowWindow::User] {
-                        assert!(
-                            machine
-                                .bus
-                                .shadow
-                                .as_deref_mut()
-                                .unwrap()
-                                .descriptor_for(window, LinearAddr(0x4000))
-                                .is_none()
-                        );
-                    }
-                    crate::x86::mem::write_phys_u32(
-                        &mut machine.bus,
-                        PhysAddr(0x2010),
-                        command | 5,
-                    )
-                    .unwrap();
-                    machine.cpu.invalidate_translation_page(LinearAddr(0x4000));
-                    machine.bus.after_invlpg(LinearAddr(0x4000));
-                    assert_eq!(
-                        mmu::read_linear_u32(
-                            &mut machine.cpu,
-                            &mut machine.bus,
-                            LinearAddr(0x4020),
-                            AccessKind::Read
-                        )
-                        .unwrap(),
-                        0x8765_4321
-                    );
-                }
-                machine.bus.io_write_u32(0xcf8, 0x8000_1004).unwrap();
-                machine.bus.io_write_u32(0xcfc, 0).unwrap();
-                assert!(
-                    machine
-                        .bus
-                        .shadow
-                        .as_deref_mut()
-                        .unwrap()
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                        .is_none()
-                );
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[cfg(feature = "monitor")]
-    #[test]
-    fn shared_shadow_table_write_retains_software_translation_until_invlpg() {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                use crate::monitor::shadow::ShadowWindow;
-                use crate::monitor::{
-                    DefaultMonitorShadowRuntime, MONITOR_SHADOW_L3_TABLES,
-                    MonitorShadowStage1Tables,
-                };
-                let tables = Box::leak(Box::new(MonitorShadowStage1Tables::<
-                    MONITOR_SHADOW_L3_TABLES,
-                >::new()));
-                let shadow = Box::leak(Box::new(DefaultMonitorShadowRuntime::new(tables)));
-                let mut machine =
-                    Machine::new_firmware(2 * 1024 * 1024, FirmwareDisplay::Serial).unwrap();
-                machine.cpu = paging_cpu(0x1000);
-                for (addr, value) in [
-                    (0x1000, 0x2003),
-                    (0x2010, 0x8003),
-                    (0x2014, 0x2003),
-                    (0x2018, 0xa003),
-                    (0x8000, 11),
-                    (0x9000, 22),
-                    (0xa000, 33),
-                ] {
-                    write_ram_u32(&mut machine.bus, addr, value);
-                }
-                machine.enable_hardmmu(shadow);
-                let read = |m: &mut Machine, addr| {
-                    mmu::read_linear_u32(&mut m.cpu, &mut m.bus, LinearAddr(addr), AccessKind::Read)
-                        .unwrap()
-                };
-                assert_eq!(read(&mut machine, 0x4000), 11);
-                assert_eq!(read(&mut machine, 0x6000), 33);
-                let neighbor = machine
-                    .cpu
-                    .cached_read_translation(LinearAddr(0x6000), false);
-                mmu::write_linear_u32(
-                    &mut machine.cpu,
-                    &mut machine.bus,
-                    LinearAddr(0x5010),
-                    0x9003,
-                )
-                .unwrap();
-                assert_eq!(
-                    read(&mut machine, 0x4000),
-                    11,
-                    "cached mapping can survive an ordinary PTE write"
-                );
-                assert_eq!(
-                    machine
-                        .cpu
-                        .cached_read_translation(LinearAddr(0x6000), false),
-                    neighbor
-                );
-                let shadow = machine.bus.shadow.as_deref_mut().unwrap();
-                assert!(
-                    shadow
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                        .is_none()
-                );
-                assert!(
-                    shadow
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x6000))
-                        .is_some()
-                );
-                assert!(
-                    !machine
-                        .bus
-                        .cached_write_translation_allowed(PhysAddr(0x2000)),
-                    "surviving hardware sources still prohibit untracked native writes"
-                );
-                machine.cpu.invalidate_translation_page(LinearAddr(0x4000));
-                machine.bus.after_invlpg(LinearAddr(0x4000));
-                assert_eq!(read(&mut machine, 0x4000), 22);
-                assert_eq!(read(&mut machine, 0x6000), 33);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
-    }
-
-    #[cfg(feature = "monitor")]
-    #[test]
-    fn shared_machine_shadow_observes_inactive_table_writes_and_pc_regions() {
-        std::thread::Builder::new()
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                use crate::monitor::shadow::ShadowWindow;
-                use crate::monitor::{
-                    DefaultMonitorShadowRuntime, MONITOR_SHADOW_L3_TABLES,
-                    MonitorShadowStage1Tables,
-                };
-                use crate::x86::mem;
-                let tables = Box::leak(Box::new(MonitorShadowStage1Tables::<
-                    MONITOR_SHADOW_L3_TABLES,
-                >::new()));
-                let shadow = Box::leak(Box::new(DefaultMonitorShadowRuntime::new(tables)));
-                let mut machine =
-                    Machine::new_firmware(2 * 1024 * 1024, FirmwareDisplay::Serial).unwrap();
-                machine.cpu = paging_cpu(0x1000);
-                for (addr, value) in [
-                    (0x1000, 0x2003),
-                    (0x2010, 0x8003),
-                    (0x3000, 0x4003),
-                    (0x4010, 0x9003),
-                    (0x4014, 0x2003),
-                    (0x8000, 11),
-                    (0x9000, 22),
-                    (0xa000, 33),
-                ] {
-                    write_ram_u32(&mut machine.bus, addr, value);
-                }
-                machine.enable_hardmmu(shadow);
-                fn switch(machine: &mut Machine, cr3: u32) {
-                    let old = machine.cpu.cr3;
-                    machine.cpu.cr3 = cr3;
-                    machine.cpu.invalidate_translation_context();
-                    machine.bus.after_control_register_write(3, old, cr3);
-                }
-                fn read(machine: &mut Machine) -> u32 {
-                    mmu::read_linear_u32(
-                        &mut machine.cpu,
-                        &mut machine.bus,
-                        LinearAddr(0x4000),
-                        AccessKind::Read,
-                    )
-                    .unwrap()
-                }
-                assert_eq!(read(&mut machine), 11);
-                let a = machine
-                    .bus
-                    .shadow
-                    .as_deref_mut()
-                    .unwrap()
-                    .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                    .unwrap();
-                assert_ne!(a & (1 << 7), 0, "native mapping is read-only");
-                assert_eq!(
-                    machine.bus.read_phys_u32(PhysAddr(0x2010)).unwrap() & PTE_DIRTY,
-                    0
-                );
-                switch(&mut machine, 0x3000);
-                assert_eq!(read(&mut machine), 22);
-                // A high MMIO write cannot modify either context's RAM page
-                // tables. Retain A's mapping across that write and switch.
-                let flushes = machine.hardmmu_stats().page_table_write_flushes;
-                mem::write_phys_u32(&mut machine.bus, PhysAddr(0xfee0_0000), 0x1234).unwrap();
-                switch(&mut machine, 0x1000);
-                assert_eq!(
-                    machine
-                        .bus
-                        .shadow
-                        .as_deref_mut()
-                        .unwrap()
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000)),
-                    Some(a)
-                );
-                assert_eq!(read(&mut machine), 11);
-                assert_eq!(machine.hardmmu_stats().page_table_write_flushes, flushes);
-                switch(&mut machine, 0x3000);
-                // Context B writes context A's page table through an ordinary x86
-                // alias. Both shared software tracking and native dependencies run.
-                mmu::write_linear_u32(
-                    &mut machine.cpu,
-                    &mut machine.bus,
-                    LinearAddr(0x5010),
-                    0xa003,
-                )
-                .unwrap();
-                switch(&mut machine, 0x1000);
-                assert!(
-                    machine
-                        .bus
-                        .shadow
-                        .as_deref_mut()
-                        .unwrap()
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                        .is_none()
-                );
-                assert!(
-                    machine
-                        .bus
-                        .cached_write_translation_allowed(PhysAddr(0x2000)),
-                    "retired table dependency no longer owns write protection"
-                );
-                assert_eq!(read(&mut machine), 33);
-                assert!(
-                    !machine
-                        .bus
-                        .cached_write_translation_allowed(PhysAddr(0x2000)),
-                    "a fresh walk reestablishes table write protection"
-                );
-                assert!(
-                    mmu::read_linear_u32_at_cpl(
-                        &mut machine.cpu,
-                        &mut machine.bus,
-                        LinearAddr(0x4000),
-                        AccessKind::Read,
-                        3
-                    )
-                    .is_err()
-                );
-                assert!(
-                    machine
-                        .bus
-                        .shadow
-                        .as_deref_mut()
-                        .unwrap()
-                        .descriptor_for(ShadowWindow::User, LinearAddr(0x4000))
-                        .is_none()
-                );
-                for target in [0xb8000, 0xc0000] {
-                    mem::write_phys_u32(&mut machine.bus, PhysAddr(0x2010), target | 3).unwrap();
-                    machine.cpu.invalidate_translation_context();
-                    let _ = read(&mut machine);
-                    assert!(
-                        machine
-                            .bus
-                            .shadow
-                            .as_deref_mut()
-                            .unwrap()
-                            .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                            .is_none(),
-                        "VGA/ROM must not acquire a normal RAM shadow"
-                    );
-                }
-                switch(&mut machine, 0x3000);
-                assert_eq!(read(&mut machine), 22);
-                machine.bus.io_write_u8(0x92, 0).unwrap();
-                assert!(matches!(
-                    machine.bus.try_native_read_linear_u32(
-                        LinearAddr(0x4000),
-                        AccessKind::Read,
-                        mmu::AccessPriv::Supervisor,
-                        machine.cpu.cr0,
-                        machine.cpu.cr3,
-                        machine.cpu.cr4,
-                        machine.cpu.eflags,
-                    ),
-                    crate::x86::mem::NativeRead::Unsupported
-                ));
-                assert!(
-                    machine
-                        .bus
-                        .shadow
-                        .as_deref_mut()
-                        .unwrap()
-                        .descriptor_for(ShadowWindow::Supervisor, LinearAddr(0x4000))
-                        .is_none()
-                );
-                assert_eq!(machine.hardmmu_stats().shadow_errors, 0);
-            })
-            .unwrap()
-            .join()
-            .unwrap();
     }
 
     #[test]

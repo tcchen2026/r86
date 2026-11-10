@@ -381,7 +381,7 @@ fn translation_cache_target_is_ram<B: Bus>(bus: &B, phys: PhysAddr) -> bool {
 /// survive interpretation or device/event handling. This performs
 /// no paging writes or fault delivery: missing A/D bits, PAE/large pages and
 /// permission failures remain the shared walker's responsibility. Paging-off
-/// accesses use the same physical backing proof, including A20/overlay/monitor
+/// accesses use the same physical backing proof, including A20/overlay
 /// exclusions. No device callback with guest-visible side effects runs here.
 ///
 /// Consulted tiny386's tlb_refill. Unlike an ordinary walker this probe may run
@@ -393,13 +393,7 @@ fn translation_cache_target_is_ram<B: Bus>(bus: &B, phys: PhysAddr) -> bool {
     any(
         test,
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(
-            target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
-        )
+        all(target_arch = "aarch64", feature = "host", target_os = "linux")
     )
 ))]
 pub(crate) fn try_resident_data_translation<B: Bus>(
@@ -460,13 +454,7 @@ pub(crate) fn try_resident_data_translation<B: Bus>(
     any(
         test,
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(
-            target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
-        )
+        all(target_arch = "aarch64", feature = "host", target_os = "linux")
     )
 ))]
 struct ResidentPage {
@@ -485,13 +473,7 @@ struct ResidentPage {
     feature = "jit",
     any(
         test,
-        all(
-            target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
-        )
+        all(target_arch = "aarch64", feature = "host", target_os = "linux")
     )
 ))]
 pub(crate) fn try_resident_fetch_translation<B: Bus>(
@@ -526,13 +508,7 @@ pub(crate) fn try_resident_fetch_translation<B: Bus>(
     any(
         test,
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(
-            target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
-        )
+        all(target_arch = "aarch64", feature = "host", target_os = "linux")
     )
 ))]
 #[inline(always)]
@@ -572,54 +548,6 @@ fn resident_page<B: Bus>(
         pte,
         phys,
     })
-}
-
-/// A recoverable native fault may only retry after a side-effect-free proof.
-/// Missing A/D, PAE/large pages and devices leave through the precise exit.
-/// Read refills remain read-only: speculative writable aliases make later
-/// code/table promotion retire unrelated hardware mappings.
-#[cfg(all(
-    feature = "jit",
-    feature = "monitor",
-    feature = "machine",
-    target_arch = "aarch64",
-    target_os = "none"
-))]
-pub(crate) fn try_resident_native_translation<B: Bus>(
-    cpu: &Cpu,
-    bus: &mut B,
-    linear: LinearAddr,
-    write: bool,
-) -> Option<Translation> {
-    let page = resident_page(cpu, bus, linear, write)?;
-    bus.jit_page_table_source(page.phys)?;
-    if write && !bus.cached_write_translation_allowed(page.phys) {
-        return None;
-    }
-    // Hardware mappings survive CR3 switches only with complete source
-    // dependencies. The monitor admits these after checking that both source
-    // frames are already protected; this probe never promotes a live writable
-    // frame or invalidates a native block's earlier range proofs.
-    let mut frames = WalkFrameSet::new();
-    assert!(frames.push(
-        mem::PhysFrame::containing(PhysAddr(u64::from(cpu.cr3 & PAGE_MASK))),
-        mem::PageTableFrameRole::Directory
-    ));
-    assert!(frames.push(
-        mem::PhysFrame::containing(PhysAddr(u64::from(page.pde & PAGE_MASK))),
-        mem::PageTableFrameRole::Table
-    ));
-    let translation = Translation::new(
-        page.phys,
-        TranslationPageSize::Size4K,
-        frames,
-        true,
-        page.pte & PTE_DIRTY != 0,
-        false,
-        false,
-    )
-    .with_global(cpu.cr4 & CR4_PGE != 0 && page.pte & (1 << 8) != 0);
-    Some(translation)
 }
 
 pub(crate) fn fill_linear_translation_cache<B: Bus>(
@@ -1298,11 +1226,9 @@ pub fn read_linear_u32_at_priv<B: Bus>(
     read_linear_u32_split(cpu, bus, linear, access, priv_)
 }
 
-// Bare-metal native misses need a call boundary to keep software hits frameless.
-// In userspace the native branch folds away; inline the resulting forwarding
-// function so the optional backend adds no branch to the software miss path.
-#[cfg_attr(all(target_arch = "aarch64", target_os = "none"), inline(never))]
-#[cfg_attr(not(all(target_arch = "aarch64", target_os = "none")), inline)]
+// A bus without a native read path folds the hook away; inline the resulting
+// forwarding function so it adds no branch to the software miss path.
+#[inline]
 fn read_linear_u32_uncached<B: Bus>(
     cpu: &mut Cpu,
     bus: &mut B,

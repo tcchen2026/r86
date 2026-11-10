@@ -13,7 +13,7 @@ Timing starts before process creation and ends when the marker is received.
 CPU time is sampled from /proc at that endpoint; total child CPU through cleanup
 is also reported. Runs alternate order, each starts with an empty process/code
 cache. Guest devices use realtime by default; deterministic runs are a separate
-engine/checkpoint comparison. Defaults are two measured runs per engine, without
+engine comparison. Defaults are two measured runs per engine, without
 warm-ups. Counters and tracing must be collected separately. A faster timing does not by itself
 prove native coverage, architectural correctness or completion of the JIT goal.
 """

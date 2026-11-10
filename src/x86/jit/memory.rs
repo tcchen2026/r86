@@ -1,19 +1,13 @@
 //! Guest memory effects and native fault locations, independent of MMU lowering.
 //!
-//! The decoder names an x86 access; it does not choose a SoftMMU TLB load or a
-//! HardMMU native pointer. Both must preserve segment checks, effective-address
-//! wrapping, access width/privilege, A/D effects and the same commit boundary.
+//! The decoder names an x86 access; the lowering preserves segment checks,
+//! effective-address wrapping, access width/privilege, A/D effects and the
+//! commit boundary.
 //!
 //! SoftMMU handles semantic misses with the shared page walker/access helper.
 //! Native guards admit complete permitted RAM ranges and explicitly qualified
 //! linear-framebuffer ranges with dirty notification. Code promotion revokes
 //! writable aliases; ordinary page-table RAM stores obey TLB lifetime rules.
-//! EL1 HardMMU replaces ordinary read guards with protected native loads. Its
-//! exact-PC table permits a proven RAM refill/retry or redirects to the precise
-//! exit for shared A/D effects and guest exceptions. Native
-//! SS stores can use writable hardware leaves; physical code/table promotion
-//! revokes native write aliases before access resumes. Other writes remain
-//! software-qualified. The two lowerings share ALU/flags/decoder semantics.
 //!
 //! A fault site is immediately before an architecturally faultable ARM64 access.
 //! Pending x86 destination/flag updates are not committed before it. RMW and
@@ -34,18 +28,6 @@ pub struct FaultSite {
     /// RMW's load). Remaining bits must be zero. This names guest access intent,
     /// not just the native LDR/STR opcode.
     pub access: u32,
-}
-
-/// Sorted by absolute native PC, valid until the arena is reclaimed. The EL1
-/// exception boundary uses only this explicit pair, never Cpu/Engine layout.
-#[cfg(all(feature = "monitor", target_os = "none"))]
-#[derive(Clone, Copy)]
-#[repr(C)]
-pub struct NativeFault {
-    pub pc: usize,
-    /// Aligned recovery PC with required guest write permission in bit 0.
-    /// RMW loads require write permission even when ESR.WnR is clear.
-    pub recovery: usize,
 }
 
 impl FaultSite {

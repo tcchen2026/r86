@@ -18,21 +18,18 @@
 //! interrupt check.
 //! These registers survive
 //! links and memory guards. Only
-//! the exit materializes both into Frame.eflags. The EL1 data-abort boundary
-//! preserves these live registers across a side-effect-free refill/retry or
-//! redirects to that same precise exit before committing flags/destination.
+//! the exit materializes both into Frame.eflags.
 //! W14 carries the next x86 PC at dispatch/return boundaries. Direct same-page
 //! edges skip its materialization; budget/memory exits name their own exact PC.
 //! Frame.remaining and Frame.tsc
 //! retain the invocation's starting values until exit: completed steps are the
 //! initial budget minus the refunded X27. FaultSite.steps_adjust describes that
-//! refund for each native access; the EL1 boundary reuses the associated cold
-//! exit instead of duplicating its accounting. Each exit uses its guest PC,
+//! refund for each native access. Each exit uses its guest PC,
 //! since CALL may already have its target in W14. Deferred updates never change
 //! a machine event deadline.
 //!
-//! This explicit representation is usable by a Linux SoftMMU adapter or an EL1
-//! HardMMU adapter. Neither may embed Rust object offsets into emitted code.
+//! The adapter uses this explicit representation and may not embed Rust
+//! object offsets into emitted code.
 //! Only one invocation owns the live CPU state. Commit/reload at a helper or
 //! machine boundary; do not let Rust observers read stale architectural state.
 
@@ -86,21 +83,6 @@ pub struct Frame {
     pub call_base: *mut super::links::ReturnStack,
     /// Shared CALL dispatcher, with the same validation as dispatch_entry.
     pub call_dispatch_entry: usize,
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_read_base: u64,
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_faults: *const super::memory::NativeFault,
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_fault_count: usize,
-    /// Zero or the native FAR of a recorded access miss. Set only by the EL1
-    /// boundary; consumed after the ordinary precise exit committed live state.
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_fault_address: u64,
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_fault_write: u32,
-    /// Translation faults repaired without leaving this invocation.
-    #[cfg(all(feature = "monitor", target_os = "none"))]
-    pub hard_refills: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub memory_reads: u64,
     #[cfg(any(test, feature = "jit-profile"))]
@@ -153,18 +135,6 @@ impl Frame {
             }),
             call_base: core::ptr::null_mut(),
             call_dispatch_entry: 0,
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_read_base: 0,
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_faults: core::ptr::null(),
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_fault_count: 0,
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_fault_address: 0,
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_fault_write: 0,
-            #[cfg(all(feature = "monitor", target_os = "none"))]
-            hard_refills: 0,
             #[cfg(any(test, feature = "jit-profile"))]
             memory_reads: 0,
             #[cfg(any(test, feature = "jit-profile"))]

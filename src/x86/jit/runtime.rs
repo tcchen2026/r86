@@ -1,13 +1,11 @@
-//! AArch64 invocation/lookup owner shared by Linux and the EL1 Machine monitor.
-//! The code arena selects executable mappings at build time; x86 semantics,
-//! admission, invalidation and event deadlines are identical on both hosts.
+//! AArch64 invocation/lookup owner for Linux hosts.
+//! The code arena selects executable mappings at build time.
 //!
 //! Lookups require a valid shared execute translation and the recorded backing
 //! page's content version. Guarded native blocks cannot change code or mappings
 //! internally. Writable aliases are revoked on code-page promotion; scalar,
 //! token, page-walk, bulk and device RAM writes notify the version owner. Loaders
-//! and reset discard all derived code. The validity module is also usable by a
-//! future HardMMU protection handler. No future page walk is done by lookahead.
+//! and reset discard all derived code. No future page walk is done by lookahead.
 //! A renewed watch may retain a page's compiled entries only after comparing
 //! every byte used by its native and negative entries. Retain or retire the
 //! whole page together: a same-page direct branch can reach any of those bodies.
@@ -29,12 +27,6 @@
 //! CLI defaults to JIT on supported ARM64 Linux builds, otherwise interpretation.
 //! Statistics distinguish native steps from interpreter boundaries; a successful
 //! boot alone is not JIT validation.
-//! The no_std Machine monitor selects this same engine with `monitor,machine,jit`.
-//! Its paged generated reads use protected shadow windows and exact native-PC
-//! recovery. Qualified SS stores/RMW also use hardware windows; other writes
-//! retain SoftMMU qualification. JIT read-abort counts are separate from
-//! interpreter HardMMU counters. Unpaged EL1 blocks use
-//! the shared software qualification, with the mode included in their code key.
 
 use super::code::{CodeArena, CodeError, CodeHandle, ENTRY_TABLES, TableIndex, cache_limits};
 use super::validity::CodeContent;
@@ -51,8 +43,6 @@ use crate::x86::{
 };
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::hash::{BuildHasherDefault, Hasher};
-#[cfg(target_os = "none")]
-use hashbrown::HashMap;
 #[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
@@ -159,7 +149,7 @@ struct CompiledPage {
 
 impl CompiledPage {
     fn new(version: u64, arena: &mut CodeArena) -> Self {
-        // Full pools (large hosts, EL1) keep a table per visited page, so pages
+        // Full pools (large hosts) keep a table per visited page, so pages
         // without native code still dispatch through links.
         let entries = if arena.table_capacity() < ENTRY_TABLES {
             PageEntries::Cold(Box::new([0; PAGE_BYTES / 4]))
@@ -274,7 +264,7 @@ unsafe extern "C" fn load_cached_segment(frame: *mut Frame, segment: u32, select
 
 /// Operands and CR0 were qualified by generated code. This helper cannot
 /// interpret, access guest memory/devices or inspect stale GPRs/flags/time.
-/// Stores call it only after their native access, including HardMMU recovery.
+/// Stores call it only after their native access.
 pub(super) unsafe extern "C" fn execute_mmx(view: *mut View, control: u32, value: u64) {
     // SAFETY: the invocation exclusively owns this CPU. Its scalar MMX array
     // pointer is read only outside this helper, with no concurrent Rust borrow.
@@ -340,12 +330,6 @@ pub struct Stats {
     pub division_exits: u64,
     pub memory_exits: u64,
     pub native_invocations: u64,
-    #[cfg(target_os = "none")]
-    pub hard_read_aborts: u64,
-    #[cfg(target_os = "none")]
-    pub hard_write_aborts: u64,
-    #[cfg(target_os = "none")]
-    pub hard_refills: u64,
     #[cfg(feature = "jit-profile")]
     pub compile_nanoseconds: u128,
     #[cfg(feature = "jit-profile")]
@@ -383,11 +367,9 @@ pub struct Stats {
 
 pub struct Engine {
     arena: CodeArena,
-    #[cfg(target_os = "none")]
-    hard_faults: Vec<super::memory::NativeFault>,
     entry: Entry,
     // Key: EIP at the linear page's start, canonical physical backing page,
-    // flat DS/ES/SS facts and the EL1 paged/unpaged memory lowering.
+    // and flat DS/ES/SS facts.
     // This also handles nonzero/unaligned CS bases and different RAM aliases.
     pages: HashMap<(u64, u64), CompiledPage, BuildHasherDefault<PageHasher>>,
     // Both privilege planes have fixed bounds. Keep that ownership invariant
@@ -416,7 +398,6 @@ pub struct Engine {
 impl Engine {
     pub fn new() -> Result<Self, String> {
         // Small Linux hosts trade more whole-cache clears for bounded memory.
-        // EL1 keeps its fixed 128 MiB code / 4096-table allocation.
         let (bytes, tables) = cache_limits();
         Self::with_limits(bytes, tables)
     }
@@ -432,8 +413,6 @@ impl Engine {
         let entry = Self::publish_entry(&mut arena)?;
         Ok(Self {
             arena,
-            #[cfg(target_os = "none")]
-            hard_faults: Vec::new(),
             entry,
             pages: HashMap::default(),
             links: vec![Link::EMPTY; 2 * SLOTS]
@@ -498,8 +477,6 @@ impl Engine {
         self.links.fill(Link::EMPTY);
         self.global_links.fill(0);
         self.pages.clear();
-        #[cfg(target_os = "none")]
-        self.hard_faults.clear();
         self.arena.clear();
         // No compiled code or published link can observe an old version now.
         // Reclaim write watches with their code, including capacity evictions;
@@ -941,23 +918,6 @@ impl Engine {
                 .arena
                 .address(entry, 0)
                 .map_err(|error| format!("JIT linked entry: {error:?}"))?;
-            #[cfg(target_os = "none")]
-            for (fault, recovery) in code.faults.iter().zip(&code.recoveries) {
-                // The exact site owns the instruction's precise commit/exit.
-                // SS stores may fault; software accesses cannot fault in the
-                // selected hardware window and are excluded by FAR validation.
-                if cpu.cr0 & crate::x86::cpu::CR0_PG == 0 {
-                    continue;
-                }
-                let pc = body + fault.native_offset as usize;
-                assert!(self.hard_faults.last().is_none_or(|last| last.pc < pc));
-                self.hard_faults.push(super::memory::NativeFault {
-                    pc,
-                    // Bit 0 carries guest write intent, also for RMW loads.
-                    // Native PCs are 4-byte aligned; the vector masks the bit.
-                    recovery: (body + *recovery as usize) | ((fault.access as usize >> 8) & 1),
-                });
-            }
             (Some(NativeBlock { body }), code.faults, code.edges)
         };
         let page = self
@@ -1071,16 +1031,6 @@ impl Engine {
                     cpu.begin_instruction();
                     cpu.segment_override = None;
                     let mut frame = Frame::from_cpu(cpu, native_limit);
-                    #[cfg(target_os = "none")]
-                    {
-                        frame.hard_read_base = if cpu.cr0 & crate::x86::cpu::CR0_PG != 0 {
-                            bus.jit_prepare_hard_reads(cpu)
-                        } else {
-                            0 // This block has software-qualified unpaged reads.
-                        };
-                        frame.hard_faults = self.hard_faults.as_ptr();
-                        frame.hard_fault_count = self.hard_faults.len();
-                    }
                     frame.native_entry = body;
                     frame.dispatch_entry = self.entry.dispatch;
                     frame.call_dispatch_entry = self.entry.call_dispatch;
@@ -1111,23 +1061,6 @@ impl Engine {
                         "JIT chain exceeded its budget"
                     );
                     frame.commit(cpu);
-                    #[cfg(target_os = "none")]
-                    {
-                        self.stats.hard_refills += frame.hard_refills;
-                    }
-                    #[cfg(target_os = "none")]
-                    if frame.hard_fault_address != 0 {
-                        // Memory-source DIV shares the precise division exit;
-                        // its operand fault must precede any divide exception.
-                        assert!(matches!(frame.exit_kind, 1 | 3 | 4));
-                        cpu.translation_cache
-                            .discard_hard_access_miss(LinearAddr(frame.hard_fault_address as u32));
-                        if frame.hard_fault_write != 0 {
-                            self.stats.hard_write_aborts += 1;
-                        } else {
-                            self.stats.hard_read_aborts += 1;
-                        }
-                    }
                     ran += frame.completed;
                     self.stats.native_steps += frame.completed;
                     #[cfg(any(test, feature = "jit-profile"))]

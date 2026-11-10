@@ -1,5 +1,4 @@
-//! Direct i386 integer lowering to AArch64, sharing one register/flag model
-//! across future SoftMMU and HardMMU access sequences.
+//! Direct i386 integer lowering to AArch64 with one register/flag model.
 //!
 //! W19..W26 are guest GPRs, W15 holds packed NZCV with x86 carry/borrow, X27
 //! the budget and X28 the invocation frame. W0..W6 are temporaries; W7 belongs
@@ -139,9 +138,6 @@ pub struct CompiledBlock {
     pub cold_word: usize,
     pub relocations: Vec<super::a64::Relocation>,
     pub faults: Vec<FaultSite>,
-    /// Parallel precise-exit offsets, relocated together with the cold body.
-    #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-    pub recoveries: Vec<u32>,
     pub edges: Vec<super::links::Edge>,
 }
 
@@ -1410,16 +1406,10 @@ pub fn entry() -> Result<CompiledEntry, EmitError> {
 /// SUBS X27, X27, #1 at the start of a one-instruction block. The host may
 /// recognize this header for an interrupt-shadow invocation with budget one;
 /// an unrecognized entry simply declines that specialization.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(
-        all(feature = "host", target_os = "linux"),
-        all(feature = "monitor", feature = "machine", target_os = "none")
-    )
-))]
+#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
 pub(super) const ONE_INSTRUCTION_ENTRY: u32 = 0xf100_077b;
 
-/// `block_facts` (flat segment qualifications and EL1 read mode) are
+/// `block_facts` (flat segment qualifications) are
 /// proven by the adapter for every entry into this
 /// code, including linked edges. They remain constant throughout a native
 /// invocation: a segment load exits if these qualifications change. Pass zero
@@ -1939,8 +1929,7 @@ pub fn block(
                 let site = site.as_ref().unwrap();
                 let access = soft::prepare(&mut a, address, bits, true, site.guard());
                 let read_offset = access.access(&mut a, LHS, false);
-                // RMW needs write permission even if a future HardMMU fault is
-                // first observed at the native load. No guest state is changed.
+                // RMW needs write permission at its load. No guest state is changed.
                 faults.push(FaultSite::new(
                     read_offset,
                     site.eip,
@@ -1958,8 +1947,7 @@ pub fn block(
                     bits / 8,
                     true,
                 ));
-                // STR preserves NZCV. Publish x86 flags only after its commit,
-                // so the same lowering can recover a HardMMU store abort.
+                // STR preserves NZCV. Publish x86 flags only after its commit.
                 finish_alu_flags(&mut a, kind, needed[index], (LHS, rhs, RESULT));
             }
             Op::Alu {
@@ -2872,10 +2860,7 @@ pub fn block(
     // checking references. Native fault records above remain independent.
     a.flush_tails();
     for site in &exits {
-        let needed = a.is_referenced(site.miss);
-        #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-        let needed = needed || faults.iter().any(|fault| fault.guest_eip == site.eip);
-        if !needed {
+        if !a.is_referenced(site.miss) {
             continue;
         }
         a.bind(site.miss);
@@ -2927,17 +2912,6 @@ pub fn block(
     a.bind(done);
     a.load_store(true, LHS, FRAME, offset_of!(Frame, return_entry) as u32, 3);
     a.br(LHS);
-    #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-    let recoveries = faults
-        .iter()
-        .map(|fault| {
-            let site = exits
-                .iter()
-                .find(|site| site.eip == fault.guest_eip)
-                .expect("native access without an instruction exit");
-            a.label_offset(site.miss)
-        })
-        .collect();
     let (words, relocations) = a.finish_split(cold_word)?;
     for fault in &mut faults {
         fault.steps_adjust -= i32::from(count);
@@ -2947,8 +2921,6 @@ pub fn block(
         cold_word,
         relocations,
         faults,
-        #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-        recoveries,
         edges,
     })
 }

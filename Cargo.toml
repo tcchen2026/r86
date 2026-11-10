@@ -24,8 +24,6 @@ handheld-frontend = ["host", "toml/display"]
 handheld-sdl = ["handheld-frontend"]
 # The C API linked into the Mac app (apple/), built as a staticlib.
 apple = ["host", "toml/display"]
-monitor = []
-kvm = ["host", "monitor", "dep:libc"]
 jit = ["dep:hashbrown", "dep:dlmalloc"]
 # Compilation timing and unsupported-opcode counts, excluded from timing builds.
 jit-profile = ["jit"]
@@ -85,48 +83,10 @@ required-features = ["machine"]
 test = false
 bench = false
 
-[[bin]]
-name = "r86-kvm"
-path = "src/kvm/main.rs"
-required-features = ["kvm"]
-
-[[bin]]
-name = "rust_monitor_smoke"
-path = "src/monitor/bin/rust_monitor_smoke.rs"
-required-features = ["monitor"]
-
-[[bin]]
-name = "x86_monitor_smoke"
-path = "src/monitor/bin/x86_monitor_smoke.rs"
-required-features = ["monitor"]
-
-[[bin]]
-name = "hardmmu_paged_monitor_smoke"
-path = "src/monitor/bin/hardmmu_paged_monitor_smoke.rs"
-required-features = ["monitor"]
-
-[[bin]]
-name = "tinycore_monitor_smoke"
-path = "src/monitor/bin/tinycore_monitor_smoke.rs"
-required-features = ["monitor"]
-
-[[bin]]
-name = "machine_monitor_smoke"
-path = "src/monitor/bin/machine_monitor_smoke.rs"
-required-features = ["monitor", "machine"]
-
 [profile.release]
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-
-[[example]]
-name = "kvm_timeout_smoke"
-required-features = ["kvm"]
-
-[[example]]
-name = "kvm_speculation_smoke"
-required-features = ["kvm"]
 
 [[example]]
 name = "reactos_boot_benchmark"
@@ -137,13 +97,3 @@ required-features = ["host"]
 name = "softmmu_boot_benchmark"
 path = "benchmarks/tinycore_boot/softmmu_boot.rs"
 required-features = ["host"]
-
-[[example]]
-name = "reactos_hard_benchmark"
-path = "benchmarks/reactos_livecd_boot_to_langsel/hard_boot.rs"
-required-features = ["kvm"]
-
-[[bin]]
-name = "reactos_monitor_benchmark"
-path = "benchmarks/reactos_livecd_boot_to_langsel/monitor.rs"
-required-features = ["monitor", "machine", "jit"]

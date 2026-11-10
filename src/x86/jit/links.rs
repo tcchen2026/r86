@@ -21,7 +21,6 @@
 //! failed guards commit exact progress and return before the next instruction.
 //! Linear framebuffer writes notify dirty pages without changing device decode.
 //! A chain shares one memory view and frame until the next event deadline.
-//! The future HardMMU adapter must enforce the same exit and invalidation rules.
 //!
 //! Reclamation clears links before executable storage or version storage can
 //! disappear. Publication, reclamation and content retirement never run on an

@@ -142,11 +142,6 @@ impl Assembler {
         self.words.len() * 4
     }
 
-    #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-    pub(super) fn label_offset(&self, label: Label) -> u32 {
-        (self.labels[label.0 as usize].expect("unbound native recovery") * 4) as u32
-    }
-
     fn emit(&mut self, word: u32) {
         self.words.push(word);
     }

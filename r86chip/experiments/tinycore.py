@@ -120,7 +120,7 @@ def main():
             runner.append("--resume")
         return finish(args, runner)
     args.out.mkdir(parents=True, exist_ok=True)
-    features = "machine,monitor,r86chip" + (",r86chip-native" if args.extensions else "")
+    features = "machine,r86chip" + (",r86chip-native" if args.extensions else "")
     command(["cargo", "rustc", "--release", "--no-default-features", "--features", features,
              "--bin", "r86chip-machine", "--target", "riscv32im-unknown-none-elf", "--", "-C",
              f"link-arg=-T{FIRMWARE / 'machine.ld'}", "-C", "link-arg=--no-relax", "-C", "relocation-model=static"])

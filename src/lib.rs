@@ -1,8 +1,8 @@
 //! Rust i386 machine and execution backends.
 //!
 //! The default `host` build includes the embeddable interpreter runtime.
-//! `monitor` without default features builds the same x86 implementation for
-//! bare-metal EL1. Frontends and platform backends are selected at build time.
+//! `machine` without default features builds the same x86 implementation for
+//! bare metal (no_std). Frontends and platform backends are selected at build time.
 
 #![cfg_attr(not(feature = "host"), no_std)]
 
@@ -60,8 +60,3 @@ pub mod network;
 mod run_devices;
 #[cfg(feature = "machine")]
 pub use run_devices::FirmwareDisplay;
-
-#[cfg(all(feature = "kvm", target_os = "linux"))]
-pub mod kvm;
-#[cfg(feature = "monitor")]
-pub mod monitor;

@@ -14,7 +14,7 @@ cadence and report its endpoint quantization; frequent screenshots can create a
 false wall-time win. Keep CPU time and preserved frames alongside every sample.
 
 Process creation, asset loading and compilation are timed. Guest clocks default
-to realtime. Deterministic SoftMMU/monitor runs are separate engine comparisons;
+to realtime. Deterministic runs are separate engine comparisons;
 no icount or guest/image-specific execution shortcut is used. Each
 run starts a new process, including warm-ups, and engine order alternates.
 Profile builds are unsuitable for acceptance. Device and CPUID differences
@@ -73,14 +73,10 @@ def run(args, name: str, directory: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="r86-reactos-") as control:
         sock_path = str(Path(control) / "qmp")
         if name == "r86":
-            # EL1 uses the same assets, observer cadence and external endpoint.
-            # The fourth argument selects its monitor ELF rather than an engine.
-            mode = str(args.monitor) if getattr(args, "monitor", None) else args.engine
             command = [str(args.r86), str(args.iso), str(args.bios), str(args.vga_bios),
-                       mode, str(frame), str(int(args.timeout))]
+                       args.engine, str(frame), str(int(args.timeout))]
             command.append(str(args.frame_ms))
-            if not args.monitor:
-                command.append(args.clock)
+            command.append(args.clock)
         else:
             command = [str(args.qemu), "-accel", "tcg,thread=single", "-machine", "pc",
                        "-cpu", "pentium2", "-smp", "1", "-m", "128", "-bios", str(args.bios),
@@ -168,8 +164,6 @@ def main():
     for name in ("iso", "bios", "vga-bios"):
         parser.add_argument(f"--{name}", type=Path, required=True)
     parser.add_argument("--r86", type=Path)
-    parser.add_argument("--monitor", type=Path,
-                        help="EL1 monitor ELF; --r86 must be reactos_hard_benchmark")
     parser.add_argument("--qemu", type=Path)
     parser.add_argument("--qemu-backend", choices=["native", "tcti"], default="native")
     parser.add_argument("--output", "--out-dir", type=Path, required=True)
@@ -184,14 +178,8 @@ def main():
     args = parser.parse_args()
     if (args.engine == "jit" or args.only != "r86") and platform.machine() != "aarch64":
         parser.error("JIT and QEMU comparison require an ARM64 host")
-    if "R86_BENCH_STEPS" in os.environ or "R86_BENCH_STATE" in os.environ:
-        parser.error("fixed-step checkpoints are not timing samples; run the Rust observer directly")
-    if args.monitor and args.clock != "deterministic":
-        parser.error("the no_std monitor requires --clock deterministic")
     if args.only == "qemu" and args.clock != "realtime":
         parser.error("QEMU uses realtime clocks (no icount)")
-    if args.monitor and (args.engine != "jit" or args.only == "qemu"):
-        parser.error("--monitor requires the r86 JIT engine")
     if args.runs < 1 or args.warmups < 0 or args.timeout < 1 or args.frame_ms < 1:
         parser.error("invalid run count, timeout, or frame interval")
     engines = (args.only,) if args.only else ("r86", "qemu")
@@ -199,8 +187,6 @@ def main():
         if getattr(args, engine) is None:
             parser.error(f"--{engine} is required for the selected profile")
     names = ("iso", "bios", "vga_bios") + engines
-    if args.monitor:
-        names += ("monitor",)
     paths = {name: getattr(args, name).resolve(strict=True) for name in names}
     for name, path in paths.items():
         setattr(args, name, path)

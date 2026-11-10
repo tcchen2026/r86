@@ -1,54 +1,24 @@
-// The bare-metal target conservatively decomposes read_unaligned into bytes,
-// because startup runs with the MMU off. These helpers are used only after
-// stage-1 setup, on bounded Normal RAM (or the monitor's constant ROM backing).
-// Keep startup and all Device/MMIO accesses out of this boundary.
+// Unaligned little-endian accesses to bounded guest RAM. Device and MMIO
+// accesses never use these helpers.
 macro_rules! normal_ram_access {
-    ($read:ident, $write:ident, $ty:ty, $load:literal, $store:literal) => {
-        #[cfg(any(feature = "machine", feature = "monitor"))]
+    ($read:ident, $write:ident, $ty:ty) => {
+        #[cfg(feature = "machine")]
         #[inline(always)]
         pub(crate) unsafe fn $read(ptr: *const u8) -> $ty {
-            #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-            let value: $ty = {
-                let value;
-                unsafe { core::arch::asm!($load, ptr = in(reg) ptr, value = out(reg) value, options(readonly, nostack, preserves_flags)) };
-                value
-            };
-            #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
             let value = unsafe { ptr.cast::<$ty>().read_unaligned() };
             <$ty>::from_le(value)
         }
-        #[cfg(any(feature = "machine", feature = "monitor"))]
+        #[cfg(feature = "machine")]
         #[inline(always)]
         pub(crate) unsafe fn $write(ptr: *mut u8, value: $ty) {
             let value = value.to_le();
-            #[cfg(all(target_arch = "aarch64", target_os = "none"))]
-            unsafe { core::arch::asm!($store, ptr = in(reg) ptr, value = in(reg) value, options(nostack, preserves_flags)) };
-            #[cfg(not(all(target_arch = "aarch64", target_os = "none")))]
             unsafe { ptr.cast::<$ty>().write_unaligned(value) };
         }
     };
 }
-normal_ram_access!(
-    ram_read_u16,
-    ram_write_u16,
-    u16,
-    "ldrh {value:w}, [{ptr}]",
-    "strh {value:w}, [{ptr}]"
-);
-normal_ram_access!(
-    ram_read_u32,
-    ram_write_u32,
-    u32,
-    "ldr {value:w}, [{ptr}]",
-    "str {value:w}, [{ptr}]"
-);
-normal_ram_access!(
-    ram_read_u64,
-    ram_write_u64,
-    u64,
-    "ldr {value}, [{ptr}]",
-    "str {value}, [{ptr}]"
-);
+normal_ram_access!(ram_read_u16, ram_write_u16, u16);
+normal_ram_access!(ram_read_u32, ram_write_u32, u32);
+normal_ram_access!(ram_read_u64, ram_write_u64, u64);
 
 use crate::x86::addr::{LinearAddr, PhysAddr};
 

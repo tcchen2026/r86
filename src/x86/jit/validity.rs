@@ -11,9 +11,8 @@
 //! arena. A runner may retain compiled entries under the new token only after
 //! proving that all their instruction-byte dependencies remain unchanged.
 //!
-//! SoftMMU uses its existing write-permission cache to enforce this contract;
-//! HardMMU can protect backing aliases and notify the same version owner after
-//! handling the write. Neither invalidation source changes decoding or flags.
+//! SoftMMU uses its existing write-permission cache to enforce this contract.
+//! The invalidation source does not change decoding or flags.
 //! RAM/device/loader writes must all notify the owner. Reclamation of executable
 //! mappings remains separate and is allowed only with no active native stack.
 

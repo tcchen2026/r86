@@ -1,9 +1,9 @@
 //! AArch64 code publication, packing and bounded entry-table ownership.
-//! Linux and EL1 select their mapping owner at build time. Both publish through
-//! an RW/NX alias and execute through a distinct RO/RX alias, with no live writes.
+//! The Linux mapping owner publishes through an RW/NX alias and executes
+//! through a distinct RO/RX alias, with no live writes.
 //!
 //! Publish and reclaim only outside native execution. Linux uses one private
-//! memfd; EL1 uses dedicated monitor storage shared by all ASID roots. Neither
+//! memfd. Neither
 //! code alias is RWX. Every arena starts empty, and generated code is compiled
 //! in the current execution and never restored from a file. Optional Linux
 //! dumps are for offline analysis only, with no generated-code loading path.
@@ -33,10 +33,6 @@ use std::io;
 mod linux;
 #[cfg(target_os = "linux")]
 use linux::Mapping;
-#[cfg(target_os = "none")]
-pub(crate) mod monitor;
-#[cfg(target_os = "none")]
-use monitor::Mapping;
 
 pub(super) const ENTRY_TABLES: usize = 4096;
 type EntryWords = [u32; super::links::PAGE_BYTES];
@@ -89,8 +85,6 @@ impl CodeHandle {
 pub enum CodeError {
     #[cfg(target_os = "linux")]
     Os(io::Error),
-    #[cfg(target_os = "none")]
-    MonitorUnavailable,
     Capacity,
     Empty,
     StaleHandle,
@@ -282,11 +276,6 @@ impl CodeArena {
         let start = self.hot_cursor;
         self.cold_cursor -= cold_len;
         self.hot_cursor += hot_len;
-        #[cfg(any(test, all(feature = "monitor", target_os = "none")))]
-        for recovery in &mut code.recoveries {
-            assert!(*recovery as usize >= hot_len);
-            *recovery += (self.cold_cursor - self.hot_cursor) as u32;
-        }
         for relocation in &code.relocations {
             relocation.split(
                 &mut code.words,
@@ -374,8 +363,6 @@ impl CodeArena {
     /// access only valid guest/adapter data. Its helpers must not mutate this
     /// arena. Publication checks bytes/capacity, not the semantics of native code.
     pub unsafe fn invoke(&self, handle: CodeHandle, frame: &mut Frame) -> Result<(), CodeError> {
-        #[cfg(target_os = "none")]
-        let _invocation = super::hard::Invocation::enter(frame);
         let address = self.address(handle, 0)?;
         // SAFETY: checked handle lies inside published RX bytes. The caller
         // establishes that the entry has this exact ABI and code behavior.
@@ -421,40 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn packed_access_recovery_keeps_its_exact_cold_exit() {
-        let decoded = super::super::decode::block(
-            &[0x40, 0x8b, 0x03, 0x8b, 0x4b, 4, 0x01, 0x4b, 8, 0xf3, 0xa5],
-            0x1000,
-            32,
-        );
-        let mut code = super::super::compile::block(&decoded, None, 0).unwrap();
-        assert!(code.faults.len() >= 4);
-        let recovery_words: alloc::vec::Vec<_> = code
-            .recoveries
-            .iter()
-            .map(|&offset| code.words[offset as usize / 4])
-            .collect();
-        let mut arena = CodeArena::new(64 * 1024).unwrap();
-        let handle = arena.publish_block(&mut code).unwrap();
-        let body = arena.address(handle, 0).unwrap();
-        for ((fault, &recovery), word) in
-            code.faults.iter().zip(&code.recoveries).zip(recovery_words)
-        {
-            // Each native access still names the same x86 instruction's cold
-            // exit after packing hot blocks together and moving their tails.
-            assert!(recovery > fault.native_offset);
-            assert_eq!(
-                unsafe { ((body + recovery as usize) as *const u32).read() },
-                word
-            );
-            assert_eq!(
-                unsafe { ((body + fault.native_offset as usize) as *const u32).read() },
-                code.words[fault.native_offset as usize / 4]
-            );
-        }
-    }
-
-    #[test]
     fn entry_tables_publish_to_native_alias_and_reset_without_overlapping_code() {
         let mut arena = CodeArena::new(4096).unwrap();
         let code = arena.publish(&[0xd65f_03c0]).unwrap(); // RET
@@ -484,8 +437,8 @@ mod tests {
     }
 }
 
-/// Both adapters use the architectural D-cache clean / I-cache invalidate
-/// sequence, like the existing KVM loader. Read the actual host cache-line sizes;
+/// Use the architectural D-cache clean / I-cache invalidate
+/// sequence. Read the actual host cache-line sizes;
 /// neither a 4 KiB guest page nor an assumed 64-byte line is a host ABI guarantee.
 /// All regions have been written before this call. IDC/DIC can remove maintenance
 /// operations, but publication still orders stores and synchronizes execution.

@@ -1,10 +1,5 @@
 use alloc::vec::Vec;
 
-#[cfg(feature = "monitor")]
-mod backing;
-#[cfg(feature = "monitor")]
-use backing::Vram;
-#[cfg(not(feature = "monitor"))]
 type Vram = Vec<u8>;
 
 use font8x8::legacy::BASIC_LEGACY;
@@ -124,9 +119,6 @@ pub struct PcVga {
 
 impl PcVga {
     pub fn new() -> Self {
-        #[cfg(feature = "monitor")]
-        let vram = Vram::zeroed();
-        #[cfg(not(feature = "monitor"))]
         let vram = alloc::vec![0; VRAM_SIZE];
         Self::with_backing(vram, alloc::vec![0; VRAM_PAGES / 8])
     }

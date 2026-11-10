@@ -89,8 +89,7 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   without CDS_TEST. [?]
 - structure: the `Bus` trait has 70 methods; devices live in four places
   and port dispatch in six functions; the translation cache has two
-  layouts selected by the `jit` feature; KVM and the EL1 monitor
-  (HardMMU, 20,000 lines) burden the core for no measured gain.
+  layouts selected by the `jit` feature.
 
 ## Deferred: no known guest depends on them
 

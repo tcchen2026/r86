@@ -13,8 +13,7 @@
 //! allocation and calling conventions can use its properties directly. The
 //! emitter and architectural exit records use core/alloc; Linux executable
 //! mappings belong to the host adapter. [`arm32`] is a separate, smaller ARMv6K
-//! backend for the 3DS that shares decoding, flag liveness and code validity. EL1 selects its own mapping owner and
-//! read-fault boundary without making x86 decoding depend on Linux or a TLB.
+//! backend for the 3DS that shares decoding, flag liveness and code validity.
 //!
 //! Cpu remains the persistent state owner. An invocation exclusively borrows it
 //! and may keep live guest registers in ARM64 registers. Semantic helpers see
@@ -29,10 +28,8 @@
 //!
 //! Keep an x86 memory operation's segment, access width, permission and commit
 //! semantics separate from its ARM64 access sequence. SoftMMU first emits a
-//! guarded TLB hit, with cold revalidation/refill before a semantic miss. HardMMU
-//! can emit a native access with the same guest instruction/exit metadata. Expected native
-//! aborts must occur at emitted, recorded accesses; arbitrary Rust loads are not
-//! a recoverable fault boundary. See [`memory`] and [`frame`].
+//! guarded TLB hit, with cold revalidation/refill before a semantic miss.
+//! See [`memory`] and [`frame`].
 //!
 //! Preserve segmentation, paging, fault priority, CR2/error code, A/D effects and
 //! restartable writes. Never replay an instruction after a side-effecting read
@@ -54,8 +51,8 @@
 //! executable mappings. CR3 alone is not a unique context. Track scalar, bulk,
 //! interpreter, device and page-walk writes, including aliases. A store changing
 //! the current block must exit before its next stale instruction. Code-page
-//! promotion must revoke old writable translations. Both SoftMMU write barriers
-//! and future HardMMU write protection feed this same validity contract.
+//! promotion must revoke old writable translations. SoftMMU write barriers
+//! feed this validity contract.
 //!
 //! Lookup invalidation, content invalidation and native-page reclamation have
 //! different lifetimes. Reclaim only with no active invocation. Reset/restore
@@ -74,9 +71,8 @@
 //! complement the two timed endpoints. Boot success does not establish XP
 //! application readiness. Remaining x87 interpretation, MMX helper cost, whole-cache
 //! reclamation and compiler cost must be measured on the relevant workload.
-//! EL1 checks cover native reads and qualified SS stores/RMW, including exact
-//! fault recovery and fixed-step machine-state comparisons. Linux performance
-//! is recorded per workload; Apple runtime and performance remain unverified.
+//! Linux performance is recorded per workload; Apple runtime and performance
+//! remain unverified.
 //! Historical boot targets are not a new task or a sustained-workload guarantee.
 //!
 //! Sources consulted: FEX at 37d83d937586f342ca3e9131270f8ef23b61adc4,
@@ -96,13 +92,6 @@ mod cold;
 pub mod compile;
 pub mod decode;
 pub mod frame;
-#[cfg(all(
-    feature = "monitor",
-    feature = "machine",
-    target_arch = "aarch64",
-    target_os = "none"
-))]
-mod hard;
 pub mod links;
 pub mod memory;
 pub mod soft;
@@ -110,22 +99,10 @@ pub mod validity;
 #[cfg(feature = "wasm-jit")]
 pub mod wasm;
 
-#[cfg(all(
-    target_arch = "aarch64",
-    any(
-        all(feature = "host", target_os = "linux"),
-        all(feature = "monitor", feature = "machine", target_os = "none")
-    )
-))]
+#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
 pub mod code;
 
-#[cfg(all(
-    target_arch = "aarch64",
-    any(
-        all(feature = "host", target_os = "linux"),
-        all(feature = "monitor", feature = "machine", target_os = "none")
-    )
-))]
+#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
 pub mod runtime;
 
 #[cfg(all(feature = "machine", target_arch = "arm"))]

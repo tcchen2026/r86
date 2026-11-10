@@ -723,17 +723,6 @@ impl LinearTranslationCache {
         // replaces it before publishing a new translation in the empty row.
     }
 
-    /// A JIT hardware access miss must reach the shared walker even when this
-    /// derived software row survived eviction of the separate shadow cache.
-    /// This is a data-cache eviction, not guest INVLPG or code invalidation.
-    #[cfg(all(feature = "jit", feature = "monitor", target_os = "none"))]
-    pub(crate) fn discard_hard_access_miss(&mut self, linear: LinearAddr) {
-        self.invalidate_linear_range(
-            linear.0 & LINEAR_TRANSLATION_PAGE_MASK,
-            LINEAR_TRANSLATION_PAGE_MASK,
-        );
-    }
-
     #[inline]
     fn set_current_user(&mut self, user: bool) {
         #[cfg(all(feature = "r86chip-native", target_arch = "riscv32"))]
@@ -1741,10 +1730,8 @@ impl Cpu {
             all(
                 feature = "jit",
                 target_arch = "aarch64",
-                any(
-                    all(feature = "host", target_os = "linux"),
-                    all(feature = "monitor", feature = "machine", target_os = "none")
-                )
+                feature = "host",
+                target_os = "linux"
             )
         )
     ))]
@@ -1757,10 +1744,8 @@ impl Cpu {
         all(
             feature = "jit",
             target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
+            feature = "host",
+            target_os = "linux"
         )
     ))]
     pub(crate) fn jit_global_epoch(&self) -> u64 {
@@ -1773,10 +1758,8 @@ impl Cpu {
         all(
             feature = "jit",
             target_arch = "aarch64",
-            any(
-                all(feature = "host", target_os = "linux"),
-                all(feature = "monitor", feature = "machine", target_os = "none")
-            )
+            feature = "host",
+            target_os = "linux"
         )
     ))]
     pub(crate) fn fetch_translation_is_global(&self, linear: LinearAddr) -> bool {
@@ -1790,10 +1773,8 @@ impl Cpu {
             all(
                 feature = "jit",
                 target_arch = "aarch64",
-                any(
-                    all(feature = "host", target_os = "linux"),
-                    all(feature = "monitor", feature = "machine", target_os = "none")
-                )
+                feature = "host",
+                target_os = "linux"
             )
         )
     ))]
@@ -2013,10 +1994,8 @@ impl Cpu {
     #[cfg(all(
         feature = "jit",
         target_arch = "aarch64",
-        any(
-            all(feature = "host", target_os = "linux"),
-            all(feature = "monitor", feature = "machine", target_os = "none")
-        )
+        feature = "host",
+        target_os = "linux"
     ))]
     pub(crate) fn fetch_recheck(&self, linear: LinearAddr) -> TranslationRecheck {
         self.fetch_cache.rechecks[FetchCache::slot(linear)]
@@ -2027,10 +2006,8 @@ impl Cpu {
     #[cfg(all(
         feature = "jit",
         target_arch = "aarch64",
-        any(
-            all(feature = "host", target_os = "linux"),
-            all(feature = "monitor", feature = "machine", target_os = "none")
-        )
+        feature = "host",
+        target_os = "linux"
     ))]
     pub(crate) fn restore_fetch_translation(
         &mut self,

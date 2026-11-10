@@ -686,22 +686,6 @@ impl IdeBus {
         self.attach_cdrom(CdromImage::Memory(iso.into()), true);
     }
 
-    #[cfg(all(feature = "monitor", not(feature = "host")))]
-    pub fn attach_primary_master_cdrom_borrowed(&mut self, iso: &'static [u8]) {
-        self.enabled = true;
-        self.primary.drives[0] = Some(IdeDrive {
-            kind: IdeDriveKind::Cdrom {
-                iso: CdromImage::Memory(alloc::borrow::Cow::Borrowed(iso)),
-                tray_open: false,
-                locked: false,
-                media_event: 0,
-            },
-            sense_key: 0,
-            asc: 0,
-        });
-        self.primary.reset_signature();
-    }
-
     pub fn attach_secondary_master_cdrom(&mut self, iso: Vec<u8>) {
         self.attach_cdrom(CdromImage::Memory(iso.into()), false);
     }
@@ -2301,12 +2285,7 @@ enum IdeDriveKind {
     },
 }
 
-// Ordinary hosts keep the original Vec representation. Only the monitor can
-// borrow immutable media from a fixed memslot instead of allocating a copy.
-#[cfg(not(all(feature = "monitor", not(feature = "host"))))]
 type CdromBacking = Vec<u8>;
-#[cfg(all(feature = "monitor", not(feature = "host")))]
-type CdromBacking = alloc::borrow::Cow<'static, [u8]>;
 
 #[derive(Clone)]
 enum CdromImage {
