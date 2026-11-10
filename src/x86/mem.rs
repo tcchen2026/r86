@@ -356,8 +356,10 @@ pub trait Bus {
     /// paths need no update; exits must establish it before device dispatch.
     fn instruction_address(&mut self, _linear: u32) {}
 
-    fn begin_io_instruction(&mut self, instruction_count: u64) {
-        let _ = instruction_count;
+    /// Establish the instruction time once, before any transactions (including
+    /// REP and wide accesses). The machine samples only ports that observe time.
+    fn begin_io_instruction(&mut self, instruction_count: u64, port: u16) {
+        let _ = (instruction_count, port);
     }
 
     /// The machine may provide a time-based TSC without changing instruction

@@ -993,12 +993,12 @@ impl Interpreter {
                         step_try!(bound(cpu, bus, modrm, operand16, address16, start_eip));
                     }
                     0x6c => {
-                        bus.begin_io_instruction(instruction_step);
+                        bus.begin_io_instruction(instruction_step, cpu.reg(Reg32::Edx) as u16);
                         step_try!(ins_string(cpu, bus, prefix, 1, address16, start_eip));
                         stop!(BatchStepStop::Attention);
                     }
                     0x6d => {
-                        bus.begin_io_instruction(instruction_step);
+                        bus.begin_io_instruction(instruction_step, cpu.reg(Reg32::Edx) as u16);
                         if operand16 {
                             step_try!(ins_string(cpu, bus, prefix, 2, address16, start_eip));
                         } else {
@@ -1007,12 +1007,12 @@ impl Interpreter {
                         stop!(BatchStepStop::Attention);
                     }
                     0x6e => {
-                        bus.begin_io_instruction(instruction_step);
+                        bus.begin_io_instruction(instruction_step, cpu.reg(Reg32::Edx) as u16);
                         step_try!(outs_string(cpu, bus, prefix, 1, address16, start_eip));
                         stop!(BatchStepStop::Attention);
                     }
                     0x6f => {
-                        bus.begin_io_instruction(instruction_step);
+                        bus.begin_io_instruction(instruction_step, cpu.reg(Reg32::Edx) as u16);
                         if operand16 {
                             step_try!(outs_string(cpu, bus, prefix, 2, address16, start_eip));
                         } else {
@@ -2462,8 +2462,14 @@ impl Interpreter {
                         cpu.eip = step_try!(near_rel8_target(cpu, rel, operand16, start_eip));
                     }
                     0xe4..=0xe7 | 0xec..=0xef => {
-                        bus.begin_io_instruction(instruction_step);
-                        step_try!(execute_scalar_io(cpu, bus, opcode, operand16, start_eip));
+                        step_try!(execute_scalar_io(
+                            cpu,
+                            bus,
+                            opcode,
+                            operand16,
+                            start_eip,
+                            instruction_step
+                        ));
                         stop!(BatchStepStop::Attention);
                     }
                     0xf6 => {
@@ -2842,17 +2848,22 @@ fn execute_scalar_io<B: Bus>(
     opcode: u8,
     operand16: bool,
     start_eip: u32,
+    instruction_step: u64,
 ) -> Result<(), StepError> {
+    let port = if opcode < 0xe8 {
+        fetch_u8(cpu, bus)? as u16
+    } else {
+        cpu.reg(Reg32::Edx) as u16
+    };
+    bus.begin_io_instruction(instruction_step, port);
     match opcode {
         0xe4 => {
-            let port = fetch_u8(cpu, bus)? as u16;
             check_io_permission(cpu, bus, port, 1, start_eip)?;
             let value = bus.io_read_u8(port)?;
             let eax = (cpu.reg(Reg32::Eax) & 0xffff_ff00) | value as u32;
             cpu.set_reg(Reg32::Eax, eax);
         }
         0xe5 => {
-            let port = fetch_u8(cpu, bus)? as u16;
             if operand16 {
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 let value = bus.io_read_u16(port)?;
@@ -2864,12 +2875,10 @@ fn execute_scalar_io<B: Bus>(
             }
         }
         0xe6 => {
-            let port = fetch_u8(cpu, bus)? as u16;
             check_io_permission(cpu, bus, port, 1, start_eip)?;
             bus.io_write_u8(port, cpu.reg(Reg32::Eax) as u8)?;
         }
         0xe7 => {
-            let port = fetch_u8(cpu, bus)? as u16;
             if operand16 {
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 bus.io_write_u16(port, read_reg16(cpu, Reg32::Eax as u8))?;
@@ -2879,14 +2888,12 @@ fn execute_scalar_io<B: Bus>(
             }
         }
         0xec => {
-            let port = cpu.reg(Reg32::Edx) as u16;
             check_io_permission(cpu, bus, port, 1, start_eip)?;
             let value = bus.io_read_u8(port)?;
             let eax = (cpu.reg(Reg32::Eax) & 0xffff_ff00) | value as u32;
             cpu.set_reg(Reg32::Eax, eax);
         }
         0xed => {
-            let port = cpu.reg(Reg32::Edx) as u16;
             if operand16 {
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 let value = bus.io_read_u16(port)?;
@@ -2898,12 +2905,10 @@ fn execute_scalar_io<B: Bus>(
             }
         }
         0xee => {
-            let port = cpu.reg(Reg32::Edx) as u16;
             check_io_permission(cpu, bus, port, 1, start_eip)?;
             bus.io_write_u8(port, cpu.reg(Reg32::Eax) as u8)?;
         }
         0xef => {
-            let port = cpu.reg(Reg32::Edx) as u16;
             if operand16 {
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 bus.io_write_u16(port, read_reg16(cpu, Reg32::Eax as u8))?;

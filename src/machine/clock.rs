@@ -1,5 +1,6 @@
 //! Device time is independent of CPU throughput. The host clock is sampled at
-//! device/interrupt boundaries, never by the ordinary instruction or RAM path.
+//! slice/deadline boundaries and time-observing ports, never by the ordinary
+//! instruction or RAM path. Early PIC polls reuse the last sample.
 //! The instruction clock remains available for reproducible tests and replay.
 //! Both use the same oscillator units so devices have only one implementation.
 //! Slow ISA accesses add wait ticks to this clock, including deterministic mode.

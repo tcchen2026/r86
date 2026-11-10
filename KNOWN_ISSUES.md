@@ -22,9 +22,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   IN/OUT, INS/OUTS, STI and SS load, and reports `was_interruptible: false`,
   so with IF=1 each exit polls for interrupts (about 90,000 exits per 1M
   instructions in a real-mode DOS game).
-- perf: each poll, and each port I/O instruction, reads the host clock
-  with 128-bit arithmetic in realtime mode (`Clock::sample`,
-  `begin_io_instruction`): +12% CPU measured on a DOS boot.
 - device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
   upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
   DA000-E7FFF through PAM, which r86 now enforces

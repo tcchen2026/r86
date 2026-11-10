@@ -103,7 +103,9 @@ fn poll_pending_external_irq<P: PerfSink>(
 ) -> Option<u8> {
     perf.external_irq_check();
     bus.current_step = step;
-    bus.clock.sample();
+    if cpu.halted || step >= bus.next_attention_step {
+        bus.sample_device_clock(step);
+    }
     if bus.refresh_interrupt_attention(step) {
         perf.full_device_scan();
     }
@@ -1163,6 +1165,7 @@ impl Machine {
     }
 
     pub fn step_once(&mut self) -> Result<GuestStepStatus, String> {
+        self.bus.sample_device_clock(self.step);
         self.bus.sync_ioram(&mut self.cpu);
         if self.powered_off() {
             self.flush_disks()?;
@@ -1220,6 +1223,7 @@ impl Machine {
         &mut self,
         budget: u64,
     ) -> Result<RunReport, String> {
+        self.bus.sample_device_clock(self.step);
         let start_step = self.step;
         if self.powered_off() {
             self.flush_disks()?;
@@ -2928,6 +2932,13 @@ impl HostBus {
         self.clock.ticks(self.current_step)
     }
 
+    fn sample_device_clock(&mut self, step: u64) {
+        self.clock.sample();
+        if self.clock.ticks(step) >= self.next_device_tick {
+            self.set_attention();
+        }
+    }
+
     fn next_device_event(&self) -> u64 {
         self.pit
             .next_irq_tick()
@@ -2998,8 +3009,8 @@ impl HostBus {
         true
     }
 
-    /// CPU IF/shadow transitions still poll the PIC and sample the clock, but
-    /// devices need service only after a source change or their next deadline.
+    /// CPU IF/shadow transitions poll the latched PIC request. Devices need
+    /// service only after a source change or their next deadline.
     /// Keep that deadline in oscillator ticks: realtime sampling and ISA waits
     /// can reach it without reaching the instruction polling boundary.
     fn refresh_interrupt_attention(&mut self, step: u64) -> bool {
@@ -3015,7 +3026,11 @@ impl HostBus {
             self.sync_device_irqs();
             self.next_device_tick = self.next_device_event();
         }
-        self.next_attention_step = self.clock.poll_step(step, self.next_device_tick);
+        // Early IRQ polls must not postpone the next realtime sample: a guest
+        // can execute IRET/port instructions more often than that boundary.
+        if !self.clock.is_realtime() || step >= self.next_attention_step {
+            self.next_attention_step = self.clock.poll_step(step, self.next_device_tick);
+        }
         // If IF or the interrupt shadow blocks delivery, the CPU transition
         // check polls the latched PIC request when the CPU becomes interruptible.
         self.attention = false;
@@ -4066,13 +4081,24 @@ impl Bus for HostBus {
     }
 
     #[inline(always)]
-    fn begin_io_instruction(&mut self, instruction_count: u64) {
+    fn begin_io_instruction(&mut self, instruction_count: u64, port: u16) {
         self.current_step = instruction_count;
-        self.clock.sample();
-        self.ide.advance(self.device_ticks());
-        self.advance_usb(self.device_ticks());
-        self.sync_pci_irq();
-        self.sync_ide_irqs();
+        let ide = self.pci.ide_port_enabled(port) || self.ide_bus_master_contains(port, 1);
+        // One sample for the whole instruction, including wide PM reads and
+        // REP port transfers. Ordinary VGA, PCI address and debug ports do not
+        // observe time. USB/sound advance themselves in their port handlers.
+        if ide
+            || matches!(port, 0x40..=0x43 | 0x61 | 0x71 | 0x3ba | 0x3da | 0xcfc..=0xcff)
+            || Sound::contains(port)
+            || self.acpi.contains_pm_ports(port, 1)
+            || self.pci.usb_port(port, 1).is_some()
+        {
+            self.sample_device_clock(instruction_count);
+        }
+        if ide {
+            self.ide.advance(self.device_ticks());
+            self.sync_ide_irqs();
+        }
     }
 
     fn read_timestamp_counter(&mut self, instruction_tsc: u64) -> u64 {
@@ -13539,19 +13565,19 @@ mod host_bus_tests {
         bus.io_write_u8(0x21, 0xfe).unwrap();
         bus.io_write_u8(0x43, 0x10).unwrap();
         bus.io_write_u8(0x40, 3).unwrap();
-        bus.begin_io_instruction(4 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(4 * PIT_OSCILLATOR_DIVISOR, 0x71);
         bus.update_pit0_irq(bus.device_ticks());
         assert_eq!(bus.pic.pending_irq(), Some(0));
         assert_eq!(bus.pic.acknowledge(), 0x20);
         bus.io_write_u8(0x20, 0x20).unwrap();
-        bus.begin_io_instruction(70_000 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(70_000 * PIT_OSCILLATOR_DIVISOR, 0x71);
         bus.update_pit0_irq(bus.device_ticks());
         assert_eq!(bus.pic.pending_irq(), None, "mode 0 never becomes periodic");
 
         bus.io_write_u8(0x43, 0x14).unwrap(); // rate mode, count 4
         bus.io_write_u8(0x40, 4).unwrap();
         // Both samples see OUT high, with many complete low pulses between.
-        bus.begin_io_instruction(74_001 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(74_001 * PIT_OSCILLATOR_DIVISOR, 0x71);
         bus.update_pit0_irq(bus.device_ticks());
         assert_eq!(bus.pic.pending_irq(), Some(0));
         bus.io_write_u8(0x43, 0).unwrap(); // latching must not withdraw the IRQ
@@ -13564,7 +13590,7 @@ mod host_bus_tests {
             None,
             "no replay queue or duplicate edge"
         );
-        bus.begin_io_instruction(74_005 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(74_005 * PIT_OSCILLATOR_DIVISOR, 0x71);
         bus.update_pit0_irq(bus.device_ticks());
         assert_eq!(bus.pic.pending_irq(), Some(0));
     }
@@ -13577,10 +13603,10 @@ mod host_bus_tests {
         bus.io_write_u8(0x61, 0xff).unwrap();
         let before = bus.io_read_u8(0x61).unwrap();
         assert_eq!(before & 0xcf, 0x0f); // parity/error bits cannot be written
-        bus.begin_io_instruction(5 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(5 * PIT_OSCILLATOR_DIVISOR, 0x71);
         assert_eq!(bus.io_read_u8(0x61).unwrap() ^ before, 0x10);
         assert_eq!(bus.io_read_u8(0x61).unwrap() ^ before, 0x10);
-        bus.begin_io_instruction(9 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(9 * PIT_OSCILLATOR_DIVISOR, 0x71);
         assert_eq!(bus.io_read_u8(0x61).unwrap(), before);
     }
 
@@ -13672,6 +13698,24 @@ mod host_bus_tests {
             Some(0)
         );
         assert_eq!(perf.full_device_scans, 3);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn realtime_early_irq_polls_do_not_postpone_clock_sampling() {
+        let mut bus = HostBus::new(0x4000);
+        bus.clock = Clock::realtime();
+        let cpu = Cpu::new();
+        let mut perf = PerfCounters::default();
+        poll_pending_external_irq(0, &cpu, &mut bus, &mut perf);
+        let deadline = bus.next_attention_step;
+        for step in [1, deadline / 2, deadline - 1] {
+            bus.set_attention(); // e.g. an EOI, even while IF is clear
+            poll_pending_external_irq(step, &cpu, &mut bus, &mut perf);
+            assert_eq!(bus.next_attention_step, deadline);
+        }
+        poll_pending_external_irq(deadline, &cpu, &mut bus, &mut perf);
+        assert_eq!(bus.next_attention_step, 2 * deadline);
     }
 
     #[test]
@@ -13808,9 +13852,9 @@ mod host_bus_tests {
         for _ in 0..8 {
             assert_eq!(bus.io_read_u8(0x61).unwrap() & 0x20, 0);
         }
-        bus.begin_io_instruction(101 * PIT_OSCILLATOR_DIVISOR - 1);
+        bus.begin_io_instruction(101 * PIT_OSCILLATOR_DIVISOR - 1, 0x71);
         assert_eq!(bus.io_read_u8(0x61).unwrap() & 0x20, 0);
-        bus.begin_io_instruction(101 * PIT_OSCILLATOR_DIVISOR);
+        bus.begin_io_instruction(101 * PIT_OSCILLATOR_DIVISOR, 0x71);
         assert_eq!(bus.io_read_u8(0x61).unwrap() & 0x20, 0x20);
     }
 
@@ -13847,17 +13891,17 @@ mod host_bus_tests {
         write(&mut bus, CMOS_REG_B, 0x32); // AIE, UIE, BCD, 24h
         assert_eq!(bus.next_device_event(), TICKS_PER_SECOND);
         // A host pause crosses the alarm. It must still be latched on resume.
-        bus.begin_io_instruction(3 * TICKS_PER_SECOND);
+        bus.begin_io_instruction(3 * TICKS_PER_SECOND, 0x71);
         bus.cmos_index = CMOS_REG_C;
         assert_eq!(bus.cmos_read(), 0xb0);
         assert!(!bus.pic.line(8));
         assert_eq!(bus.cmos_read(), 0);
         write(&mut bus, 1, 0xc0); // wildcard seconds, once per second
-        bus.begin_io_instruction(4 * TICKS_PER_SECOND);
+        bus.begin_io_instruction(4 * TICKS_PER_SECOND, 0x71);
         bus.cmos_index = CMOS_REG_C;
         assert_eq!(bus.cmos_read(), 0xb0);
         write(&mut bus, CMOS_REG_B, 0x82); // SET clears UIE and stops updates
-        bus.begin_io_instruction(8 * TICKS_PER_SECOND);
+        bus.begin_io_instruction(8 * TICKS_PER_SECOND, 0x71);
         bus.cmos_index = 0;
         assert_eq!(bus.cmos_read(), 4);
         bus.cmos_index = CMOS_REG_C;
@@ -13873,11 +13917,11 @@ mod host_bus_tests {
             bus.cmos_index = index;
             bus.cmos_write(0xc0);
         }
-        bus.begin_io_instruction(TICKS_PER_SECOND);
+        bus.begin_io_instruction(TICKS_PER_SECOND, 0x71);
         bus.cmos_index = CMOS_REG_C;
         assert_eq!(bus.cmos_read(), 0x70, "masked events remain observable");
         assert!(!bus.pic.line(8));
-        bus.begin_io_instruction(2 * TICKS_PER_SECOND);
+        bus.begin_io_instruction(2 * TICKS_PER_SECOND, 0x71);
         bus.cmos_index = CMOS_REG_B;
         bus.cmos_write(0x72);
         assert!(bus.pic.line(8), "unmasking a latched event raises IRQ8");
@@ -13891,7 +13935,7 @@ mod host_bus_tests {
     #[test]
     fn rtc_uip_depends_on_time_and_set_not_port_reads() {
         let mut bus = HostBus::new_firmware(2 << 20).unwrap();
-        bus.begin_io_instruction(TICKS_PER_SECOND - TICKS_PER_SECOND / 2000);
+        bus.begin_io_instruction(TICKS_PER_SECOND - TICKS_PER_SECOND / 2000, 0x71);
         bus.cmos_index = CMOS_REG_A;
         for _ in 0..4 {
             assert_ne!(bus.cmos_read() & 0x80, 0);
@@ -13903,7 +13947,7 @@ mod host_bus_tests {
         assert_eq!(bus.cmos_read() & 0x80, 0);
         bus.cmos_index = CMOS_REG_B;
         bus.cmos_write(2);
-        bus.begin_io_instruction(2 * TICKS_PER_SECOND);
+        bus.begin_io_instruction(2 * TICKS_PER_SECOND, 0x71);
         bus.cmos_index = 0;
         assert_eq!(bus.cmos_read(), 1);
     }
@@ -14695,7 +14739,7 @@ mod host_bus_tests {
         bus.current_step = 100;
         bus.io_write_u8(0x70, 0x0b).unwrap();
         bus.io_write_u8(0x71, 0x46).unwrap();
-        bus.begin_io_instruction(100 + TICKS_PER_SECOND / 1024);
+        bus.begin_io_instruction(100 + TICKS_PER_SECOND / 1024, 0x71);
         bus.update_rtc(bus.device_ticks());
 
         assert!(bus.rtc_irq8);
