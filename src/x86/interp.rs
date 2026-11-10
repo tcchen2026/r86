@@ -2898,6 +2898,8 @@ fn execute_scalar_io<B: Bus>(
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 let value = bus.io_read_u16(port)?;
                 write_reg16(cpu, Reg32::Eax as u8, value);
+            } else if port == 0x5286 && cpu.reg(Reg32::Eax) == 0x2136_3872 {
+                bus.magic_instruction(cpu);
             } else {
                 check_io_permission(cpu, bus, port, 4, start_eip)?;
                 let value = bus.io_read_u32(port)?;
@@ -4103,6 +4105,7 @@ fn cpuid(cpu: &mut Cpu) {
 
 fn cpuid_leaf(eax: u32, _ecx: u32) -> CpuidLeaf {
     match eax {
+        0x4000_0000 => CpuidLeaf::new(0x4000_0000, 0x7236_3872, 0x3872_3638, 0x3638_7236),
         0x0000_0000 => CpuidLeaf::new(
             CPUID_MAX_BASIC_LEAF,
             CPUID_VENDOR_EBX,
@@ -20383,7 +20386,7 @@ mod tests {
 
     #[test]
     fn cpuid_unknown_basic_leaves_return_zero() {
-        for eax in [3, 4, 7, 0x0b, 0x0d, 0x4000_0000, 0x7fff_ffff] {
+        for eax in [3, 4, 7, 0x0b, 0x0d, 0x4000_0001, 0x7fff_ffff] {
             let cpu = run_cpuid(eax, 0xaaaa_5555);
 
             assert_cpuid_regs(&cpu, CpuidLeaf::zero());
@@ -28067,6 +28070,86 @@ mod tests {
         assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5679);
         assert_eq!(cpu.eip, 1);
         step_gp(&mut cpu, &mut ram, 1);
+    }
+
+    #[test]
+    fn magic_instruction_cpuid_signature_without_hypervisor_bit() {
+        let cpu = run_cpuid(0x4000_0000, 0);
+        let mut signature = Vec::new();
+        for reg in [Reg32::Ebx, Reg32::Ecx, Reg32::Edx] {
+            signature.extend(cpu.reg(reg).to_le_bytes());
+        }
+        assert_eq!(signature, b"r86r86r86r86");
+        assert_eq!(cpu.reg(Reg32::Eax), 0x4000_0000);
+        assert_eq!(run_cpuid(1, 0).reg(Reg32::Ecx) & (1 << 31), 0);
+    }
+
+    #[test]
+    fn magic_instruction_unknown_at_cpl3_vm86_and_real_mode() {
+        for mode in 0..3 {
+            let mut cpu = cpl3_io_cpu(0);
+            let code: &[u8] = if mode == 0 {
+                &[0xed]
+            } else {
+                cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0, 0, 0xffff, 0x009b));
+                if mode == 1 {
+                    cpu.eflags |= EFLAGS_VM;
+                } else {
+                    cpu.cr0 &= !CR0_PE;
+                }
+                &[0x66, 0xed]
+            };
+            cpu.set_reg(Reg32::Eax, 0x2136_3872);
+            cpu.set_reg(Reg32::Edx, 0xabcd_5286); // Only DX identifies the port.
+            cpu.set_reg(Reg32::Ecx, 0xffff_ffff);
+            cpu.set_reg(Reg32::Ebx, 0x8765_4321);
+            cpu.set_reg(Reg32::Esi, 0x1234_5678);
+            cpu.set_reg(Reg32::Edi, 0x7654_3210);
+            let before = cpu.regs;
+            let flags = cpu.eflags;
+            let ram = run_instruction(&mut cpu, code);
+            assert_eq!(cpu.reg(Reg32::Eax), u32::MAX);
+            assert_eq!(&cpu.regs[1..], &before[1..]);
+            assert_eq!(cpu.eflags, flags);
+            assert_eq!(ram.io_read_count, 0);
+            assert_eq!(cpu.eip, code.len() as u32);
+        }
+    }
+
+    #[test]
+    fn magic_instruction_mismatches_keep_io_permissions() {
+        for vm86 in [false, true] {
+            for (code, eax, dx) in [
+                (&[0xed][..], 0x2136_3873, 0x5286),
+                (&[0xed][..], 0x2136_3872, 0x5287),
+                (&[0x66, 0xed][..], 0x2136_3872, 0x5286), // IN AX,DX
+                (&[0x6d][..], 0x2136_3872, 0x5286),       // INSD
+                (&[0xec][..], 0x2136_3872, 0x5286),       // IN AL,DX
+            ] {
+                let mut cpu = cpl3_io_cpu(0);
+                if vm86 {
+                    cpu.eflags |= EFLAGS_VM;
+                }
+                cpu.set_reg(Reg32::Eax, eax);
+                cpu.set_reg(Reg32::Edx, dx);
+                let before = cpu.regs;
+                let mut ram = Ram::new();
+                ram.data[..code.len()].copy_from_slice(code);
+                assert_eq!(
+                    Interpreter::step(&mut cpu, &mut ram),
+                    Err(StepError::GeneralProtection { eip: 0, code: 0 })
+                );
+                assert_eq!(cpu.regs, before);
+                assert_eq!(ram.io_read_count, 0);
+            }
+        }
+        let mut cpu = flat_cpu();
+        cpu.set_reg(Reg32::Edx, 0x5286);
+        cpu.set_reg(Reg32::Eax, 0);
+        let ram = run_instruction(&mut cpu, &[0xed]);
+        assert_eq!(ram.io_read_count, 1);
+        assert_eq!(ram.io_read_ports[0], 0x5286);
+        assert_eq!(ram.io_read_widths[0], 4);
     }
 
     #[test]

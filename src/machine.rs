@@ -3,6 +3,7 @@
 
 mod bus_diagnostics;
 mod clock;
+mod magic;
 #[cfg(test)]
 mod sound_tests;
 #[cfg(test)]
@@ -881,9 +882,13 @@ impl Machine {
         {
             // The RTC stores a wall calendar without a timezone. Seed local
             // time once; monotonic ticks and guest writes advance it afterward.
-            let local = chrono::Local::now().naive_local();
-            self.bus.rtc_epoch_seconds = u64::try_from(local.and_utc().timestamp())
-                .map_err(|_| "host RTC: local date predates 1970".to_string())?;
+            let local = chrono::Local::now();
+            self.bus.magic.utc_seconds = u64::try_from(local.timestamp())
+                .map_err(|_| "host time predates 1970".to_string())?;
+            self.bus.magic.utc_offset = local.offset().local_minus_utc();
+            self.bus.rtc_epoch_seconds =
+                u64::try_from(local.naive_local().and_utc().timestamp())
+                    .map_err(|_| "host RTC: local date predates 1970".to_string())?;
         }
         #[cfg(all(
             not(feature = "host"),
@@ -892,6 +897,7 @@ impl Machine {
         ))]
         {
             self.bus.rtc_epoch_seconds = crate::browser::epoch_seconds();
+            self.bus.magic.utc_seconds = self.bus.rtc_epoch_seconds;
         }
         self.bus.rtc_epoch_tick = 0;
         self.bus.clock = Clock::realtime();
@@ -2399,6 +2405,7 @@ pub(crate) struct HostBus {
     last_cpu_shutdown: Option<CpuShutdown>,
     current_step: u64,
     clock: Clock,
+    magic: magic::State,
     rtc_epoch_seconds: u64,
     rtc_epoch_tick: u64,
     rtc_frozen: Option<RtcCalendar>,
@@ -2466,6 +2473,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             last_cpu_shutdown: _,
             current_step,
             clock,
+            magic,
             rtc_epoch_seconds,
             rtc_epoch_tick,
             rtc_frozen,
@@ -2513,6 +2521,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             .field("reset_requested", reset_requested)
             .field("physical_mapping_changed", physical_mapping_changed)
             .field("realtime_clock", &clock.is_realtime())
+            .field("magic", magic)
             .field("rtc_epoch_seconds", rtc_epoch_seconds)
             .field("rtc_epoch_tick", rtc_epoch_tick)
             .field("rtc_frozen", rtc_frozen)
@@ -2755,6 +2764,7 @@ impl HostBus {
             last_cpu_shutdown: None,
             current_step: 0,
             clock: Clock::default(),
+            magic: magic::State::default(),
             rtc_epoch_seconds: 1_767_225_600, // 2026-01-01 UTC for deterministic runs
             rtc_epoch_tick: 0,
             rtc_frozen: None,
@@ -2810,6 +2820,8 @@ impl HostBus {
         fresh.clock = core::mem::take(&mut self.clock);
         fresh.clock.sample();
         fresh.clock.write_tsc(0);
+        fresh.magic.utc_seconds = self.magic.utc_seconds;
+        fresh.magic.utc_offset = self.magic.utc_offset;
         fresh.rtc_epoch_seconds = self.rtc_epoch_seconds;
         fresh.rtc_epoch_tick = self.rtc_epoch_tick;
         fresh.rtc_frozen = self.rtc_frozen;
@@ -4064,6 +4076,10 @@ impl HostBus {
 }
 
 impl Bus for HostBus {
+    fn magic_instruction(&mut self, cpu: &mut Cpu) {
+        self.magic.call(cpu, self.device_ticks());
+    }
+
     #[inline(always)]
     fn current_instruction(&self) -> u64 {
         self.current_step

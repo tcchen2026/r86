@@ -753,6 +753,11 @@ pub trait Bus {
 
     fn after_invlpg(&mut self, _linear: LinearAddr) {}
 
+    /// Register-only magic instruction; the machine owns its commands.
+    fn magic_instruction(&mut self, cpu: &mut crate::x86::Cpu) {
+        cpu.set_reg(crate::x86::Reg32::Eax, u32::MAX);
+    }
+
     fn io_read_u8(&mut self, port: u16) -> Result<u8, MemError> {
         Err(MemError::IoUnhandled { port })
     }
