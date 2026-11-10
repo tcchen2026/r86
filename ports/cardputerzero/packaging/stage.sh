@@ -7,12 +7,15 @@ set -eu
 root=$(cd "$(dirname "$0")/../../.." && pwd)
 app=$STAGE$APP_INSTALL_DIR
 install -D -m 0755 "$root/target/aarch64-unknown-linux-gnu/release/r86-handheld" "$app/r86-handheld"
+install -m 0755 "$root/ports/cardputerzero/packaging/helpers.sh" "$app/helpers.sh"
 "$root/ports/share.sh" "$app"
 
 cat >"$STAGE$INSTALL_PREFIX/bin/$PKG_NAME" <<WRAPPER
 #!/bin/sh
 data=\$HOME/r86
 mkdir -p "\$data"
+# the HDMI desktop's panel and file manager stop while r86 runs (helpers.sh)
+$APP_INSTALL_DIR/helpers.sh stop \$\$
 exec $APP_INSTALL_DIR/r86-handheld --data "\$data" "\$@" >"\$data/r86.log" 2>&1
 WRAPPER
 chmod 0755 "$STAGE$INSTALL_PREFIX/bin/$PKG_NAME"
