@@ -31,6 +31,7 @@ impl Playback {
 #[derive(Debug)]
 pub(crate) struct Sb16 {
     mixer: [u8; 256],
+    dsp_registers: [u8; 256],
     index: u8,
     reset: bool,
     replies: VecDeque<u8>,
@@ -53,6 +54,7 @@ impl Default for Sb16 {
     fn default() -> Self {
         let mut s = Self {
             mixer: [0; 256],
+            dsp_registers: [0; 256],
             index: 0,
             reset: false,
             replies: VecDeque::new(),
@@ -70,6 +72,8 @@ impl Default for Sb16 {
             last_tick: 0,
             dac: [0; 2],
         };
+        s.dsp_registers[5] = 1;
+        s.dsp_registers[9] = 0xf8;
         s.mixer[0x80] = 2; // IRQ 5
         s.mixer[0x81] = 0x22; // DMA 1 and 5
         s.reset_mixer();
@@ -283,6 +287,8 @@ impl Sb16 {
                     self.used = 0;
                     self.needed = match value {
                         0xb0..=0xcf => 3,
+                        0x05 | 0x0e => 2,
+                        0x04 | 0x0f => 1,
                         0x14 | 0x16 | 0x17 | 0x24 | 0x41 | 0x42 | 0x48 | 0x74..=0x77 | 0x80 => 2,
                         0x10 | 0x40 | 0xe0 | 0xe2 | 0xe4 | 0xf9 => 1,
                         _ => 0,
@@ -345,6 +351,11 @@ impl Sb16 {
         let p = self.parameters;
         let length = u32::from(u16::from_le_bytes([p[0], p[1]])) + 1;
         match cmd {
+            // Windows WDM uses DSP register reads/writes during reset and stop.
+            // Consume the complete command: register 10h is not direct DAC 10h.
+            // This register bank does not implement the optional ASP codec.
+            0x0e => self.dsp_registers[p[0] as usize] = p[1],
+            0x0f => self.reply(&[self.dsp_registers[p[0] as usize]]),
             0x10 => self.dac = [((i32::from(p[0]) - 128) * 256) as i16; 2],
             0x14 | 0x1c | 0x90 | 0x91 => self.start(
                 now,

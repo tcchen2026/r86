@@ -78,6 +78,57 @@ fn sound_reset_version_test_and_independent_irq_ack() {
 }
 
 #[test]
+fn sound_dsp_register_commands_preserve_wdm_playback() {
+    let mut s = Sound::default();
+    s.write(0x226, 1);
+    s.write(0x226, 0);
+    assert_eq!(s.read(0x22a), 0xaa);
+
+    // Windows 2000's WDM driver reads register 05h and sets low control bits.
+    command(&mut s, &[0x0f, 0x05]);
+    assert_ne!(s.read(0x22e) & 0x80, 0);
+    assert_eq!(s.read(0x22a), 1);
+    command(&mut s, &[0x0e, 0x05, 0x03, 0x0f, 0x05]);
+    assert_eq!(s.read(0x22a), 3);
+    assert_eq!(s.read(0x22e) & 0x80, 0);
+
+    // ASP setup operands can themselves look like playback commands. The
+    // unsupported codec commands must consume them without starting DMA.
+    command(&mut s, &[0x04, 0xb6, 0x05, 0xb0, 0xd3, 0xe1]);
+    assert_eq!([s.read(0x22a), s.read(0x22a)], [4, 5]);
+    assert_eq!(s.next_event(), u64::MAX);
+
+    s.enable(0);
+    full_volume(&mut s);
+    dma(&mut s, true, true, 0, 4);
+    let ram = [0x34, 0x12, 0, 0x80, 0, 0, 0, 0];
+    command(&mut s, &[0x41, 0x56, 0x22, 0xb6, 0x30, 0xff, 0xff]);
+    s.advance(tick(1, 22050), &ram);
+    assert_eq!(s.sb.dac, [0x1234, -32768]);
+    s.advance(tick(2, 22050), &ram);
+    assert_eq!(s.sb.dac, [0, 0]);
+    assert_eq!(count(&mut s, true), 3); // 8237 auto-init reloaded
+
+    // Observed stop sequence: read register 10h, write its low control bits,
+    // exit auto-init, then mask DMA. It must not inject two direct-DAC values.
+    command(&mut s, &[0x0f, 0x10]);
+    assert_ne!(s.read(0x22e) & 0x80, 0);
+    assert_eq!(s.read(0x22a), 0);
+    command(&mut s, &[0x0e, 0x10, 0x02, 0xd9]);
+    s.write(0xd4, 5);
+    s.advance(tick(3, 22050), &ram);
+    assert_eq!(s.sb.dac, [0, 0]);
+    assert_eq!(count(&mut s, true), 3);
+    assert_eq!(irq(&mut s), 0);
+    let mut pcm = Vec::new();
+    s.drain(&mut pcm);
+    assert!(pcm.chunks_exact(2).any(|frame| frame == [0x1234, -32768]));
+    assert_eq!(&pcm[pcm.len() - 2..], &[0, 0]);
+    command(&mut s, &[0x0f, 0x10]);
+    assert_eq!(s.read(0x22a), 2);
+}
+
+#[test]
 fn sound_dma_single_has_exact_count_deadline_and_pcm() {
     let mut s = Sound::default();
     let ram = [0, 128, 255, 128];

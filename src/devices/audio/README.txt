@@ -2,7 +2,8 @@
 
 `devices/audio.rs` owns an AT DMA pair, Sound Blaster 16 DSP 4.05 and OPL2.
 The machine exposes SB16 at 220h, initially IRQ 5, DMA 1/5. DOS software can
-use `BLASTER=A220 I5 D1 H5 T6`. Windows driver validation is still outstanding.
+use `BLASTER=A220 I5 D1 H5 T6`. Windows 2000 SP4 in-box WDM playback is checked
+locally; other Windows drivers and host audio devices need separate validation.
 
 DMA address/count units are bytes on channels 0–3 and words on 5–7. Each
 controller has its own byte flip-flop. Transfers respect masks, direction,
@@ -22,8 +23,11 @@ status flag but do not mute DSP 4.xx output, as Creative documents.
 
 Unknown commands produce no reply. Known unsupported recording/ADPCM commands
 consume their operands without transferring data. This is a compatibility
-limit, not an implementation of those formats. No MPU-401, PC speaker, CSP,
-tone filters, recording, DMA identification or OPL3 is provided.
+limit, not an implementation of those formats. DSP register read/write commands
+(0Fh/0Eh) retain byte values for Windows WDM setup/stop; they do not implement
+ASP/CSP processing. Mode/codec setup commands consume their operands without
+starting playback. No MPU-401, PC speaker, CSP, tone filters, recording, DMA
+identification or OPL3 is provided.
 
 DMA and block IRQs advance on the machine's guest oscillator. Transfers copy
 bounded chunks and retain each sample's guest timestamp. PCM uses a hold
@@ -73,3 +77,9 @@ References consulted for DMA/SB16 (study, no code copied): tiny386 mainline
 [Sound Blaster Series Hardware Programming Guide](https://www.ardent-tool.com/sound/Sound_Blaster_HW_Programming_Guide_1st.pdf),
 chapters 2–4 and 6. Creative's sample-count contract takes precedence over
 tiny386's stereo single-cycle length workaround.
+
+For DSP register framing/defaults, also consulted Bochs
+`bochs/iodev/sound/sb16.cc` (902cc44abc1fe8fe9369b53dc3d7599abc453fb9),
+86Box `src/sound/snd_sb_dsp.c` (d2bbd6bc40456d2b110f3f3447ea93504a68b4d3),
+and tiny386 `sb16.c` (d47748e2b2d84597365c681e9e09c989cbce97c1). No reference
+code was copied. Windows 2000 port traffic supplies the regression sequence.
