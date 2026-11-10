@@ -432,6 +432,17 @@ pub trait Bus {
         BackingToken(addr.0)
     }
 
+    /// Cold fetch admission. A ROM decoder may read immutable bytes outside
+    /// the backing used by ordinary RAM tokens and native code watches.
+    fn fetch_backing_token(&self, addr: PhysAddr) -> Option<BackingToken> {
+        let page = PhysAddr(addr.0 & PHYS_PAGE_MASK);
+        matches!(
+            self.classify_phys(page, 4096),
+            PhysRegionKind::Ram | PhysRegionKind::Rom
+        )
+        .then(|| self.cached_backing_token(addr))
+    }
+
     /// Optional ordinary RAM source for a JIT walk comparison. The complete
     /// containing page must have stable, side-effect-free backing. The host
     /// adapter also gates native rechecks when its physical decode is unsuitable.

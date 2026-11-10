@@ -6719,8 +6719,7 @@ fn fetch_u8_miss<B: Bus>(
     let translation =
         mmu::translate_detailed_with_priv(cpu, bus, linear, AccessKind::Execute, priv_)?;
     let value = bus.read_phys_u8(translation.phys)?;
-    if fetch_cache_target_is_backing(bus, translation.phys) {
-        let backing = bus.cached_backing_token(translation.phys);
+    if let Some(backing) = bus.fetch_backing_token(translation.phys) {
         cpu.fill_fetch_cache_with_backing(linear, translation.phys, backing, translation.global);
         #[cfg(feature = "jit")]
         mmu::finish_fetch_translation(cpu, bus, linear, &translation);
@@ -6783,8 +6782,7 @@ fn fetch_u32_slow<B: Bus>(cpu: &mut Cpu, bus: &mut B, eip: u32) -> Result<u32, S
     let translation =
         mmu::translate_detailed_with_priv(cpu, bus, linear, AccessKind::Execute, priv_)?;
     let value = bus.read_phys_u32(translation.phys)?;
-    if fetch_cache_target_is_backing(bus, translation.phys) {
-        let backing = bus.cached_backing_token(translation.phys);
+    if let Some(backing) = bus.fetch_backing_token(translation.phys) {
         cpu.fill_fetch_cache_with_backing(linear, translation.phys, backing, translation.global);
         cpu.fill_fetch_cursor_after(eip, backing, 4, window_len);
     } else {
@@ -6844,8 +6842,7 @@ fn fetch_u16_slow<B: Bus>(cpu: &mut Cpu, bus: &mut B, eip: u32) -> Result<u16, S
     let translation =
         mmu::translate_detailed_with_priv(cpu, bus, linear, AccessKind::Execute, priv_)?;
     let value = bus.read_phys_u16(translation.phys)?;
-    if fetch_cache_target_is_backing(bus, translation.phys) {
-        let backing = bus.cached_backing_token(translation.phys);
+    if let Some(backing) = bus.fetch_backing_token(translation.phys) {
         cpu.fill_fetch_cache_with_backing(linear, translation.phys, backing, translation.global);
         cpu.fill_fetch_cursor_after(eip, backing, 2, window_len);
     } else {
@@ -6860,14 +6857,6 @@ fn fetch_window_len(eip: u32, code_limit: u32, linear: LinearAddr) -> u32 {
     let segment_len = u64::from(code_limit) - u64::from(eip) + 1;
     let page_len = u64::from(4096 - (linear.0 & 0x0fff));
     segment_len.min(page_len) as u32
-}
-
-fn fetch_cache_target_is_backing<B: Bus>(bus: &B, phys: PhysAddr) -> bool {
-    let page = PhysAddr(phys.0 & crate::x86::mem::PHYS_PAGE_MASK);
-    matches!(
-        bus.classify_phys(page, 4096),
-        crate::x86::mem::PhysRegionKind::Ram | crate::x86::mem::PhysRegionKind::Rom
-    )
 }
 
 fn mem_addr_with_override(cpu: &Cpu, offset: u32) -> MemAddr {

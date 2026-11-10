@@ -1,5 +1,6 @@
 pub mod audio;
 pub(crate) mod dma;
+pub(crate) mod firmware;
 pub mod ne2000;
 pub(crate) mod opl2;
 pub(crate) mod pic;

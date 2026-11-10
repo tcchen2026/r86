@@ -30,9 +30,10 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   `begin_io_instruction`): +12% CPU measured on a DOS boot.
 - perf: every CS load discards the fetch translations, so real-mode INT,
   IRET and far calls re-translate (`Cpu::set_seg_cache`).
-- perf: C0000-FFFFF is one always-writable "ROM" region on the slow
-  physical path, with no PAM shadow model; SeaBIOS keeps its stack there
-  (64% of CPU in a mode 13h game using BIOS calls).
+- device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
+  upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
+  DA000-E7FFF through PAM, which r86 now enforces
+  (firmware/seabios/bios.config lacks `CONFIG_WRITABLE_UPPERMEMORY=y`).
 - perf: self-modifying code under the A64 JIT recompiles on every change;
   Doom costs 28% more cycles with the JIT than with the interpreter.
 - perf: MMX in JIT code calls a shared helper per instruction (38% of

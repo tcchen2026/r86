@@ -252,6 +252,7 @@ fn push_e820(out: &mut Vec<u8>, addr: u64, len: u64, kind: u32) {
 #[derive(Clone, Debug)]
 pub struct PciConfig {
     addr: u32,
+    pub(crate) firmware: crate::devices::firmware::FirmwareShadow,
     ide_command: u16,
     ide_bus_master_bar4: u32,
     ide_timing: u32,
@@ -274,6 +275,7 @@ impl PciConfig {
     pub fn new() -> Self {
         Self {
             addr: 0,
+            firmware: crate::devices::firmware::FirmwareShadow::default(),
             ide_command: 0x0005,
             ide_bus_master_bar4: 0x0000_c001,
             ide_timing: 0x8000_8000,
@@ -356,6 +358,17 @@ impl PciConfig {
         // IDE has legacy PIO ports and a BM BAR with interrupt status;
         // VGA has I/O/memory decode, no bus master, IRQ or capability list.
         match (dev, func, reg) {
+            (0, 0, 0x58 | 0x5c) => {
+                let mut changed = false;
+                for byte in 0..4 {
+                    let offset = reg + byte;
+                    if (0x59..=0x5f).contains(&offset) && lanes & (0xff << (byte * 8)) != 0 {
+                        self.firmware.write_pam(offset, (value >> (byte * 8)) as u8);
+                        changed = true;
+                    }
+                }
+                return changed;
+            }
             (1, 2, 0x04) if self.usb_present => {
                 self.usb_command = merge(u32::from(self.usb_command)) as u16 & 5
             }
@@ -463,6 +476,7 @@ impl PciConfig {
     fn read_config_u8(&self, dev: u8, func: u8, offset: u16) -> u8 {
         match (dev, func) {
             (0, 0) => match offset {
+                0x59..=0x5f => self.firmware.read_pam(offset),
                 0x00 => 0x86,
                 0x01 => 0x80,
                 0x02 => 0x37,

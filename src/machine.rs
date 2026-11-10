@@ -13,6 +13,7 @@ use clock::{Clock, TICKS_PER_SECOND};
 
 use crate::acpi::Acpi;
 use crate::devices::audio::Sound;
+use crate::devices::firmware::FirmwareShadow;
 use crate::devices::ne2000::{IRQ as NET_IRQ, Ne2000};
 use crate::devices::pic::Pic;
 #[cfg(test)]
@@ -60,9 +61,6 @@ const SERIAL_KEEP: usize = 64 * 1024;
 // Match the selected CPU model's PAE/PSE36 physical address width.
 const PC_PHYS_LIMIT: u64 = 1 << 36;
 const A20_BIT: u64 = 1 << 20;
-const FIRMWARE_HIGH_ALIAS_BASE: u64 = 0xffd0_0000;
-const FIRMWARE_HIGH_ALIAS_LEN: u64 = 0x0030_0000;
-const FIRMWARE_HIGH_ALIAS_MASK: u64 = 0x000f_ffff;
 const FDC_MSR_RQM: u8 = 0x80;
 const FDC_MSR_DIO: u8 = 0x40;
 const FDC_MSR_BUSY: u8 = 0x10;
@@ -2355,7 +2353,7 @@ pub(crate) struct HostBus {
     acpi: Acpi,
     boot_order: BootOrder,
     vga: PcVga,
-    ioram_generation: u64,
+    ioram_generation: (u64, u64),
     ps2: I8042,
     pic: Pic,
     ide: IdeBus,
@@ -2650,8 +2648,8 @@ impl HostBus {
             .map_err(|err| format!("failed to build firmware region map: {err:?}"))?;
         regions
             .push(PhysRegion::rom(
-                PhysAddr(FIRMWARE_HIGH_ALIAS_BASE),
-                FIRMWARE_HIGH_ALIAS_LEN,
+                PhysAddr(FirmwareShadow::HIGH_BASE),
+                FirmwareShadow::HIGH_LEN,
             ))
             .map_err(|err| format!("failed to build firmware region map: {err:?}"))?;
         Ok(Self::with_regions(ram, regions, true, display))
@@ -2665,14 +2663,18 @@ impl HostBus {
     ) -> Self {
         let size = ram.len();
         let frame_count = size.saturating_add(GUEST_PAGE_SIZE - 1) / GUEST_PAGE_SIZE;
-        Self::with_buffers(
+        let mut bus = Self::with_buffers(
             ram,
             regions,
             firmware_mode,
             display,
             PcVga::new(),
             vec![FrameRoleFlags::RAM; frame_count],
-        )
+        );
+        if firmware_mode {
+            bus.pci.firmware.initialize(&bus.ram);
+        }
+        bus
     }
 
     fn with_buffers(
@@ -2699,7 +2701,7 @@ impl HostBus {
             acpi: Acpi::new(firmware_mode),
             boot_order: BootOrder::DiskFirst,
             vga,
-            ioram_generation: 0,
+            ioram_generation: (0, 0),
             ps2: I8042::new(),
             pic: Pic::new(),
             ide: if firmware_mode {
@@ -2771,6 +2773,8 @@ impl HostBus {
         {
             fresh.shadow = self.shadow.take();
         }
+        fresh.pci.firmware = core::mem::take(&mut self.pci.firmware);
+        fresh.pci.firmware.reset();
         // Retain media and immutable firmware configuration without copying
         // disk images or RAM. Pending transfers and controller state are reset.
         core::mem::swap(&mut fresh.ide, &mut self.ide);
@@ -3040,6 +3044,7 @@ impl HostBus {
             .get_mut(start..start + bytes.len())
             .ok_or_else(|| "BIOS does not fit below 1 MiB".to_string())?
             .copy_from_slice(bytes);
+        self.pci.firmware.load_rom(start, bytes);
         Ok(())
     }
 
@@ -3062,6 +3067,7 @@ impl HostBus {
             .get_mut(base..end)
             .ok_or_else(|| "option ROM does not fit in RAM backing".to_string())?
             .copy_from_slice(bytes);
+        self.pci.firmware.load_rom(base, bytes);
         if base == 0x000c_0000 {
             // SeaBIOS 1.17 clears the legacy ROM area before discovery. Keep
             // the source in fw_cfg so it can deploy the VGA device's ROM.
@@ -3106,11 +3112,6 @@ impl HostBus {
     }
 
     fn backing_index_for_len(&self, addr: PhysAddr, len: usize) -> Result<usize, MemError> {
-        if self.firmware_mode {
-            if let Some(index) = Self::high_alias_backing_index_for_len(addr, len) {
-                return Ok(index);
-            }
-        }
         let index = usize::try_from(addr.as_u64()).map_err(|_| MemError::OutOfRange { addr })?;
         let Some(end) = index.checked_add(len) else {
             return Err(MemError::OutOfRange { addr });
@@ -3119,25 +3120,6 @@ impl HostBus {
             Ok(index)
         } else {
             Err(MemError::OutOfRange { addr })
-        }
-    }
-
-    #[inline]
-    fn fast_backing_index_for_len(&self, addr: PhysAddr, len: usize) -> Option<usize> {
-        if self.firmware_mode {
-            if let Some(index) = Self::high_alias_backing_index_for_len(addr, len) {
-                return Some(index);
-            }
-        }
-        let start = usize::try_from(addr.as_u64()).ok()?;
-        let end = start.checked_add(len)?;
-        if end > self.ram.len() {
-            return None;
-        }
-        if !self.firmware_mode || end <= 0x000a_0000 || start >= 0x000c_0000 {
-            Some(start)
-        } else {
-            None
         }
     }
 
@@ -3201,11 +3183,6 @@ impl HostBus {
         unsafe {
             ram_write_u64(self.ram.as_mut_ptr().add(index), value);
         }
-    }
-
-    #[inline(always)]
-    fn cached_backing_index_for_len(addr: PhysAddr, len: usize) -> usize {
-        Self::high_alias_backing_index_for_len(addr, len).unwrap_or(addr.as_u64() as usize)
     }
 
     #[cfg(feature = "jit")]
@@ -3402,20 +3379,22 @@ impl HostBus {
         &self.ram[backing as usize..backing as usize + len]
     }
 
-    fn high_alias_backing_index_for_len(addr: PhysAddr, len: usize) -> Option<usize> {
-        let raw = addr.as_u64();
-        let len = u64::try_from(len).ok()?;
-        let end = raw.checked_add(len.checked_sub(1)?)?;
-        let alias_end = FIRMWARE_HIGH_ALIAS_BASE.checked_add(FIRMWARE_HIGH_ALIAS_LEN - 1)?;
-        if raw < FIRMWARE_HIGH_ALIAS_BASE || end > alias_end {
-            return None;
+    #[inline]
+    fn write_firmware(&mut self, addr: PhysAddr, width: u8, value: u64) -> bool {
+        let Some(written) = self
+            .pci
+            .firmware
+            .memory_write(&mut self.ram, addr.0, width, value)
+        else {
+            return false;
+        };
+        #[cfg(feature = "jit")]
+        if written {
+            self.jit_backing_write(addr.0 as usize, usize::from(width));
         }
-        let index = raw & FIRMWARE_HIGH_ALIAS_MASK;
-        if index.checked_add(len)? <= 0x0010_0000 {
-            usize::try_from(index).ok()
-        } else {
-            None
-        }
+        #[cfg(not(feature = "jit"))]
+        let _ = written;
+        true
     }
 
     fn repeat_write_len(width: u8, units: u32) -> Option<u32> {
@@ -3439,10 +3418,17 @@ impl HostBus {
             }
         }
         let kind = self.classify_phys_kind(addr, len as u32);
+        if !write && kind == PhysRegionKind::Rom {
+            return self
+                .pci
+                .firmware
+                .read_range(&self.ram, addr.0, len)
+                .map(|ptr| ptr as *mut u8);
+        }
         let index = if write && kind == PhysRegionKind::Ram {
             self.fast_ram_index_for_len(addr, len)?
         } else if !write && matches!(kind, PhysRegionKind::Ram | PhysRegionKind::Rom) {
-            self.fast_backing_index_for_len(addr, len)?
+            self.fast_ram_index_for_len(addr, len)?
         } else {
             return None;
         };
@@ -3477,6 +3463,8 @@ impl HostBus {
     fn check_write_range(&self, write: PhysWrite) -> Result<(), MemError> {
         match self.classify_phys_kind(write.addr, u32::from(write.len)) {
             PhysRegionKind::Ram => Ok(()),
+            // A/D updates are physical stores too; ROM may ignore them.
+            PhysRegionKind::Rom if write.origin == WriteOrigin::PageWalk => Ok(()),
             PhysRegionKind::Hole | PhysRegionKind::Mixed
                 if matches!(
                     write.origin,
@@ -4109,7 +4097,10 @@ impl Bus for HostBus {
         if let Some(value) = self.vga.memory_read(addr.0, 1) {
             return Ok(value as u8);
         }
-        if let Some(index) = self.fast_backing_index_for_len(addr, 1) {
+        if let Some(value) = self.pci.firmware.memory_read(&self.ram, addr.0, 1) {
+            return Ok(value as u8);
+        }
+        if let Some(index) = self.fast_ram_index_for_len(addr, 1) {
             return Ok(self.ram[index]);
         }
         match self.classify_phys_kind(addr, 1) {
@@ -4135,11 +4126,25 @@ impl Bus for HostBus {
 
     #[inline(always)]
     fn cached_backing_token(&self, addr: PhysAddr) -> BackingToken {
-        let index = Self::cached_backing_index_for_len(self.cpu_phys_addr(addr), 1);
+        let index = self.cpu_phys_addr(addr).0 as usize;
         debug_assert!(index < self.ram.len());
         // Guest RAM is fixed-size while the CPU runs. Fetch-cursor bounds keep
         // every token advance inside the page and segment approved at fill.
         BackingToken(unsafe { self.ram.as_ptr().add(index) } as u64)
+    }
+
+    fn fetch_backing_token(&self, addr: PhysAddr) -> Option<BackingToken> {
+        let addr = self.cpu_phys_addr(addr);
+        let page = PhysAddr(addr.0 & !4095);
+        if !matches!(
+            self.classify_phys_kind(page, 4096),
+            PhysRegionKind::Ram | PhysRegionKind::Rom
+        ) || (self.pci.firmware.contains_memory(page.0, 4096)
+            && !self.pci.firmware.shadow_reads(page.0, 4096))
+        {
+            return None;
+        }
+        Some(self.cached_backing_token(addr))
     }
 
     #[cfg(feature = "jit")]
@@ -4189,7 +4194,10 @@ impl Bus for HostBus {
         if let Some(value) = self.vga.memory_read(addr.0, 2) {
             return Ok(value as u16);
         }
-        if let Some(index) = self.fast_backing_index_for_len(addr, 2) {
+        if let Some(value) = self.pci.firmware.memory_read(&self.ram, addr.0, 2) {
+            return Ok(value as u16);
+        }
+        if let Some(index) = self.fast_ram_index_for_len(addr, 2) {
             return Ok(self.read_backing_u16(index));
         }
         match self.classify_phys_kind(addr, 2) {
@@ -4227,7 +4235,10 @@ impl Bus for HostBus {
         if let Some(value) = self.vga.memory_read(addr.0, 4) {
             return Ok(value as u32);
         }
-        if let Some(index) = self.fast_backing_index_for_len(addr, 4) {
+        if let Some(value) = self.pci.firmware.memory_read(&self.ram, addr.0, 4) {
+            return Ok(value as u32);
+        }
+        if let Some(index) = self.fast_ram_index_for_len(addr, 4) {
             return Ok(self.read_backing_u32(index));
         }
         match self.classify_phys_kind(addr, 4) {
@@ -4267,7 +4278,10 @@ impl Bus for HostBus {
         if let Some(value) = self.vga.memory_read(addr.0, 8) {
             return Ok(value as u64);
         }
-        if let Some(index) = self.fast_backing_index_for_len(addr, 8) {
+        if let Some(value) = self.pci.firmware.memory_read(&self.ram, addr.0, 8) {
+            return Ok(value as u64);
+        }
+        if let Some(index) = self.fast_ram_index_for_len(addr, 8) {
             return Ok(self.read_backing_u64(index));
         }
         match self.classify_phys_kind(addr, 8) {
@@ -4286,6 +4300,9 @@ impl Bus for HostBus {
     #[inline(always)]
     fn probe_phys_write_u8(&mut self, addr: PhysAddr) -> Result<(), MemError> {
         let addr = self.cpu_phys_addr(addr);
+        if self.pci.firmware.contains_memory(addr.0, 1) {
+            return Ok(());
+        }
         match self.classify_phys_kind(addr, 1) {
             PhysRegionKind::Ram | PhysRegionKind::Rom => self.backing_byte_index(addr).map(|_| ()),
             PhysRegionKind::Mmio if PcVga::contains_legacy(addr.as_u64()) => Ok(()),
@@ -4308,6 +4325,9 @@ impl Bus for HostBus {
         if self.vga.memory_write(addr.0, 1, value as u64) {
             return Ok(());
         }
+        if self.write_firmware(addr, 1, value as u64) {
+            return Ok(());
+        }
         if let Some(index) = self.fast_ram_index_for_len(addr, 1) {
             #[cfg(feature = "jit")]
             self.jit_backing_write(index, 1);
@@ -4322,13 +4342,7 @@ impl Bus for HostBus {
                 self.ram[index] = value;
                 Ok(())
             }
-            PhysRegionKind::Rom => {
-                let index = self.backing_byte_index(addr)?;
-                #[cfg(feature = "jit")]
-                self.jit_backing_write(index, 1);
-                self.ram[index] = value;
-                Ok(())
-            }
+            PhysRegionKind::Rom => Ok(()),
             PhysRegionKind::Mmio | PhysRegionKind::FbDirtyTracked | PhysRegionKind::Hole => {
                 self.unclaimed_memory(addr, true, value)
             }
@@ -4366,6 +4380,9 @@ impl Bus for HostBus {
             return self.write_phys_u8(PhysAddr(addr.0.wrapping_add(1)), (value >> 8) as u8);
         };
         if self.vga.memory_write(addr.0, 2, value as u64) {
+            return Ok(());
+        }
+        if self.write_firmware(addr, 2, value as u64) {
             return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 2) {
@@ -4410,6 +4427,9 @@ impl Bus for HostBus {
         if self.vga.memory_write(addr.0, 4, value as u64) {
             return Ok(());
         }
+        if self.write_firmware(addr, 4, value as u64) {
+            return Ok(());
+        }
         if let Some(index) = self.fast_ram_index_for_len(addr, 4) {
             self.write_backing_u32(index, value);
             return Ok(());
@@ -4450,6 +4470,9 @@ impl Bus for HostBus {
             return self.write_phys_u32(PhysAddr(addr.0.wrapping_add(4)), (value >> 32) as u32);
         };
         if self.vga.memory_write(addr.0, 8, value as u64) {
+            return Ok(());
+        }
+        if self.write_firmware(addr, 8, value as u64) {
             return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 8) {
@@ -4718,13 +4741,19 @@ impl Bus for HostBus {
             )
             && self.classify_phys_kind(block_base, 0x20_0000) == PhysRegionKind::Ram
             && self.fast_ram_index_for_len(block_base, 0x20_0000).is_some();
-        // Only the PCI linear aperture is side-effect-free. Legacy VGA reads
-        // load latches and must retain device dispatch. PCI decode changes and
-        // reset flush every shadow before guest access can use the old backing.
+        // Reported video pages and PAM shadow reads are side-effect-free.
+        // Decode changes retire these native mappings before guest access.
         let read_page = if ordinary_ram_page {
             Some(crate::monitor::abi::X86_RAM_IPA_BASE + base.0)
         } else {
-            self.ioram_page(base, false).map(|token| token.0)
+            self.ioram_page(base, false).map(|token| {
+                let offset = token.0.wrapping_sub(self.ram.as_ptr() as u64);
+                if offset < self.ram.len() as u64 {
+                    crate::monitor::abi::X86_RAM_IPA_BASE + offset
+                } else {
+                    token.0
+                }
+            })
         };
         if let Some(shadow) = self.shadow.as_deref_mut() {
             shadow.after_linear_translate_backing(
@@ -4851,15 +4880,29 @@ impl Bus for HostBus {
 
     fn ioram_page(&mut self, page: PhysAddr, write: bool) -> Option<BackingToken> {
         let page = self.cpu_phys_range(page, 4096)?;
-        self.vga
-            .direct_page(page.0, write)
-            .map(|ptr| BackingToken(ptr as u64))
+        let ptr = if self.vga.contains_memory(page.0, 4096) {
+            self.vga.direct_page(page.0, write)
+        } else if !write || self.cached_write_translation_allowed(page) {
+            self.pci.firmware.direct_page(&mut self.ram, page.0, write)
+        } else {
+            None
+        };
+        ptr.map(|ptr| BackingToken(ptr as u64))
     }
 
     fn sync_ioram(&mut self, cpu: &mut Cpu) {
-        let generation = self.vga.mapping_generation();
+        let generation = (
+            self.vga.mapping_generation(),
+            self.pci.firmware.mapping_generation(),
+        );
         if self.ioram_generation != generation {
-            cpu.invalidate_ioram_translations();
+            if self.ioram_generation.1 != generation.1 {
+                // PAM can change instruction bytes without a RAM store. Retire
+                // fetch cursors and every native mapping proof as well as data.
+                cpu.invalidate_translation_context();
+            } else {
+                cpu.invalidate_ioram_translations();
+            }
             #[cfg(feature = "monitor")]
             if let Some(shadow) = self.shadow.as_deref_mut() {
                 shadow.flush_for_physical_map_change();
@@ -4869,8 +4912,9 @@ impl Bus for HostBus {
     }
 
     fn device_write_width_supported(&self, addr: PhysAddr, len: u32) -> bool {
-        self.cpu_phys_range(addr, len)
-            .is_some_and(|addr| self.vga.contains_memory(addr.0, len))
+        self.cpu_phys_range(addr, len).is_some_and(|addr| {
+            self.vga.contains_memory(addr.0, len) || self.pci.firmware.contains_memory(addr.0, len)
+        })
     }
 
     fn copy_backing_tokens(&mut self, src: BackingToken, dst: BackingToken, len: u32) -> bool {
@@ -12390,6 +12434,213 @@ mod host_bus_tests {
         bus.write_phys_u8(PhysAddr(0xa0000), 0x5a).unwrap();
         bus.write_phys_u8(PhysAddr(0xb8000), b'V').unwrap();
         assert_eq!(bus.vga.text_byte(0), Some(b'V'));
+    }
+
+    #[test]
+    fn firmware_pam_pci_lanes_widths_and_a20() {
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        bus.load_bios_rom(&vec![0x5a; 0x40000]).unwrap();
+        bus.ram[0xc0000..0x100000].fill(0xa5);
+        bus.io_write_u32(0xcf8, 0x80000058).unwrap();
+        bus.io_write_u32(0xcfc, u32::MAX).unwrap();
+        assert_eq!(bus.io_read_u32(0xcfc).unwrap(), 0x77777000);
+        bus.io_write_u16(0xcfe, 0x1234).unwrap();
+        bus.io_write_u8(0xcfd, 0x31).unwrap();
+        assert_eq!(bus.io_read_u32(0xcfc).unwrap(), 0x12343000);
+        bus.io_write_u32(0xcf8, 0x8000005c).unwrap();
+        bus.io_write_u32(0xcfc, 0x76543210).unwrap();
+        assert_eq!(bus.io_read_u32(0xcfc).unwrap(), 0x76543210);
+        for state in 0..4 {
+            bus.ram[0xe9910..0xe9918].fill(0xa5);
+            let generation = bus.pci.firmware.mapping_generation();
+            bus.io_write_u8(0xcff, state).unwrap();
+            bus.io_write_u8(0xcff, state).unwrap();
+            assert_eq!(bus.pci.firmware.mapping_generation(), generation + 2);
+            let byte = if state & 1 != 0 { 0xa5 } else { 0x5a };
+            assert_eq!(bus.read_phys_u8(PhysAddr(0xe9910)).unwrap(), byte);
+            assert_eq!(
+                bus.read_phys_u16(PhysAddr(0xe9910)).unwrap(),
+                u16::from_le_bytes([byte; 2])
+            );
+            assert_eq!(
+                bus.read_phys_u32(PhysAddr(0xe9910)).unwrap(),
+                u32::from_le_bytes([byte; 4])
+            );
+            assert_eq!(
+                bus.read_phys_u64(PhysAddr(0xe9910)).unwrap(),
+                u64::from_le_bytes([byte; 8])
+            );
+            bus.write_phys_u8(PhysAddr(0xe9910), 0x11).unwrap();
+            bus.write_phys_u16(PhysAddr(0xe9911), 0x3322).unwrap();
+            bus.write_phys_u32(PhysAddr(0xe9913), 0x77665544).unwrap();
+            let expected = if state & 2 != 0 {
+                &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77][..]
+            } else {
+                &[0xa5; 7]
+            };
+            assert_eq!(&bus.ram[0xe9910..0xe9917], expected);
+            bus.write_phys_u64(PhysAddr(0xe9910), 0x8877665544332211)
+                .unwrap();
+            assert_eq!(
+                bus.read_phys_u64(PhysAddr(0xfffe9910)).unwrap(),
+                0x5a5a5a5a5a5a5a5a
+            );
+            bus.write_phys_u64(PhysAddr(0xfffe9910), 0).unwrap();
+            assert_eq!(
+                bus.read_phys_u64(PhysAddr(0xfffe9910)).unwrap(),
+                0x5a5a5a5a5a5a5a5a
+            );
+            bus.set_a20(false);
+            assert_eq!(
+                bus.read_phys_u64(PhysAddr(0x1e9910)),
+                bus.read_phys_u64(PhysAddr(0xe9910))
+            );
+            assert_eq!(
+                bus.read_phys_u64(PhysAddr(0xfffe9910)).unwrap(),
+                0x5a5a5a5a5a5a5a5a
+            );
+            bus.set_a20(true);
+        }
+        bus.ram[0xfffff] = 0x11;
+        bus.ram[0x100000..0x100003].copy_from_slice(&[0x22, 0x33, 0x44]);
+        assert_eq!(bus.read_phys_u32(PhysAddr(0xfffff)).unwrap(), 0x44332211);
+        bus.write_phys_u32(PhysAddr(0xfffff), 0x88776655).unwrap();
+        assert_eq!(&bus.ram[0xfffff..0x100003], &[0x55, 0x66, 0x77, 0x88]);
+        bus.reset(0);
+        assert_eq!(bus.read_phys_u8(PhysAddr(0xfffff)).unwrap(), 0x5a);
+        assert_eq!(bus.read_phys_u8(PhysAddr(0xffffffff)).unwrap(), 0x5a);
+    }
+
+    #[test]
+    fn firmware_pam_revokes_data_and_fetch_backing() {
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        bus.load_option_rom(0xc8000, &[0xb8, 0x11, 0, 0, 0])
+            .unwrap();
+        bus.ram[0xc8001] = 0x22;
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0xc8000, 0);
+        let data = LinearAddr(0xe9910);
+        bus.io_write_u32(0xcf8, 0x8000005c).unwrap();
+        for state in [3, 2, 0, 1, 3] {
+            bus.io_write_u8(0xcff, state).unwrap();
+            bus.sync_ioram(&mut cpu);
+            assert!(cpu.cached_write_translation(data, false).is_none());
+            mmu::write_linear_u32(&mut cpu, &mut bus, data, 0x12345678).unwrap();
+            assert_eq!(
+                cpu.cached_write_translation(data, false).is_some(),
+                state == 3
+            );
+            assert_eq!(
+                mmu::read_linear_u32(&mut cpu, &mut bus, data, AccessKind::Read).unwrap(),
+                if state & 1 != 0 { 0x12345678 } else { 0 }
+            );
+        }
+        bus.io_write_u32(0xcf8, 0x80000058).unwrap();
+        for state in [1, 0, 3, 2] {
+            cpu.eip = 0xc8000;
+            bus.io_write_u8(0xcff, state).unwrap();
+            assert_eq!(
+                Interpreter::step(&mut cpu, &mut bus),
+                Ok(StepOutcome::Running)
+            );
+            assert_eq!(
+                cpu.reg(Reg32::Eax),
+                if state & 1 != 0 { 0x22 } else { 0x11 }
+            );
+        }
+        cpu.eip = 0xfffc8000;
+        assert_eq!(
+            Interpreter::step(&mut cpu, &mut bus),
+            Ok(StepOutcome::Running)
+        );
+        assert_eq!(cpu.reg(Reg32::Eax), 0x11);
+    }
+
+    #[test]
+    fn firmware_pam_page_walk_ad_stores_obey_write_enable() {
+        let mut rom = vec![0; 8192];
+        rom[..4].copy_from_slice(&0xe9003u32.to_le_bytes());
+        rom[0x1008..0x100c].copy_from_slice(&0x3003u32.to_le_bytes());
+        for state in 0..4 {
+            let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+            bus.load_option_rom(0xe8000, &rom).unwrap();
+            bus.pci.firmware.write_pam(0x5f, state);
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            cpu.cr0 |= CR0_PG;
+            cpu.cr3 = 0xe8000;
+            bus.sync_ioram(&mut cpu);
+            mmu::write_linear_u32(&mut cpu, &mut bus, LinearAddr(0x2000), 0x12345678).unwrap();
+            assert_eq!(bus.read_phys_u32(PhysAddr(0x3000)).unwrap(), 0x12345678);
+            let ad = state & 2 != 0;
+            assert_eq!(
+                u32::from_le_bytes(bus.ram[0xe8000..0xe8004].try_into().unwrap()),
+                0xe9003 | if ad { 0x20 } else { 0 }
+            );
+            assert_eq!(
+                u32::from_le_bytes(bus.ram[0xe9008..0xe900c].try_into().unwrap()),
+                0x3003 | if ad { 0x60 } else { 0 }
+            );
+            assert_eq!(bus.read_phys_u32(PhysAddr(0xfffe9008)).unwrap(), 0x3003);
+        }
+    }
+
+    #[cfg(feature = "jit")]
+    #[test]
+    fn firmware_pam_watched_code_excludes_writable_grants() {
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        bus.pci.firmware.write_pam(0x5f, 3);
+        let mut pages = crate::x86::jit::validity::CodePages::new(bus.ram.len());
+        pages.watch(0xe9);
+        bus.jit_code_pages = Some(pages);
+        assert!(bus.ioram_page(PhysAddr(0xe9000), false).is_some());
+        assert!(bus.ioram_page(PhysAddr(0xe9000), true).is_none());
+        bus.write_phys_u32(PhysAddr(0xe9910), 0x12345678).unwrap();
+        assert_eq!(&bus.ram[0xe9910..0xe9914], &0x12345678u32.to_le_bytes());
+        assert!(!bus.jit_code_pages.as_ref().unwrap().watched(0xe9));
+        assert!(bus.ioram_page(PhysAddr(0xe9000), true).is_some());
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_firmware_pam_changes_match_interpretation() {
+        let make = || {
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0xc8000, 0);
+            cpu.set_reg(Reg32::Esi, 0xe9910);
+            let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+            // ROM increments EDX; shadow increments EAX. Both store/read data.
+            bus.load_option_rom(0xc8000, &[0x42, 0x89, 0x06, 0x8b, 0x1e, 0xeb, 0xf9])
+                .unwrap();
+            bus.ram[0xc8000] = 0x40;
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            (cpu, bus)
+        };
+        let (mut expected, mut reference) = make();
+        let (mut actual, mut bus) = make();
+        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+        for (phase, state) in [3, 2, 0, 1, 3].into_iter().enumerate() {
+            for b in [&mut reference, &mut bus] {
+                b.io_write_u32(0xcf8, 0x80000058).unwrap();
+                b.io_write_u8(0xcff, u8::from(phase & 1 == 0)).unwrap();
+                b.io_write_u32(0xcf8, 0x8000005c).unwrap();
+                b.io_write_u8(0xcff, state).unwrap();
+                b.attention = false;
+            }
+            let result =
+                Interpreter::run_batch(&mut expected, &mut reference, phase as u64 * 2000, 2000);
+            let native = engine
+                .run_batch(&mut actual, &mut bus, phase as u64 * 2000, 2000)
+                .unwrap();
+            assert_eq!(native, result);
+            assert_eq!(actual.regs, expected.regs);
+            assert_eq!(actual.eip, expected.eip);
+            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+            assert_eq!(bus.ram, reference.ram);
+        }
+        assert!(engine.stats.native_steps > 1000);
+        assert!(engine.stats.native_memory_writes > 0);
     }
 
     #[test]
