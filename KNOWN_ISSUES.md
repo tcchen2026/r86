@@ -25,8 +25,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: each poll, and each port I/O instruction, reads the host clock
   with 128-bit arithmetic in realtime mode (`Clock::sample`,
   `begin_io_instruction`): +12% CPU measured on a DOS boot.
-- perf: every CS load discards the fetch translations, so real-mode INT,
-  IRET and far calls re-translate (`Cpu::set_seg_cache`).
 - device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
   upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
   DA000-E7FFF through PAM, which r86 now enforces

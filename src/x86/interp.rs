@@ -28052,6 +28052,16 @@ mod tests {
         step_running(&mut cpu, &mut ram);
         assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5678);
         assert_eq!(cpu.eip, 5);
+
+        // Return to an already translated page after changing its instruction.
+        // The old CS cursor must not hide the new base, bytes or shorter limit.
+        ram.data[0] = 0x40; // inc ax
+        cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0x10, 0, 0, 0x009a));
+        cpu.eip = 0;
+        step_running(&mut cpu, &mut ram);
+        assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5679);
+        assert_eq!(cpu.eip, 1);
+        step_gp(&mut cpu, &mut ram, 1);
     }
 
     #[test]

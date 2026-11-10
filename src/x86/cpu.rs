@@ -1498,6 +1498,10 @@ impl Cpu {
     pub(super) fn task_switch_cpl(&mut self, cpl: u8) {
         #[cfg(all(feature = "r86chip-native", target_arch = "riscv32"))]
         crate::chipinterp::native::disable_guest();
+        // A qualification fault can enter a handler before the final CS load.
+        if (self.cached_cpl == 3) != (cpl == 3) {
+            self.invalidate_fetch_translations();
+        }
         self.cached_cpl = cpl;
     }
 
@@ -1505,6 +1509,10 @@ impl Cpu {
     /// Direct segment mutation would leave permission and fetch caches stale.
     #[inline(always)]
     pub fn set_seg_cache(&mut self, seg: SegmentReg, cache: SegmentCache) {
+        #[cfg(any(
+            feature = "jit",
+            all(feature = "r86chip-native", target_arch = "riscv32")
+        ))]
         let previous = self.segments[seg as usize];
         #[cfg(all(feature = "r86chip-native", target_arch = "riscv32"))]
         if previous != cache {
@@ -1513,29 +1521,25 @@ impl Cpu {
         self.segments[seg as usize] = cache;
         self.update_flat_segment_mask(seg);
         if matches!(seg, SegmentReg::Cs) {
+            let was_user = self.cached_cpl == 3;
             self.cached_cpl = self.mode_cpl(cache.selector);
             self.code_default16 = (cache.flags & SEGMENT_FLAG_DEFAULT_BIG) == 0;
-            // The fetch cursor is CS-relative, whereas data translations are
-            // linear and privilege-tagged. Reloading the same CS must not
-            // discard valid mappings on every interrupt/IRET. A changed CS
-            // still expires execute links and their embedded guest PCs.
-            // Segment/prefetch changes are distinct from a paging TLB flush
-            // (v86 cpu.rs also keeps the data TLB on CS cache updates).
+            // Fetch translations are linear, not CS-relative. Rebuild the
+            // cursor below for the new base/limit; keep translations across
+            // INT/IRET/far branches at the same paging privilege. Unlike data
+            // translations, fetch entries have no user/supervisor tag.
+            if was_user != (self.cached_cpl == 3) {
+                self.invalidate_fetch_translations();
+            }
+            #[cfg(feature = "jit")]
             if previous != cache {
-                #[cfg(feature = "jit")]
                 let same_code = previous.base == cache.base
                     && previous.limit == cache.limit
                     && (previous.flags ^ cache.flags) & !0x60 == 0;
-                #[cfg(not(feature = "jit"))]
-                let same_code = false;
-                if same_code {
-                    // JIT execute permissions are cached separately for user
-                    // and supervisor. A CPL change selects the corresponding
-                    // table; it does not alter its checked mapping. The ordinary
-                    // fetch cache has no privilege tag and still expires here.
-                    self.invalidate_fetch_translations();
-                } else {
-                    self.invalidate_fetch_cache();
+                if !same_code {
+                    // Native links embed guest PCs and CS attributes. Their
+                    // user/supervisor execute tables remain privilege-tagged.
+                    self.invalidate_jit_fetch_context();
                 }
             }
             self.fetch_cursor.invalidate();
@@ -1700,15 +1704,19 @@ impl Cpu {
     #[inline]
     pub fn invalidate_fetch_cache(&mut self) {
         #[cfg(feature = "jit")]
-        {
-            self.jit_invalidated_range = None;
-            self.jit_mapping_epoch = self
-                .jit_mapping_epoch
-                .checked_add(1)
-                .expect("JIT mapping epoch exhausted");
-            self.jit_global_epoch = self.jit_mapping_epoch;
-        }
+        self.invalidate_jit_fetch_context();
         self.invalidate_fetch_translations();
+    }
+
+    #[cfg(feature = "jit")]
+    #[inline]
+    fn invalidate_jit_fetch_context(&mut self) {
+        self.jit_invalidated_range = None;
+        self.jit_mapping_epoch = self
+            .jit_mapping_epoch
+            .checked_add(1)
+            .expect("JIT mapping epoch exhausted");
+        self.jit_global_epoch = self.jit_mapping_epoch;
     }
 
     #[inline]
@@ -2981,8 +2989,26 @@ mod tests {
             },
         );
 
-        assert_eq!(cpu.fetch_cache_phys(linear), None);
+        assert_eq!(cpu.fetch_cache_phys(linear), Some(phys));
         assert_eq!(cpu.cached_read_translation(linear, false), Some(backing));
+    }
+
+    #[test]
+    fn task_entry_privilege_change_expires_supervisor_fetch() {
+        let mut cpu = Cpu::new();
+        cpu.cr0 |= CR0_PE;
+        let linear = LinearAddr(0x3000);
+        cpu.fill_fetch_cache(linear, PhysAddr(0x7000));
+        cpu.task_switch_cpl(3);
+        // A user handler entered on a qualification fault sees CPL3 already.
+        cpu.set_seg_cache(
+            SegmentReg::Cs,
+            SegmentCache {
+                selector: 3,
+                ..cpu.seg(SegmentReg::Cs)
+            },
+        );
+        assert_eq!(cpu.fetch_cache_phys(linear), None);
     }
 
     #[test]
