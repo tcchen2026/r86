@@ -9,9 +9,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
 ## P0: a guest or the network can hang or kill the emulator
 
-- host/cpu: the prefix loop has no length limit; a guest that maps every
-  page to prefix bytes keeps the interpreter in one instruction for ever
-  (`Interpreter::run_batch_inner`, src/x86/interp.rs).
 - host: one WebSocket text frame with a `\u` escape followed by a
   multi-byte character panics `parse_json_string`
   (src/frontend/protocol.rs); release builds abort on panic.
@@ -47,6 +44,8 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: every port write outside USB, sound and the NIC raises attention,
   making the next batch one instruction long.
 - perf: 16-bit, real-mode and virtual-8086 code is never compiled.
+- cpu: an instruction longer than 15 bytes with fewer than 15 prefixes
+  executes instead of raising #GP(0).
 - cpu: INT3 and INTO in virtual-8086 mode with IOPL < 3 raise #GP. [?]
 - cpu: byte and word read-modify-write instructions report a read page
   fault where a write fault is due; zero-count shifts skip the write

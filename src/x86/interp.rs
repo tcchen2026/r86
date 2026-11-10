@@ -879,6 +879,11 @@ impl Interpreter {
                     0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3 => {
                         opcode = {
                             let mut byte = opcode;
+                            // An instruction is at most 15 bytes, so a fifteenth
+                            // prefix is #GP(0). Counting here bounds the loop (a guest
+                            // can map every page to prefixes) at no cost to
+                            // instructions without prefixes.
+                            let mut prefixes = 0u8;
                             loop {
                                 match OPCODE_PREFIX_CLASS[byte as usize] {
                                     PREFIX_SEG_ES => cpu.segment_override = Some(SegmentReg::Es),
@@ -900,6 +905,13 @@ impl Interpreter {
                                         address16 = !default16;
                                     }
                                     _ => break byte,
+                                }
+                                prefixes += 1;
+                                if prefixes == 15 {
+                                    stop!(BatchStepStop::Error(StepError::GeneralProtection {
+                                        eip: start_eip,
+                                        code: 0,
+                                    }));
                                 }
                                 byte = step_try!(fetch_u8(cpu, bus));
                             }
@@ -28072,6 +28084,27 @@ mod tests {
         assert_eq!(cpu.reg(Reg32::Eax), 0x1234_5679);
         assert_eq!(cpu.eip, 1);
         step_gp(&mut cpu, &mut ram, 1);
+    }
+
+    #[test]
+    fn fifteenth_prefix_is_a_general_protection_fault() {
+        // Fourteen prefixes and a one-byte opcode are the longest legal form.
+        let mut code = [0x2e; 16];
+        code[14] = 0x90;
+        let mut cpu = flat_cpu();
+        run_instruction(&mut cpu, &code[..15]);
+        assert_eq!(cpu.eip, 15);
+
+        // One more prefix exceeds 15 bytes whatever follows; a page of
+        // prefixes must not be scanned as one instruction either.
+        code[14] = 0x2e;
+        code[15] = 0x90;
+        for fill in [&code[..], &[0x66; 4096][..]] {
+            let mut cpu = flat_cpu();
+            let mut ram = Ram::new();
+            ram.data[..fill.len()].copy_from_slice(fill);
+            step_gp(&mut cpu, &mut ram, 0);
+        }
     }
 
     #[test]
