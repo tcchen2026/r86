@@ -13,6 +13,8 @@ pub struct AudioOutput {
     dropped: u64,
     /// Playback level in percent; WAV capture is never scaled.
     volume: u8,
+    /// Whether this output has the machine's mixer running.
+    rendering: bool,
 }
 
 impl AudioOutput {
@@ -30,6 +32,7 @@ impl AudioOutput {
             samples: Vec::new(),
             dropped: 0,
             volume: 100,
+            rendering: false,
         })
     }
 
@@ -52,17 +55,23 @@ impl AudioOutput {
             samples: Vec::new(),
             dropped: 0,
             volume: 100,
+            rendering: false,
         }
     }
 
-    /// Set the playback level. Muted playback without a WAV capture stops
-    /// the machine's mixer, so it costs nothing.
+    /// Set the playback level and start or stop the machine's mixer as
+    /// needed. Muted playback without a WAV capture stops it, so it costs
+    /// nothing. Enabling restarts the stream, so only transitions do it.
     pub fn set_volume(&mut self, machine: &mut Machine, percent: u8) {
         self.volume = percent.min(100);
-        if self.wav.is_some() || (self.playback.is_some() && self.volume > 0) {
-            machine.enable_audio();
-        } else {
-            machine.disable_audio();
+        let render = self.wav.is_some() || (self.playback.is_some() && self.volume > 0);
+        if render != self.rendering {
+            if render {
+                machine.enable_audio();
+            } else {
+                machine.disable_audio();
+            }
+            self.rendering = render;
         }
     }
 

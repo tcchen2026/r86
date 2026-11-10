@@ -155,9 +155,7 @@ fn run(arguments: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn run_machine(args: Args, machine: &mut Machine) -> Result<(), String> {
     let mut audio = AudioOutput::new(args.audio_wav.as_deref(), args.sdl2)?;
-    if audio.enabled() {
-        machine.enable_audio();
-    }
+    audio.set_volume(machine, 100);
     let result = run_machine_output(args, machine, &mut audio);
     let finished = audio.finish(machine);
     result.and(finished)

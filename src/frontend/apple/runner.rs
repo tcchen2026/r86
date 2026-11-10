@@ -330,12 +330,16 @@ impl Core {
                 lock(&self.shared.status).messages.push_back(message);
             }
             Command::Volume(volume) => {
+                let was = self.vm.volume > 0;
                 self.vm.volume = volume.min(100);
-                if self.vm.volume > 0 {
-                    self.machine.enable_audio();
-                } else {
-                    self.machine.disable_audio();
-                    lock(&self.shared.audio).clear();
+                // Enabling restarts the stream: only on leaving mute.
+                match (was, self.vm.volume > 0) {
+                    (false, true) => self.machine.enable_audio(),
+                    (true, false) => {
+                        self.machine.disable_audio();
+                        lock(&self.shared.audio).clear();
+                    }
+                    _ => {}
                 }
                 self.vm.save_locked()?;
             }

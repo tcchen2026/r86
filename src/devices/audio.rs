@@ -74,9 +74,6 @@ impl core::fmt::Debug for Sound {
 
 impl Sound {
     pub fn enable(&mut self, now: u64) {
-        if self.mixer.enabled {
-            return;
-        }
         self.mixer.enabled = true;
         self.mixer.epoch = now;
         self.mixer.frames = 0;
