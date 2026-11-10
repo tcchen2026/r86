@@ -102,10 +102,11 @@ fn poll_pending_external_irq<P: PerfSink>(
     perf: &mut P,
 ) -> Option<u8> {
     perf.external_irq_check();
-    perf.full_device_scan();
     bus.current_step = step;
     bus.clock.sample();
-    bus.refresh_interrupt_attention(step);
+    if bus.refresh_interrupt_attention(step) {
+        perf.full_device_scan();
+    }
     pending_external_irq(cpu, bus)
 }
 
@@ -2399,6 +2400,7 @@ pub(crate) struct HostBus {
     rtc_frozen: Option<RtcCalendar>,
     attention: bool,
     next_attention_step: u64,
+    next_device_tick: u64,
 }
 
 #[cfg(feature = "monitor")]
@@ -2465,6 +2467,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             rtc_frozen,
             attention,
             next_attention_step,
+            next_device_tick,
         } = self.0;
         f.debug_struct("PC")
             .field("regions", regions)
@@ -2512,6 +2515,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             .field("current_step", current_step)
             .field("attention", attention)
             .field("next_attention_step", next_attention_step)
+            .field("next_device_tick", next_device_tick)
             .finish()
     }
 }
@@ -2752,6 +2756,7 @@ impl HostBus {
             rtc_frozen: None,
             attention: true,
             next_attention_step: 0,
+            next_device_tick: 0,
         }
     }
 
@@ -2993,20 +2998,28 @@ impl HostBus {
         true
     }
 
-    fn refresh_interrupt_attention(&mut self, step: u64) {
+    /// CPU IF/shadow transitions still poll the PIC and sample the clock, but
+    /// devices need service only after a source change or their next deadline.
+    /// Keep that deadline in oscillator ticks: realtime sampling and ISA waits
+    /// can reach it without reaching the instruction polling boundary.
+    fn refresh_interrupt_attention(&mut self, step: u64) -> bool {
         let ticks = self.clock.ticks(step);
-        self.update_pit0_irq(ticks);
-        self.update_rtc(ticks);
-        self.acpi.update(ticks);
-        self.ide.advance(ticks);
-        self.sound.advance(ticks, &self.ram);
-        self.advance_usb(ticks);
-        self.sync_device_irqs();
-        self.next_attention_step = self.clock.poll_step(step, self.next_device_event());
-        // A level-triggered request needs one scan when it changes. If IF or
-        // the interrupt shadow blocks delivery, the CPU-side transition check
-        // requests another scan exactly when the CPU becomes interruptible.
+        let scan = self.attention || ticks >= self.next_device_tick;
+        if scan {
+            self.update_pit0_irq(ticks);
+            self.update_rtc(ticks);
+            self.acpi.update(ticks);
+            self.ide.advance(ticks);
+            self.sound.advance(ticks, &self.ram);
+            self.advance_usb(ticks);
+            self.sync_device_irqs();
+            self.next_device_tick = self.next_device_event();
+        }
+        self.next_attention_step = self.clock.poll_step(step, self.next_device_tick);
+        // If IF or the interrupt shadow blocks delivery, the CPU transition
+        // check polls the latched PIC request when the CPU becomes interruptible.
         self.attention = false;
+        scan
     }
 
     fn drain_ps2_effects(&mut self) {
@@ -13609,8 +13622,56 @@ mod host_bus_tests {
             GuestStepStatus::Continue
         ));
         assert_eq!(perf.external_irq_checks, 2);
+        assert_eq!(perf.full_device_scans, 1);
         assert_eq!(bus.pic.pending_irq(), None);
         assert_eq!(cpu.eip, 0x3000);
+    }
+
+    #[test]
+    fn interrupt_device_deadline_tracks_io_waits_and_timer_reprogramming() {
+        let mut bus = HostBus::new(0x4000);
+        let mut cpu = Cpu::new();
+        cpu.eflags |= EFLAGS_IF;
+        let mut perf = PerfCounters::default();
+        bus.io_write_u8(0x21, 0xfe).unwrap();
+        bus.io_write_u8(0x43, 0x10).unwrap(); // one-shot, LSB-only
+        bus.io_write_u8(0x40, 20).unwrap();
+        assert_eq!(
+            poll_pending_external_irq(0, &cpu, &mut bus, &mut perf),
+            None
+        );
+
+        // An early IF transition neither raises an IRQ nor advances devices.
+        assert_eq!(
+            poll_pending_external_irq(1, &cpu, &mut bus, &mut perf),
+            None
+        );
+        assert_eq!(perf.full_device_scans, 1);
+        bus.clock.io_wait(2 * PIT_OSCILLATOR_DIVISOR);
+        assert_eq!(
+            poll_pending_external_irq(1, &cpu, &mut bus, &mut perf),
+            None
+        );
+        let original_due = 19 * PIT_OSCILLATOR_DIVISOR;
+        assert_eq!(bus.next_attention_step, original_due);
+
+        // Reprogramming must replace the cached deadline even before it is due.
+        bus.io_write_u8(0x40, 3).unwrap();
+        assert_eq!(
+            poll_pending_external_irq(1, &cpu, &mut bus, &mut perf),
+            None
+        );
+        let due = 4 * PIT_OSCILLATOR_DIVISOR; // PIT load is on the next clock
+        assert!(due < original_due);
+        assert_eq!(
+            poll_pending_external_irq(due - 1, &cpu, &mut bus, &mut perf),
+            None
+        );
+        assert_eq!(
+            poll_pending_external_irq(due, &cpu, &mut bus, &mut perf),
+            Some(0)
+        );
+        assert_eq!(perf.full_device_scans, 3);
     }
 
     #[test]

@@ -22,9 +22,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   IN/OUT, INS/OUTS, STI and SS load, and reports `was_interruptible: false`,
   so with IF=1 each exit polls for interrupts (about 90,000 exits per 1M
   instructions in a real-mode DOS game).
-- perf: each poll advances every timed device and drives all IRQ pins
-  whether or not anything changed (`refresh_interrupt_attention`,
-  src/machine.rs): 15-17% of CPU in a timer-polling DOS game.
 - perf: each poll, and each port I/O instruction, reads the host clock
   with 128-bit arithmetic in realtime mode (`Clock::sample`,
   `begin_io_instruction`): +12% CPU measured on a DOS boot.
