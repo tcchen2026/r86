@@ -131,7 +131,7 @@ pub fn status_json(machine: &Machine, ok: bool) -> String {
         machine.cpu().gdtr.base,
         machine.cpu().gdtr.limit,
         machine.cpu().halted,
-        machine.serial_output().len(),
+        machine.serial_end(),
         mode_name(mode.mode),
         mode.width,
         mode.height,

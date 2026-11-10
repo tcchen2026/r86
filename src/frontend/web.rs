@@ -270,6 +270,13 @@ mod wasm {
         unsafe { state(handle) }.machine.serial_output().len() as u32
     }
 
+    /// Absolute position of `r86_serial`'s first byte: older output is dropped.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_serial_start(handle: *mut WebMachine) -> f64 {
+        let machine = &unsafe { state(handle) }.machine;
+        (machine.serial_end() - machine.serial_output().len() as u64) as f64
+    }
+
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn r86_asyncify_data(handle: *mut WebMachine) -> *mut u32 {
         let s = unsafe { state(handle) };

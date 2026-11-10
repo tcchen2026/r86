@@ -560,7 +560,7 @@ mod tests {
         frontend: FrontendState,
         events: sdl2::EventSubsystem,
         pump: sdl2::EventPump,
-        serial_cursor: usize,
+        serial_cursor: u64,
         _sdl: sdl2::Sdl,
     }
 
@@ -587,7 +587,7 @@ mod tests {
             machine.enter_bootsector();
             machine.run_steps(20_000).unwrap();
             assert!(String::from_utf8_lossy(machine.serial_output()).ends_with("R86_SYN_READY "));
-            let serial_cursor = machine.serial_output().len();
+            let serial_cursor = machine.serial_end();
             Self {
                 machine,
                 canvas,
@@ -662,10 +662,9 @@ mod tests {
         }
 
         fn serial(&mut self) -> String {
-            let bytes = self.machine.serial_output();
-            let text = String::from_utf8(bytes[self.serial_cursor..].to_vec()).unwrap();
-            self.serial_cursor = bytes.len();
-            text
+            let (bytes, end) = self.machine.serial_since(self.serial_cursor);
+            self.serial_cursor = end;
+            String::from_utf8(bytes.to_vec()).unwrap()
         }
     }
 

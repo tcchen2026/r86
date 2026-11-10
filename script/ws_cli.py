@@ -111,7 +111,9 @@ Deterministic clock/device state advances only with execution requests.
 
 ``logs`` accepts independent ``serial_from`` byte and ``event_from`` sequence
 offsets. Advance to ``serial_next`` / ``event_next`` after each reply. Serial
-output remains available across guest resets. Reads are bounded by ``limit``
+output remains available across guest resets; r86 keeps at least its last
+64 KiB, and an older ``serial_from`` resumes at the oldest kept byte (the
+reply's ``serial_from``). Reads are bounded by ``limit``
 (default 8192, max 65536 bytes); events retain the last 256 entries, with
 ``event_first`` explicitly reporting the oldest available sequence. Readers do
 not consume each other's data. ``logs --follow`` emits incremental JSON records.

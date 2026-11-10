@@ -132,11 +132,13 @@ export class WasmPc {
         if (await this.invoke("r86_control", action) !== 0) throw new Error(this.text(3));
     }
     steps() { this.idle(); return this.exports.r86_steps(this.handle); }
+    // Bytes from absolute position `from`; r86 keeps at least the last 64 KiB.
     serial(from = 0) {
         this.idle();
         const len = this.exports.r86_serial_len(this.handle);
         const ptr = this.exports.r86_serial(this.handle);
-        return this.view(ptr + Math.min(from, len), Math.max(0, len - from)).slice();
+        const skip = Math.min(Math.max(0, from - this.exports.r86_serial_start(this.handle)), len);
+        return this.view(ptr + skip, len - skip).slice();
     }
     text(kind) {
         this.idle();

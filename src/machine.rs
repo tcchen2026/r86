@@ -55,6 +55,8 @@ pub const DEFAULT_JIT: bool = cfg!(all(
     target_os = "linux"
 ));
 const GUEST_PAGE_SIZE: usize = 4096;
+/// Guest serial output retained for frontends (at least this many bytes).
+const SERIAL_KEEP: usize = 64 * 1024;
 // Match the selected CPU model's PAE/PSE36 physical address width.
 const PC_PHYS_LIMIT: u64 = 1 << 36;
 const A20_BIT: u64 = 1 << 20;
@@ -510,8 +512,21 @@ impl Machine {
         self.bus.acpi.power_button();
         self.bus.set_attention();
     }
+    /// The retained tail of the guest's COM1 and debug-port output: at least
+    /// the last 64 KiB, ending at absolute position `serial_end`.
     pub fn serial_output(&self) -> &[u8] {
         &self.bus.serial
+    }
+    /// Bytes the guest has written to COM1 and the debug ports in total.
+    pub fn serial_end(&self) -> u64 {
+        self.bus.serial_dropped + self.bus.serial.len() as u64
+    }
+    /// Retained output from absolute position `from` on, and the position
+    /// after it. A position older than the retained tail starts at its head.
+    pub fn serial_since(&self, from: u64) -> (&[u8], u64) {
+        let skip = from.saturating_sub(self.bus.serial_dropped);
+        let skip = skip.min(self.bus.serial.len() as u64) as usize;
+        (&self.bus.serial[skip..], self.serial_end())
     }
 
     /// Cumulative absent-device accesses, one latest record per address page.
@@ -2347,6 +2362,8 @@ pub(crate) struct HostBus {
     // COM1 is a 16450-style console: host input is queued and TX completes
     // immediately. FCR is absent; the queue is not an advertised UART FIFO.
     serial: Vec<u8>,
+    /// Bytes dropped from the front of `serial` (see `push_serial`).
+    serial_dropped: u64,
     serial_rx: VecDeque<u8>,
     serial_dll: u8,
     serial_dlh: u8,
@@ -2411,6 +2428,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             sound,
             fw_cfg,
             serial,
+            serial_dropped: _,
             serial_rx,
             serial_dll,
             serial_dlh,
@@ -2691,6 +2709,7 @@ impl HostBus {
                 FwCfgDevice::absent()
             },
             serial: Vec::new(),
+            serial_dropped: 0,
             serial_rx: VecDeque::new(),
             serial_dll: 0,
             serial_dlh: 0,
@@ -2762,6 +2781,7 @@ impl HostBus {
         core::mem::swap(&mut fresh.fw_cfg, &mut self.fw_cfg);
         fresh.fw_cfg.reset();
         fresh.serial = core::mem::take(&mut self.serial);
+        fresh.serial_dropped = self.serial_dropped;
         fresh.diagnostics = core::mem::take(&mut self.diagnostics);
         fresh.last_cpu_shutdown = self.last_cpu_shutdown.take();
         fresh.current_step = step;
@@ -3898,6 +3918,17 @@ impl HostBus {
         value
     }
 
+    /// Guest output is kept for frontends to read by absolute position; a
+    /// guest writing without end must not grow it without end. Dropping
+    /// half at once keeps pushes amortized O(1).
+    fn push_serial(&mut self, value: u8) {
+        if self.serial.len() == 2 * SERIAL_KEEP {
+            self.serial.drain(..SERIAL_KEEP);
+            self.serial_dropped += SERIAL_KEEP as u64;
+        }
+        self.serial.push(value);
+    }
+
     fn serial_write(&mut self, port: u16, value: u8) {
         match port - 0x3f8 {
             0 => {
@@ -3907,7 +3938,7 @@ impl HostBus {
                     if self.serial_mcr & 0x10 != 0 {
                         self.serial_rx.push_back(value);
                     } else {
-                        self.serial.push(value);
+                        self.push_serial(value);
                     }
                     if (self.serial_ier & 0x02) != 0 {
                         self.serial_tx_interrupt = true;
@@ -5141,7 +5172,7 @@ impl Bus for HostBus {
                 Ok(())
             }
             0x402 => {
-                self.serial.push(value);
+                self.push_serial(value);
                 Ok(())
             }
             0xcf8..=0xcfb => {
@@ -5175,7 +5206,7 @@ impl Bus for HostBus {
                 Ok(())
             }
             0x8900 => {
-                self.serial.push(value);
+                self.push_serial(value);
                 Ok(())
             }
             0x279 | 0xa79 => Ok(()),
@@ -12513,6 +12544,26 @@ mod host_bus_tests {
         assert_eq!(machine.cpu.eip, 0x1004);
         assert_eq!(machine.bus.io_read_u8(0x92).unwrap(), 0x02);
         assert!(machine.bus.reset_requested);
+    }
+
+    #[test]
+    fn serial_output_keeps_a_bounded_tail_at_absolute_positions() {
+        let mut m = Machine::new_firmware(2 * 1024 * 1024, FirmwareDisplay::Vga).unwrap();
+        for i in 0..2 * SERIAL_KEEP + 3 {
+            m.bus.io_write_u8(0x402, i as u8).unwrap();
+        }
+        let end = 2 * SERIAL_KEEP as u64 + 3;
+        assert_eq!(m.serial_end(), end);
+        assert_eq!(m.serial_output().len(), SERIAL_KEEP + 3);
+        let (bytes, next) = m.serial_since(end - 2);
+        assert_eq!(
+            (bytes, next),
+            (&[(end - 2) as u8, (end - 1) as u8][..], end)
+        );
+        // A reader that fell behind resumes at the oldest kept byte.
+        let (bytes, _) = m.serial_since(0);
+        assert_eq!(bytes.len(), SERIAL_KEEP + 3);
+        assert_eq!(bytes[0], SERIAL_KEEP as u8);
     }
 
     #[test]

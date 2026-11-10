@@ -301,7 +301,7 @@ fn run_machine_output(
     let mut replay = ReplaySchedule::load(args.replay.as_deref())?;
     let mut completed_budget = true;
     let mut matched_serial_expectation = args.expect_serial.is_none();
-    let mut serial_observed_len = 0usize;
+    let mut serial_observed = 0u64;
     let mut input_after_matcher = args.serial_input_after.as_deref().map(ByteMatcher::new);
     let mut expect_matcher = args.expect_serial.as_deref().map(ByteMatcher::new);
     let can_bulk_run = !audio.enabled()
@@ -362,8 +362,8 @@ fn run_machine_output(
                 break;
             }
             let (input_after_matched, expect_matched) = {
-                let new_serial = &machine.serial_output()[serial_observed_len..];
-                serial_observed_len = machine.serial_output().len();
+                let (new_serial, end) = machine.serial_since(serial_observed);
+                serial_observed = end;
                 let input_after_matched = input_after_matcher.as_mut().is_some_and(|matcher| {
                     delayed_serial_input.is_some() && matcher.observe(new_serial)
                 });

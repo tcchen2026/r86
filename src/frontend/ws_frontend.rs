@@ -34,7 +34,7 @@ impl Reply {
 
 struct WsSession {
     slice_steps: u64,
-    serial_cursor: usize,
+    serial_cursor: u64,
     mouse_buttons: Ps2ButtonState,
     tablet_buttons: u8,
     record: Option<Arc<fs::File>>,
@@ -133,10 +133,9 @@ impl WsSession {
     }
 
     fn take_serial_hex(&mut self, machine: &Machine) -> String {
-        let start = self.serial_cursor.min(machine.serial_output().len());
-        let hex = hex_encode(&machine.serial_output()[start..]);
-        self.serial_cursor = machine.serial_output().len();
-        hex
+        let (bytes, end) = machine.serial_since(self.serial_cursor);
+        self.serial_cursor = end;
+        hex_encode(bytes)
     }
 
     fn record_line(&mut self, line: &str) -> Result<(), String> {
@@ -764,11 +763,13 @@ impl Service {
             }
             "logs" => {
                 let serial = machine.serial_output();
+                let total = machine.serial_end();
+                let first = total - serial.len() as u64;
                 let from = json_u64(message, "serial_from")?
                     .unwrap_or(0)
-                    .min(serial.len() as u64) as usize;
-                let limit = json_u64(message, "limit")?.unwrap_or(8192).clamp(1, 65536) as usize;
-                let end = from.saturating_add(limit).min(serial.len());
+                    .clamp(first, total);
+                let limit = json_u64(message, "limit")?.unwrap_or(8192).clamp(1, 65536);
+                let end = from.saturating_add(limit).min(total);
                 let after = json_u64(message, "event_from")?.unwrap_or(0);
                 let events = self
                     .events
@@ -780,8 +781,8 @@ impl Service {
                 format!(
                     "{{\"type\":\"logs\",\"ok\":true,\"step\":{},\"serial_from\":{from},\"serial_next\":{end},\"serial_len\":{},\"serial_hex\":\"{}\",\"event_first\":{},\"event_next\":{},\"events\":[{events}]}}",
                     machine.step_count(),
-                    serial.len(),
-                    hex_encode(&serial[from..end]),
+                    total,
+                    hex_encode(&serial[(from - first) as usize..(end - first) as usize]),
                     self.events.front().map_or(self.event_next, |(n, _)| *n),
                     self.event_next
                 )
@@ -1220,7 +1221,7 @@ struct Job {
     slice: u64,
     needle: String,
     matcher: ByteMatcher,
-    serial_seen: usize,
+    serial_seen: u64,
     stable_needed: u64,
     stable_count: u64,
     last_hash: String,
@@ -1290,11 +1291,9 @@ impl Job {
         let matched = match self.cmd.as_str() {
             "wait-text" => machine.vga().text_contains(&self.needle),
             "wait-serial" => {
-                let matched = self
-                    .matcher
-                    .observe(&machine.serial_output()[self.serial_seen..]);
-                self.serial_seen = machine.serial_output().len();
-                matched
+                let (bytes, end) = machine.serial_since(self.serial_seen);
+                self.serial_seen = end;
+                self.matcher.observe(bytes)
             }
             "wait-frame-stable" => {
                 if self.sampled_at != Some(machine.step_count()) {
