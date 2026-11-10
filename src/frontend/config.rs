@@ -15,6 +15,7 @@ fn kind(key: &str) -> Option<Kind> {
         "no-cdrom"
         | "no-vga-bios"
         | "hdd-writable"
+        | "usb-tablet"
         | "do-not-exit-when-poweroff"
         | "host-decompress-kernel"
         | "guest-decompress-initrd"

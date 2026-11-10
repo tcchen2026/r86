@@ -445,3 +445,35 @@ pub fn json_escape(value: &str) -> String {
     }
     out
 }
+
+/// Shared by live input and deterministic replay. Reject malformed values at
+/// the protocol boundary instead of narrowing integers into a different input.
+pub fn parse_usb_tablet(json: &str) -> Result<(u16, u16, u8, i8), String> {
+    let integer = |key: &str| -> Result<Option<i64>, String> {
+        let Some(raw) = json_value(json, key)? else {
+            return Ok(None);
+        };
+        raw.split([',', '}'])
+            .next()
+            .unwrap()
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| format!("usb-tablet {key} must be an integer"))
+    };
+    let coordinate = |key| -> Result<u16, String> {
+        let value = integer(key)?.ok_or_else(|| format!("usb-tablet missing {key}"))?;
+        if !(0..=i64::from(r86::devices::usb::TABLET_MAX)).contains(&value) {
+            return Err(format!("usb-tablet {key} must be 0..32767"));
+        }
+        Ok(value as u16)
+    };
+    let x = coordinate("x")?;
+    let y = coordinate("y")?;
+    let buttons = integer("buttons")?.unwrap_or(0);
+    let wheel = integer("wheel")?.unwrap_or(0);
+    if !(0..=7).contains(&buttons) || !(-127..=127).contains(&wheel) {
+        return Err("usb-tablet buttons must be 0..7 and wheel -127..127".into());
+    }
+    Ok((x, y, buttons as u8, wheel as i8))
+}

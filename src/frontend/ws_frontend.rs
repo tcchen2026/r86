@@ -36,6 +36,7 @@ struct WsSession {
     slice_steps: u64,
     serial_cursor: usize,
     mouse_buttons: Ps2ButtonState,
+    tablet_buttons: u8,
     record: Option<Arc<fs::File>>,
     held_keys: Vec<(InputKey, String)>,
 }
@@ -46,6 +47,7 @@ impl WsSession {
             slice_steps,
             serial_cursor: 0,
             mouse_buttons: Ps2ButtonState::default(),
+            tablet_buttons: 0,
             record,
             held_keys: Vec::new(),
         }
@@ -53,7 +55,7 @@ impl WsSession {
 
     fn hello(&self, machine: &Machine) -> String {
         let response = format!(
-            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"usb-tablet\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
             machine.step_count(),
             self.slice_steps
         );
@@ -177,6 +179,7 @@ struct PendingText {
 
 struct Service {
     clients: BTreeMap<usize, Client>,
+    tablet_position: (u16, u16),
     running: bool,
     job: Option<Job>,
     last_stop: String,
@@ -249,6 +252,7 @@ impl Service {
     fn new() -> Self {
         Self {
             clients: BTreeMap::new(),
+            tablet_position: (0, 0),
             running: false,
             job: None,
             last_stop: "null".into(),
@@ -550,11 +554,39 @@ impl Service {
         }
         Ok(())
     }
+    fn tablet(
+        &mut self,
+        machine: &mut Machine,
+        id: usize,
+        x: u16,
+        y: u16,
+        buttons: u8,
+        wheel: i8,
+    ) -> Result<(), String> {
+        let combined = self
+            .clients
+            .iter()
+            .filter(|(other, _)| **other != id)
+            .fold(buttons, |mask, (_, client)| {
+                mask | client.session.tablet_buttons
+            });
+        machine.inject_usb_tablet(x, y, combined, wheel)?;
+        self.tablet_position = (x, y);
+        let session = &mut self.clients.get_mut(&id).unwrap().session;
+        session.tablet_buttons = buttons;
+        session.record_line(&format!(
+            "{{\"step\":{},\"cmd\":\"usb-tablet\",\"x\":{x},\"y\":{y},\"buttons\":{combined},\"wheel\":{wheel}}}", machine.step_count()
+        ))
+    }
     fn release_input(&mut self, machine: &mut Machine, id: usize) -> Result<(), String> {
         let Some(client) = self.clients.get(&id) else {
             return Ok(());
         };
         let keys = client.session.held_keys.clone();
+        if client.session.tablet_buttons != 0 {
+            let (x, y) = self.tablet_position;
+            self.tablet(machine, id, x, y, 0, 0)?;
+        }
         for (_, name) in keys {
             self.key(machine, id, &name, false)?;
         }
@@ -680,6 +712,15 @@ impl Service {
                 format!(
                     "{{\"type\":\"ack\",\"ok\":true,\"cmd\":\"mouse-button\",\"button\":\"{}\",\"down\":{down},\"step\":{},\"applied_step\":{}}}",
                     json_escape(&name),
+                    machine.step_count(),
+                    machine.step_count()
+                )
+            }
+            "usb-tablet" => {
+                let (x, y, buttons, wheel) = parse_usb_tablet(message)?;
+                self.tablet(machine, id, x, y, buttons, wheel)?;
+                format!(
+                    "{{\"type\":\"ack\",\"ok\":true,\"cmd\":\"usb-tablet\",\"step\":{},\"applied_step\":{}}}",
                     machine.step_count(),
                     machine.step_count()
                 )
@@ -2049,5 +2090,68 @@ mod import_tests {
             .collect();
         assert_eq!(files, [saved]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod usb_tests {
+    use super::*;
+    #[test]
+    fn usb_tablet_clients_record_union_and_disconnect_release() {
+        let path = std::env::temp_dir().join(format!("r86-usb-ws-{}.jsonl", std::process::id()));
+        let file = Arc::new(fs::File::create(&path).unwrap());
+        let mut service = Service::new();
+        for id in [1, 2] {
+            service.clients.insert(
+                id,
+                Client {
+                    session: WsSession::new(1000, Some(file.clone())),
+                    reply: mpsc::sync_channel(1).0,
+                },
+            );
+        }
+        let mut machine = Machine::new(0x10000);
+        assert!(
+            service
+                .command(
+                    &mut machine,
+                    1,
+                    r#"{"cmd":"usb-tablet","x":100,"y":200,"buttons":1}"#
+                )
+                .is_err()
+        );
+        assert_eq!(service.clients[&1].session.tablet_buttons, 0);
+        machine.attach_usb_tablet();
+        service
+            .command(
+                &mut machine,
+                1,
+                r#"{"cmd":"usb-tablet","x":100,"y":200,"buttons":1}"#,
+            )
+            .unwrap();
+        service
+            .command(
+                &mut machine,
+                2,
+                r#"{"cmd":"usb-tablet","x":300,"y":400,"buttons":2}"#,
+            )
+            .unwrap();
+        service.release_input(&mut machine, 1).unwrap();
+        service.release_input(&mut machine, 2).unwrap();
+        let record = fs::read_to_string(&path).unwrap();
+        let reports: Vec<_> = record
+            .lines()
+            .map(|line| parse_usb_tablet(line).unwrap())
+            .collect();
+        assert_eq!(
+            reports,
+            [
+                (100, 200, 1, 0),
+                (300, 400, 3, 0),
+                (300, 400, 2, 0),
+                (300, 400, 0, 0)
+            ]
+        );
+        fs::remove_file(path).unwrap();
     }
 }

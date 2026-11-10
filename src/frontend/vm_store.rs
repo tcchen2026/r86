@@ -24,6 +24,7 @@ pub struct Vm {
     pub disk_mib: u64,
     pub iso: Option<PathBuf>,
     pub cdrom: bool,
+    pub usb_tablet: bool,
     pub engine: String,
     pub boot_order: String,
     pub bios: Option<PathBuf>,
@@ -142,6 +143,7 @@ impl Vm {
             disk_mib: preset.disk_mib,
             iso: None,
             cdrom: true,
+            usb_tablet: false,
             engine: if DEFAULT_JIT { "jit" } else { "interp" }.into(),
             boot_order: "disk".into(),
             bios: None,
@@ -233,6 +235,11 @@ impl Vm {
                 .get("cdrom")
                 .and_then(Value::as_bool)
                 .ok_or("Missing cdrom setting")?,
+            usb_tablet: match table.get("usb-tablet") {
+                None => false,
+                Some(Value::Boolean(value)) => *value,
+                _ => return Err("Invalid usb-tablet setting".into()),
+            },
             engine: text("cpu-engine")?,
             boot_order: text("boot-order")?,
             scale: match table.get("scale") {
@@ -288,6 +295,7 @@ impl Vm {
         }
         table.insert("cdrom".into(), Value::Boolean(self.cdrom));
         table.insert("network".into(), Value::Boolean(self.network));
+        table.insert("usb-tablet".into(), Value::Boolean(self.usb_tablet));
         for (key, path) in [
             ("disk", Some(&self.disk)),
             ("iso", self.iso.as_ref()),
@@ -379,6 +387,9 @@ impl Vm {
         };
         let mut machine =
             Machine::new_firmware(self.memory as usize * 1024 * 1024, FirmwareDisplay::Vga)?;
+        if self.usb_tablet {
+            machine.attach_usb_tablet();
+        }
         machine.set_boot_order(if self.boot_order == "cdrom" {
             BootOrder::CdromFirst
         } else {
@@ -427,6 +438,7 @@ mod tests {
         vm.scale = "integer".into();
         vm.volume = 25;
         vm.network = false;
+        vm.usb_tablet = true;
         vm.create_blank().unwrap();
         let original = fs::read(&vm.disk).unwrap();
         assert!(vm.create_blank().is_err());
@@ -438,6 +450,7 @@ mod tests {
         assert_eq!(reopened.notes, vm.notes);
         assert_eq!(reopened.scale, "integer");
         assert_eq!((reopened.volume, reopened.network), (25, false));
+        assert!(reopened.usb_tablet);
         assert!(reopened.iso.is_none());
         let lock = lock_vm(&vm.directory).unwrap();
         assert!(vm.save().is_err());

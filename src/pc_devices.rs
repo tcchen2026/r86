@@ -261,6 +261,13 @@ pub struct PciConfig {
     pub net_present: bool,
     net_command: u16,
     net_bar0: u32,
+    pub usb_present: bool,
+    usb_command: u16,
+    usb_bar4: u32,
+    usb_latency: u8,
+    usb_line: u8,
+    usb_clock: u8,
+    usb_legacy: u16,
 }
 
 impl PciConfig {
@@ -278,6 +285,13 @@ impl PciConfig {
             net_present: false,
             net_command: 1,
             net_bar0: 0xc101,
+            usb_present: false,
+            usb_command: 0,
+            usb_bar4: 1,
+            usb_latency: 0,
+            usb_line: 0,
+            usb_clock: 1,
+            usb_legacy: 0x2000,
         }
     }
 
@@ -342,6 +356,23 @@ impl PciConfig {
         // IDE has legacy PIO ports and a BM BAR with interrupt status;
         // VGA has I/O/memory decode, no bus master, IRQ or capability list.
         match (dev, func, reg) {
+            (1, 2, 0x04) if self.usb_present => {
+                self.usb_command = merge(u32::from(self.usb_command)) as u16 & 5
+            }
+            (1, 2, 0x0c) if self.usb_present => {
+                self.usb_latency = (merge(u32::from(self.usb_latency) << 8) >> 8) as u8 & 0xf0
+            }
+            (1, 2, 0x20) if self.usb_present => self.usb_bar4 = (merge(self.usb_bar4) & !31) | 1,
+            (1, 2, 0x3c) if self.usb_present => {
+                self.usb_line = merge(u32::from(self.usb_line)) as u8
+            }
+            (1, 2, 0x68) if self.usb_present => {
+                self.usb_clock = (merge(u32::from(self.usb_clock) << 16) >> 16) as u8 & 1
+            }
+            // No SMI/legacy keyboard trap: retain only the PIRQD interrupt gate.
+            (1, 2, 0xc0) if self.usb_present => {
+                self.usb_legacy = merge(u32::from(self.usb_legacy)) as u16 & 0x2000
+            }
             (3, 0, 0x04) if self.net_present => {
                 self.net_command = merge(u32::from(self.net_command)) as u16 & 1
             }
@@ -382,6 +413,24 @@ impl PciConfig {
         let base = self.net_bar0 & !31;
         let offset = u32::from(port).checked_sub(base)?;
         (base != 0 && offset < 32).then_some(offset as u8)
+    }
+
+    pub fn usb_port(&self, port: u16, width: u8) -> Option<u8> {
+        if !self.usb_present || self.usb_command & 1 == 0 {
+            return None;
+        }
+        // QEMU-compatible 32-bit BAR sizing: SeaBIOS's allocator needs the
+        // high probe bits. A high assigned I/O address must never alias low ports.
+        let base = self.usb_bar4 & !31;
+        let offset = u32::from(port).checked_sub(base)?;
+        (base != 0 && offset + u32::from(width) <= 32).then_some(offset as u8)
+    }
+
+    pub fn usb_bus_master(&self) -> bool {
+        self.usb_command & 4 != 0
+    }
+    pub fn usb_irq_enabled(&self) -> bool {
+        self.usb_legacy & 0x2000 != 0
     }
 
     pub fn vga_mem_enabled(&self) -> bool {
@@ -472,6 +521,26 @@ impl PciConfig {
                 0x3d => 0, // Compatibility-mode channels use ISA IRQ14/15.
                 0x40..=0x43 => (self.ide_timing >> ((offset - 0x40) * 8)) as u8,
                 0x44 => self.ide_slave_timing,
+                _ => 0,
+            },
+            (1, 2) if self.usb_present => match offset {
+                0 => 0x86,
+                1 => 0x80,
+                2 => 0x20,
+                3 => 0x70,
+                4 => self.usb_command as u8,
+                6 => 0x80,
+                7 => 2,
+                8 => 1, // PIIX3 revision 1; Windows rejects the earlier USB stepping.
+                0x0a => 3,
+                0x0b => 0x0c,
+                0x0d => self.usb_latency,
+                0x20..=0x23 => (self.usb_bar4 >> ((offset - 0x20) * 8)) as u8,
+                0x3c => self.usb_line,
+                0x3d => 4,
+                0x60 => 0x10,
+                0x6a => self.usb_clock,
+                0xc0..=0xc1 => (self.usb_legacy >> ((offset - 0xc0) * 8)) as u8,
                 _ => 0,
             },
             (2, 0) => match offset {

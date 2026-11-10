@@ -247,6 +247,9 @@ fn run_machine_output(
     if args.realtime_clock {
         machine.use_realtime_clock()?;
     }
+    if args.usb_tablet {
+        machine.attach_usb_tablet();
+    }
     let mut network = if args.net {
         let net = UserNetwork::new(&args.net_forward).map_err(|e| format!("network: {e}"))?;
         machine.attach_network();
@@ -774,6 +777,10 @@ impl ReplaySchedule {
                 let bytes = parse_hex_bytes(&hex)?;
                 machine.inject_scancode_set2(&bytes);
             }
+            "usb-tablet" => {
+                let (x, y, buttons, wheel) = parse_usb_tablet(line)?;
+                machine.inject_usb_tablet(x, y, buttons, wheel)?;
+            }
             "mouse-move" => {
                 let dx = clamp_i64_to_i16(json_i64(line, "dx")?.unwrap_or(0));
                 let dy = clamp_i64_to_i16(json_i64(line, "dy")?.unwrap_or(0));
@@ -810,6 +817,7 @@ struct Args {
     hdd: Option<String>,
     hdd_writable: bool,
     net: bool,
+    usb_tablet: bool,
     net_forward: Vec<PortForward>,
     audio_wav: Option<String>,
     do_not_exit_when_poweroff: bool,
@@ -870,6 +878,7 @@ impl Args {
         let mut hdd = None;
         let mut hdd_writable = false;
         let mut net = false;
+        let mut usb_tablet = false;
         let mut net_forward = Vec::new();
         let mut audio_wav = None;
         let mut do_not_exit_when_poweroff = false;
@@ -944,6 +953,7 @@ impl Args {
                 "--no-vga-bios" => vga_bios = None,
                 "--hdd" => hdd = Some(take_value(&mut args, "--hdd")?),
                 "--hdd-writable" => hdd_writable = true,
+                "--usb-tablet" => usb_tablet = true,
                 "--audio-wav" => audio_wav = Some(take_value(&mut args, "--audio-wav")?),
                 "--net" => {
                     net = match take_value(&mut args, "--net")?.as_str() {
@@ -1166,6 +1176,7 @@ impl Args {
         }
         Ok(Self {
             net,
+            usb_tablet,
             net_forward,
             audio_wav,
             iso,
@@ -1255,7 +1266,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable] [--audio-wav PATH] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]
@@ -1325,6 +1336,34 @@ mod tests {
         assert!(machine.powered_off());
         assert!(machine.step_count() > 2000 && machine.step_count() < 2100);
         assert_eq!(machine.serial_output(), b"P");
+    }
+
+    #[test]
+    fn usb_tablet_cli_toml_and_replay_boundary() {
+        let config = TestConfig::new("usb-tablet = true\n");
+        assert!(config.parse(&[]).unwrap().usb_tablet);
+        assert!(!config.parse(&["--usb-tablet=false"]).unwrap().usb_tablet);
+        assert!(config.parse(&["--usb-tablet=true"]).unwrap().usb_tablet);
+        assert_eq!(
+            parse_usb_tablet(r#"{"x":32767,"y":0,"buttons":7,"wheel":-127}"#).unwrap(),
+            (32767, 0, 7, -127)
+        );
+        for input in [
+            r#"{"x":32768,"y":0}"#,
+            r#"{"x":-1,"y":0}"#,
+            r#"{"x":0}"#,
+            r#"{"x":0,"y":0,"buttons":8}"#,
+            r#"{"x":0,"y":0,"wheel":-128}"#,
+            r#"{"x":0.5,"y":0}"#,
+        ] {
+            assert!(parse_usb_tablet(input).is_err(), "{input}");
+        }
+        let mut m = Machine::new(0x10000);
+        let mut replay = ReplaySchedule::load(None).unwrap();
+        let input = r#"{"cmd":"usb-tablet","x":123,"y":456,"buttons":1}"#;
+        assert!(replay.apply_event(&mut m, input).is_err());
+        m.attach_usb_tablet();
+        replay.apply_event(&mut m, input).unwrap();
     }
 
     #[test]

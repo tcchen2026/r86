@@ -175,6 +175,7 @@ Commands implemented by the current harness:
     {"cmd":"send-scancodes", "hex": HEX_BYTES}
     {"cmd":"mouse-move", "dx": DX, "dy": DY}
     {"cmd":"mouse-button", "button": "left|right|middle", "down": BOOL}
+    {"cmd":"usb-tablet", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"text-snapshot"}
     {"cmd":"hash-frame"}
     {"cmd":"screenshot"}
@@ -294,6 +295,17 @@ moves down. The emulator-side PS/2 core converts that to PS/2 packet sign
 conventions. Each session latches its own mouse buttons; motion carries the union of all
 clients' buttons until their matching button-up or disconnect. Symbolic keys
 include left/right modifiers, arrows, navigation keys, F1-F12 and the keypad.
+
+``usb-tablet`` requires the opt-in ``--usb-tablet`` / TOML ``usb-tablet = true``.
+X and Y are absolute coordinates 0..32767 (left/top to right/bottom); normalize
+against the guest display, excluding host letterboxing. Buttons use bits 0/1/2
+for left/right/middle and default to 0; wheel is -127..127 and defaults to 0
+(positive scrolls up). Invalid values or a disabled tablet return an error.
+Tablet buttons are combined across clients, independently of PS/2 buttons;
+release-input or disconnect releases that client's tablet buttons at the latest
+absolute position. Keep one connection open for a drag. Accepted input is
+recorded with its applied step and can be replayed with the tablet enabled.
+SDL, handheld and browser pointer UI wiring is separate from this command.
 
 Display and binary frame format
 ===============================
@@ -563,6 +575,12 @@ def build_parser():
     sc = sub.add_parser("send-scancodes")
     sc.add_argument("hex")
 
+    tablet = sub.add_parser("usb-tablet")
+    tablet.add_argument("x", type=int)
+    tablet.add_argument("y", type=int)
+    tablet.add_argument("--buttons", type=int, default=0)
+    tablet.add_argument("--wheel", type=int, default=0)
+
     mouse = sub.add_parser("mouse")
     mouse_sub = mouse.add_subparsers(dest="mouse_command", required=True)
     move = mouse_sub.add_parser("move")
@@ -634,6 +652,9 @@ def command_object(args):
         return {"cmd": "keyup", "key": args.key}
     if args.command == "send-scancodes":
         return {"cmd": "send-scancodes", "hex": args.hex}
+    if args.command == "usb-tablet":
+        return {"cmd": "usb-tablet", "x": args.x, "y": args.y,
+                "buttons": args.buttons, "wheel": args.wheel}
     if args.command == "mouse":
         if args.mouse_command == "move":
             return {"cmd": "mouse-move", "dx": args.dx, "dy": args.dy}

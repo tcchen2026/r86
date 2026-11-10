@@ -40,3 +40,6 @@ clock = "realtime"
 # expect-serial = "R86_BOOTLOCAL_OK"
 # serial-input = "echo hello\n"
 # initrd-file = ["/tmp/example.txt:tmp/example.txt:644"]
+
+# PIIX3 UHCI and absolute HID tablet; off by default.
+# usb-tablet = true

@@ -5,6 +5,8 @@ mod bus_diagnostics;
 mod clock;
 #[cfg(test)]
 mod sound_tests;
+#[cfg(test)]
+mod usb_tests;
 use bus_diagnostics::BusDiagnostics;
 pub use bus_diagnostics::{BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning};
 use clock::{Clock, TICKS_PER_SECOND};
@@ -16,6 +18,7 @@ use crate::devices::pic::Pic;
 #[cfg(test)]
 use crate::devices::pit::CLOCK_DIVISOR as PIT_OSCILLATOR_DIVISOR;
 use crate::devices::pit::Pit;
+use crate::devices::usb::{IRQ as USB_IRQ, TABLET_MAX, Uhci};
 use crate::devices::{DeviceEffect, I8042, PcVga, Ps2ButtonState, Ps2Key};
 #[cfg(feature = "host")]
 use crate::linux_boot::{BootConfig, DirectLinuxBoot, LoadedBoot};
@@ -726,19 +729,48 @@ impl Machine {
         self.bus.pci.net_present = true;
         let elcr = self.bus.pic.read(0x4d1);
         self.bus.pic.write(0x4d1, elcr | (1 << (NET_IRQ - 8)));
-        self.bus.sync_net_irq();
+        self.bus.sync_pci_irq();
+    }
+
+    /// Opt in before boot: PIIX3 UHCI and one full-speed HID absolute tablet.
+    pub fn attach_usb_tablet(&mut self) {
+        self.bus.usb = Some(Uhci::default());
+        self.bus.pci.usb_present = true;
+        let elcr = self.bus.pic.read(0x4d1);
+        self.bus.pic.write(0x4d1, elcr | (1 << (USB_IRQ - 8)));
+        self.bus.set_attention();
+    }
+
+    /// Absolute coordinates 0..=TABLET_MAX; buttons are left/right/middle bits
+    /// 0/1/2. Wheel is signed HID motion (-127..=127). Call at a slice boundary.
+    pub fn inject_usb_tablet(
+        &mut self,
+        x: u16,
+        y: u16,
+        buttons: u8,
+        wheel: i8,
+    ) -> Result<(), String> {
+        if x > TABLET_MAX || y > TABLET_MAX || buttons & !7 != 0 || wheel == i8::MIN {
+            return Err("USB tablet input outside logical range".into());
+        }
+        self.bus.advance_usb(self.bus.clock.ticks(self.step));
+        let usb = self.bus.usb.as_mut().ok_or("USB tablet is disabled")?;
+        usb.input(x, y, buttons, wheel);
+        self.bus.sync_pci_irq();
+        self.bus.set_attention();
+        Ok(())
     }
 
     /// External input at a frontend slice boundary. False means keep queued.
     pub fn receive_network_frame(&mut self, frame: &[u8]) -> bool {
         let accepted = self.bus.net.as_mut().is_some_and(|nic| nic.receive(frame));
-        self.bus.sync_net_irq();
+        self.bus.sync_pci_irq();
         accepted
     }
 
     pub fn take_network_transmit(&mut self) -> Option<Vec<u8>> {
         let frame = self.bus.net.as_mut()?.take_transmit();
-        self.bus.sync_net_irq();
+        self.bus.sync_pci_irq();
         frame
     }
 
@@ -2309,6 +2341,7 @@ pub(crate) struct HostBus {
     ide: IdeBus,
     pci: PciConfig,
     net: Option<Ne2000>,
+    usb: Option<Uhci>,
     sound: Sound,
     fw_cfg: FwCfgDevice,
     // COM1 is a 16450-style console: host input is queued and TX completes
@@ -2374,6 +2407,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             ide,
             pci,
             net,
+            usb,
             sound,
             fw_cfg,
             serial,
@@ -2419,6 +2453,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             .field("ide", ide)
             .field("pci", pci)
             .field("net", net)
+            .field("usb", usb)
             .field("sound", sound)
             .field("fw_cfg", fw_cfg)
             .field("serial", serial)
@@ -2648,6 +2683,7 @@ impl HostBus {
             },
             pci: PciConfig::new(),
             net: None,
+            usb: None,
             sound: Sound::default(),
             fw_cfg: if firmware_mode {
                 FwCfgDevice::new_qemu_with_display(size, display)
@@ -2717,6 +2753,12 @@ impl HostBus {
             fresh.pci.net_present = true;
             fresh.pic.write(0x4d1, 1 << (NET_IRQ - 8));
         }
+        if self.usb.is_some() {
+            fresh.usb = Some(Uhci::default());
+            fresh.pci.usb_present = true;
+            let elcr = fresh.pic.read(0x4d1);
+            fresh.pic.write(0x4d1, elcr | (1 << (USB_IRQ - 8)));
+        }
         core::mem::swap(&mut fresh.fw_cfg, &mut self.fw_cfg);
         fresh.fw_cfg.reset();
         fresh.serial = core::mem::take(&mut self.serial);
@@ -2757,7 +2799,11 @@ impl HostBus {
     }
 
     fn drive_irq(&mut self, irq: u8, high: bool) {
-        let high = high || (self.sound.irq() && self.sound.irq_mask() & (1 << irq) != 0);
+        let high = high
+            || (self.sound.irq() && self.sound.irq_mask() & (1 << irq) != 0)
+            || (irq == USB_IRQ
+                && self.pci.usb_irq_enabled()
+                && self.usb.as_ref().is_some_and(Uhci::irq));
         if self.pic.set_irq(irq, high) {
             self.set_attention();
         }
@@ -2768,7 +2814,9 @@ impl HostBus {
         self.drive_irq(15, self.ide.irq_asserted(IdeIrq::Secondary));
     }
 
-    fn sync_net_irq(&mut self) {
+    /// IRQ 11 is shared by the NIC and the USB controller (PIRQC/PIRQD);
+    /// drive_irq adds the USB level.
+    fn sync_pci_irq(&mut self) {
         self.drive_irq(NET_IRQ, self.net.as_ref().is_some_and(Ne2000::irq));
     }
 
@@ -2780,7 +2828,7 @@ impl HostBus {
 
     fn sync_device_irqs(&mut self) {
         self.sync_sound_irq();
-        self.sync_net_irq();
+        self.sync_pci_irq();
         self.sync_ide_irqs();
         self.drive_irq(4, self.serial_irq_asserted());
         self.drive_irq(6, self.fdc.irq_asserted());
@@ -2850,6 +2898,67 @@ impl HostBus {
             .min(self.acpi.next_event_step())
             .min(self.ide.next_event_step())
             .min(self.sound.next_event())
+            .min(self.usb.as_ref().map_or(u64::MAX, Uhci::next_event))
+    }
+
+    fn advance_usb(&mut self, ticks: u64) {
+        let Some(usb) = self.usb.as_mut() else {
+            return;
+        };
+        usb.advance(
+            ticks,
+            &mut self.ram,
+            self.pci.usb_bus_master(),
+            |addr, len| {
+                // PCI DMA uses physical RAM without CPU A20 translation. The
+                // device checks its windows before notifying and committing.
+                #[cfg(feature = "jit")]
+                if let Some(pages) = self.jit_code_pages.as_mut() {
+                    pages.write(addr as usize, usize::from(len));
+                }
+                #[cfg(feature = "monitor")]
+                if let Some(shadow) = self.shadow.as_deref_mut() {
+                    shadow.observe_phys_write(PhysWrite::new(
+                        WriteOrigin::Device,
+                        PhysAddr(u64::from(addr)),
+                        len,
+                    ));
+                }
+                #[cfg(test)]
+                {
+                    self.tracked_writes.total = self.tracked_writes.total.wrapping_add(1);
+                    self.tracked_writes.device = self.tracked_writes.device.wrapping_add(1);
+                    if ((addr >> 12)..=((u64::from(addr) + u64::from(len) - 1) >> 12) as u32)
+                        .any(|frame| self.frame_roles[frame as usize].is_page_table())
+                    {
+                        self.tracked_writes.page_table_frame =
+                            self.tracked_writes.page_table_frame.wrapping_add(1);
+                    }
+                }
+                let _ = (addr, len);
+            },
+        );
+    }
+
+    fn usb_read(&mut self, port: u16, width: u8) -> Option<u32> {
+        let offset = self.pci.usb_port(port, width)?;
+        self.advance_usb(self.device_ticks());
+        self.sync_pci_irq();
+        Some(self.usb.as_ref()?.read(offset, width))
+    }
+
+    fn usb_write(&mut self, port: u16, width: u8, value: u32) -> bool {
+        let Some(offset) = self.pci.usb_port(port, width) else {
+            return false;
+        };
+        let now = self.device_ticks();
+        self.advance_usb(now);
+        if let Some(usb) = self.usb.as_mut() {
+            usb.write(offset, width, value, now);
+        }
+        self.sync_pci_irq();
+        self.set_attention();
+        true
     }
 
     fn refresh_interrupt_attention(&mut self, step: u64) {
@@ -2859,6 +2968,7 @@ impl HostBus {
         self.acpi.update(ticks);
         self.ide.advance(ticks);
         self.sound.advance(ticks, &self.ram);
+        self.advance_usb(ticks);
         self.sync_device_irqs();
         self.next_attention_step = self.clock.poll_step(step, self.next_device_event());
         // A level-triggered request needs one scan when it changes. If IF or
@@ -3881,6 +3991,8 @@ impl Bus for HostBus {
         self.current_step = instruction_count;
         self.clock.sample();
         self.ide.advance(self.device_ticks());
+        self.advance_usb(self.device_ticks());
+        self.sync_pci_irq();
         self.sync_ide_irqs();
     }
 
@@ -4790,6 +4902,9 @@ impl Bus for HostBus {
     }
 
     fn io_read_u8(&mut self, port: u16) -> Result<u8, MemError> {
+        if let Some(value) = self.usb_read(port, 1) {
+            return Ok(value as u8);
+        }
         if Sound::contains(port) {
             self.clock.io_wait(Sound::io_wait_ticks(port));
             self.sound.advance(self.device_ticks(), &self.ram);
@@ -4801,7 +4916,7 @@ impl Bus for HostBus {
         if let Some(offset) = self.pci.net_port(port)
             && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 1))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(value as u8);
         }
         if let Some(value) = self.acpi.read(port, self.device_ticks()) {
@@ -4872,10 +4987,13 @@ impl Bus for HostBus {
     }
 
     fn io_read_u16(&mut self, port: u16) -> Result<u16, MemError> {
+        if let Some(value) = self.usb_read(port, 2) {
+            return Ok(value as u16);
+        }
         if let Some(offset) = self.pci.net_port(port)
             && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 2))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(value as u16);
         }
         if self.pci.ide_port_enabled(port)
@@ -4910,10 +5028,13 @@ impl Bus for HostBus {
     }
 
     fn io_read_u32(&mut self, port: u16) -> Result<u32, MemError> {
+        if let Some(value) = self.usb_read(port, 4) {
+            return Ok(value as u32);
+        }
         if let Some(offset) = self.pci.net_port(port)
             && let Some(value) = self.net.as_mut().and_then(|nic| nic.read(offset, 4))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(value as u32);
         }
         if self.pci.ide_port_enabled(port)
@@ -4942,6 +5063,9 @@ impl Bus for HostBus {
     }
 
     fn io_write_u8(&mut self, port: u16, value: u8) -> Result<(), MemError> {
+        if self.usb_write(port, 1, value as u32) {
+            return Ok(());
+        }
         if Sound::contains(port) {
             self.clock.io_wait(Sound::io_wait_ticks(port));
             self.sound.advance(self.device_ticks(), &self.ram);
@@ -4956,7 +5080,7 @@ impl Bus for HostBus {
                 .as_mut()
                 .is_some_and(|nic| nic.write(offset, 1, value as u32))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(());
         }
         self.set_attention();
@@ -5028,9 +5152,12 @@ impl Bus for HostBus {
                 Ok(())
             }
             0xcfc..=0xcff => {
+                self.advance_usb(self.device_ticks());
                 if self.pci.write_data_u8((port - 0xcfc) as u8, value) {
                     self.physical_mapping_changed();
                 }
+                self.advance_usb(self.device_ticks());
+                self.sync_pci_irq();
                 Ok(())
             }
             0x511 => {
@@ -5060,13 +5187,16 @@ impl Bus for HostBus {
     }
 
     fn io_write_u16(&mut self, port: u16, value: u16) -> Result<(), MemError> {
+        if self.usb_write(port, 2, value as u32) {
+            return Ok(());
+        }
         if let Some(offset) = self.pci.net_port(port)
             && self
                 .net
                 .as_mut()
                 .is_some_and(|nic| nic.write(offset, 2, value as u32))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(());
         }
         self.set_attention();
@@ -5083,9 +5213,12 @@ impl Bus for HostBus {
                 Ok(())
             }
             0xcfc | 0xcfe => {
+                self.advance_usb(self.device_ticks());
                 if self.pci.write_data_u16((port - 0xcfc) as u8, value) {
                     self.physical_mapping_changed();
                 }
+                self.advance_usb(self.device_ticks());
+                self.sync_pci_irq();
                 Ok(())
             }
             0x510 => {
@@ -5108,13 +5241,16 @@ impl Bus for HostBus {
     }
 
     fn io_write_u32(&mut self, port: u16, value: u32) -> Result<(), MemError> {
+        if self.usb_write(port, 4, value) {
+            return Ok(());
+        }
         if let Some(offset) = self.pci.net_port(port)
             && self
                 .net
                 .as_mut()
-                .is_some_and(|nic| nic.write(offset, 4, value as u32))
+                .is_some_and(|nic| nic.write(offset, 4, value))
         {
-            self.sync_net_irq();
+            self.sync_pci_irq();
             return Ok(());
         }
         self.set_attention();
@@ -5128,9 +5264,12 @@ impl Bus for HostBus {
                 Ok(())
             }
             0xcfc => {
+                self.advance_usb(self.device_ticks());
                 if self.pci.write_data_u32(value) {
                     self.physical_mapping_changed();
                 }
+                self.advance_usb(self.device_ticks());
+                self.sync_pci_irq();
                 Ok(())
             }
             _ if self.acpi.contains_pm_ports(port, 4) || self.ide_bus_master_contains(port, 4) => {

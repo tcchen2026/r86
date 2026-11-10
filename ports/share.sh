@@ -14,6 +14,7 @@ install -m 0644 "$root/tmp/freedos/share/dos.zip" "$app/"
 licenses=$app/licenses
 install -D -m 0644 "$root/LICENSE" "$licenses/r86/LICENSE"
 install -D -m 0644 "$root/src/devices/audio/ymfm-license.txt" "$licenses/ymfm/LICENSE"
+install -D -m 0644 "$root/src/devices/usb/qemu-license.txt" "$licenses/qemu-usb/LICENSE"
 install -D -m 0644 "$root/vendor/fatfs/LICENSE.txt" "$root/vendor/fatfs/provenance.txt" \
     -t "$licenses/fatfs"
 install -D -m 0644 "$root/vendor/seabios/COPYING" "$root/vendor/seabios/COPYING.LESSER" \

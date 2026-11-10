@@ -34,6 +34,8 @@ DefinitionBlock ("", "DSDT", 1, "R86   ", "R86PC   ", 1)
             })
             Name (_PRT, Package () {
                 Package () { 0x0001FFFF, Zero, Zero, 14 },
+                // PIIX3 USB 00:01.2 INTD -> PIRQD -> IRQ11 (level).
+                Package () { 0x0001FFFF, 3, Zero, 11 },
                 // PCI slot 3 INTA -> PIIX PIRQC -> level IRQ11.
                 Package () { 0x0003FFFF, Zero, Zero, 11 }
             })
