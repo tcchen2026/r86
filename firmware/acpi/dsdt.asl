@@ -104,6 +104,24 @@ DefinitionBlock ("", "DSDT", 1, "R86   ", "R86PC   ", 1)
                         IRQNoFlags () { 4 }
                     })
                 }
+                // Sound Blaster 16 (src/devices/audio.rs). Windows 2000's
+                // wdma_ctl.inf installs its in-box SB16 WDM driver for PNPB003
+                // with these factory resources: DSP 220h, MPU-401 330h, OPL
+                // 388h, IRQ 5, DMA 1/5. r86 has no MPU-401; the range is kept
+                // so the driver sees the port layout it was written for.
+                Device (SB16)
+                {
+                    Name (_HID, EisaId ("PNPB003"))
+                    Name (_CRS, ResourceTemplate ()
+                    {
+                        IO (Decode16, 0x220, 0x220, 1, 16)
+                        IO (Decode16, 0x330, 0x330, 1, 2)
+                        IO (Decode16, 0x388, 0x388, 1, 4)
+                        IRQNoFlags () { 5 }
+                        DMA (Compatibility, NotBusMaster, Transfer8) { 1 }
+                        DMA (Compatibility, NotBusMaster, Transfer16) { 5 }
+                    })
+                }
             }
         }
     }
