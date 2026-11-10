@@ -25,6 +25,12 @@ pub mod chipinterp;
 #[cfg(feature = "machine")]
 mod acpi;
 
+#[cfg(feature = "apple")]
+#[path = "frontend/apple/mod.rs"]
+pub mod apple;
+// Frontend modules shared with the binaries name the crate `r86`.
+#[cfg(feature = "apple")]
+extern crate self as r86;
 #[cfg(feature = "host")]
 #[path = "frontend/audio_output.rs"]
 pub mod audio_output;

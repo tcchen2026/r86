@@ -1,0 +1,47 @@
+# XcodeGen spec for the r86 Mac app: `xcodegen generate` in apple/.
+# The generated r86.xcodeproj is not tracked.
+name: r86
+options:
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  r86:
+    type: application
+    platform: macOS
+    sources:
+      - path: r86
+        excludes:
+          - "**/*.entitlements"
+      - path: ../firmware/seabios/bios.bin
+        buildPhase: resources
+      - path: ../firmware/seabios/vgabios-stdvga.bin
+        buildPhase: resources
+    preBuildScripts:
+      - name: Rust library
+        script: '"$PROJECT_DIR/build-rust.sh"'
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(PROJECT_DIR)/build/rust/libr86.a
+    settings:
+      base:
+        PRODUCT_NAME: r86
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.tcchen2026.r86
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_CFBundleDisplayName: r86
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.utilities
+        INFOPLIST_KEY_NSHumanReadableCopyright: "Apache-2.0; see the bundled licenses"
+        ARCHS: arm64
+        CODE_SIGN_ENTITLEMENTS: r86/r86.entitlements
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        SWIFT_OBJC_BRIDGING_HEADER: r86/Bridge/r86-Bridging-Header.h
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/build/rust
+        OTHER_LDFLAGS: -lr86 -liconv -framework CoreFoundation

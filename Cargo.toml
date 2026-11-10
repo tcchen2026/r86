@@ -22,6 +22,8 @@ handheld-frontend = ["host", "toml/display"]
 # The same app in a desktop window with ./tmp/handheld data, for trying it
 # without the device.
 handheld-sdl = ["handheld-frontend"]
+# The C API linked into the Mac app (apple/), built as a staticlib.
+apple = ["host", "toml/display"]
 monitor = []
 kvm = ["host", "monitor", "dep:libc"]
 jit = ["dep:hashbrown", "dep:dlmalloc"]

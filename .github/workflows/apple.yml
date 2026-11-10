@@ -1,0 +1,39 @@
+# The r86 Mac app (Apple silicon, macOS 26): ad-hoc signed and sandboxed,
+# uploaded as a dmg artifact. Notarization needs Developer ID secrets (later).
+name: Mac app
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - apple/**
+      - src/**
+      - Cargo.toml
+      - Cargo.lock
+      - firmware/seabios/**
+      - script/build_macos.sh
+      - .github/workflows/apple.yml
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          brew install xcodegen
+          xcodebuild -version
+          rustc -V
+
+      - name: Build
+        run: |
+          script/build_macos.sh
+          codesign -d --entitlements - apple/build/derived/Build/Products/Release/r86.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r86-mac
+          path: apple/build/r86.dmg
