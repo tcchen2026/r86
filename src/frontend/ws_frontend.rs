@@ -724,6 +724,20 @@ impl Service {
                     machine.step_count()
                 )
             }
+            "pointer" => {
+                let (x, y, buttons, wheel) = parse_pointer(message)?;
+                machine.inject_pointer(x, y, buttons, wheel)?;
+                self.clients.get_mut(&id).unwrap().session.record_line(&format!(
+                    "{{\"step\":{},\"cmd\":\"pointer\",\"x\":{x},\"y\":{y},\"buttons\":{buttons},\"wheel\":{wheel}}}",
+                    machine.step_count()
+                ))?;
+                format!(
+                    "{{\"type\":\"ack\",\"ok\":true,\"cmd\":\"pointer\",\"step\":{},\"applied_step\":{},\"guest_pointer_active\":{}}}",
+                    machine.step_count(),
+                    machine.step_count(),
+                    machine.guest_pointer_active()
+                )
+            }
             "mouse-move" => {
                 let dx = clamp_i64_to_i16(json_i64(message, "dx")?.unwrap_or(0));
                 let dy = clamp_i64_to_i16(json_i64(message, "dy")?.unwrap_or(0));

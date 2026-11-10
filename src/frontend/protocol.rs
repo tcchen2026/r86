@@ -446,6 +446,29 @@ pub fn json_escape(value: &str) -> String {
     out
 }
 
+pub fn parse_pointer(line: &str) -> Result<(u16, u16, u8, i16), String> {
+    let integer = |key: &str, default: Option<i64>| -> Result<i64, String> {
+        match json_value(line, key)? {
+            Some(raw) => raw
+                .split([',', '}'])
+                .next()
+                .unwrap()
+                .trim()
+                .parse()
+                .map_err(|_| format!("pointer {key} must be an integer")),
+            None => default.ok_or_else(|| format!("pointer missing {key}")),
+        }
+    };
+    let x = u16::try_from(integer("x", None)?).map_err(|_| "pointer x must be 0..65535")?;
+    let y = u16::try_from(integer("y", None)?).map_err(|_| "pointer y must be 0..65535")?;
+    let buttons = integer("buttons", Some(0))?;
+    if !(0..=7).contains(&buttons) {
+        return Err("pointer buttons must be 0..7".into());
+    }
+    let wheel = i16::try_from(integer("wheel", Some(0))?)
+        .map_err(|_| "pointer wheel must be -32768..32767")?;
+    Ok((x, y, buttons as u8, wheel))
+}
 /// Shared by live input and deterministic replay. Reject malformed values at
 /// the protocol boundary instead of narrowing integers into a different input.
 pub fn parse_usb_tablet(json: &str) -> Result<(u16, u16, u8, i8), String> {

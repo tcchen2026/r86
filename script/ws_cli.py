@@ -178,6 +178,7 @@ Commands implemented by the current harness:
     {"cmd":"mouse-move", "dx": DX, "dy": DY}
     {"cmd":"mouse-button", "button": "left|right|middle", "down": BOOL}
     {"cmd":"usb-tablet", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
+    {"cmd":"pointer", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"text-snapshot"}
     {"cmd":"hash-frame"}
     {"cmd":"screenshot"}
@@ -297,6 +298,13 @@ moves down. The emulator-side PS/2 core converts that to PS/2 packet sign
 conventions. Each session latches its own mouse buttons; motion carries the union of all
 clients' buttons until their matching button-up or disconnect. Symbolic keys
 include left/right modifiers, arrows, navigation keys, F1-F12 and the keypad.
+
+``pointer`` injects absolute input for the magic instruction guest tool. X/Y
+are 0..65535, buttons are 0..7 (left/right/middle), and wheel is -32768..32767.
+Its acknowledgement includes ``guest_pointer_active``. This diagnostic command
+uses one input source; it does not combine buttons or release on disconnect.
+Queue-full errors require retrying the same transition. Input is replayable.
+The guest call protocol is defined in ``src/machine/magic.rs``.
 
 ``usb-tablet`` requires the opt-in ``--usb-tablet`` / TOML ``usb-tablet = true``.
 X and Y are absolute coordinates 0..32767 (left/top to right/bottom); normalize
@@ -583,6 +591,12 @@ def build_parser():
     tablet.add_argument("--buttons", type=int, default=0)
     tablet.add_argument("--wheel", type=int, default=0)
 
+    pointer = sub.add_parser("pointer")
+    pointer.add_argument("x", type=int)
+    pointer.add_argument("y", type=int)
+    pointer.add_argument("--buttons", type=int, default=0)
+    pointer.add_argument("--wheel", type=int, default=0)
+
     mouse = sub.add_parser("mouse")
     mouse_sub = mouse.add_subparsers(dest="mouse_command", required=True)
     move = mouse_sub.add_parser("move")
@@ -654,8 +668,8 @@ def command_object(args):
         return {"cmd": "keyup", "key": args.key}
     if args.command == "send-scancodes":
         return {"cmd": "send-scancodes", "hex": args.hex}
-    if args.command == "usb-tablet":
-        return {"cmd": "usb-tablet", "x": args.x, "y": args.y,
+    if args.command in ("usb-tablet", "pointer"):
+        return {"cmd": args.command, "x": args.x, "y": args.y,
                 "buttons": args.buttons, "wheel": args.wheel}
     if args.command == "mouse":
         if args.mouse_command == "move":

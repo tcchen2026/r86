@@ -329,6 +329,10 @@ impl BackingToken {
     }
 }
 
+/// Recognition constants for the magic instruction (protocol: machine/magic.rs).
+pub const MAGIC_INSTRUCTION_PORT: u16 = 0x5286;
+pub const MAGIC_INSTRUCTION_VALUE: u32 = 0x2136_3872;
+
 pub trait Bus {
     /// Optional stable RAM backing for an immediately preceding native read hit.
     /// The backing must remain valid through ordinary translation-cache eviction

@@ -21,6 +21,7 @@ mod media;
 #[path = "protocol.rs"]
 mod protocol;
 use protocol::*;
+
 #[cfg(feature = "sdl2-frontend")]
 #[path = "sdl2_frontend.rs"]
 mod sdl2_frontend;
@@ -781,6 +782,10 @@ impl ReplaySchedule {
                 let (x, y, buttons, wheel) = parse_usb_tablet(line)?;
                 machine.inject_usb_tablet(x, y, buttons, wheel)?;
             }
+            "pointer" => {
+                let (x, y, buttons, wheel) = parse_pointer(line)?;
+                machine.inject_pointer(x, y, buttons, wheel)?;
+            }
             "mouse-move" => {
                 let dx = clamp_i64_to_i16(json_i64(line, "dx")?.unwrap_or(0));
                 let dy = clamp_i64_to_i16(json_i64(line, "dy")?.unwrap_or(0));
@@ -1336,6 +1341,28 @@ mod tests {
         assert!(machine.powered_off());
         assert!(machine.step_count() > 2000 && machine.step_count() < 2100);
         assert_eq!(machine.serial_output(), b"P");
+    }
+
+    #[test]
+    fn pointer_replay_boundary() {
+        let mut m = Machine::new(0x10000);
+        let mut replay = ReplaySchedule::load(None).unwrap();
+        replay
+            .apply_event(
+                &mut m,
+                r#"{"cmd":"pointer","x":65535,"y":0,"buttons":7,"wheel":-32768}"#,
+            )
+            .unwrap();
+        for line in [
+            r#"{"x":65536,"y":0}"#,
+            r#"{"x":-1,"y":0}"#,
+            r#"{"x":0}"#,
+            r#"{"x":0.5,"y":0}"#,
+            r#"{"x":0,"y":0,"buttons":8}"#,
+            r#"{"x":0,"y":0,"wheel":32768}"#,
+        ] {
+            assert!(parse_pointer(line).is_err(), "{line}");
+        }
     }
 
     #[test]

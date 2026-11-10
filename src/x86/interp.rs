@@ -4,7 +4,7 @@ use crate::x86::cpu::{
     CR4_PSE, CR4_PVI, CR4_TSD, CR4_VME, Cpu, EFLAGS_AF, EFLAGS_CF, EFLAGS_DF, EFLAGS_IF, EFLAGS_OF,
     Reg32, SegmentCache, SegmentReg, TableReg,
 };
-use crate::x86::mem::{Bus, MemError};
+use crate::x86::mem::{Bus, MAGIC_INSTRUCTION_PORT, MAGIC_INSTRUCTION_VALUE, MemError};
 use crate::x86::mmu::{self, AccessKind, Fault};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2898,7 +2898,9 @@ fn execute_scalar_io<B: Bus>(
                 check_io_permission(cpu, bus, port, 2, start_eip)?;
                 let value = bus.io_read_u16(port)?;
                 write_reg16(cpu, Reg32::Eax as u8, value);
-            } else if port == 0x5286 && cpu.reg(Reg32::Eax) == 0x2136_3872 {
+            } else if port == MAGIC_INSTRUCTION_PORT
+                && cpu.reg(Reg32::Eax) == MAGIC_INSTRUCTION_VALUE
+            {
                 bus.magic_instruction(cpu);
             } else {
                 check_io_permission(cpu, bus, port, 4, start_eip)?;

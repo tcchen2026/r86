@@ -909,6 +909,30 @@ impl Machine {
         self.bus.clock.is_realtime()
     }
 
+    /// Absolute input for the magic instruction pointer command. See its
+    /// protocol for queue capacity and retry behavior.
+    pub fn inject_pointer(
+        &mut self,
+        x: u16,
+        y: u16,
+        buttons: u8,
+        wheel: i16,
+    ) -> Result<(), String> {
+        self.bus
+            .magic
+            .pointer
+            .inject(x, y, buttons, wheel, self.bus.clock.ticks(self.step))
+            .map_err(String::from)
+    }
+
+    /// Frontends suppress PS/2 injection and capture while the tool is polling.
+    pub fn guest_pointer_active(&self) -> bool {
+        self.bus
+            .magic
+            .pointer
+            .active(self.bus.clock.ticks(self.step))
+    }
+
     /// Host wait after HLT, bounded so UI input remains responsive. Never used
     /// to limit a runnable CPU. Device deadlines use oscillator ticks.
     #[cfg(feature = "host")]
