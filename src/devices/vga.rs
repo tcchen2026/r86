@@ -90,6 +90,11 @@ pub enum Viewer {
 pub struct PcVga {
     vram: Vram,
     dirty_pages: Vec<u8>,
+    mapping_generation: u64,
+    lfb_base: u64,
+    memory_enabled: bool,
+    legacy_enabled: bool,
+    direct_write_granted: bool,
     /// One bit per viewer (see `Viewer`); any frame change sets all of them.
     frame_dirty: u8,
     misc_output: u8,
@@ -133,13 +138,20 @@ impl PcVga {
         let mut dirty_pages = core::mem::take(&mut self.dirty_pages);
         vram.fill(0);
         dirty_pages.fill(0);
-        Self::with_backing(vram, dirty_pages)
+        let mut fresh = Self::with_backing(vram, dirty_pages);
+        fresh.mapping_generation = self.mapping_generation.wrapping_add(1);
+        fresh
     }
 
     fn with_backing(vram: Vram, dirty_pages: Vec<u8>) -> Self {
         let mut dev = Self {
             vram,
             dirty_pages,
+            mapping_generation: 1,
+            lfb_base: DEFAULT_LFB_BASE,
+            memory_enabled: true,
+            legacy_enabled: true,
+            direct_write_granted: false,
             frame_dirty: u8::MAX,
             misc_output: 0x01,
             feature_control: 0,
@@ -243,6 +255,7 @@ impl PcVga {
 
     /// Clears the local display's change bits (see `Viewer`).
     pub fn clear_dirty(&mut self) {
+        self.retire_write_grants();
         self.dirty_pages.fill(0);
         self.frame_dirty &= !(1 << Viewer::Local as u8);
     }
@@ -257,7 +270,110 @@ impl PcVga {
     }
 
     pub fn clear_frame_dirty_for(&mut self, viewer: Viewer) {
+        // Cached writes must set this viewer's flag again on their next grant.
+        self.retire_write_grants();
         self.frame_dirty &= !(1 << viewer as u8);
+    }
+
+    pub(crate) fn mapping_generation(&self) -> u64 {
+        self.mapping_generation
+    }
+
+    fn advance_mapping_generation(&mut self) {
+        self.mapping_generation = self.mapping_generation.wrapping_add(1);
+        self.direct_write_granted = false;
+    }
+
+    fn retire_write_grants(&mut self) {
+        if self.direct_write_granted {
+            self.advance_mapping_generation();
+        }
+    }
+
+    /// PCI decoding belongs to this memory owner too. Revoke grants when a
+    /// configuration write changes the decoded address or access enables.
+    pub(crate) fn set_memory_decode(&mut self, base: u64, enabled: bool, legacy: bool) {
+        let before = self.direct_mapping_key();
+        self.lfb_base = base;
+        self.memory_enabled = enabled;
+        self.legacy_enabled = legacy;
+        if before != self.direct_mapping_key() {
+            self.advance_mapping_generation();
+        }
+    }
+
+    /// Every register/decode input to direct_offset. Scanout, latches and
+    /// planar write masks do not affect a RAM-like page while it is granted.
+    fn direct_mapping_key(&self) -> (u64, u16, u8) {
+        let flags = u8::from(self.memory_enabled)
+            | (u8::from(self.legacy_enabled) << 1)
+            | (u8::from(self.vbe_enabled()) << 2)
+            | (u8::from(self.vbe_regs[VBE_INDEX_BPP] >= 8) << 3)
+            | (u8::from(self.chain4_enabled()) << 4)
+            | (u8::from(self.seq[2] == 0x0f) << 5)
+            | ((self.gc[6] & 0x0c) << 4);
+        (self.lfb_base, self.vbe_regs[VBE_INDEX_BANK], flags)
+    }
+
+    pub(crate) fn contains_memory(&self, addr: u64, len: u32) -> bool {
+        self.memory_enabled
+            && (Self::contains_lfb(addr, len, self.lfb_base)
+                || (self.legacy_enabled
+                    && addr >= LEGACY_VGA_BASE
+                    && addr
+                        .checked_add(u64::from(len))
+                        .is_some_and(|end| end <= LEGACY_VGA_BASE + LEGACY_VGA_LEN)))
+    }
+
+    fn direct_offset(&self, page: u64) -> Option<usize> {
+        debug_assert_eq!(page & 4095, 0);
+        if !self.contains_memory(page, 4096) {
+            return None;
+        }
+        if Self::contains_lfb(page, 4096, self.lfb_base) {
+            return self
+                .vbe_enabled()
+                .then_some((page - self.lfb_base) as usize);
+        }
+        // Restrict the legacy direct window to A0000. Odd/even text and
+        // planar accesses retain their latches and masks in the device path.
+        if !(0xa0000..0xb0000).contains(&page) {
+            return None;
+        }
+        let offset = self.legacy_offset(page)?;
+        if self.legacy_offset(page + 4095)? != offset + 4095 {
+            return None;
+        }
+        let offset = if self.vbe_enabled() && self.vbe_regs[VBE_INDEX_BPP] >= 8 {
+            usize::from(self.vbe_regs[VBE_INDEX_BANK]) * 0x10000 + (offset & 0xffff)
+        } else if !self.vbe_enabled() && self.chain4_enabled() && self.seq[2] == 0x0f {
+            // QEMU vga_update_memory_access requires all four map-mask bits.
+            offset
+        } else {
+            return None;
+        };
+        (offset + 4096 <= self.vram.len()).then_some(offset)
+    }
+
+    /// A grant covers one whole CPU page in the fixed allocation. The owner
+    /// revokes grants on generation changes before guest execution resumes.
+    /// A write grant accounts for all later stores until presentation clears
+    /// the dirty state and changes that generation again.
+    pub(crate) fn direct_page(&mut self, page: u64, write: bool) -> Option<*mut u8> {
+        let offset = self.direct_offset(page)?;
+        if write {
+            self.direct_write_granted = true;
+            self.mark_dirty_range(offset, 4096);
+        }
+        Some(unsafe { self.vram.as_mut_ptr().add(offset) })
+    }
+
+    // The caller holds a live token into this fixed allocation. This address
+    // is used only when a cached access needs physical write bookkeeping.
+    pub(crate) fn backing_phys(&self, pointer: u64) -> u64 {
+        let offset = pointer.wrapping_sub(self.vram.as_ptr() as u64);
+        debug_assert!(offset < self.vram.len() as u64);
+        self.lfb_base.wrapping_add(offset)
     }
 
     pub fn mode_info(&self) -> VgaModeInfo {
@@ -441,14 +557,147 @@ impl PcVga {
     }
 
     pub fn legacy_write_u8(&mut self, addr: u64, value: u8) -> bool {
+        self.legacy_write(addr, 1, u64::from(value))
+    }
+
+    pub(crate) fn legacy_read(&mut self, addr: u64, width: u8) -> u64 {
+        let mut value = 0;
+        for n in 0..width {
+            value |= u64::from(self.legacy_read_u8(addr + u64::from(n)).unwrap_or(0xff)) << (n * 8);
+        }
+        value
+    }
+
+    pub(crate) fn legacy_write(&mut self, addr: u64, width: u8, value: u64) -> bool {
+        let mut dirty = None;
+        let mut handled = false;
+        for n in 0..width {
+            if let Some((start, len)) =
+                self.legacy_store(addr + u64::from(n), (value >> (n * 8)) as u8)
+            {
+                handled = true;
+                self.extend_dirty(&mut dirty, start, len);
+            }
+        }
+        if let Some((start, end)) = dirty {
+            self.mark_dirty_range(start, end - start);
+        }
+        handled
+    }
+
+    // Aggregate a contiguous store's damage. A bank wrap starts a new span;
+    // marking the gap would dirty pages the CPU never touched.
+    fn extend_dirty(&mut self, dirty: &mut Option<(usize, usize)>, start: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        if let Some((first, end)) = *dirty {
+            if start < first {
+                self.mark_dirty_range(first, end - first);
+                *dirty = Some((start, start + len));
+            } else {
+                *dirty = Some((first, end.max(start + len)));
+            }
+        } else {
+            *dirty = Some((start, start + len));
+        }
+    }
+
+    fn legacy_store(&mut self, addr: u64, value: u8) -> Option<(usize, usize)> {
+        let Some(offset) = self.legacy_offset(addr) else {
+            return None;
+        };
+        if self.vbe_enabled() && self.vbe_regs[VBE_INDEX_BPP] != 4 {
+            let index = usize::from(self.vbe_regs[VBE_INDEX_BANK]) * 0x10000 + (offset & 0xffff);
+            *self.vram.get_mut(index)? = value;
+            return Some((index, 1));
+        }
+        if self.chain4_enabled() {
+            let index = offset % self.vram.len();
+            if self.seq[2] & (1 << (offset & 3)) == 0 {
+                return Some((0, 0));
+            }
+            self.vram[index] = value;
+            return Some((index, 1));
+        }
+        if self.odd_even_enabled() {
+            let plane = offset & 1;
+            let byte_addr = offset & !1;
+            let index = (byte_addr << 2) | plane;
+            if index < self.vram.len() {
+                self.vram[index] = value;
+                return Some((index, 1));
+            }
+            return None;
+        }
+        let Some(index) = self.standard_plane_base(offset) else {
+            return None;
+        };
+        // The four interleaved plane bytes share one ALU operation. Writes
+        // use the last read's latches, never reload the destination's latches.
+        let planes = plane_mask(self.seq[2]);
+        if planes == 0 {
+            return Some((0, 0));
+        }
+        let latch = u32::from_le_bytes(self.latch);
+        let mode = self.gc[5] & 3;
+        let result = if mode == 1 {
+            latch
+        } else {
+            let rotated = value.rotate_right(u32::from(self.gc[3] & 7));
+            let src = match mode {
+                0 => {
+                    let enabled = plane_mask(self.gc[1]);
+                    (u32::from(rotated) * 0x01010101 & !enabled)
+                        | (plane_mask(self.gc[0]) & enabled)
+                }
+                2 => plane_mask(value),
+                3 => plane_mask(self.gc[0]),
+                _ => unreachable!(),
+            };
+            let logical = match (self.gc[3] >> 3) & 3 {
+                0 => src,
+                1 => src & latch,
+                2 => src | latch,
+                _ => src ^ latch,
+            };
+            let bits = if mode == 3 {
+                self.gc[8] & rotated
+            } else {
+                self.gc[8]
+            };
+            let mask = u32::from(bits) * 0x01010101;
+            (logical & mask) | (latch & !mask)
+        };
+        let bytes = &mut self.vram[index..index + 4];
+        let result = if planes == u32::MAX {
+            result
+        } else {
+            (result & planes) | (u32::from_le_bytes(bytes.try_into().unwrap()) & !planes)
+        };
+        bytes.copy_from_slice(&result.to_le_bytes());
+        Some((index, 4))
+    }
+
+    #[cfg(test)]
+    fn reference_write_u8(&mut self, addr: u64, value: u8) -> bool {
         let Some(offset) = self.legacy_offset(addr) else {
             return false;
         };
         if self.vbe_enabled() && self.vbe_regs[VBE_INDEX_BPP] != 4 {
-            return self.vbe_bank_write(offset, value);
+            let index = usize::from(self.vbe_regs[VBE_INDEX_BANK]) * 0x10000 + (offset & 0xffff);
+            if let Some(byte) = self.vram.get_mut(index) {
+                *byte = value;
+                self.mark_dirty(index);
+                return true;
+            }
+            return false;
         }
         if self.chain4_enabled() {
             let index = offset % self.vram.len();
+            if self.seq[2] & (1 << (offset & 3)) == 0 {
+                return true;
+            }
             self.vram[index] = value;
             self.mark_dirty(index);
             return true;
@@ -535,6 +784,117 @@ impl PcVga {
         self.vram.get(offset).copied()
     }
 
+    pub(crate) fn memory_read(&mut self, addr: u64, width: u8) -> Option<u64> {
+        if !self.contains_memory(addr, u32::from(width)) {
+            return None;
+        }
+        if Self::contains_lfb(addr, u32::from(width), self.lfb_base) {
+            let offset = (addr - self.lfb_base) as usize;
+            let mut bytes = [0; 8];
+            bytes[..width as usize].copy_from_slice(&self.vram[offset..offset + width as usize]);
+            Some(u64::from_le_bytes(bytes))
+        } else {
+            Some(self.legacy_read(addr, width))
+        }
+    }
+
+    pub(crate) fn memory_write(&mut self, addr: u64, width: u8, value: u64) -> bool {
+        self.memory_write_bytes(addr, &value.to_le_bytes()[..width as usize])
+    }
+
+    pub(crate) fn memory_read_bytes(&mut self, addr: u64, out: &mut [u8]) -> bool {
+        if !self.contains_memory(addr, out.len() as u32) {
+            return false;
+        }
+        if Self::contains_lfb(addr, out.len() as u32, self.lfb_base) {
+            return self.lfb_read_bytes(addr, self.lfb_base, out);
+        }
+        for (n, byte) in out.iter_mut().enumerate() {
+            *byte = self.legacy_read_u8(addr + n as u64).unwrap_or(0xff);
+        }
+        true
+    }
+
+    pub(crate) fn memory_write_bytes(&mut self, addr: u64, bytes: &[u8]) -> bool {
+        if !self.contains_memory(addr, bytes.len() as u32) {
+            return false;
+        }
+        if Self::contains_lfb(addr, bytes.len() as u32, self.lfb_base) {
+            return self.lfb_write_bytes(addr, self.lfb_base, bytes);
+        }
+        let mut dirty = None;
+        for (n, &value) in bytes.iter().enumerate() {
+            if let Some((start, len)) = self.legacy_store(addr + n as u64, value) {
+                self.extend_dirty(&mut dirty, start, len);
+            }
+        }
+        if let Some((start, end)) = dirty {
+            self.mark_dirty_range(start, end - start);
+        }
+        true
+    }
+
+    pub(crate) fn memory_fill(&mut self, addr: u64, width: u8, value: u32, units: u32) -> bool {
+        let Some(len) = u32::from(width).checked_mul(units) else {
+            return false;
+        };
+        if !matches!(width, 1 | 2 | 4) || !self.contains_memory(addr, len) {
+            return false;
+        }
+        if Self::contains_lfb(addr, len, self.lfb_base) {
+            return self.lfb_write_repeat(addr, self.lfb_base, width, value, units);
+        }
+        let mut dirty = None;
+        for n in 0..len {
+            let byte = (value >> ((n % u32::from(width)) * 8)) as u8;
+            if let Some((start, len)) = self.legacy_store(addr + u64::from(n), byte) {
+                self.extend_dirty(&mut dirty, start, len);
+            }
+        }
+        if let Some((start, end)) = dirty {
+            self.mark_dirty_range(start, end - start);
+        }
+        true
+    }
+
+    /// MOVS reads a complete element before writing it. In planar mode this
+    /// leaves the latches from its last source byte for every destination byte.
+    /// Never substitute a raw VRAM copy for that ordering, even in write mode 1.
+    pub(crate) fn memory_copy(&mut self, src: u64, dst: u64, width: u8, units: u32) -> bool {
+        let Some(len) = u32::from(width).checked_mul(units) else {
+            return false;
+        };
+        if !matches!(width, 1 | 2 | 4)
+            || !self.contains_memory(src, len)
+            || !self.contains_memory(dst, len)
+        {
+            return false;
+        }
+        let mut dirty = None;
+        for unit in 0..units {
+            let offset = u64::from(unit) * u64::from(width);
+            let value = self.memory_read(src + offset, width).unwrap();
+            for n in 0..width {
+                let addr = dst + offset + u64::from(n);
+                let byte = (value >> (n * 8)) as u8;
+                let touched = if Self::contains_lfb(addr, 1, self.lfb_base) {
+                    let index = (addr - self.lfb_base) as usize;
+                    self.vram[index] = byte;
+                    Some((index, 1))
+                } else {
+                    self.legacy_store(addr, byte)
+                };
+                if let Some((start, len)) = touched {
+                    self.extend_dirty(&mut dirty, start, len);
+                }
+            }
+        }
+        if let Some((start, end)) = dirty {
+            self.mark_dirty_range(start, end - start);
+        }
+        true
+    }
+
     pub fn lfb_write_u8(&mut self, addr: u64, lfb_base: u64, value: u8) -> bool {
         let Some(offset) = addr
             .checked_sub(lfb_base)
@@ -584,28 +944,6 @@ impl PcVga {
         let start = usize::try_from(addr.checked_sub(lfb_base)?).ok()?;
         let end = start.checked_add(len)?;
         (end <= self.vram.len()).then_some(start..end)
-    }
-
-    /// The allocation is fixed until its owning Machine is destroyed. Software
-    /// JIT proofs expire before interpretation or device/event handling; a
-    /// native-only dispatch can retain one within that exclusive batch.
-    /// Hardware read mappings must be invalidated on reset or PCI aperture
-    /// changes before guest access resumes.
-    /// Unlike legacy planar VGA, this aperture has no latch/read side effects
-    /// or write masks (v86 memory.rs agrees: raw VRAM with dirty writes).
-    #[cfg(any(feature = "jit", feature = "monitor"))]
-    pub(crate) fn direct_lfb_page(&mut self, addr: u64, base: u64, write: bool) -> Option<*mut u8> {
-        let offset = usize::try_from(addr.checked_sub(base)?).ok()?;
-        let page = offset & !4095;
-        if page.checked_add(4096)? > self.vram.len() {
-            return None;
-        }
-        if write {
-            self.mark_dirty_range(page, 4096);
-        }
-        // SAFETY: the complete page is in the fixed VRAM allocation; its owner
-        // excludes reset/reallocation and device changes throughout native use.
-        Some(unsafe { self.vram.as_mut_ptr().add(offset) })
     }
 
     pub fn lfb_write_repeat(
@@ -749,6 +1087,7 @@ impl PcVga {
                 true
             }
             0x3c5 => {
+                let before = self.direct_mapping_key();
                 if let Some(register) = self.seq.get_mut(self.seq_index as usize) {
                     let mask = match self.seq_index {
                         0 => 0x03,
@@ -759,6 +1098,9 @@ impl PcVga {
                     };
                     *register = value & mask;
                     self.frame_dirty = u8::MAX;
+                }
+                if before != self.direct_mapping_key() {
+                    self.advance_mapping_generation();
                 }
                 true
             }
@@ -802,6 +1144,7 @@ impl PcVga {
                 true
             }
             0x3cf => {
+                let before = self.direct_mapping_key();
                 if let Some(register) = self.gc.get_mut(self.gc_index as usize) {
                     let mask = match self.gc_index {
                         0..=2 | 6 | 7 => 0x0f,
@@ -812,6 +1155,9 @@ impl PcVga {
                     };
                     *register = value & mask;
                     self.frame_dirty = u8::MAX;
+                }
+                if before != self.direct_mapping_key() {
+                    self.advance_mapping_generation();
                 }
                 true
             }
@@ -983,6 +1329,7 @@ impl PcVga {
         if index >= VBE_REGS || index == VBE_INDEX_VIDEO_MEMORY_64K {
             return;
         }
+        let before = self.direct_mapping_key();
         match index {
             VBE_INDEX_ID => {
                 if (VBE_ID0..=VBE_ID5).contains(&value) {
@@ -1008,6 +1355,9 @@ impl PcVga {
                 }
             }
             _ => self.vbe_regs[index] = value,
+        }
+        if before != self.direct_mapping_key() {
+            self.advance_mapping_generation();
         }
     }
 
@@ -1079,19 +1429,6 @@ impl PcVga {
     fn vbe_bank_read(&self, offset: usize) -> Option<u8> {
         let base = usize::from(self.vbe_regs[VBE_INDEX_BANK]) * 0x10000;
         self.vram.get(base.checked_add(offset & 0xffff)?).copied()
-    }
-
-    fn vbe_bank_write(&mut self, offset: usize, value: u8) -> bool {
-        let base = usize::from(self.vbe_regs[VBE_INDEX_BANK]) * 0x10000;
-        let Some(index) = base.checked_add(offset & 0xffff) else {
-            return false;
-        };
-        let Some(byte) = self.vram.get_mut(index) else {
-            return false;
-        };
-        *byte = value;
-        self.mark_dirty(index);
-        true
     }
 
     fn status_1(&self, now_step: u64) -> u8 {
@@ -1393,10 +1730,33 @@ fn bytes_per_pixel(bpp: u16) -> u32 {
     }
 }
 
+// Expand four plane-selection bits to four byte masks. Keeping the ALU in
+// one word matches the interleaved backing without exposing it to callers.
+fn plane_mask(value: u8) -> u32 {
+    const MASKS: [u32; 16] = {
+        let mut masks = [0; 16];
+        let mut n = 0;
+        while n < 16 {
+            let mut plane = 0;
+            while plane < 4 {
+                if n & (1 << plane) != 0 {
+                    masks[n] |= 0xff << (plane * 8);
+                }
+                plane += 1;
+            }
+            n += 1;
+        }
+        masks
+    };
+    MASKS[(value & 15) as usize]
+}
+
+#[cfg(test)]
 fn rotate_right_u8(value: u8, count: u8) -> u8 {
     value.rotate_right(u32::from(count & 7))
 }
 
+#[cfg(test)]
 fn apply_logical_op(src: u8, latch: u8, gc_data_rotate: u8) -> u8 {
     match (gc_data_rotate >> 3) & 3 {
         0 => src,
@@ -1476,6 +1836,261 @@ fn rgb565_to_rgba(value: u16) -> [u8; 4] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ioram_reporter_requires_plain_pages_and_expires_on_mapping_and_presentation() {
+        let mut vga = PcVga::new();
+        assert!(vga.direct_page(DEFAULT_LFB_BASE, false).is_none());
+        assert!(vga.direct_page(0xa0000, false).is_none());
+        vga.io_write_u16(0x3ce, 0x0506, 0);
+        vga.io_write_u16(0x3c4, 0x0e04, 0);
+        for mask in 0..16 {
+            vga.io_write_u16(0x3c4, (mask << 8) | 2, 0);
+            assert_eq!(vga.direct_page(0xa0000, false).is_some(), mask == 15);
+            assert_eq!(vga.direct_page(0xa0000, true).is_some(), mask == 15);
+        }
+        let generation = vga.mapping_generation();
+        vga.clear_frame_dirty_for(Viewer::Remote);
+        assert_ne!(generation, vga.mapping_generation());
+        assert!(!vga.frame_dirty_for(Viewer::Remote));
+        assert!(vga.direct_page(0xa0000, true).is_some());
+        assert!(vga.frame_dirty_for(Viewer::Remote));
+        vga.clear_dirty();
+        assert!(!vga.dirty_page(0));
+        let generation = vga.mapping_generation();
+        vga.direct_page(0xa0000, false).unwrap();
+        vga.clear_dirty();
+        vga.clear_frame_dirty_for(Viewer::Remote);
+        assert_eq!(generation, vga.mapping_generation());
+        for (port, value) in [(0x3c4, 0x0101), (0x3ce, 0x5a08), (0x1ce, 5)] {
+            vga.io_write_u16(port, value, 0);
+            assert_eq!(generation, vga.mapping_generation());
+        }
+        vga.direct_page(0xa0000, true).unwrap();
+        assert!(vga.frame_dirty_for(Viewer::Local));
+        assert!(vga.frame_dirty_for(Viewer::Remote));
+        vga.clear_frame_dirty_for(Viewer::Remote);
+        assert_ne!(generation, vga.mapping_generation());
+        let generation = vga.mapping_generation();
+        vga.clear_dirty();
+        assert_eq!(generation, vga.mapping_generation());
+        vga.direct_page(0xa0000, true).unwrap();
+        assert!(vga.dirty_page(0));
+        for (index, value) in [(1, 640), (2, 480), (3, 8), (4, 0x81), (5, 2)] {
+            vga.io_write_u16(0x1ce, index, 0);
+            vga.io_write_u16(0x1cf, value, 0);
+        }
+        let bank = vga.direct_page(0xa0000, false).unwrap();
+        let linear = vga.direct_page(DEFAULT_LFB_BASE + 0x20000, false).unwrap();
+        assert_eq!(bank, linear);
+        assert!(vga.direct_page(0xb0000, false).is_none());
+        vga.set_memory_decode(0xfd00_0000, true, true);
+        assert!(vga.direct_page(DEFAULT_LFB_BASE, false).is_none());
+        assert!(vga.direct_page(0xfd00_0000, false).is_some());
+        vga.set_memory_decode(0xfd00_0000, false, true);
+        assert!(vga.direct_page(0xfd00_0000, false).is_none());
+        assert!(vga.direct_page(0xa0000, false).is_none());
+        let generation = vga.mapping_generation();
+        let reset = vga.take_for_reset();
+        assert_ne!(reset.mapping_generation(), generation);
+    }
+
+    #[test]
+    fn ioram_and_planar_widths_differential_against_byte_device() {
+        fn program(vga: &mut PcVga, port: u16, value: u16) {
+            let generation = vga.mapping_generation();
+            let pages: Vec<_> = (0xa0000..0xc0000)
+                .step_by(4096)
+                .chain([DEFAULT_LFB_BASE, DEFAULT_LFB_BASE + VRAM_SIZE as u64 - 4096])
+                .collect();
+            let before: Vec<_> = pages.iter().map(|&page| vga.direct_offset(page)).collect();
+            vga.io_write_u16(port, value, 0);
+            if generation == vga.mapping_generation() {
+                for (&page, offset) in pages.iter().zip(before) {
+                    assert_eq!(vga.direct_offset(page), offset, "unrevoked page {page:x}");
+                }
+            }
+        }
+        let mut fast = PcVga::new();
+        for (n, byte) in fast.vram.iter_mut().enumerate() {
+            *byte = (n ^ (n >> 7)) as u8;
+        }
+        let mut reference = fast.clone();
+        let mut seed = 0x6d3f97a1u32;
+        for case in 0..768u32 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let region = case % 6;
+            for vga in [&mut fast, &mut reference] {
+                // Systematic modes/functions/rotates/masks, with random data,
+                // set/reset, compare and bit masks. Include invalid banks.
+                program(
+                    vga,
+                    0x3c4,
+                    (if region == 1 {
+                        0x0e00
+                    } else if region == 2 {
+                        0x0200
+                    } else {
+                        0x0600
+                    }) | 4,
+                );
+                program(vga, 0x3c4, (((case / 6) & 15) as u16) << 8 | 2);
+                for (reg, value) in [
+                    (0, seed as u8),
+                    (1, (seed >> 4) as u8),
+                    (2, (seed >> 8) as u8),
+                    (3, ((case / 6) & 31) as u8),
+                    (4, (case & 3) as u8),
+                    (5, ((case / 24) & 3) as u8 | ((seed >> 8) as u8 & 8)),
+                    (6, if region == 2 { 0x0e } else { 5 }),
+                    (7, (seed >> 12) as u8),
+                    (8, (seed >> 16) as u8),
+                ] {
+                    program(vga, 0x3ce, u16::from(value) << 8 | reg);
+                }
+                for (reg, value) in [
+                    (1, 640),
+                    (2, 480),
+                    (3, if region == 3 { 4 } else { 8 }),
+                    (4, if region >= 3 { 0x81 } else { 0 }),
+                    (5, [0, 1, 63, 255, 256][(case / 6) as usize % 5]),
+                ] {
+                    program(vga, 0x1ce, reg);
+                    program(vga, 0x1cf, value);
+                }
+                vga.clear_dirty();
+            }
+            let width = [1u8, 2, 4][(case / 6) as usize % 3];
+            let base = if region == 5 {
+                DEFAULT_LFB_BASE
+            } else if region == 2 {
+                0xb8000
+            } else {
+                0xa0000
+            };
+            let offset = [0x21, 0xffe, 0xfffc, 0xffff][(case / 18) as usize % 4];
+            let addr = base + if region == 2 { offset & 0x7fff } else { offset };
+            if !fast.contains_memory(addr, u32::from(width)) {
+                assert!(fast.memory_read(addr, width).is_none());
+                continue;
+            }
+            let reference_read = |vga: &mut PcVga, at: u64| {
+                if PcVga::contains_lfb(at, 1, DEFAULT_LFB_BASE) {
+                    vga.lfb_read_u8(at, DEFAULT_LFB_BASE).unwrap()
+                } else {
+                    vga.legacy_read_u8(at).unwrap_or(0xff)
+                }
+            };
+            let mut expected = 0;
+            for n in 0..width {
+                expected |=
+                    u64::from(reference_read(&mut reference, addr + u64::from(n))) << (n * 8);
+            }
+            let actual = if (addr & 4095) + u64::from(width) <= 4096 {
+                fast.direct_page(addr & !4095, false).map(|page| {
+                    let mut bytes = [0; 8];
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            page.add((addr & 4095) as usize),
+                            bytes.as_mut_ptr(),
+                            width as usize,
+                        );
+                    }
+                    u64::from_le_bytes(bytes)
+                })
+            } else {
+                None
+            };
+            assert_eq!(
+                actual.unwrap_or_else(|| fast.memory_read(addr, width).unwrap()),
+                expected,
+                "read case {case}"
+            );
+            for n in 0..width {
+                let at = addr + u64::from(n);
+                let byte = (seed >> (n * 8)) as u8;
+                if PcVga::contains_lfb(at, 1, DEFAULT_LFB_BASE) {
+                    reference.lfb_write_u8(at, DEFAULT_LFB_BASE, byte);
+                } else {
+                    reference.reference_write_u8(at, byte);
+                }
+            }
+            let pointer = if (addr & 4095) + u64::from(width) <= 4096 {
+                fast.direct_page(addr & !4095, true)
+            } else {
+                None
+            };
+            if let Some(page) = pointer {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        seed.to_le_bytes().as_ptr(),
+                        page.add((addr & 4095) as usize),
+                        width as usize,
+                    );
+                }
+            } else {
+                assert!(fast.memory_write(addr, width, u64::from(seed)));
+            }
+            assert_eq!(fast.vram, reference.vram, "bytes case {case}");
+            assert_eq!(fast.latch, reference.latch, "latches case {case}");
+            assert_eq!(fast.dirty_pages, reference.dirty_pages, "dirty case {case}");
+        }
+    }
+
+    #[test]
+    fn planar_bulk_copy_and_fill_preserve_element_latch_order() {
+        for mode in 0..4u16 {
+            for width in [1u8, 2, 4] {
+                let mut fast = PcVga::new();
+                fast.io_write_u16(0x3ce, 0x0506, 0);
+                fast.io_write_u16(0x3ce, mode << 8 | 5, 0);
+                fast.io_write_u16(0x3ce, 0x1803, 0); // XOR
+                fast.io_write_u16(0x3ce, 0x5a08, 0);
+                fast.io_write_u16(0x3c4, 0x0b02, 0);
+                for (n, byte) in fast.vram[..0x10000].iter_mut().enumerate() {
+                    *byte = (n ^ (n >> 4)) as u8;
+                }
+                let mut reference = fast.clone();
+                fast.clear_dirty();
+                reference.clear_dirty();
+                assert!(fast.memory_copy(0xa03f8, 0xa05fd, width, 7));
+                for unit in 0..7 {
+                    let offset = unit * u64::from(width);
+                    let mut value = 0;
+                    for n in 0..width {
+                        value |= u32::from(
+                            reference
+                                .legacy_read_u8(0xa03f8 + offset + u64::from(n))
+                                .unwrap(),
+                        ) << (n * 8);
+                    }
+                    for n in 0..width {
+                        reference.reference_write_u8(
+                            0xa05fd + offset + u64::from(n),
+                            (value >> (n * 8)) as u8,
+                        );
+                    }
+                }
+                assert_eq!(fast.vram, reference.vram);
+                assert_eq!(fast.latch, reference.latch);
+                assert_eq!(fast.dirty_pages, reference.dirty_pages);
+                fast.clear_dirty();
+                reference.clear_dirty();
+                assert!(fast.memory_fill(0xa0fff, width, 0xf12c875a, 9));
+                for n in 0..9 * u32::from(width) {
+                    reference.reference_write_u8(
+                        0xa0fff + u64::from(n),
+                        (0xf12c875au32 >> ((n % u32::from(width)) * 8)) as u8,
+                    );
+                }
+                assert_eq!(fast.vram, reference.vram);
+                assert_eq!(fast.latch, reference.latch);
+                assert_eq!(fast.dirty_pages, reference.dirty_pages);
+            }
+        }
+    }
 
     #[test]
     fn lfb_bulk_ranges_copy_bytes_and_dirty_only_destinations() {

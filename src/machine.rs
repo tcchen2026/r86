@@ -844,9 +844,11 @@ impl Machine {
 
     pub fn clear_frame_dirty(&mut self) {
         self.bus.vga.clear_dirty();
+        self.bus.sync_ioram(&mut self.cpu);
     }
     pub fn clear_frame_dirty_for(&mut self, viewer: crate::devices::Viewer) {
         self.bus.vga.clear_frame_dirty_for(viewer);
+        self.bus.sync_ioram(&mut self.cpu);
     }
     pub fn text_snapshot(&self) -> String {
         vga_text_snapshot_string(&self.bus)
@@ -1162,6 +1164,7 @@ impl Machine {
     }
 
     pub fn step_once(&mut self) -> Result<GuestStepStatus, String> {
+        self.bus.sync_ioram(&mut self.cpu);
         if self.powered_off() {
             self.flush_disks()?;
             return Ok(GuestStepStatus::PoweredOff);
@@ -1254,6 +1257,7 @@ impl Machine {
         &mut self,
         budget: u64,
     ) -> Result<RunReport, String> {
+        self.bus.sync_ioram(&mut self.cpu);
         #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
         if self.chip_jit.is_some()
             && !matches!(
@@ -2351,6 +2355,7 @@ pub(crate) struct HostBus {
     acpi: Acpi,
     boot_order: BootOrder,
     vga: PcVga,
+    ioram_generation: u64,
     ps2: I8042,
     pic: Pic,
     ide: IdeBus,
@@ -2419,6 +2424,7 @@ impl core::fmt::Debug for MachineDeviceState<'_> {
             acpi,
             boot_order,
             vga,
+            ioram_generation: _,
             ps2,
             pic,
             ide,
@@ -2674,10 +2680,11 @@ impl HostBus {
         regions: PhysRegionMap<8>,
         firmware_mode: bool,
         display: FirmwareDisplay,
-        vga: PcVga,
+        mut vga: PcVga,
         frame_roles: Vec<FrameRoleFlags>,
     ) -> Self {
         let size = ram.len();
+        vga.set_memory_decode(crate::devices::vga::DEFAULT_LFB_BASE, true, firmware_mode);
         Self {
             ram,
             #[cfg(feature = "jit")]
@@ -2692,6 +2699,7 @@ impl HostBus {
             acpi: Acpi::new(firmware_mode),
             boot_order: BootOrder::DiskFirst,
             vga,
+            ioram_generation: 0,
             ps2: I8042::new(),
             pic: Pic::new(),
             ide: if firmware_mode {
@@ -3414,6 +3422,45 @@ impl HostBus {
         u32::from(width).checked_mul(units)
     }
 
+    // Physical bulk operations are already bounded by the caller's guest
+    // pages. Device grants must also fit a complete reported physical page;
+    // ordinary RAM retains its existing larger-range operations.
+    // Bulk destination probes exclude Rom. For the remaining RAM and VGA
+    // ranges, read/write grants have identical admission; write grants add
+    // dirty tracking. No mapping change can intervene between probe and commit.
+    fn direct_range(&mut self, addr: PhysAddr, len: usize, write: bool) -> Option<*mut u8> {
+        let addr = self.cpu_phys_range(addr, u32::try_from(len).ok()?)?;
+        if len == 0 {
+            return None;
+        }
+        if (addr.0 & 4095) + len as u64 <= 4096 {
+            if let Some(page) = self.ioram_page(PhysAddr(addr.0 & !4095), write) {
+                return Some((page.0 + (addr.0 & 4095)) as *mut u8);
+            }
+        }
+        let kind = self.classify_phys_kind(addr, len as u32);
+        let index = if write && kind == PhysRegionKind::Ram {
+            self.fast_ram_index_for_len(addr, len)?
+        } else if !write && matches!(kind, PhysRegionKind::Ram | PhysRegionKind::Rom) {
+            self.fast_backing_index_for_len(addr, len)?
+        } else {
+            return None;
+        };
+        Some(unsafe { self.ram.as_mut_ptr().add(index) })
+    }
+
+    fn notify_direct_write(&mut self, ptr: *mut u8, len: usize) {
+        #[cfg(feature = "jit")]
+        {
+            let offset = (ptr as usize).wrapping_sub(self.ram.as_ptr() as usize);
+            if offset < self.ram.len() {
+                self.jit_backing_write(offset, len);
+            }
+        }
+        #[cfg(not(feature = "jit"))]
+        let _ = (ptr, len);
+    }
+
     fn phys_ranges_overlap(a: PhysAddr, b: PhysAddr, len: u32) -> bool {
         if len == 0 {
             return false;
@@ -4059,11 +4106,8 @@ impl Bus for HostBus {
     #[inline(always)]
     fn read_phys_u8(&mut self, addr: PhysAddr) -> Result<u8, MemError> {
         let addr = self.cpu_phys_addr(addr);
-        if self.vga_lfb_enabled_contains(addr, 1) {
-            return self
-                .vga
-                .lfb_read_u8(addr.as_u64(), self.pci.vga_lfb_base())
-                .ok_or(MemError::Mmio { addr });
+        if let Some(value) = self.vga.memory_read(addr.0, 1) {
+            return Ok(value as u8);
         }
         if let Some(index) = self.fast_backing_index_for_len(addr, 1) {
             return Ok(self.ram[index]);
@@ -4072,19 +4116,6 @@ impl Bus for HostBus {
             PhysRegionKind::Ram | PhysRegionKind::Rom => {
                 let index = self.backing_byte_index(addr)?;
                 Ok(self.ram[index])
-            }
-            PhysRegionKind::Mmio
-                if PcVga::contains_legacy(addr.as_u64()) && self.pci.vga_mem_enabled() =>
-            {
-                Ok(self.vga.legacy_read_u8(addr.as_u64()).unwrap_or(0xff))
-            }
-            PhysRegionKind::FbDirtyTracked
-                if PcVga::contains_lfb(addr.as_u64(), 1, self.pci.vga_lfb_base())
-                    && self.pci.vga_mem_enabled() =>
-            {
-                self.vga
-                    .lfb_read_u8(addr.as_u64(), self.pci.vga_lfb_base())
-                    .ok_or(MemError::Mmio { addr })
             }
             PhysRegionKind::Mmio | PhysRegionKind::FbDirtyTracked | PhysRegionKind::Hole => {
                 self.unclaimed_memory(addr, false, 0xff)?;
@@ -4125,21 +4156,22 @@ impl Bus for HostBus {
 
     #[cfg(feature = "jit")]
     fn jit_uncached_data_source(&mut self, addr: PhysAddr, write: bool) -> Option<BackingToken> {
-        let page = PhysAddr(addr.0 & !4095);
-        if !self.jit_rechecks_enabled() || !self.vga_lfb_enabled_contains(page, 4096) {
+        if !self.jit_rechecks_enabled() {
             return None;
         }
-        self.vga
-            .direct_lfb_page(addr.0, self.pci.vga_lfb_base(), write)
-            .map(|ptr| BackingToken(ptr as u64))
+        let page = self.ioram_page(PhysAddr(addr.0 & !4095), write)?;
+        Some(BackingToken(page.0 + (addr.0 & 4095)))
     }
 
     #[inline(always)]
     fn cached_backing_phys(&self, token: BackingToken) -> PhysAddr {
         let base = self.ram.as_ptr() as u64;
         let offset = token.0.wrapping_sub(base);
-        debug_assert!(offset < self.ram.len() as u64);
-        PhysAddr(offset)
+        if offset < self.ram.len() as u64 {
+            PhysAddr(offset)
+        } else {
+            PhysAddr(self.vga.backing_phys(token.0))
+        }
     }
 
     #[inline(always)]
@@ -4154,10 +4186,8 @@ impl Bus for HostBus {
             let hi = self.read_phys_u8(PhysAddr(addr.0.wrapping_add(1)))? as u16;
             return Ok(lo | (hi << 8));
         };
-        if self.vga_lfb_enabled_contains(addr, 2) {
-            let lo = self.read_phys_u8(addr)? as u16;
-            let hi = self.read_phys_u8(PhysAddr(addr.0.wrapping_add(1)))? as u16;
-            return Ok(lo | (hi << 8));
+        if let Some(value) = self.vga.memory_read(addr.0, 2) {
+            return Ok(value as u16);
         }
         if let Some(index) = self.fast_backing_index_for_len(addr, 2) {
             return Ok(self.read_backing_u16(index));
@@ -4194,12 +4224,8 @@ impl Bus for HostBus {
             let hi = self.read_phys_u16(PhysAddr(addr.0.wrapping_add(2)))? as u32;
             return Ok(lo | (hi << 16));
         };
-        if self.vga_lfb_enabled_contains(addr, 4) {
-            let b0 = self.read_phys_u8(addr)? as u32;
-            let b1 = self.read_phys_u8(PhysAddr(addr.0.wrapping_add(1)))? as u32;
-            let b2 = self.read_phys_u8(PhysAddr(addr.0.wrapping_add(2)))? as u32;
-            let b3 = self.read_phys_u8(PhysAddr(addr.0.wrapping_add(3)))? as u32;
-            return Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+        if let Some(value) = self.vga.memory_read(addr.0, 4) {
+            return Ok(value as u32);
         }
         if let Some(index) = self.fast_backing_index_for_len(addr, 4) {
             return Ok(self.read_backing_u32(index));
@@ -4238,10 +4264,8 @@ impl Bus for HostBus {
             let hi = self.read_phys_u32(PhysAddr(addr.0.wrapping_add(4)))? as u64;
             return Ok(lo | (hi << 32));
         };
-        if self.vga_lfb_enabled_contains(addr, 8) {
-            let lo = self.read_phys_u32(addr)? as u64;
-            let hi = self.read_phys_u32(PhysAddr(addr.0.wrapping_add(4)))? as u64;
-            return Ok(lo | (hi << 32));
+        if let Some(value) = self.vga.memory_read(addr.0, 8) {
+            return Ok(value as u64);
         }
         if let Some(index) = self.fast_backing_index_for_len(addr, 8) {
             return Ok(self.read_backing_u64(index));
@@ -4281,15 +4305,8 @@ impl Bus for HostBus {
     #[inline(always)]
     fn write_phys_u8(&mut self, addr: PhysAddr, value: u8) -> Result<(), MemError> {
         let addr = self.cpu_phys_addr(addr);
-        if self.vga_lfb_enabled_contains(addr, 1) {
-            return if self
-                .vga
-                .lfb_write_u8(addr.as_u64(), self.pci.vga_lfb_base(), value)
-            {
-                Ok(())
-            } else {
-                Err(MemError::Mmio { addr })
-            };
+        if self.vga.memory_write(addr.0, 1, value as u64) {
+            return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 1) {
             #[cfg(feature = "jit")]
@@ -4311,25 +4328,6 @@ impl Bus for HostBus {
                 self.jit_backing_write(index, 1);
                 self.ram[index] = value;
                 Ok(())
-            }
-            PhysRegionKind::Mmio
-                if PcVga::contains_legacy(addr.as_u64()) && self.pci.vga_mem_enabled() =>
-            {
-                let _ = self.vga.legacy_write_u8(addr.as_u64(), value);
-                Ok(())
-            }
-            PhysRegionKind::FbDirtyTracked
-                if PcVga::contains_lfb(addr.as_u64(), 1, self.pci.vga_lfb_base())
-                    && self.pci.vga_mem_enabled() =>
-            {
-                if self
-                    .vga
-                    .lfb_write_u8(addr.as_u64(), self.pci.vga_lfb_base(), value)
-                {
-                    Ok(())
-                } else {
-                    Err(MemError::Mmio { addr })
-                }
             }
             PhysRegionKind::Mmio | PhysRegionKind::FbDirtyTracked | PhysRegionKind::Hole => {
                 self.unclaimed_memory(addr, true, value)
@@ -4367,9 +4365,8 @@ impl Bus for HostBus {
             self.write_phys_u8(addr, value as u8)?;
             return self.write_phys_u8(PhysAddr(addr.0.wrapping_add(1)), (value >> 8) as u8);
         };
-        if self.vga_lfb_enabled_contains(addr, 2) {
-            self.write_phys_u8(addr, value as u8)?;
-            return self.write_phys_u8(PhysAddr(addr.0.wrapping_add(1)), (value >> 8) as u8);
+        if self.vga.memory_write(addr.0, 2, value as u64) {
+            return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 2) {
             self.write_backing_u16(index, value);
@@ -4410,9 +4407,8 @@ impl Bus for HostBus {
             self.write_phys_u16(addr, value as u16)?;
             return self.write_phys_u16(PhysAddr(addr.0.wrapping_add(2)), (value >> 16) as u16);
         };
-        if self.vga_lfb_enabled_contains(addr, 4) {
-            self.write_phys_u16(addr, value as u16)?;
-            return self.write_phys_u16(PhysAddr(addr.0.wrapping_add(2)), (value >> 16) as u16);
+        if self.vga.memory_write(addr.0, 4, value as u64) {
+            return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 4) {
             self.write_backing_u32(index, value);
@@ -4453,9 +4449,8 @@ impl Bus for HostBus {
             self.write_phys_u32(addr, value as u32)?;
             return self.write_phys_u32(PhysAddr(addr.0.wrapping_add(4)), (value >> 32) as u32);
         };
-        if self.vga_lfb_enabled_contains(addr, 8) {
-            self.write_phys_u32(addr, value as u32)?;
-            return self.write_phys_u32(PhysAddr(addr.0.wrapping_add(4)), (value >> 32) as u32);
+        if self.vga.memory_write(addr.0, 8, value as u64) {
+            return Ok(());
         }
         if let Some(index) = self.fast_ram_index_for_len(addr, 8) {
             self.write_backing_u64(index, value);
@@ -4475,16 +4470,13 @@ impl Bus for HostBus {
         }
     }
 
-    fn phys_ram_repeat_write_supported(&self, addr: PhysAddr, len: u32) -> bool {
+    fn phys_ram_repeat_write_supported(&mut self, addr: PhysAddr, len: u32) -> bool {
         let Some(addr) = self.cpu_phys_range(addr, len) else {
             return false;
         };
-        if self.vga_lfb_enabled_contains(addr, len) {
-            return true;
-        }
-        self.fast_ram_index_for_len(addr, len as usize).is_some()
-            || (matches!(self.classify_phys_kind(addr, len), PhysRegionKind::Ram)
-                && self.backing_index_for_len(addr, len as usize).is_ok())
+        self.direct_range(addr, len as usize, false).is_some()
+            && (self.classify_phys_kind(addr, len) != PhysRegionKind::Rom)
+            || self.vga.contains_memory(addr.0, len)
     }
 
     fn write_phys_ram_repeat(
@@ -4494,126 +4486,96 @@ impl Bus for HostBus {
         value: u32,
         units: u32,
     ) -> Result<(), MemError> {
-        let Some(len) = Self::repeat_write_len(width, units) else {
+        let len = Self::repeat_write_len(width, units).ok_or(MemError::OutOfRange { addr })?;
+        if !matches!(width, 1 | 2 | 4) {
             return Err(MemError::OutOfRange { addr });
-        };
+        }
         let addr = self
             .cpu_phys_range(addr, len)
             .ok_or(MemError::OutOfRange { addr })?;
-        if self.vga_lfb_enabled_contains(addr, len) {
-            return if self.vga.lfb_write_repeat(
-                addr.as_u64(),
-                self.pci.vga_lfb_base(),
-                width,
-                value,
-                units,
-            ) {
-                Ok(())
+        if let Some(ptr) = self.direct_range(addr, len as usize, true) {
+            self.notify_direct_write(ptr, len as usize);
+            // The RAM proof or device grant owns these plain host bytes.
+            let out = unsafe { core::slice::from_raw_parts_mut(ptr, len as usize) };
+            if width == 1 {
+                out.fill(value as u8);
             } else {
-                Err(MemError::Mmio { addr })
-            };
-        }
-        if !self.phys_ram_repeat_write_supported(addr, len) {
-            return Err(MemError::OutOfRange { addr });
-        }
-        let index = self.backing_index_for_len(addr, len as usize)?;
-        #[cfg(feature = "jit")]
-        self.jit_backing_write(index, len as usize);
-        // The whole range is validated and its code version retired above.
-        // Repeating that notification for every element adds no protection.
-        match width {
-            1 => self.ram[index..index + len as usize].fill(value as u8),
-            2 => {
-                let mut offset = 0usize;
-                while offset < len as usize {
-                    unsafe {
-                        ram_write_u16(self.ram.as_mut_ptr().add(index + offset), value as u16);
-                    }
-                    offset += 2;
+                let bytes = value.to_le_bytes();
+                for unit in out.chunks_exact_mut(width as usize) {
+                    unit.copy_from_slice(&bytes[..width as usize]);
                 }
             }
-            4 => {
-                let mut offset = 0usize;
-                while offset < len as usize {
-                    unsafe {
-                        ram_write_u32(self.ram.as_mut_ptr().add(index + offset), value);
-                    }
-                    offset += 4;
-                }
-            }
-            _ => return Err(MemError::OutOfRange { addr }),
+            return Ok(());
         }
-        Ok(())
+        if self.vga.memory_fill(addr.0, width, value, units) {
+            return Ok(());
+        }
+        Err(MemError::OutOfRange { addr })
     }
 
-    fn phys_ram_copy_supported(&self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
+    fn phys_ram_copy_supported(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
         let (Some(src), Some(dst)) = (self.cpu_phys_range(src, len), self.cpu_phys_range(dst, len))
         else {
             return false;
         };
-        // The linear framebuffer is plain VRAM, so blits to, from and within
-        // it (GDI on a VBE driver) copy directly too.
-        match (
-            self.vga_lfb_enabled_contains(src, len),
-            self.vga_lfb_enabled_contains(dst, len),
-        ) {
-            (true, true) => !Self::phys_ranges_overlap(src, dst, len),
-            (true, false) => self.fast_ram_index_for_len(dst, len as usize).is_some(),
-            (false, true) => self.fast_backing_index_for_len(src, len as usize).is_some(),
-            (false, false) => {
-                let (Some(src), Some(dst)) = (
-                    self.fast_backing_index_for_len(src, len as usize),
-                    self.fast_ram_index_for_len(dst, len as usize),
-                ) else {
-                    return false;
-                };
-                // Distinct CPU addresses may share A20-gated or firmware backing.
-                !Self::phys_ranges_overlap(PhysAddr(src as u64), PhysAddr(dst as u64), len)
-            }
+        let from = self.direct_range(src, len as usize, false);
+        let to = self.direct_range(dst, len as usize, false);
+        let writable = self.classify_phys_kind(dst, len) != PhysRegionKind::Rom;
+        if let (Some(from), Some(to)) = (from, to) {
+            return writable
+                && !Self::phys_ranges_overlap(PhysAddr(from as u64), PhysAddr(to as u64), len);
         }
+        (from.is_some() || self.vga.contains_memory(src.0, len))
+            && ((to.is_some() && writable) || self.vga.contains_memory(dst.0, len))
+            && !Self::phys_ranges_overlap(src, dst, len)
     }
 
-    fn copy_phys_to_ram(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> Result<(), MemError> {
-        if !self.phys_ram_copy_supported(src, dst, len) {
+    fn copy_phys_to_ram(
+        &mut self,
+        src: PhysAddr,
+        dst: PhysAddr,
+        len: u32,
+        width: u8,
+    ) -> Result<(), MemError> {
+        if !matches!(width, 1 | 2 | 4)
+            || len % u32::from(width) != 0
+            || !self.phys_ram_copy_supported(src, dst, len)
+        {
             return Err(MemError::OutOfRange { addr: dst });
         }
         let (src, dst) = (self.cpu_phys_addr(src), self.cpu_phys_addr(dst));
-        let base = self.pci.vga_lfb_base();
-        let src_lfb = self.vga_lfb_enabled_contains(src, len);
-        let len = len as usize;
-        if self.vga_lfb_enabled_contains(dst, len as u32) {
-            let copied = if src_lfb {
+        let from = self.direct_range(src, len as usize, false);
+        let to = self.direct_range(dst, len as usize, true);
+        if (from.is_none() || to.is_none())
+            && self.vga.contains_memory(src.0, len)
+            && self.vga.contains_memory(dst.0, len)
+        {
+            // Device aliases may overlap in backing even when their physical
+            // addresses differ. Keep element/latch ordering inside the owner.
+            assert!(
                 self.vga
-                    .lfb_copy_within(src.as_u64(), dst.as_u64(), base, len)
+                    .memory_copy(src.0, dst.0, width, len / u32::from(width))
+            );
+            return Ok(());
+        }
+        if let Some(to) = to {
+            self.notify_direct_write(to, len as usize);
+            if let Some(from) = from {
+                // Capability qualification rejected aliases and overlap.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(from, to, len as usize);
+                }
             } else {
-                let index = self.backing_index_for_len(src, len)?;
+                let out = unsafe { core::slice::from_raw_parts_mut(to, len as usize) };
+                assert!(self.vga.memory_read_bytes(src.0, out));
+            }
+        } else if let Some(from) = from {
+            let bytes = unsafe { core::slice::from_raw_parts(from, len as usize) };
+            assert!(self.vga.memory_write_bytes(dst.0, bytes));
+        } else {
+            assert!(
                 self.vga
-                    .lfb_write_bytes(dst.as_u64(), base, &self.ram[index..index + len])
-            };
-            return if copied {
-                Ok(())
-            } else {
-                Err(MemError::Mmio { addr: dst })
-            };
-        }
-        let dst_index = self.backing_index_for_len(dst, len)?;
-        #[cfg(feature = "jit")]
-        self.jit_backing_write(dst_index, len);
-        if src_lfb {
-            let out = &mut self.ram[dst_index..dst_index + len];
-            return if self.vga.lfb_read_bytes(src.as_u64(), base, out) {
-                Ok(())
-            } else {
-                Err(MemError::Mmio { addr: src })
-            };
-        }
-        let src_index = self.backing_index_for_len(src, len)?;
-        // Ranges were validated as in-bounds and non-overlapping above.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                self.ram.as_ptr().add(src_index),
-                self.ram.as_mut_ptr().add(dst_index),
-                len,
+                    .memory_copy(src.0, dst.0, width, len / u32::from(width))
             );
         }
         Ok(())
@@ -4761,12 +4723,8 @@ impl Bus for HostBus {
         // reset flush every shadow before guest access can use the old backing.
         let read_page = if ordinary_ram_page {
             Some(crate::monitor::abi::X86_RAM_IPA_BASE + base.0)
-        } else if self.vga_lfb_enabled_contains(base, 4096) {
-            self.vga
-                .direct_lfb_page(base.0, self.pci.vga_lfb_base(), false)
-                .map(|ptr| ptr as u64)
         } else {
-            None
+            self.ioram_page(base, false).map(|token| token.0)
         };
         if let Some(shadow) = self.shadow.as_deref_mut() {
             shadow.after_linear_translate_backing(
@@ -4888,6 +4846,56 @@ impl Bus for HostBus {
     }
 
     fn linear_translation_cache_enabled(&self) -> bool {
+        true
+    }
+
+    fn ioram_page(&mut self, page: PhysAddr, write: bool) -> Option<BackingToken> {
+        let page = self.cpu_phys_range(page, 4096)?;
+        self.vga
+            .direct_page(page.0, write)
+            .map(|ptr| BackingToken(ptr as u64))
+    }
+
+    fn sync_ioram(&mut self, cpu: &mut Cpu) {
+        let generation = self.vga.mapping_generation();
+        if self.ioram_generation != generation {
+            cpu.invalidate_ioram_translations();
+            #[cfg(feature = "monitor")]
+            if let Some(shadow) = self.shadow.as_deref_mut() {
+                shadow.flush_for_physical_map_change();
+            }
+            self.ioram_generation = generation;
+        }
+    }
+
+    fn device_write_width_supported(&self, addr: PhysAddr, len: u32) -> bool {
+        self.cpu_phys_range(addr, len)
+            .is_some_and(|addr| self.vga.contains_memory(addr.0, len))
+    }
+
+    fn copy_backing_tokens(&mut self, src: BackingToken, dst: BackingToken, len: u32) -> bool {
+        if Self::phys_ranges_overlap(PhysAddr(src.0), PhysAddr(dst.0), len) {
+            return false;
+        }
+        // A writable cache grant excludes code watches and tracked tables.
+        // Device grants have already dirtied the destination page.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.0 as *const u8, dst.0 as *mut u8, len as usize);
+        }
+        true
+    }
+
+    fn fill_backing_token(&mut self, dst: BackingToken, width: u8, value: u32, units: u32) -> bool {
+        let len = u32::from(width) * units;
+        let out = unsafe { core::slice::from_raw_parts_mut(dst.0 as *mut u8, len as usize) };
+        if width == 1 {
+            out.fill(value as u8);
+        } else {
+            let bytes = value.to_le_bytes();
+            for unit in out.chunks_exact_mut(width as usize) {
+                unit.copy_from_slice(&bytes[..width as usize]);
+            }
+        }
         true
     }
 
@@ -5187,6 +5195,11 @@ impl Bus for HostBus {
                 if self.pci.write_data_u8((port - 0xcfc) as u8, value) {
                     self.physical_mapping_changed();
                 }
+                self.vga.set_memory_decode(
+                    self.pci.vga_lfb_base(),
+                    self.pci.vga_mem_enabled(),
+                    self.firmware_mode,
+                );
                 self.advance_usb(self.device_ticks());
                 self.sync_pci_irq();
                 Ok(())
@@ -5248,6 +5261,11 @@ impl Bus for HostBus {
                 if self.pci.write_data_u16((port - 0xcfc) as u8, value) {
                     self.physical_mapping_changed();
                 }
+                self.vga.set_memory_decode(
+                    self.pci.vga_lfb_base(),
+                    self.pci.vga_mem_enabled(),
+                    self.firmware_mode,
+                );
                 self.advance_usb(self.device_ticks());
                 self.sync_pci_irq();
                 Ok(())
@@ -5299,6 +5317,11 @@ impl Bus for HostBus {
                 if self.pci.write_data_u32(value) {
                     self.physical_mapping_changed();
                 }
+                self.vga.set_memory_decode(
+                    self.pci.vga_lfb_base(),
+                    self.pci.vga_mem_enabled(),
+                    self.firmware_mode,
+                );
                 self.advance_usb(self.device_ticks());
                 self.sync_pci_irq();
                 Ok(())
@@ -9711,7 +9734,7 @@ mod host_bus_tests {
                     bus.ram.copy_within(0x1000..0x3000, 0x5000);
                     bus.ram[0x5000] = 0x40;
                     bus.ram[0x6000] = 0x49;
-                    bus.copy_phys_to_ram(PhysAddr(0x5000), PhysAddr(0x1000), 8192)
+                    bus.copy_phys_to_ram(PhysAddr(0x5000), PhysAddr(0x1000), 8192, 1)
                         .unwrap();
                 }
             }
@@ -10179,6 +10202,64 @@ mod host_bus_tests {
 
     #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
     #[test]
+    fn jit_ioram_bank_mode_and_dirty_changes_match_interpretation() {
+        let make = || {
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            cpu.set_reg(Reg32::Esi, 0xa2001);
+            let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+            enable_test_vbe(&mut bus);
+            // INC EAX; MOV [ESI],EAX; MOV EBX,[ESI]; JMP start.
+            bus.ram[0x1000..0x1007].copy_from_slice(&[0x40, 0x89, 0x06, 0x8b, 0x1e, 0xeb, 0xf9]);
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            (cpu, bus)
+        };
+        let (mut expected, mut reference) = make();
+        let (mut actual, mut bus) = make();
+        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+        for phase in 0..5u64 {
+            for b in [&mut reference, &mut bus] {
+                b.vga.clear_dirty();
+                if phase == 1 {
+                    b.io_write_u16(0x1ce, 5).unwrap();
+                    b.io_write_u16(0x1cf, 1).unwrap();
+                } else if phase == 2 {
+                    b.io_write_u16(0x1ce, 4).unwrap();
+                    b.io_write_u16(0x1cf, 0).unwrap();
+                    b.io_write_u16(0x3c4, 0x0e04).unwrap();
+                } else if phase == 3 {
+                    b.io_write_u16(0x3c4, 0x0502).unwrap();
+                } else if phase == 4 {
+                    b.io_write_u16(0x3c4, 0x0604).unwrap();
+                }
+                b.attention = false;
+            }
+            let result = Interpreter::run_batch(&mut expected, &mut reference, phase * 2000, 2000);
+            let native = engine
+                .run_batch(&mut actual, &mut bus, phase * 2000, 2000)
+                .unwrap();
+            assert_eq!(native, result);
+            assert_eq!(actual.regs, expected.regs);
+            assert_eq!(actual.eip, expected.eip);
+            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+            for offset in (0..0x20000).step_by(4) {
+                let addr = PhysAddr(0xe0000000 + offset);
+                assert_eq!(
+                    bus.read_phys_u32(addr).unwrap(),
+                    reference.read_phys_u32(addr).unwrap()
+                );
+            }
+            for page in 0..32 {
+                assert_eq!(bus.vga.dirty_page(page), reference.vga.dirty_page(page));
+            }
+        }
+        assert!(engine.stats.native_steps > 1000);
+        assert!(engine.stats.native_memory_writes > 0);
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
     fn jit_framebuffer_accesses_preserve_bytes_dirty_pages_faults_and_pci_decode() {
         use crate::devices::vga::DEFAULT_LFB_BASE;
         for case in 0..16 {
@@ -10191,6 +10272,7 @@ mod host_bus_tests {
                 cpu.cr0 |= CR0_PG | crate::x86::cpu::CR0_WP;
                 cpu.cr3 = 0x4000;
                 let mut bus = HostBus::new_firmware(0x200000).unwrap();
+                enable_test_vbe(&mut bus);
                 bus.io_write_u32(0xcf8, 0x8000_1004).unwrap();
                 bus.io_write_u32(0xcfc, 2).unwrap();
                 bus.attention = false;
@@ -10314,7 +10396,6 @@ mod host_bus_tests {
                 assert!(engine.stats.native_memory_reads > 500);
                 assert!(engine.stats.native_memory_writes > 500);
                 assert!(engine.stats.refilled_data > 0);
-                assert!(engine.stats.cached_data_refills > 500);
             }
         }
     }
@@ -11757,11 +11838,7 @@ mod host_bus_tests {
                             .unwrap()
                             .descriptor_for(window, LinearAddr(0x4000))
                             .unwrap();
-                        let backing = machine
-                            .bus
-                            .vga
-                            .direct_lfb_page(0xfd00_0000, 0xfd00_0000, false)
-                            .unwrap();
+                        let backing = machine.bus.vga.direct_page(0xfd00_0000, false).unwrap();
                         assert_eq!(backing as usize & 4095, 0);
                         assert_eq!(descriptor & 0x0000_ffff_ffff_f000, backing as u64);
                         assert_ne!(descriptor & (1 << 7), 0, "read-only mapping");
@@ -12359,6 +12436,182 @@ mod host_bus_tests {
         }
     }
 
+    fn enable_test_vbe(bus: &mut HostBus) {
+        for (index, value) in [(1, 640), (2, 480), (3, 8), (4, 0x81)] {
+            bus.io_write_u16(0x1ce, index).unwrap();
+            bus.io_write_u16(0x1cf, value).unwrap();
+        }
+        bus.io_write_u16(0x3ce, 0x0506).unwrap();
+    }
+
+    #[test]
+    fn ioram_cache_revocation_preserves_ram_and_remarks_presented_pages() {
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        enable_test_vbe(&mut bus);
+        let mut cpu = Cpu::new();
+        bus.sync_ioram(&mut cpu);
+        let ram = LinearAddr(0x4000);
+        let bank = LinearAddr(0xa2001);
+        mmu::write_linear_u32(&mut cpu, &mut bus, ram, 0x12345678).unwrap();
+        mmu::write_linear_u32(&mut cpu, &mut bus, bank, 0xaabbccdd).unwrap();
+        assert!(cpu.cached_write_translation(bank, false).is_some());
+        assert!(cpu.cached_write_translation(ram, false).is_some());
+        bus.vga.clear_dirty();
+        bus.sync_ioram(&mut cpu);
+        assert!(cpu.cached_write_translation(bank, false).is_none());
+        assert!(cpu.cached_write_translation(ram, false).is_some());
+        assert!(!bus.vga.dirty_page(2));
+        mmu::write_linear_u16(&mut cpu, &mut bus, bank, 0x1122).unwrap();
+        assert!(bus.vga.dirty_page(2));
+        bus.io_write_u16(0x1ce, 5).unwrap();
+        bus.io_write_u16(0x1cf, 1).unwrap();
+        bus.sync_ioram(&mut cpu);
+        assert!(cpu.cached_write_translation(bank, false).is_none());
+        assert_eq!(
+            mmu::read_linear_u32(&mut cpu, &mut bus, bank, AccessKind::Read).unwrap(),
+            0
+        );
+        assert!(cpu.cached_read_translation(bank, false).is_some());
+        mmu::write_linear_u32(&mut cpu, &mut bus, bank, 0x87654321).unwrap();
+        assert_eq!(
+            bus.read_phys_u32(PhysAddr(0xe000_2001)).unwrap(),
+            0xaabb1122
+        );
+        assert_eq!(
+            bus.read_phys_u32(PhysAddr(0xe001_2001)).unwrap(),
+            0x87654321
+        );
+        bus.io_write_u16(0x1ce, 4).unwrap();
+        bus.io_write_u16(0x1cf, 0).unwrap();
+        bus.sync_ioram(&mut cpu);
+        assert!(cpu.cached_write_translation(bank, false).is_none());
+        assert!(cpu.cached_write_translation(ram, false).is_some());
+        assert!(bus.ioram_page(PhysAddr(0xa2000), true).is_none());
+        assert!(bus.ioram_page(PhysAddr(0xe000_2000), true).is_none());
+    }
+
+    #[test]
+    fn ioram_address16_rep_preserves_wrap_budget_and_high_register_halves() {
+        use crate::x86::cpu::SegmentCache;
+        for mode in 0..3 {
+            for width in [1u32, 2, 4] {
+                for fill in [false, true] {
+                    let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+                    bus.attention = false;
+                    if mode == 1 {
+                        enable_test_vbe(&mut bus);
+                        bus.io_write_u16(0x1ce, 5).unwrap();
+                        bus.io_write_u16(0x1cf, 2).unwrap();
+                    } else {
+                        bus.io_write_u16(0x3c4, if mode == 0 { 0x0e04 } else { 0x0604 })
+                            .unwrap();
+                        bus.io_write_u16(0x3c4, 0x0f02).unwrap();
+                        bus.io_write_u16(0x3ce, 0x0506).unwrap();
+                        bus.io_write_u16(0x3ce, 0x0005).unwrap();
+                    }
+                    for offset in 0..65536usize {
+                        bus.ram[0x20000 + offset] = (offset ^ (offset >> 8)) as u8;
+                    }
+                    let mut code = vec![0x67, 0xf3];
+                    if width == 2 {
+                        code.push(0x66);
+                    }
+                    code.push(if fill {
+                        if width == 1 { 0xaa } else { 0xab }
+                    } else if width == 1 {
+                        0xa4
+                    } else {
+                        0xa5
+                    });
+                    bus.ram[0x1000..0x1000 + code.len()].copy_from_slice(&code);
+                    let mut cpu = Cpu::new();
+                    cpu.enter_protected_flat(0x1000, 0);
+                    for (seg, base) in [(SegmentReg::Ds, 0x20000), (SegmentReg::Es, 0xa0000)] {
+                        cpu.set_seg_cache(
+                            seg,
+                            SegmentCache {
+                                base,
+                                ..cpu.seg(seg)
+                            },
+                        );
+                    }
+                    cpu.set_reg(Reg32::Esi, 0xaaaa_fff0);
+                    cpu.set_reg(Reg32::Edi, 0xbbbb_fff0);
+                    cpu.set_reg(Reg32::Ecx, 0xcccc_1004);
+                    cpu.set_reg(Reg32::Eax, 0x7351_2917);
+                    for completed in [4096u32, 4100] {
+                        assert_eq!(
+                            Interpreter::step(&mut cpu, &mut bus),
+                            Ok(StepOutcome::Running)
+                        );
+                        let index = 0xfff0u32.wrapping_add(completed * width) & 65535;
+                        assert_eq!(cpu.reg(Reg32::Edi), 0xbbbb_0000 | index);
+                        assert_eq!(
+                            cpu.reg(Reg32::Esi),
+                            if fill {
+                                0xaaaa_fff0
+                            } else {
+                                0xaaaa_0000 | index
+                            }
+                        );
+                        assert_eq!(cpu.reg(Reg32::Ecx), 0xcccc_0000 | (4100 - completed));
+                        assert_eq!(
+                            cpu.eip,
+                            if completed == 4096 {
+                                0x1000
+                            } else {
+                                0x1000 + code.len() as u32
+                            }
+                        );
+                        for byte in 0..completed * width {
+                            let at = (0xfff0 + byte) & 65535;
+                            let expected = if fill {
+                                (0x7351_2917u32 >> ((byte % width) * 8)) as u8
+                            } else {
+                                bus.ram[0x20000 + at as usize]
+                            };
+                            assert_eq!(
+                                bus.read_phys_u8(PhysAddr(0xa0000 + u64::from(at))).unwrap(),
+                                expected,
+                                "mode={mode} width={width} fill={fill} byte={byte}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ioram_split_faults_do_not_dirty_or_commit_the_first_page() {
+        for width in [2, 4] {
+            for present in [false, true] {
+                let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+                enable_test_vbe(&mut bus);
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0, 0);
+                cpu.cr0 |= CR0_PG | crate::x86::cpu::CR0_WP;
+                cpu.cr3 = 0x4000;
+                write_ram_u32(&mut bus, 0x4000, 0x5007);
+                write_ram_u32(&mut bus, 0x5018, 0xe0002007);
+                write_ram_u32(&mut bus, 0x501c, if present { 0xe0003005 } else { 0 });
+                bus.sync_ioram(&mut cpu);
+                bus.vga.clear_dirty();
+                bus.sync_ioram(&mut cpu);
+                let result = if width == 2 {
+                    mmu::write_linear_u16(&mut cpu, &mut bus, LinearAddr(0x6fff), 0x1234)
+                } else {
+                    mmu::write_linear_u32(&mut cpu, &mut bus, LinearAddr(0x6ffd), 0x12345678)
+                };
+                assert!(matches!(result, Err(mmu::Fault::Page(_))));
+                assert_eq!(cpu.cr2, 0x7000);
+                assert_eq!(bus.read_phys_u32(PhysAddr(0xe0002ffc)).unwrap(), 0);
+                assert!(!bus.vga.dirty_page(2));
+                assert!(!bus.vga.dirty_page(3));
+            }
+        }
+    }
+
     #[test]
     fn rep_movsd_lfb_routes_preserve_data_registers_and_dirty_pages() {
         for base in [0xe000_0000u32, 0xfd00_0000, 0x0100_0000] {
@@ -12846,7 +13099,7 @@ mod host_bus_tests {
         );
 
         assert!(bus.phys_ram_copy_supported(PhysAddr(0x100100), PhysAddr(0x100200), 16));
-        bus.copy_phys_to_ram(PhysAddr(0x100100), PhysAddr(0x100200), 16)
+        bus.copy_phys_to_ram(PhysAddr(0x100100), PhysAddr(0x100200), 16, 1)
             .unwrap();
         assert_eq!(&bus.ram[0x200..0x210], &bus.ram[0x100..0x110]);
         bus.write_phys_ram_repeat(PhysAddr(0x100300), 4, 0x9876_5432, 4)

@@ -1045,6 +1045,7 @@ impl Engine {
         start: u64,
         budget: u64,
     ) -> Result<BatchResult, String> {
+        bus.sync_ioram(cpu);
         let mut ran = 0;
         while ran < budget {
             let mut repeat = None;

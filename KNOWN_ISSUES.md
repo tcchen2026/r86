@@ -33,9 +33,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: C0000-FFFFF is one always-writable "ROM" region on the slow
   physical path, with no PAM shadow model; SeaBIOS keeps its stack there
   (64% of CPU in a mode 13h game using BIOS calls).
-- perf: 2- and 4-byte stores to the linear framebuffer, and all access to
-  the banked VBE window and the mode 13h window, go one byte at a time in
-  the interpreter, REP included.
 - perf: self-modifying code under the A64 JIT recompiles on every change;
   Doom costs 28% more cycles with the JIT than with the interpreter.
 - perf: MMX in JIT code calls a shared helper per instruction (38% of

@@ -351,6 +351,9 @@ fn cache_native_read<B: Bus>(cpu: &mut Cpu, bus: &mut B, linear: LinearAddr, pri
                 cpu.note_large_translation(linear);
             }
             cpu.fill_cached_read_translation(linear, backing, priv_.is_user());
+            if !translation_cache_target_is_ram(bus, bus.cached_backing_phys(backing)) {
+                cpu.translation_cache.mark_ioram(linear);
+            }
         }
     }
 }
@@ -373,8 +376,8 @@ fn translation_cache_target_is_ram<B: Bus>(bus: &B, phys: PhysAddr) -> bool {
 }
 
 /// Resolve a native data miss without executing an x86 instruction. Ordinary
-/// RAM can populate the shared cache; the linear framebuffer supplies a
-/// transient native-only pointer and marks dirty pages before writes. It cannot
+/// RAM can populate the shared cache; device reporters supply a
+/// transient native-only pointer and mark dirty pages before writes. It cannot
 /// survive interpretation or device/event handling. This performs
 /// no paging writes or fault delivery: missing A/D bits, PAE/large pages and
 /// permission failures remain the shared walker's responsibility. Paging-off
@@ -430,10 +433,9 @@ pub(crate) fn try_resident_data_translation<B: Bus>(
     } = resident_page(cpu, bus, linear, write)?;
     let priv_ = AccessPriv::from_cpl(cpu.cpl());
     let Some(token) = bus.jit_page_table_source(phys) else {
-        // A linear framebuffer pointer may live through this native invocation.
-        // Never publish it in Cpu's RAM/fetch caches: their tokens have different
-        // ownership and notification rules. A new write still needs its own
-        // permission proof and dirty notification before native reuse.
+        // Device pointers live through this native invocation. Only the shared
+        // walker publishes device-owned cache rows; resident page-table proofs
+        // alone cannot preserve their mapping generation or dirty grant.
         return bus.jit_uncached_data_source(phys, write);
     };
     let writable = pte & PTE_DIRTY != 0
@@ -620,17 +622,28 @@ pub(crate) fn try_resident_native_translation<B: Bus>(
     Some(translation)
 }
 
-fn fill_linear_translation_cache<B: Bus>(
+pub(crate) fn fill_linear_translation_cache<B: Bus>(
     cpu: &mut Cpu,
-    bus: &B,
+    bus: &mut B,
     linear: LinearAddr,
     access: AccessKind,
     priv_: AccessPriv,
     translation: Translation,
 ) {
-    if !bus.linear_translation_cache_enabled()
-        || !translation_cache_target_is_ram(bus, translation.phys)
-    {
+    if !bus.linear_translation_cache_enabled() {
+        return;
+    }
+    if !translation_cache_target_is_ram(bus, translation.phys) {
+        if matches!(access, AccessKind::Read | AccessKind::Write) {
+            cache_ioram_translation(
+                cpu,
+                bus,
+                linear,
+                priv_,
+                &translation,
+                access == AccessKind::Write,
+            );
+        }
         return;
     }
     match (access, translation.page_size) {
@@ -681,6 +694,45 @@ fn fill_linear_translation_cache<B: Bus>(
         }
         _ => {}
     }
+}
+
+// Reject unreported pages before entering the cache-publication frame.
+#[inline]
+fn cache_ioram_translation<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    linear: LinearAddr,
+    priv_: AccessPriv,
+    translation: &Translation,
+    write: bool,
+) -> Option<BackingToken> {
+    if !bus.linear_translation_cache_enabled() {
+        return None;
+    }
+    let phys = translation.phys;
+    let page = bus.ioram_page(PhysAddr(phys.0 & !4095), write)?;
+    let backing = BackingToken(page.0 + (phys.0 & 4095));
+    publish_ioram_translation(cpu, linear, priv_, translation.global, write, backing);
+    Some(backing)
+}
+
+// Keep device publication and ownership bookkeeping out of RAM hit frames.
+#[inline(never)]
+fn publish_ioram_translation(
+    cpu: &mut Cpu,
+    linear: LinearAddr,
+    priv_: AccessPriv,
+    global: bool,
+    write: bool,
+    backing: BackingToken,
+) {
+    if write {
+        cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+    } else {
+        cpu.fill_cached_read_translation(linear, backing, priv_.is_user());
+    }
+    cpu.mark_cached_translation_global(linear, global);
+    cpu.translation_cache.mark_ioram(linear);
 }
 
 fn finish_cached_translation<B: Bus>(
@@ -822,6 +874,38 @@ fn write_probed_cached_ram_u32<B: Bus>(
     Ok(())
 }
 
+pub(crate) fn try_cached_copy<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    src: LinearAddr,
+    dst: LinearAddr,
+    len: u32,
+) -> bool {
+    let priv_ = AccessPriv::from_cpl(cpu.cpl());
+    let Some(src) = cached_read_backing(cpu, bus, src, AccessKind::Read, priv_) else {
+        return false;
+    };
+    let Some(dst) = cached_write_backing(cpu, bus, dst, priv_) else {
+        return false;
+    };
+    bus.copy_backing_tokens(src, dst, len)
+}
+
+pub(crate) fn try_cached_repeat<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    dst: LinearAddr,
+    width: u8,
+    value: u32,
+    units: u32,
+) -> bool {
+    let priv_ = AccessPriv::from_cpl(cpu.cpl());
+    let Some(dst) = cached_write_backing(cpu, bus, dst, priv_) else {
+        return false;
+    };
+    bus.fill_backing_token(dst, width, value, units)
+}
+
 pub fn write_probed_phys_repeat<B: Bus>(
     cpu: &mut Cpu,
     bus: &mut B,
@@ -864,6 +948,7 @@ pub fn write_probed_phys_copy<B: Bus>(
     src: PhysAddr,
     dst: PhysAddr,
     len: u32,
+    width: u8,
 ) -> Result<bool, Fault> {
     if len == 0 || !bus.phys_ram_copy_supported(src, dst, len) {
         return Ok(false);
@@ -884,7 +969,7 @@ pub fn write_probed_phys_copy<B: Bus>(
         offset += u32::from(chunk);
     }
 
-    bus.copy_phys_to_ram(src, dst, len)?;
+    bus.copy_phys_to_ram(src, dst, len, width)?;
 
     finish_phys_range_write(cpu, bus, dst, len, flush_translation);
     Ok(true)
@@ -1008,6 +1093,18 @@ pub fn read_linear_u8_at_priv<B: Bus>(
     if let Some(backing) = cached_read_backing(cpu, bus, linear, access, priv_) {
         return Ok(bus.read_backing_token_u8(backing));
     }
+    read_linear_u8_miss(cpu, bus, linear, access, priv_)
+}
+
+// Device miss handling must not add saved registers to ordinary cache hits.
+#[inline(never)]
+fn read_linear_u8_miss<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    linear: LinearAddr,
+    access: AccessKind,
+    priv_: AccessPriv,
+) -> Result<u8, Fault> {
     match bus
         .try_native_read_linear_u8(linear, access, priv_, cpu.cr0, cpu.cr3, cpu.cr4, cpu.eflags)
     {
@@ -1115,11 +1212,30 @@ pub(crate) fn read_linear_rmw_u32<B: Bus>(
     linear: LinearAddr,
 ) -> Result<u32, Fault> {
     let priv_ = AccessPriv::from_cpl(cpu.cpl());
-    let within_page = (linear.0 & 0xfff) <= 0xffc;
-    if within_page {
+    if (linear.0 & 0xfff) <= 0xffc {
         if let Some(backing) = cached_write_backing(cpu, bus, linear, priv_) {
             return Ok(bus.read_backing_token_u32(backing));
         }
+    }
+    read_linear_rmw_u32_miss(cpu, bus, linear, priv_)
+}
+
+#[inline(never)]
+fn read_linear_rmw_u32_miss<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    linear: LinearAddr,
+    priv_: AccessPriv,
+) -> Result<u32, Fault> {
+    if (linear.0 & 0xfff) <= 0xffc {
+        let phys = probe_linear_write_u8_at_priv(cpu, bus, linear, priv_)?;
+        if let Some(backing) = cached_write_backing(cpu, bus, linear, priv_) {
+            return Ok(bus.read_backing_token_u32(backing));
+        }
+        for n in 1..4 {
+            bus.probe_phys_write_u8(PhysAddr(phys.0 + n))?;
+        }
+        return Ok(bus.read_phys_u32(phys)?);
     }
     let mut physical = [PhysAddr(0); 4];
     for (n, slot) in physical.iter_mut().enumerate() {
@@ -1129,9 +1245,6 @@ pub(crate) fn read_linear_rmw_u32<B: Bus>(
             LinearAddr(linear.0.wrapping_add(n as u32)),
             priv_,
         )?;
-    }
-    if within_page {
-        return Ok(bus.read_phys_u32(physical[0])?);
     }
     let mut value = 0;
     for (n, addr) in physical.into_iter().enumerate() {
@@ -1307,6 +1420,9 @@ fn write_linear_u8_miss<B: Bus>(
         finish_cached_translation(cpu, bus, linear, &translation);
         return write_probed_cached_ram_u8(cpu, bus, backing, value);
     }
+    if let Some(backing) = cache_ioram_translation(cpu, bus, linear, priv_, &translation, true) {
+        return write_probed_cached_ram_u8(cpu, bus, backing, value);
+    }
     write_probed_phys_u8(cpu, bus, phys, value)
 }
 
@@ -1331,7 +1447,11 @@ pub fn probe_linear_write_u8_at_priv<B: Bus>(
     let translation = translate_detailed_with_priv(cpu, bus, linear, AccessKind::Write, priv_)?;
     let phys = translation.phys;
     bus.probe_phys_write_u8(phys)?;
-    fill_linear_translation_cache(cpu, bus, linear, AccessKind::Write, priv_, translation);
+    // Split operands qualify every page before a commit. A device write
+    // grant dirties its page, so do not acquire one during this preflight.
+    if translation_cache_target_is_ram(bus, phys) {
+        fill_linear_translation_cache(cpu, bus, linear, AccessKind::Write, priv_, translation);
+    }
     Ok(phys)
 }
 
@@ -1398,6 +1518,13 @@ fn write_linear_u16_slow<B: Bus>(
         // MMIO target. Keep the ordered byte probes and commits, but do not
         // repeat the same PDE/PTE reads for each byte of this instruction.
         probe_contiguous_phys_write(bus, phys, 2)?;
+        if let Some(backing) = cache_ioram_translation(cpu, bus, linear, priv_, &translation, true)
+        {
+            return write_probed_cached_ram_u16(cpu, bus, backing, value);
+        }
+        if bus.device_write_width_supported(phys, 2) {
+            return write_probed_phys_u16(cpu, bus, phys, value);
+        }
         write_probed_phys_u8(cpu, bus, phys, value as u8)?;
         return write_probed_phys_u8(cpu, bus, PhysAddr(phys.0 + 1), (value >> 8) as u8);
     }
@@ -1487,6 +1614,13 @@ fn write_linear_u32_slow<B: Bus>(
             return write_probed_phys_u32(cpu, bus, phys, value);
         }
         probe_contiguous_phys_write(bus, phys, 4)?;
+        if let Some(backing) = cache_ioram_translation(cpu, bus, linear, priv_, &translation, true)
+        {
+            return write_probed_cached_ram_u32(cpu, bus, backing, value);
+        }
+        if bus.device_write_width_supported(phys, 4) {
+            return write_probed_phys_u32(cpu, bus, phys, value);
+        }
         for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
             write_probed_phys_u8(cpu, bus, PhysAddr(phys.0 + offset as u64), byte)?;
         }
@@ -2103,6 +2237,7 @@ mod tests {
         translation_flush_checks: Cell<u32>,
         probe_fault_addr: Option<u64>,
         writes: Vec<(u64, u8)>,
+        cache_page_table_writes: bool,
     }
 
     impl CacheBus {
@@ -2118,6 +2253,7 @@ mod tests {
                 translation_flush_checks: Cell::new(0),
                 probe_fault_addr: None,
                 writes: Vec::new(),
+                cache_page_table_writes: false,
             }
         }
 
@@ -2193,7 +2329,7 @@ mod tests {
             }
         }
 
-        fn phys_ram_repeat_write_supported(&self, addr: PhysAddr, len: u32) -> bool {
+        fn phys_ram_repeat_write_supported(&mut self, addr: PhysAddr, len: u32) -> bool {
             matches!(self.classify_phys(addr, len), mem::PhysRegionKind::Ram)
         }
 
@@ -2212,6 +2348,25 @@ mod tests {
                         .write_phys_u8(PhysAddr(addr.0 + offset), bytes[index as usize])?;
                 }
             }
+            Ok(())
+        }
+
+        fn phys_ram_copy_supported(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
+            self.classify_phys(src, len) == mem::PhysRegionKind::Ram
+                && self.classify_phys(dst, len) == mem::PhysRegionKind::Ram
+        }
+
+        fn copy_phys_to_ram(
+            &mut self,
+            src: PhysAddr,
+            dst: PhysAddr,
+            len: u32,
+            _width: u8,
+        ) -> Result<(), MemError> {
+            let start = ram_index(src);
+            self.ram
+                .data
+                .copy_within(start..start + len as usize, ram_index(dst));
             Ok(())
         }
 
@@ -2244,7 +2399,9 @@ mod tests {
 
         fn cached_write_translation_allowed(&self, phys: PhysAddr) -> bool {
             self.frame_index(mem::PhysFrame::containing(phys))
-                .is_some_and(|index| !self.frame_roles[index].is_page_table())
+                .is_some_and(|index| {
+                    self.cache_page_table_writes || !self.frame_roles[index].is_page_table()
+                })
         }
 
         fn after_linear_translate(
@@ -2751,6 +2908,49 @@ mod tests {
         assert_eq!(cpu.fetch_cache_phys(LinearAddr(0x1000)), None);
         assert_eq!(&bus.ram.data[0x4000..0x4010], &[0xa5; 16]);
         assert_eq!(bus.translation_flush_checks.get(), 1);
+    }
+
+    #[test]
+    fn rep_page_table_write_does_not_republish_old_translations() {
+        use crate::x86::{cpu::Reg32, interp::Interpreter};
+
+        for opcode in [0xa5, 0xab] {
+            let mut bus = CacheBus::new();
+            // Model a bus that requires a full flush after page-table writes,
+            // including rows granted during the REP operation itself.
+            bus.cache_page_table_writes = true;
+            let flags = PTE_PRESENT | PTE_WRITE | PTE_ACCESSED | PTE_DIRTY;
+            install_non_pae_4k(&mut bus.ram, flags, flags, 0x4000);
+            bus.ram.write_u32(PT_BASE + 4, PT_BASE as u32 | flags);
+            bus.ram.write_u32(PT_BASE + 12, 0x6000 | flags);
+            let new_pte = 0x5000 | flags;
+            bus.ram.write_u32(0x4000, new_pte);
+            bus.ram.write_u32(0x4004, new_pte);
+            bus.ram.write_u32(0x5000, 0xdead_beef);
+            bus.ram.data[0x6000..0x6002].copy_from_slice(&[0xf3, opcode]);
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x3000, 0);
+            cpu.cr0 |= CR0_PG;
+            cpu.cr3 = PD_BASE as u32;
+            cpu.set_reg(Reg32::Eax, new_pte);
+            cpu.set_reg(Reg32::Ecx, 2);
+            cpu.set_reg(Reg32::Edi, 0x1000);
+
+            Interpreter::step(&mut cpu, &mut bus).unwrap();
+
+            assert_eq!(cpu.reg(Reg32::Ecx), 0);
+            assert_eq!(bus.ram.read_u32(PT_BASE), new_pte);
+            assert_eq!(bus.ram.read_u32(PT_BASE + 4), new_pte);
+            assert!(bus.translation_flush_checks.get() > 0);
+            for linear in [0, 0x1000] {
+                assert_eq!(
+                    read_linear_u32(&mut cpu, &mut bus, LinearAddr(linear), AccessKind::Read)
+                        .unwrap(),
+                    0xdead_beef,
+                    "opcode {opcode:x}, linear {linear:x}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3453,6 +3653,29 @@ mod tests {
         assert_eq!(page.linear.0, 0x0040_0000);
         assert_eq!(page.code & PFEC_PRESENT, 0);
         assert_ne!(page.code & PFEC_USER, 0);
+    }
+
+    #[test]
+    fn same_page_rmw_probes_before_reading_the_device() {
+        for fail in 0..=4 {
+            let mut cpu = paging_cpu();
+            let mut bus = CacheBus::new();
+            install_non_pae_4k(&mut bus.ram, 0x67, 0x67, 0x5000);
+            bus.mmio_page = Some(0x5000);
+            bus.ram.write_u32(0x5081, 0x87654321);
+            if fail < 4 {
+                bus.probe_fault_addr = Some(0x5081 + fail);
+            }
+            let result = read_linear_rmw_u32(&mut cpu, &mut bus, LinearAddr(0x81));
+            if fail < 4 {
+                assert_eq!(expect_mem_out_of_range(result), PhysAddr(0x5081 + fail));
+                assert_eq!(bus.phys_reads, 8); // Only PDE/PTE reads.
+            } else {
+                assert_eq!(result.unwrap(), 0x87654321);
+                assert_eq!(bus.phys_reads, 12);
+            }
+            assert_eq!(bus.translations, 1);
+        }
     }
 
     #[test]

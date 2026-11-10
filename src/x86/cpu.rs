@@ -575,6 +575,10 @@ pub struct LinearTranslationCache {
     // test so the much more common read path does not mask every tag.
     write_permissions: [u64; LINEAR_TRANSLATION_WRITE_WORDS],
     global_entries: [u64; LINEAR_TRANSLATION_WRITE_WORDS],
+    // Device grants are evicted at mapping/presentation boundaries, never
+    // checked on an ordinary RAM hit. Fill removes stale ownership on reuse.
+    ioram_entries: [u64; LINEAR_TRANSLATION_WRITE_WORDS],
+    ioram_active: bool,
     #[cfg(feature = "jit")]
     pub(crate) rechecks: [TranslationRecheck; LINEAR_TRANSLATION_CACHE_SLOTS],
     #[cfg(feature = "jit")]
@@ -634,6 +638,8 @@ impl LinearTranslationCache {
             entries: [LinearTranslationCacheEntry::EMPTY; LINEAR_TRANSLATION_CACHE_SLOTS],
             write_permissions: [0; LINEAR_TRANSLATION_WRITE_WORDS],
             global_entries: [0; LINEAR_TRANSLATION_WRITE_WORDS],
+            ioram_entries: [0; LINEAR_TRANSLATION_WRITE_WORDS],
+            ioram_active: false,
             #[cfg(feature = "jit")]
             rechecks: [TranslationRecheck::EMPTY; LINEAR_TRANSLATION_CACHE_SLOTS],
             #[cfg(feature = "jit")]
@@ -831,6 +837,7 @@ impl LinearTranslationCache {
     #[inline(always)]
     fn fill(&mut self, linear: LinearAddr, backing: BackingToken, user: bool, write: bool) {
         let slot = Self::slot(linear);
+        self.ioram_entries[slot >> 6] &= !(1u64 << (slot & 63));
         #[cfg(feature = "jit")]
         {
             self.rechecks[slot] = TranslationRecheck::EMPTY;
@@ -859,6 +866,41 @@ impl LinearTranslationCache {
                 0
             },
         };
+    }
+
+    pub(crate) fn mark_ioram(&mut self, linear: LinearAddr) {
+        self.ioram_active = true;
+        let slot = Self::slot(linear);
+        self.ioram_entries[slot >> 6] |= 1u64 << (slot & 63);
+        // Native resident rechecks only certify guest page tables. They must
+        // not resurrect a device pointer without asking its owner again.
+        #[cfg(feature = "jit")]
+        {
+            self.rechecks[slot] = TranslationRecheck::EMPTY;
+        }
+    }
+
+    pub(crate) fn invalidate_ioram(&mut self) {
+        if !core::mem::take(&mut self.ioram_active) {
+            return;
+        }
+        #[cfg(all(feature = "r86chip-native", target_arch = "riscv32"))]
+        crate::chipinterp::native::flush();
+        for (word, slots) in self.ioram_entries.iter_mut().enumerate() {
+            let mut bits = core::mem::take(slots);
+            self.global_entries[word] &= !bits;
+            self.write_permissions[word] &= !bits;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let slot = word * 64 + bit;
+                self.entries[slot] = LinearTranslationCacheEntry::EMPTY;
+                #[cfg(feature = "jit")]
+                {
+                    self.rechecks[slot] = TranslationRecheck::EMPTY;
+                }
+            }
+        }
     }
 
     #[inline(always)]
@@ -1886,6 +1928,15 @@ impl Cpu {
         self.invalidate_fetch_cache();
         self.invalidate_translation_cache();
         self.large_translation_regions.fill(0);
+    }
+
+    pub(crate) fn invalidate_ioram_translations(&mut self) {
+        // Device data grants never certify instruction fetch. Retire their
+        // shared rows and resident rechecks; native refill proofs last only
+        // until the current invocation returns, before this sync can run.
+        // Keep execute links qualified. Changes to executable backing (PAM,
+        // PCI decode, A20) use invalidate_translation_context instead.
+        self.translation_cache.invalidate_ioram();
     }
 
     /// CR3 reload retires nonglobal translations. Preserve global rows by

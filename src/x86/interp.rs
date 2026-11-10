@@ -706,6 +706,7 @@ impl Interpreter {
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
     ) -> BatchResult {
+        bus.sync_ioram(cpu);
         #[cfg(feature = "r86chip")]
         let before = cpu.chip_counts.incomplete();
         let result = if budget <= u64::from(u32::MAX) {
@@ -2916,6 +2917,7 @@ fn execute_scalar_io<B: Bus>(
     if bus.take_physical_mapping_change() {
         cpu.invalidate_translation_context();
     }
+    bus.sync_ioram(cpu);
     Ok(())
 }
 
@@ -5918,6 +5920,7 @@ fn outs_string<B: Bus>(
         if bus.take_physical_mapping_change() {
             cpu.invalidate_translation_context();
         }
+        bus.sync_ioram(cpu);
         set_string_index(
             cpu,
             Reg32::Esi,
@@ -6003,7 +6006,7 @@ fn try_movs_fast_chunk<B: Bus>(
     max_units: u32,
 ) -> Result<Option<u32>, StepError> {
     if !repeat_string_io(prefix)
-        || address16
+        || (address16 && cpu.cr0 & CR0_PG != 0)
         || cpu.flag(EFLAGS_DF)
         || max_units < 2
         || !matches!(width, 1 | 2 | 4)
@@ -6021,9 +6024,20 @@ fn try_movs_fast_chunk<B: Bus>(
     let dst = dest_string_mem(cpu, edi);
     let src_linear = mem_linear_checked(cpu, src, u32::from(width), false, eip)?;
     let dst_linear = mem_linear_checked(cpu, dst, u32::from(width), true, eip)?;
+    if address16
+        && !bus.device_write_width_supported(PhysAddr(u64::from(src_linear.0)), u32::from(width))
+        && !bus.device_write_width_supported(PhysAddr(u64::from(dst_linear.0)), u32::from(width))
+    {
+        return Ok(None);
+    }
     let src_page_units = (0x1000 - (src_linear.0 & 0x0fff)) / u32::from(width);
     let dst_page_units = (0x1000 - (dst_linear.0 & 0x0fff)) / u32::from(width);
-    let units = count.min(max_units).min(src_page_units).min(dst_page_units);
+    let mut units = count.min(max_units).min(src_page_units).min(dst_page_units);
+    if address16 {
+        units = units
+            .min((0x10000 - esi) / u32::from(width))
+            .min((0x10000 - edi) / u32::from(width));
+    }
     if units < 2 {
         return Ok(None);
     }
@@ -6037,22 +6051,42 @@ fn try_movs_fast_chunk<B: Bus>(
         return Ok(None);
     }
 
-    let priv_ = mmu::AccessPriv::from_cpl(cpu.cpl());
-    let src_translation =
-        mmu::translate_detailed_with_priv(cpu, bus, src_linear, AccessKind::Read, priv_)?;
-    let dst_translation =
-        mmu::translate_detailed_with_priv(cpu, bus, dst_linear, AccessKind::Write, priv_)?;
-    if !phys_ranges_nonoverlap(src_translation.phys, dst_translation.phys, total_bytes) {
-        return Ok(None);
-    }
-    if !mmu::write_probed_phys_copy(
-        cpu,
-        bus,
-        src_translation.phys,
-        dst_translation.phys,
-        total_bytes,
-    )? {
-        return Ok(None);
+    if !mmu::try_cached_copy(cpu, bus, src_linear, dst_linear, total_bytes) {
+        let priv_ = mmu::AccessPriv::from_cpl(cpu.cpl());
+        let src_translation =
+            mmu::translate_detailed_with_priv(cpu, bus, src_linear, AccessKind::Read, priv_)?;
+        let dst_translation =
+            mmu::translate_detailed_with_priv(cpu, bus, dst_linear, AccessKind::Write, priv_)?;
+        if !phys_ranges_nonoverlap(src_translation.phys, dst_translation.phys, total_bytes) {
+            return Ok(None);
+        }
+        // Publish before the commit: a page-table write may retire these rows.
+        mmu::fill_linear_translation_cache(
+            cpu,
+            bus,
+            src_linear,
+            AccessKind::Read,
+            priv_,
+            src_translation,
+        );
+        mmu::fill_linear_translation_cache(
+            cpu,
+            bus,
+            dst_linear,
+            AccessKind::Write,
+            priv_,
+            dst_translation,
+        );
+        if !mmu::write_probed_phys_copy(
+            cpu,
+            bus,
+            src_translation.phys,
+            dst_translation.phys,
+            total_bytes,
+            width,
+        )? {
+            return Ok(None);
+        }
     }
 
     set_string_index(cpu, Reg32::Esi, address16, esi.wrapping_add(total_bytes));
@@ -6071,7 +6105,7 @@ fn try_stos_fast_chunk<B: Bus>(
     max_units: u32,
 ) -> Result<Option<u32>, StepError> {
     if !repeat_string_io(prefix)
-        || address16
+        || (address16 && cpu.cr0 & CR0_PG != 0)
         || cpu.flag(EFLAGS_DF)
         || max_units < 2
         || !matches!(width, 1 | 2 | 4)
@@ -6086,9 +6120,17 @@ fn try_stos_fast_chunk<B: Bus>(
     let edi = string_index(cpu, Reg32::Edi, address16);
     let dst = dest_string_mem(cpu, edi);
     let linear = mem_linear_checked(cpu, dst, u32::from(width), true, eip)?;
+    if address16
+        && !bus.device_write_width_supported(PhysAddr(u64::from(linear.0)), u32::from(width))
+    {
+        return Ok(None);
+    }
     let page_remaining = 0x1000 - (linear.0 & 0x0fff);
     let units_to_page = page_remaining / u32::from(width);
-    let units = count.min(max_units).min(units_to_page);
+    let mut units = count.min(max_units).min(units_to_page);
+    if address16 {
+        units = units.min((0x10000 - edi) / u32::from(width));
+    }
     if units < 2 {
         return Ok(None);
     }
@@ -6101,22 +6143,40 @@ fn try_stos_fast_chunk<B: Bus>(
         return Ok(None);
     }
 
-    let translation = mmu::translate_detailed_with_priv(
+    if !mmu::try_cached_repeat(
         cpu,
         bus,
         linear,
-        AccessKind::Write,
-        mmu::AccessPriv::from_cpl(cpu.cpl()),
-    )?;
-    if !mmu::write_probed_phys_repeat(
-        cpu,
-        bus,
-        translation.phys,
         width,
         read_accumulator_value(cpu, width),
         units,
-    )? {
-        return Ok(None);
+    ) {
+        let translation = mmu::translate_detailed_with_priv(
+            cpu,
+            bus,
+            linear,
+            AccessKind::Write,
+            mmu::AccessPriv::from_cpl(cpu.cpl()),
+        )?;
+        // Publish before the commit: a page-table write may retire this row.
+        mmu::fill_linear_translation_cache(
+            cpu,
+            bus,
+            linear,
+            AccessKind::Write,
+            mmu::AccessPriv::from_cpl(cpu.cpl()),
+            translation,
+        );
+        if !mmu::write_probed_phys_repeat(
+            cpu,
+            bus,
+            translation.phys,
+            width,
+            read_accumulator_value(cpu, width),
+            units,
+        )? {
+            return Ok(None);
+        }
     }
 
     set_string_index(

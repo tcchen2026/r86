@@ -1238,6 +1238,7 @@ impl Engine {
         start: u64,
         budget: u64,
     ) -> Result<BatchResult, String> {
+        bus.sync_ioram(cpu);
         let mut ran = 0;
         // The packed timestamp covers 17.6 trillion guest instructions. Drop
         // hints on its epoch change; this is policy only, never execute proof.

@@ -540,7 +540,7 @@ pub trait Bus {
         self.write_phys_u32(addr, value)
     }
 
-    fn phys_ram_repeat_write_supported(&self, addr: PhysAddr, len: u32) -> bool {
+    fn phys_ram_repeat_write_supported(&mut self, addr: PhysAddr, len: u32) -> bool {
         let _ = (addr, len);
         false
     }
@@ -556,12 +556,18 @@ pub trait Bus {
         Err(MemError::OutOfRange { addr })
     }
 
-    fn phys_ram_copy_supported(&self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
+    fn phys_ram_copy_supported(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
         let _ = (src, dst, len);
         false
     }
 
-    fn copy_phys_to_ram(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> Result<(), MemError> {
+    fn copy_phys_to_ram(
+        &mut self,
+        src: PhysAddr,
+        dst: PhysAddr,
+        len: u32,
+        _width: u8,
+    ) -> Result<(), MemError> {
         let _ = (src, len);
         Err(MemError::OutOfRange { addr: dst })
     }
@@ -594,6 +600,37 @@ pub trait Bus {
     }
 
     fn linear_translation_cache_enabled(&self) -> bool {
+        false
+    }
+
+    /// Plain bytes owned by a device, for one complete physical page. The
+    /// owner marks writes dirty when granting access and revokes cached slots
+    /// through sync_ioram before changing its mapping or clearing dirty state.
+    fn ioram_page(&mut self, _page: PhysAddr, _write: bool) -> Option<BackingToken> {
+        None
+    }
+
+    fn sync_ioram(&mut self, _cpu: &mut crate::x86::cpu::Cpu) {}
+
+    /// Device promises ordered byte semantics for the entire width, with no
+    /// commit failure after the caller has probed all bytes.
+    fn device_write_width_supported(&self, _addr: PhysAddr, _len: u32) -> bool {
+        false
+    }
+
+    /// Valid cache tokens for page-bounded REP operations. Implementations
+    /// may decline aliases/overlap; callers then retain element ordering.
+    fn copy_backing_tokens(&mut self, _src: BackingToken, _dst: BackingToken, _len: u32) -> bool {
+        false
+    }
+
+    fn fill_backing_token(
+        &mut self,
+        _dst: BackingToken,
+        _width: u8,
+        _value: u32,
+        _units: u32,
+    ) -> bool {
         false
     }
 

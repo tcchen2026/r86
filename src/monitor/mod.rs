@@ -3466,7 +3466,7 @@ impl<D: Doorbell> Bus for MonitorSoftBus<'_, '_, D> {
         false
     }
 
-    fn phys_ram_repeat_write_supported(&self, addr: PhysAddr, len: u32) -> bool {
+    fn phys_ram_repeat_write_supported(&mut self, addr: PhysAddr, len: u32) -> bool {
         len != 0
             && self.classify_region(addr, len) == PhysRegionKind::Ram
             && len <= 4096 - (addr.0 & 4095) as u32
@@ -3518,13 +3518,19 @@ impl<D: Doorbell> Bus for MonitorSoftBus<'_, '_, D> {
         Ok(())
     }
 
-    fn phys_ram_copy_supported(&self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
+    fn phys_ram_copy_supported(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> bool {
         self.phys_ram_repeat_write_supported(dst, len)
             && self.classify_region(src, len) == PhysRegionKind::Ram
             && (src.0.abs_diff(dst.0) >= u64::from(len))
     }
 
-    fn copy_phys_to_ram(&mut self, src: PhysAddr, dst: PhysAddr, len: u32) -> Result<(), MemError> {
+    fn copy_phys_to_ram(
+        &mut self,
+        src: PhysAddr,
+        dst: PhysAddr,
+        len: u32,
+        _width: u8,
+    ) -> Result<(), MemError> {
         if !self.phys_ram_copy_supported(src, dst, len) {
             return Err(MemError::OutOfRange { addr: dst });
         }
@@ -6945,7 +6951,7 @@ mod tests {
             bus.write_phys_ram_repeat(PhysAddr(129), width, value, 7)
                 .unwrap();
             let len = u32::from(width) * 7;
-            bus.copy_phys_to_ram(PhysAddr(129), PhysAddr(513), len)
+            bus.copy_phys_to_ram(PhysAddr(129), PhysAddr(513), len, width)
                 .unwrap();
             for offset in 0..len {
                 assert_eq!(

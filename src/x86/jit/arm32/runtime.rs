@@ -472,6 +472,7 @@ impl Engine {
         start: u64,
         budget: u64,
     ) -> Result<BatchResult, String> {
+        bus.sync_ioram(cpu);
         let mut ran = 0;
         // EIP of the last instruction interpreted as cold code. Its sequential
         // successor is no block entry; interpretation continues to a transfer.
