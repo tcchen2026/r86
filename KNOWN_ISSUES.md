@@ -1,22 +1,128 @@
 # Known issues
 
-Defects that are known and not fixed yet. Each entry gives the trigger, the
-effect and the code path. Delete an entry in the commit that fixes it.
+All known defects and costs at this commit, by priority. The goal is speed
+for DOS games and Windows guests. One entry each: effect, trigger, code.
+Delete an entry in the commit that fixes it. `[?]` = reported by an audit
+or review and not yet re-checked against this commit.
+
+Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
+
+## P0: a guest or the network can hang or kill the emulator
+
+- host/cpu: the prefix loop has no length limit; a guest that maps every
+  page to prefix bytes keeps the interpreter in one instruction for ever
+  (`Interpreter::run_batch_inner`, src/x86/interp.rs).
+- host: one WebSocket text frame with a `\u` escape followed by a
+  multi-byte character panics `parse_json_string`
+  (src/frontend/protocol.rs); release builds abort on panic.
+
+## P1: large speed cost, or ordinary guests hit it
+
+- perf: the interpreter ends its batch after every far CALL/JMP, IRET,
+  IN/OUT, INS/OUTS, STI and SS load, and reports `was_interruptible: false`,
+  so with IF=1 each exit polls for interrupts (about 90,000 exits per 1M
+  instructions in a real-mode DOS game).
+- perf: each poll advances every timed device and drives all IRQ pins
+  whether or not anything changed (`refresh_interrupt_attention`,
+  src/machine.rs): 15-17% of CPU in a timer-polling DOS game.
+- perf: each poll, and each port I/O instruction, reads the host clock
+  with 128-bit arithmetic in realtime mode (`Clock::sample`,
+  `begin_io_instruction`): +12% CPU measured on a DOS boot.
+- perf: every CS load discards the fetch translations, so real-mode INT,
+  IRET and far calls re-translate (`Cpu::set_seg_cache`).
+- perf: C0000-FFFFF is one always-writable "ROM" region on the slow
+  physical path, with no PAM shadow model; SeaBIOS keeps its stack there
+  (64% of CPU in a mode 13h game using BIOS calls).
+- perf: 2- and 4-byte stores to the linear framebuffer, and all access to
+  the banked VBE window and the mode 13h window, go one byte at a time in
+  the interpreter, REP included.
+- perf: self-modifying code under the A64 JIT recompiles on every change;
+  Doom costs 28% more cycles with the JIT than with the interpreter.
+- perf: MMX in JIT code calls a shared helper per instruction (38% of
+  Windows 2000 Start-menu fade cycles); no native lowering.
+- perf: on Windows window switches the interpreter runs 0.34% of guest
+  instructions for 11.5% of cycles (INT/IRET, short budgets, page-split
+  instructions); JIT dispatch takes another 21%.
+- cpu: x87 registers are `f64`: no 80-bit precision, precision and
+  rounding control ignored, tag word and deferred exceptions not modelled,
+  transcendental functions approximated. [?]
+- cpu: TF single-step traps and DR0-DR3 breakpoints are not delivered. [?]
+- host: the console WebSocket accepts any Origin; a web page open in a
+  LAN browser can drive the VM (`WebSocket::accept`, src/frontend/ws.rs).
+
+## P2: specific guests or drivers; smaller or unmeasured cost; bad input
+
+- perf: shipped builds store the instruction address on every instruction
+  (`host` enables `bus-instruction-context`); cost not measured.
+- perf: every port write outside USB, sound and the NIC raises attention,
+  making the next batch one instruction long.
+- perf: 16-bit, real-mode and virtual-8086 code is never compiled.
+- cpu: INT3 and INTO in virtual-8086 mode with IOPL < 3 raise #GP. [?]
+- cpu: byte and word read-modify-write instructions report a read page
+  fault where a write fault is due; zero-count shifts skip the write
+  check. [?]
+- cpu: execute page faults set the I/D error-code bit although the model
+  has neither NX nor SMEP. [?]
+- device: VGA text assumes 80 columns and 400 lines; blink, cursor shape,
+  9th dot and font select are not rendered; 16-colour modes ignore row
+  repeat (200-line EGA modes); CGA modes 4-6 have no renderer; no pel
+  panning or line compare; retrace is fixed at 60 Hz. [?]
+- device: IDE drive selection clears the other drive's pending
+  interrupt; ATAPI lacks READ SUB-CHANNEL and reports medium type 0 with
+  an empty drive. [?]
+- device: the ACPI tables declare an MPU-401 at 330h that does not exist.
+- host: `files-get` reads a whole guest file into memory; an interrupted
+  `files-put` overwrite loses the original; a disc built from uploaded
+  files is staged in RAM with no entry limit. [?]
+- host: a host socket error in the user-mode network, an audio queue
+  error, or a settings write error ends the running session. [?]
+- host: the console accept loop stops at the first accept error; dead
+  clients keep their slot and their held keys; JSON keys are found by
+  substring search. [?]
+- host: a VHD that fails to grow (disk full) fails every later read; the
+  handheld does not re-check a VM's RAM size against the device. [?]
+- host: the Mac app is built with abort-on-panic, so one VM's panic ends
+  the app. [?]
+- build: no CI builds or tests the emulator (only the Mac app); the
+  no-JIT translation-cache layout used by the Apple build is not in the
+  default test run.
+- build: README says r86 includes no QEMU code; the USB controller is
+  adapted from QEMU's MIT files, and ymfm (OPL2) is not credited there.
+
+## P3: rare paths, model honesty, structure
+
+- cpu: CR4 reserved bits are masked silently; RDPMC returns 0; P6 MSRs
+  are storage only; LES/BOUND second fields ignore 16-bit address wrap;
+  split loads read the first page before the second page can fault. [?]
+- host: unclaimed-access diagnostics grow without bound; a triple fault
+  stores a formatted dump of the whole CPU. [?]
+- tool: r86-tool formats into a 256-byte buffer and sets display modes
+  without CDS_TEST. [?]
+- structure: the `Bus` trait has 70 methods; devices live in four places
+  and port dispatch in six functions; the translation cache has two
+  layouts selected by the `jit` feature; KVM and the EL1 monitor
+  (HardMMU, 20,000 lines) burden the core for no measured gain.
 
 ## Deferred: no known guest depends on them
 
-- **Page-table accessed/dirty store into device memory stops the machine.**
-  If a guest's page directory or page table lies in device memory or ROM
-  (VGA window, linear framebuffer, APIC pages, BIOS area), the page walk's
-  A/D update is refused by `HostBus::check_write_range` (src/machine.rs) and
-  the machine stops with an emulator error. No host hang, no memory-safety
-  effect.
-- **IDE: reading the data port during a write transfer ends the write.**
-  With DRQ set for a sector write, an IN from the data register reaches
-  `IdeChannel::read_data_u8` and `finish_data_if_drained`
-  (src/pc_devices.rs), which clear DRQ and drop the transfer. The sector is
-  not written and no error is reported.
-- **FXSAVE/FXRSTOR test alignment on the segment offset, not the linear
-  address.** `aligned_fxsave_memory` (src/x86/interp.rs). With a data
-  segment whose base is not a multiple of 16, a misaligned operand is
-  accepted and an aligned one raises #GP(0). Flat segments are unaffected.
+- device: a page-table accessed/dirty store into device memory or ROM is
+  refused by `HostBus::check_write_range` and stops the machine.
+- device: reading the IDE data port during a write transfer drops the
+  write (`IdeChannel::read_data_u8`, `finish_data_if_drained`).
+- cpu: FXSAVE/FXRSTOR test alignment on the segment offset, not the
+  linear address (`aligned_fxsave_memory`).
+
+## Limits by design
+
+No SSE. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
+Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
+HID tablet.
+
+## Unexplained
+
+- VSHARE.386 without DOS SHARE loops in FreeDOS on a cyclic buffer chain.
+
+## Not measured
+
+Sound (OPL2, SB16) CPU share in games; any workload on the CardputerZero
+or an Apple device; Windows 98 and XP guests.
