@@ -32,6 +32,8 @@ const MODE_TRANSLATE: u8 = 0x40;
 const ACK: u8 = 0xfa;
 const RESEND: u8 = 0xfe;
 const QUEUE_CAPACITY: usize = 256;
+/// Largest stream count Windows' default pointer speed passes unaccelerated.
+const UNACCELERATED_COUNTS: u32 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Ps2Key {
@@ -855,14 +857,23 @@ impl Ps2Mouse {
         if !self.enabled || (dx == 0 && dy_ps2 == 0 && !buttons_changed) {
             return;
         }
-        let mut rem_x = i32::from(dx);
-        let mut rem_y = i32::from(dy_ps2);
-        // Preserve large frontend deltas using ordinary complete packets.
-        // Scaled chunks must still fit the signed nine-bit wire counts.
+        // Frontend deltas are guest pixels. Windows 3.x, 9x and 2000 double a
+        // packet's count above MouseThreshold1 (6 by default), so a large
+        // delta goes out as even packets of at most 6 counts while the queue
+        // has room, as a faster-sampling mouse would report it. Scaled
+        // chunks must still fit the signed nine-bit wire counts.
         let limit = if self.scaling_2_to_1 { 127 } else { 255 };
-        loop {
-            let step_x = rem_x.clamp(-limit, limit);
-            let step_y = rem_y.clamp(-limit, limit);
+        let span = u32::from(dx.unsigned_abs().max(dy_ps2.unsigned_abs()));
+        let room = ((QUEUE_CAPACITY - self.queued_bytes) / 3) as u32;
+        let count = span
+            .div_ceil(UNACCELERATED_COUNTS)
+            .min(room)
+            .max(span.div_ceil(limit))
+            .max(1) as i32;
+        let (dx, dy) = (i32::from(dx), i32::from(dy_ps2));
+        for i in 0..count {
+            let step_x = dx * (i + 1) / count - dx * i / count;
+            let step_y = dy * (i + 1) / count - dy * i / count;
             let (wire_x, wire_y) = if self.scaling_2_to_1 {
                 (scale_mouse_count(step_x), scale_mouse_count(step_y))
             } else {
@@ -870,11 +881,6 @@ impl Ps2Mouse {
             };
             let packet = self.packet(wire_x, wire_y);
             self.queue_packet(&packet);
-            rem_x -= step_x;
-            rem_y -= step_y;
-            if rem_x == 0 && rem_y == 0 {
-                break;
-            }
         }
     }
 
@@ -1390,10 +1396,10 @@ mod tests {
         assert_eq!(mouse_command(&mut kbc, 0xe9), [ACK, 4, 2, 100]);
         assert_eq!(mouse_command(&mut kbc, 0xf4), [ACK]);
         kbc.inject_mouse(5, 0, left);
-        kbc.inject_mouse(17, 0, left);
+        kbc.inject_mouse(6, 0, left);
         // Only the first packet has reached the controller. RESEND must not
         // substitute newer motion that is still waiting inside the mouse.
-        assert_eq!(mouse_command(&mut kbc, 0xfe), [9, 5, 0, 9, 17, 0, 9, 5, 0]);
+        assert_eq!(mouse_command(&mut kbc, 0xfe), [9, 5, 0, 9, 6, 0, 9, 5, 0]);
     }
 
     #[test]
@@ -1433,6 +1439,25 @@ mod tests {
         assert_eq!(kbc.mouse_dropped(), 3);
         kbc.inject_mouse(2, -3, Ps2ButtonState::default());
         assert_eq!(read_all(&mut kbc), [8, 2, 3]);
+    }
+
+    #[test]
+    fn large_mouse_deltas_split_into_unaccelerated_packets_while_room_lasts() {
+        let mut kbc = I8042::new();
+        assert_eq!(mouse_command(&mut kbc, 0xf4), [ACK]);
+        kbc.inject_mouse(13, -20, Ps2ButtonState::default());
+        // Four packets of at most 6 counts: x 3,3,3,4; screen y -5 each.
+        assert_eq!(read_all(&mut kbc), [8, 3, 5, 8, 3, 5, 8, 3, 5, 8, 4, 5]);
+        kbc.pio_write(0x64, 0xa7);
+        for _ in 0..84 {
+            kbc.inject_mouse(1, 0, Ps2ButtonState::default());
+        }
+        // One packet of room left: the whole delta still arrives.
+        kbc.inject_mouse(30, 0, Ps2ButtonState::default());
+        kbc.pio_write(0x64, 0xa8);
+        let bytes = read_all(&mut kbc);
+        assert_eq!(bytes[bytes.len() - 3..], [8, 30, 0]);
+        assert_eq!(kbc.mouse_dropped(), 0);
     }
 
     #[test]
