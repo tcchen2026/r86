@@ -32,10 +32,11 @@ def main():
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, vol_ident='R86_TOOLS')
     for directory in sorted(directories):
-        iso.add_directory(iso_path='/' + directory.upper(),
+        iso.add_directory(iso_path='/' + directory.upper().replace('-', '_'),
                           joliet_path='/' + directory)
     for destination, source in sorted(files.items()):
-        iso.add_file(str(source), iso_path='/' + destination.upper() + ';1',
+        # ISO 9660 excludes hyphens; Joliet retains names such as r86-tool.exe.
+        iso.add_file(str(source), iso_path='/' + destination.upper().replace('-', '_') + ';1',
                      joliet_path='/' + destination)
     output = assets / 'r86_tools.iso'
     temporary = output.with_suffix('.iso.part')
