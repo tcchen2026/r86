@@ -279,21 +279,30 @@ impl PcVga {
                 stride: self.vbe_stride,
             };
         }
-        if self.chain4_enabled() {
-            return VgaModeInfo {
-                mode: RenderMode::Chain4,
-                width: 320,
-                height: 200,
-                bpp: 8,
-                stride: 320,
-            };
-        }
         if self.graphics_mode() {
             // CRTC display end is inclusive; overflow bits supply vertical
             // bits 8/9. In particular, BIOS mode 6Ah is 800x600, not 640x480.
             let height = u16::from(self.crtc[0x12])
                 | (u16::from(self.crtc[7] & 0x02) << 7)
                 | (u16::from(self.crtc[7] & 0x40) << 3);
+            if self.gc[5] & 0x40 != 0 {
+                // GC shift mode selects pixels independently of CPU chain4.
+                // Return logical pixels, as for mode 13h: each DAC index
+                // spans two dot clocks, and repeated scanlines share a row.
+                // Consulted tiny386 vga_graphic_refresh and v86 vga.js.
+                let repeat = (u16::from(self.crtc[9] & 0x1f) + 1) << (self.crtc[9] >> 7);
+                return VgaModeInfo {
+                    mode: if self.chain4_enabled() {
+                        RenderMode::Chain4
+                    } else {
+                        RenderMode::Planar
+                    },
+                    width: (u16::from(self.crtc[1]) + 1) * 4,
+                    height: (height + 1).div_ceil(repeat),
+                    bpp: 8,
+                    stride: u32::from(self.crtc[0x13]) * 8,
+                };
+            }
             let mut stride = u32::from(self.crtc[0x13]) * 2;
             if self.crtc[0x14] & 0x40 != 0 {
                 stride *= 4;
@@ -858,7 +867,8 @@ impl PcVga {
         match info.mode {
             RenderMode::Blank => out[..needed].fill(0),
             RenderMode::Text => self.render_text(out, info.width as usize, info.height as usize),
-            RenderMode::Chain4 => self.render_chain4(out),
+            RenderMode::Chain4 => self.render_256(out, &info),
+            RenderMode::Planar if info.bpp == 8 => self.render_256(out, &info),
             RenderMode::Planar => self.render_planar(out, &info, self.crtc_start_addr() as usize),
             RenderMode::Vbe => self.render_vbe(out, &info),
         }
@@ -1222,11 +1232,12 @@ impl PcVga {
         }
     }
 
-    fn render_chain4(&self, out: &mut [u8]) {
-        let width = 320usize;
-        for y in 0..200usize {
+    fn render_256(&self, out: &mut [u8], info: &VgaModeInfo) {
+        let width = info.width as usize;
+        let start = self.crtc_start_addr() as usize * 4;
+        for y in 0..info.height as usize {
             for x in 0..width {
-                let index = y * width + x;
+                let index = start + y * info.stride as usize + x;
                 let color =
                     self.palette_rgba(self.vram.get(index).copied().unwrap_or(0) & self.pel_mask);
                 put_rgba(out, width, x, y, color);
@@ -1767,8 +1778,12 @@ mod tests {
     #[test]
     fn visible_palette_components_invalidate_the_frame() {
         let mut vga = PcVga::new();
-        vga.io_write_u8(0x3c4, 4, 0);
-        vga.io_write_u8(0x3c5, 8, 0);
+        vga.io_write_u16(0x3c4, 0x0e04, 0);
+        vga.io_write_u16(0x3ce, 0x4005, 0);
+        vga.io_write_u16(0x3ce, 0x0506, 0);
+        for (index, value) in [(1, 79), (9, 0), (0x12, 199), (0x13, 40)] {
+            vga.io_write_u16(0x3d4, (value << 8) | index, 0);
+        }
         vga.io_write_u8(0x3c8, 0, 0);
         let mut pixels = alloc::vec![0; 320 * 200 * 4];
         vga.render_rgba(&mut pixels).unwrap();
@@ -1982,6 +1997,47 @@ mod tests {
         vga.render_rgba(&mut pixels).unwrap();
         assert_eq!(&pixels[..4], &[0, 0, 170, 255]);
         assert_eq!(&pixels[pixels.len() - 4..], &[170, 0, 0, 255]);
+    }
+
+    #[test]
+    fn indexed_scanout_uses_gc_shift_crtc_pitch_start_and_repeated_rows() {
+        let mut vga = PcVga::new();
+        vga.gc[6] = 5;
+        vga.crtc[1] = 1; // Eight logical pixels per row.
+        vga.crtc[0x12] = 7;
+        vga.crtc[0x13] = 2; // Sixteen interleaved bytes per row.
+        vga.crtc[0x0d] = 3; // Start at interleaved byte twelve.
+        for index in 0..64 {
+            vga.dac[index * 3..index * 3 + 3].copy_from_slice(&[index as u8, 0, 0]);
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                vga.vram[12 + y * 16 + x] = (y * 8 + x) as u8;
+            }
+        }
+        for chain4 in [false, true] {
+            vga.seq[4] = if chain4 { 0x0e } else { 0x06 };
+            for shift in [0x40, 0x60] {
+                vga.gc[5] = shift;
+                for (scan, height) in [(0, 8), (1, 4), (0x80, 4), (0x81, 2), (2, 3)] {
+                    vga.crtc[9] = scan;
+                    let info = vga.mode_info();
+                    assert_eq!(
+                        (info.width, info.height, info.bpp, info.stride),
+                        (8, height, 8, 16)
+                    );
+                    let mut pixels = alloc::vec![0; 8 * height as usize * 4];
+                    vga.render_rgba(&mut pixels).unwrap();
+                    for (index, pixel) in pixels.chunks_exact(4).enumerate() {
+                        let red = index as u8;
+                        assert_eq!(pixel, &[red << 2 | red >> 4, 0, 0, 255]);
+                    }
+                }
+            }
+            // CPU address chaining alone must not select 256-color scanout.
+            vga.gc[5] = 0;
+            assert_eq!(vga.mode_info().bpp, 4);
+        }
     }
 
     #[test]
