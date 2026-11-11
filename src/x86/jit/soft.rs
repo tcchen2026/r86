@@ -25,7 +25,7 @@
 
 use super::a64::{Assembler, Cond, LR, Label, Reg, SP, ZR};
 use super::decode::Address;
-use super::frame::{AUXILIARY, FLAGS, FRAME, Frame, PARITY};
+use super::frame::{AUXILIARY, FLAGS, FRAME, Frame, PARITY, RETURN_TOP};
 use super::memory::{AccessRange, emit_address};
 use crate::x86::cpu::{
     Cpu, LINEAR_TRANSLATION_CACHE_BITS, LinearTranslationCacheEntry, TranslationRecheck,
@@ -68,11 +68,11 @@ pub struct View {
 }
 
 /// Cold dispatch path. All arguments are scratch registers, distinct from X5,
-/// X6 and X9. The current root and exact words certify an earlier successful
+/// X9 and X10. The current root and exact words certify an earlier successful
 /// execute walk; changes to A/D or permissions require the shared slow path.
 pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
     let root = Reg::new(5);
-    let word = Reg::new(6);
+    let word = Reg::new(10);
     // The immutable context and root are adjacent in this invocation's view.
     assert_eq!(
         offset_of!(View, walk_root),
@@ -208,7 +208,7 @@ const TABLE: Reg = Reg::new(13);
 pub(super) const STATE: Reg = Reg::new(16);
 
 // The view is needed only at entry, based-segment checks and cold helpers.
-// X29 instead retains the frequently updated native return-cache pointer.
+// X6 instead retains the frequently updated native return-cache pointer.
 fn view_load(a: &mut Assembler, dst: Reg, offset: u32, size: u8) {
     a.load_store(true, VIEW, FRAME, offset_of!(Frame, memory) as u32, 3);
     a.load_store(true, dst, VIEW, offset, size);
@@ -231,7 +231,7 @@ pub fn emit_entry(a: &mut Assembler) {
 }
 
 /// Block-ending helper: preserve packed flags and the fixed mapping registers.
-/// AAPCS64 preserves the guest registers, budget, frame and return-stack top.
+/// AAPCS64 preserves the guest registers, budget and frame. X6 is spilled here.
 /// Return 1 continues with refreshed segments, 2 must exit after commit because
 /// a compiled flat-segment qualification changed. No local access proof crosses
 /// this block boundary; a failed probe returns before the instruction.
@@ -239,15 +239,17 @@ pub fn load_segment(a: &mut Assembler, segment: crate::x86::cpu::SegmentReg, mis
     a.add_sub_imm(SP, SP, 48, true, true, false);
     a.pair(false, FLAGS, PARITY, SP, 0, true);
     a.pair(false, TABLE, STATE, SP, 16, true);
-    a.load_store(false, AUXILIARY, SP, 32, 3);
+    a.pair(false, AUXILIARY, RETURN_TOP, SP, 32, true);
     a.mov(Reg::new(2), Reg::new(0), false);
     a.mov(Reg::new(0), FRAME, true);
     a.mov_imm(Reg::new(1), segment as u64, false);
     view_load(a, Reg::new(5), offset_of!(View, load_segment) as u32, 3);
     a.blr(Reg::new(5));
+    #[cfg(test)]
+    super::frame::poison_helper_return(a, true);
     a.pair(true, FLAGS, PARITY, SP, 0, true);
     a.pair(true, TABLE, STATE, SP, 16, true);
-    a.load_store(true, AUXILIARY, SP, 32, 3);
+    a.pair(true, AUXILIARY, RETURN_TOP, SP, 32, true);
     a.add_sub_imm(SP, SP, 48, true, false, false);
     view_load(a, PERMISSIONS, offset_of!(View, permissions) as u32, 2);
     a.cbz(Reg::new(0), false, false, miss);
@@ -268,10 +270,11 @@ pub fn read_mmx(a: &mut Assembler, dst: Reg, index: u8) {
 /// All faultable operands have completed. The helper touches only FPU state;
 /// guest GPRs/time stay resident. No access-range proof crosses this call.
 pub fn mmx(a: &mut Assembler, opcode: u8, reg: u8, value: Reg) {
-    a.add_sub_imm(SP, SP, 48, true, true, false);
+    a.add_sub_imm(SP, SP, 64, true, true, false);
     a.pair(false, FLAGS, PARITY, SP, 0, true);
     a.pair(false, TABLE, STATE, SP, 16, true);
     a.pair(false, AUXILIARY, PERMISSIONS, SP, 32, true);
+    a.load_store(false, RETURN_TOP, SP, 48, 3);
     a.mov(Reg::new(2), value, true);
     a.mov_imm(
         Reg::new(1),
@@ -281,10 +284,13 @@ pub fn mmx(a: &mut Assembler, opcode: u8, reg: u8, value: Reg) {
     view_load(a, Reg::new(5), offset_of!(View, mmx) as u32, 3);
     a.mov(Reg::new(0), VIEW, true);
     a.blr(Reg::new(5));
+    #[cfg(test)]
+    super::frame::poison_helper_return(a, false);
     a.pair(true, FLAGS, PARITY, SP, 0, true);
     a.pair(true, TABLE, STATE, SP, 16, true);
     a.pair(true, AUXILIARY, PERMISSIONS, SP, 32, true);
-    a.add_sub_imm(SP, SP, 48, true, false, false);
+    a.load_store(true, RETURN_TOP, SP, 48, 3);
+    a.add_sub_imm(SP, SP, 64, true, false, false);
 }
 
 /// Compile-time facts valid only along one block's fallthrough path. A failed
@@ -749,6 +755,8 @@ fn emit_refill(a: &mut Assembler, restored: Label) {
     a.bitfield(r(2), LR, 0, 0, false, false);
     a.load_store(true, r(16), VIEW, offset_of!(View, refill) as u32, 3);
     a.blr(r(16));
+    #[cfg(test)]
+    super::frame::poison_helper_return(a, true);
     a.mov(ENTRY, r(0), true);
     #[cfg(any(test, feature = "jit-profile"))]
     {

@@ -73,7 +73,8 @@ const LHS: Reg = Reg::new(0);
 const RHS: Reg = Reg::new(1);
 const RESULT: Reg = Reg::new(2);
 const TMP: Reg = Reg::new(5);
-const TMP2: Reg = Reg::new(6);
+// PC is not live inside a block. Exit flag packing uses its own scratch below.
+const TMP2: Reg = PC;
 pub(super) const STATUS: u32 = 0x8d5;
 
 // Keep the four ARM flags packed between x86 instructions. A full arithmetic
@@ -385,8 +386,9 @@ fn materialize_parity(a: &mut Assembler, dst: Reg) {
     a.bitfield(TMP, PARITY, 4, 31, false, false);
     a.logical(2, TMP, TMP, PARITY, false);
     a.bitfield(TMP, TMP, 0, 3, false, false);
-    a.mov_imm(TMP2, 0x9669, false);
-    a.shift_reg(TMP, TMP2, TMP, false, 1);
+    let table = Reg::new(4);
+    a.mov_imm(table, 0x9669, false);
+    a.shift_reg(TMP, table, TMP, false, 1);
     a.bfi32(dst, TMP, 2, 1);
 }
 
@@ -2734,7 +2736,7 @@ pub fn block(
         a.mov(PC, LHS, false);
     }
     if matches!(last.op, Op::LoadSegment { .. } | Op::PopSegment { .. }) {
-        a.mov(TMP2, LHS, false);
+        a.mov(Reg::new(4), LHS, false);
     }
     emit_progress(&mut a, block, count);
     let continuation = matches!(last.op, Op::Call { .. }).then(|| a.label());
@@ -2755,7 +2757,7 @@ pub fn block(
             // Dynamic segment state is refreshed; a changed specialization
             // must retire old links in the adapter before another block runs.
             a.mov_imm(PC, last.next_eip.into(), false);
-            a.tbz(TMP2, 1, true, done);
+            a.tbz(Reg::new(4), 1, true, done);
             emit_edge(&mut a, page, Some(last.next_eip), false, done, &mut edges);
         }
         Op::Branch {

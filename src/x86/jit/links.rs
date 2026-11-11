@@ -129,11 +129,11 @@ impl ReturnStack {
 }
 
 /// Called only after CALL's guest stack write and ESP commit. `guest` still
-/// holds the full next EIP already formed for that write. X29 holds the
-/// cache top across linked blocks and AAPCS64 helpers. The adapter owns its
+/// holds the full next EIP already formed for that write. X6 holds the
+/// cache top across linked blocks; helper calls spill it. The adapter owns its
 /// nonnull return stack; every invocation starts at that stack's aligned base.
 pub fn push_return(a: &mut Assembler, guest: Reg, continuation: Label) {
-    let native = Reg::new(6);
+    let native = Reg::new(5);
     let full = a.label();
     let room = a.label();
     assert_eq!(size_of::<ReturnAddress>(), 16);
@@ -191,7 +191,7 @@ pub fn cached_return(a: &mut Assembler) {
     a.bind(miss);
 }
 
-/// W14 holds the next EIP. Clobbers X0..X6, X9 and NZCV, preserving the
+/// W14 holds the next EIP. Clobbers X0..X5, X9/X10 and NZCV, preserving the
 /// architectural flag registers and all resident guest registers. A hit enters
 /// the next block after its prologue; its budget check runs on every backedge.
 /// The adapter supplies a live SLOTS-entry link table for this invocation.

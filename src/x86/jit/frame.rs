@@ -7,9 +7,12 @@
 //! must spill live temporary/flag state explicitly before a helper call.
 //! SoftMMU reserves W7 for packed segment permissions and X13/X16 for its
 //! immutable translation context; X16's high half also holds the CS base.
-//! X29 holds the native return-cache top. The
-//! entry saves the caller's X29/X30; native CALL edges and cold memory
-//! continuations may overwrite LR without changing them.
+//! X6 holds the native return-cache top; helpers must preserve it explicitly.
+//! X29 always names the entry's saved X29/X30 frame record. Native CALL edges
+//! and cold memory continuations may overwrite LR without changing that record.
+//! Every SP adjustment is a multiple of 16; generated code leaves D8..D15 alone.
+//! Native-called Rust helpers take only u32/u64/pointers: Darwin requires the
+//! caller to extend narrower arguments. X18 remains reserved, including in tests.
 //! W15 carries N/Z/C/V in bits 31/30/29/28, with C meaning x86 carry/borrow.
 //! W17 carries a byte whose parity gives PF; bit 4 of W8 XOR W17 gives AF. Non-status
 //! EFLAGS remain in Frame.eflags; CLD/STD, CLI/STI and POPF update their permitted
@@ -40,7 +43,7 @@ use core::mem::offset_of;
 
 pub const BUDGET: Reg = Reg::new(27);
 pub const FRAME: Reg = Reg::new(28);
-pub const RETURN_TOP: Reg = Reg::new(29);
+pub const RETURN_TOP: Reg = Reg::new(6);
 pub const FLAGS: Reg = Reg::new(15);
 pub const PARITY: Reg = Reg::new(17);
 pub const AUXILIARY: Reg = Reg::new(8);
@@ -191,6 +194,7 @@ pub fn emit_entry(code: &mut Assembler) {
             true,
         );
     }
+    code.add_sub_imm(Reg::new(29), SP, 80, true, false, false);
     code.mov(FRAME, Reg::new(0), true);
     for pair in 0..4 {
         code.pair(
@@ -238,4 +242,26 @@ pub fn emit_return(code: &mut Assembler) {
     }
     code.add_sub_imm(SP, SP, SAVED_GPR_BYTES, true, false, false);
     code.ret();
+}
+
+/// Native tests invalidate every caller-saved GPR after a Rust helper. Keep
+/// only its declared X0 result, so missing spills cannot depend on Rust's
+/// incidental register allocation. No poison instructions enter release code.
+#[cfg(test)]
+pub(super) fn poison_helper_return(code: &mut Assembler, result: bool) {
+    if result {
+        code.add_sub_imm(SP, SP, 16, true, true, false);
+        code.load_store(false, Reg::new(0), SP, 0, 3);
+    }
+    for index in 0..18 {
+        code.mov_imm(
+            Reg::new(index),
+            0xbad0_0000_0000_0000 | u64::from(index),
+            true,
+        );
+    }
+    if result {
+        code.load_store(true, Reg::new(0), SP, 0, 3);
+        code.add_sub_imm(SP, SP, 16, true, false, false);
+    }
 }

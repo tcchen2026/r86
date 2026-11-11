@@ -171,6 +171,24 @@ mod native {
     }
 
     #[test]
+    fn native_entry_installs_an_aligned_frame_record() {
+        let mut a = Assembler::new();
+        frame::emit_entry(&mut a);
+        a.add_sub_imm(Reg::new(0), SP, 80, true, false, false);
+        a.add_sub(guest_reg(0), Reg::new(29), Reg::new(0), true, true, false);
+        a.load_store(true, Reg::new(1), Reg::new(29), 8, 3);
+        a.add_sub(guest_reg(1), Reg::new(1), LR, true, true, false);
+        a.bitfield(guest_reg(2), Reg::new(0), 0, 3, false, false);
+        frame::emit_return(&mut a);
+        let mut arena = CodeArena::new(4096).unwrap();
+        let block = arena.publish(&a.finish().unwrap()).unwrap();
+        let mut frame = Frame::from_cpu(&Cpu::new(), 0);
+        // SAFETY: fixture reads only its own entry frame and returns normally.
+        unsafe { arena.invoke(block, &mut frame).unwrap() };
+        assert_eq!(&frame.regs[..3], &[0, 0, 0]);
+    }
+
+    #[test]
     fn native_entry_preserves_host_callee_saved_d_registers() {
         // Entry/return must honor the low-64-bit preservation rule in AAPCS64
         // 6.1.2: https://github.com/ARM-software/abi-aa/blob/main/aapcs64/aapcs64.rst
@@ -188,6 +206,8 @@ mod native {
         let second = 0xfedc_ba98_7654_3210_u64;
         let actual_first: u64;
         let actual_second: u64;
+        #[cfg(target_os = "macos")]
+        arena.enter_execute();
         // SAFETY: the generated fixture only loads and stores this live frame.
         // Preserve our caller's registers even if a broken JIT fails the check.
         // The temporary stack reservation maintains 16-byte alignment.

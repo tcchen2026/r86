@@ -50,7 +50,7 @@ impl Path {
                 a.and_high_bits(RETURN_TOP, RETURN_TOP, 12, true);
                 #[cfg(any(test, feature = "jit-profile"))]
                 if overflow {
-                    let native = Reg::new(6);
+                    let native = Reg::new(5);
                     a.load_store(
                         true,
                         native,
