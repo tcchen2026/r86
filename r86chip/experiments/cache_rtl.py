@@ -2,11 +2,12 @@
 """Run native fixtures on core + caches + a slow burst RAM; compare with the ISS.
 
 Builds `r86_system` (Cache.scala) with rtl/tests/system_tb.sv and runs the
-xlate_rtl.py fixtures and benchmarks plus rtl.py's full-size programs. Each
+xlate_rtl.py fixtures and benchmarks plus rtl.py's programs (those whose RAM
+is a whole number of cache lines and that need no injected fetch error). Each
 run must end with the ISS's trap, retired count, written registers and RAM;
 the RAM is the back-end model's content after the cache wrote its dirty lines
-back. LINE_BITS=4 (16 lines of 32 bytes per cache) forces evictions and
-write-backs in these small programs; 11 is the intended size (64 KiB each).
+back. Three set bits (16 lines of 32 bytes per cache, two ways) force
+evictions and write-backs in these small programs; ten is 64 KiB per cache.
 
 Usage: cache_rtl.py --out DIR --simulator r86chip-sim
 """
@@ -22,14 +23,14 @@ HERE = Path(__file__).resolve().parent
 RTL = HERE.parent / "rtl"
 
 
-def build(out, line_bits):
-    directory = out / f"sys{line_bits}"
-    subprocess.run(["sbt", "-batch", f"runMain r86chip.GenerateSystem 2 {line_bits} {directory}"],
+def build(out, set_bits):
+    directory = out / f"sys{set_bits}"
+    subprocess.run(["sbt", "-batch", f"runMain r86chip.GenerateSystem 2 {set_bits} {set_bits} {directory}"],
                    cwd=RTL, check=True, capture_output=True)
-    sources = [directory / name for name in ("r86_system.sv", "r86_core.sv", "MulDiv.sv", "Cache.sv")]
+    sources = sorted(directory.glob("*.sv"))
     subprocess.run(["verilator", "--binary", "--timing", "--top-module", "system_tb", "-Wno-TIMESCALEMOD",
                     "-Wno-WIDTH", "-j", "2", "--Mdir", directory / "obj", *sources,
-                    RTL / "r86_regfile.v", RTL / "r86_ram.v", RTL / "tests/system_tb.sv"],
+                    RTL / "r86_ram.v", RTL / "tests/system_tb.sv"],
                    check=True, capture_output=True)
     return directory / "obj/Vsystem_tb"
 
@@ -78,7 +79,7 @@ def main():
     images.mkdir(parents=True, exist_ok=True)
     fixtures = list(xlate_rtl.cases())
     fixtures += [(name, image) for name, image, fault_pc, _ in rtl.cases()
-                 if fault_pc < 0 and len(image) == xlate_rtl.SIZE]
+                 if fault_pc < 0 and len(image) % 32 == 0]
     benches = [(f"bench-{name}-{n}", build_image(n)) for name, _, build_image in xlate_rtl.benchmarks()
                for n in (100, 300)]
     golds = {}
@@ -90,7 +91,7 @@ def main():
             [str(args.simulator), "native", str(path.with_suffix(".bin"))],
             text=True, capture_output=True, check=True).stdout)
     runs = 0
-    small, full = build(out, 4), build(out, 11)
+    small, full = build(out, 3), build(out, 10)
     for name, ram in fixtures + benches:
         if args.only and args.only not in name:
             continue

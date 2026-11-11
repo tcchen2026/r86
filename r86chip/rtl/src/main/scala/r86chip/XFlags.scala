@@ -21,8 +21,9 @@ object XFlags {
     // even for narrow operands; its bit-32 carry is inverted to obtain borrow.
     val sum = Cat(0.U(1.W), lhs) + Cat(0.U(1.W), Mux(subtract, ~rhs, rhs)) +
       Mux(subtract, !carry, carry).asUInt
-    val result = MuxLookup(kind, sum(31, 0))(Seq(
-      1.U -> (lhs | rhs), 4.U -> (lhs & rhs), 6.U -> (lhs ^ rhs))) & mask
+    val raw = MuxLookup(kind, sum(31, 0))(Seq(
+      1.U -> (lhs | rhs), 4.U -> (lhs & rhs), 6.U -> (lhs ^ rhs)))
+    val result = raw & mask
     def sign(x: UInt): Bool = Mux(lane === 0.U, x(31), Mux(lane === 1.U, x(15), x(7)))
     val rawCarry = Mux(subtract, !sum(32),
       Mux(lane === 0.U, sum(32), Mux(lane === 1.U, sum(16), sum(8))))
@@ -36,9 +37,12 @@ object XFlags {
       (zf.asUInt << 6) | (sf.asUInt << 7) | (of.asUInt << 11)).pad(32)
     // XMERGE uses the same source selection and destination merge, without
     // publishing either flag value. Keep its selection off the flag path.
-    val laneResult = Mux(control(6), rhs, result)
-    val merged = Mux(lane === 3.U,
-      (a & "hffff00ff".U) | (laneResult << 8), (a & ~mask) | laneResult)
+    // Each byte range of the destination takes the result or keeps a.
+    val laneResult = Mux(control(6), rhs, raw)
+    val merged = Cat(
+      Mux(lane === 0.U, laneResult(31, 16), a(31, 16)),
+      Mux(lane === 3.U, laneResult(7, 0), Mux(lane === 2.U, a(15, 8), laneResult(15, 8))),
+      Mux(lane === 3.U, a(7, 0), laneResult(7, 0)))
     (merged, flags)
   }
 

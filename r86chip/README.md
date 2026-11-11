@@ -15,17 +15,17 @@ instruction (`Core::step`); firmware and generated code follow it; Chisel
 implements it. Change the ISS and its tests first. See the Guide below and
 [design/ISA.md](design/ISA.md).
 
-## Status (2026-11-11, ISA identity `0x4231000a`, uncommitted work included)
+## Status (2026-11-11, ISA identity `0x4231000a`)
 
 | Item | State |
 | --- | --- |
 | ISA | RV32IM, Zifencei, Zba, plus x86 status arithmetic, guest memory with segment and page proofs, software-filled mapping and jump tables, guest return stack, instruction budget, two register banks |
-| Core | Five stages, decode-time prediction, branch target buffer; 7,998 logic LUTs with one bank, 8,374 with two (Yosys GW5A mapping) |
-| Caches | Instruction and data, 64 KiB each in block RAM, 788 LUTs; one burst `RamPort` to the RAM back end |
-| Logic depth | 20-21 LUT levels by mapping, with or without caches. **Nothing is placed or routed; there is no clock figure.** |
-| Interpreter firmware on RTL | TinyCore, 1,000,000 x86 steps, equal to the ISS; 1.200 clocks per native word with zero-wait memory, about 92 native words per x86 instruction |
-| Generated code on RTL | Hand-translated loops only: 1.85 to 2.44 clocks per x86 instruction with warm caches and a 24-clock RAM |
-| Translator firmware | **Not yet written for the new words.** `jit/` is the older register-only compiler with a frame-copy ABI ([cost](experiments/JIT_COST.md)); its replacement is specified in [design/TRANSLATOR.md](design/TRANSLATOR.md) |
+| Core | Six stages (fetch, decode, address, memory, execute, write): memory before the full ALU, a small ALU in the address stage, one commit point, replay instead of stall, 1024-row branch prediction table. The caches are stages of the pipeline |
+| Caches | Instruction and data, two-way, 64 KiB each in block RAM, write-back, one burst `RamPort` to the RAM back end. Core (two banks) plus caches: 9,463 logic LUTs (Yosys GW5A mapping) |
+| Logic depth | 17 LUT levels by mapping. **Nothing is placed or routed; there is no clock figure.** |
+| Interpreter firmware on RTL | TinyCore, 2,000,000 x86 steps through the caches with a 24-clock RAM, equal to the ISS. Second million steps: 77.5 native words and 90.2 clocks per x86 instruction |
+| Translated code on RTL | The translator firmware below, 2,000,000 TinyCore steps, equal to the ISS (RAM, guest RAM, retired count). Second million steps: 5.08 native words and 7.9 clocks per x86 instruction (7.0 with a 256 KiB instruction cache). Hand-translated loops: 1.75 to 2.40 |
+| Translator firmware | Rewritten for the translator words: resident guest registers, whole basic blocks, block links, XJT; equal to the host interpreter over 20,000,000 TinyCore steps on the ISS. Steps 3M-4M cost 320 native words per x86 instruction because of a linear lookup in its runtime; see [JIT_COST.md](experiments/JIT_COST.md) |
 | RAM back ends, board top level, devices | Not started |
 
 Open work, ideas and who does what: [`PROFESSOR_JOB_LIST.md`](../PROFESSOR_JOB_LIST.md)
@@ -58,8 +58,8 @@ Open work, ideas and who does what: [`PROFESSOR_JOB_LIST.md`](../PROFESSOR_JOB_L
 | Path | Contents |
 | --- | --- |
 | `sim/` | ISS (`rv32.rs`), flat-RAM fixture runner (`native.rs`), firmware harness (`machine.rs`), behavior tests |
-| `rtl/src/main/scala/r86chip/` | `Core.scala` (pipeline), `XFlags.scala` (x86 status ALU and shifter), `Ea32.scala`, `MulDiv.scala`, `Tables.scala` (block-RAM tables), `Cache.scala` (caches and `System`), `Ram.scala` (`RamPort`) |
-| `rtl/*.v`, `rtl/tests/` | Register file and RAM technology boundaries; `core_tb.sv` (core alone), `system_tb.sv` (core, caches, slow RAM), `machine_tb.cpp` (firmware) |
+| `rtl/src/main/scala/r86chip/` | `Core.scala` (address, memory, execute, write stages), `Front.scala` (fetch and prediction), `Fields.scala` (word classification), `Cache.scala`, `CacheStore.scala`, `CacheSequencer.scala`, `WordAccess.scala` (device and spanning accesses), `System.scala` (core plus caches), `XFlags.scala` (x86 status ALU and shifter), `Ea32.scala`, `MulDiv.scala`, `Tables.scala`, `Ram.scala` (`RamPort`) |
+| `rtl/*.v`, `rtl/tests/` | RAM technology boundaries; `system_tb.sv` (fixtures on core, caches, slow RAM), `system_machine_tb.cpp` (firmware on the same). `core_tb.sv`, `machine_tb.cpp`, `r86_regfile.v` belong to the earlier core and are not used by it |
 | `firmware/`, `interp/`, `jit/` | RV32IM firmware entry, the interpreter's chip primitives, the older translator |
 | `experiments/` | Suites and measurements listed below; outputs under ignored `experiments/out/` |
 | `design/` | Contracts and rationale. `TRANSLATOR.md` and `ISA.md` are current. `RTL.md`, `INTERPRETER.md`, `GUEST_MEMORY.md`, `TLB.md` and `experiments/RTL_NATIVE.md` describe the earlier single-stage core and 16-row table and need updating |
@@ -81,10 +81,10 @@ python3 r86chip/experiments/cache_rtl.py --out OUT/cache --simulator SIM
 | Check | What it establishes |
 | --- | --- |
 | ISS tests (64) | Word semantics, including 169,696 comparisons of the translator words with `Interpreter::step` (`sim/xlate_tests.rs`) |
-| `rtl.py` | Core against an independent Python oracle on bus events, retirement and traps: 215 programs, 1,720 runs (Verilator and Icarus, both bank counts); Yosys structure and GW5A mapping |
-| `xlate_rtl.py` | Translator words, RTL end state against the ISS: 36 fixtures, 144 runs; `--bench` measures hand-translated x86 loops |
-| `cache_rtl.py` | Core, caches and a slow burst RAM against the ISS, including RAM content after write-back: 234 images, 702 runs |
-| [tinycore.py](experiments/tinycore.py) | Firmware on the ISS or the Verilator machine model; see [TINYCORE.md](experiments/TINYCORE.md) |
+| `rtl.py` | Program generators and an independent Python oracle. Its RTL runner builds the earlier core alone and **does not run with the current one**; its programs run through `cache_rtl.py` |
+| `xlate_rtl.py` | Fixtures and hand-translated benchmarks for the translator words. Same limit: its own RTL runner is for the earlier core; the fixtures run through `cache_rtl.py` |
+| `cache_rtl.py` | The RTL check: core, caches and a slow burst RAM against the ISS, including RAM content after write-back: 236 images, 708 runs |
+| [tinycore.py](experiments/tinycore.py) | Firmware on the ISS; see [TINYCORE.md](experiments/TINYCORE.md). Its `--engine rtl` builds the earlier core. Firmware on the current RTL runs with `rtl/tests/system_machine_tb.cpp` on `r86_system` (no wrapper script yet) |
 
 Tools: sbt with Chisel 7.12.0, Verilator, Icarus Verilog, Yosys with
 `synth_gowin -family gw5a`, the `riscv32im-unknown-none-elf` Rust target.
@@ -94,8 +94,9 @@ Tools: sbt with Chisel 7.12.0, Verilator, Icarus Verilog, Yosys with
 - No routed timing, no board run, no RAM back end.
 - No translated x86 code has run on this core; the measured loops were
   translated by hand.
-- The firmware has not been run through the caches. Its text is 830 KB
-  against a 64 KiB instruction cache, so the zero-wait figure is optimistic.
+- Cache behaviour is measured on TinyCore early boot only, where guest RAM
+  is barely touched. `rtl/tests/system_machine_tb.cpp` runs the firmware on
+  core, caches and a slow RAM; no script wraps it yet.
 - Synthesis counts are Yosys mapping results for the listed modules, not
   routed occupancy.
 - 16-bit code is interpreter-only by project rule; at about 110 clocks per

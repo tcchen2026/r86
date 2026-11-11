@@ -27,6 +27,7 @@ module system_tb;
     wire [31:0] io_trap_pc, io_trap_value, io_retire_pc, io_retire_word, io_retire_value;
     wire [3:0] io_trap_cause;
     wire [5:0] io_retire_rd;
+    wire [15:0] io_events;
     r86_system dut (.*);
     reg [7:0] mem [0:BYTES-1];
     reg [1023:0] image_path;
