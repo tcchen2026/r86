@@ -10,12 +10,40 @@ on:
       - src/**
       - Cargo.toml
       - Cargo.lock
+      - build.rs
       - firmware/seabios/**
       - script/build_macos.sh
+      - script/apple_jit_check.py
+      - tests/roms/wasm_jit_lfb.asm
       - .github/workflows/apple.yml
   workflow_dispatch:
 
 jobs:
+  jit:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - name: Native arm64 tools
+        run: |
+          test "$(uname -m)" = arm64
+          rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          brew install nasm
+      # Ordinary cargo executables are not Hardened Runtime apps. MAP_JIT must
+      # work here without app entitlements; the signed app has its own build job.
+      - name: Native JIT and ABI tests
+        run: |
+          cargo test --locked --release --features apple,jit --lib -- \
+            x86::jit::a64::tests x86::jit::compile::tests x86::jit::code:: \
+            jit_data_segment_loads jit_cross_page_calls jit_return_cache \
+            jit_returns_to_zero jit_refills_preserve jit_code_rechecks \
+            jit_stack_read_page --test-threads=1
+      - name: Deterministic boot, JIT against --no-jit
+        run: |
+          cargo build --locked --release --features apple,jit --bin r86-run
+          # Hosted runners are virtual machines; their PMU counters may read zero.
+          # The gate prints them; --require-host-counters is for real Macs.
+          python3 script/apple_jit_check.py target/release/r86-run
+
   build:
     runs-on: macos-26
     steps:

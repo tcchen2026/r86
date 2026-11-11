@@ -11,6 +11,9 @@ extern crate alloc;
 
 pub mod x86;
 
+#[cfg(all(feature = "host", target_vendor = "apple"))]
+mod host_counters;
+
 #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
 pub mod browser;
 

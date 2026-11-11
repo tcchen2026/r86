@@ -1,10 +1,13 @@
 //! AArch64 code publication, packing and bounded entry-table ownership.
 //! The Linux mapping owner publishes through an RW/NX alias and executes
 //! through a distinct RO/RX alias, with no live writes.
+//! macOS uses one MAP_JIT address with per-thread write/execute protection.
+//! Its write/invoke/drop gates require the creating core thread in release
+//! builds too. Mutable entry borrows must end before invoking any arena on that
+//! thread; Apple applies permission changes to all its MAP_JIT mappings.
 //!
 //! Publish and reclaim only outside native execution. Linux uses one private
-//! memfd. Neither
-//! code alias is RWX. Every arena starts empty, and generated code is compiled
+//! memfd; neither Linux code alias is RWX. Every arena starts empty, and generated code is compiled
 //! in the current execution and never restored from a file. Optional Linux
 //! dumps are for offline analysis only, with no generated-code loading path.
 //! This is not physical-page write/execute exclusion: the aliases share backing.
@@ -17,7 +20,7 @@
 //! RW slices. Clear retires all page/table indices before reusing either area;
 //! the extra metadata mapping reserves address space, committing tables on use.
 //!
-//! The alias addresses can differ: clean D-cache by the writer address, invalidate
+//! On Linux the alias addresses can differ: clean D-cache by the writer address, invalidate
 //! I-cache by the execution address, then publish an RX entry. This avoids two
 //! mprotect calls for each of hundreds of thousands of small cold-boot blocks.
 //! Consulted FEX SharedCodeBufferManager.cpp and JIT.cpp for buffer/publication
@@ -27,12 +30,15 @@ use super::frame::Frame;
 use alloc::rc::Rc;
 use core::marker::PhantomData;
 use core::mem::size_of;
-#[cfg(target_os = "linux")]
 use std::io;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
 use linux::Mapping;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+use macos::{Mapping, synchronize_instructions};
 
 pub(super) const ENTRY_TABLES: usize = 4096;
 type EntryWords = [u32; super::links::PAGE_BYTES];
@@ -43,6 +49,10 @@ pub(super) fn cache_limits() -> (usize, usize) {
         .ok()
         .is_some_and(|info| small_host(&info))
     {
+        return (32 * 1024 * 1024, 1024);
+    }
+    #[cfg(target_os = "macos")]
+    if macos::small_host() {
         return (32 * 1024 * 1024, 1024);
     }
     (128 * 1024 * 1024, ENTRY_TABLES)
@@ -83,7 +93,6 @@ impl CodeHandle {
 
 #[derive(Debug)]
 pub enum CodeError {
-    #[cfg(target_os = "linux")]
     Os(io::Error),
     Capacity,
     Empty,
@@ -170,6 +179,8 @@ impl CodeArena {
     }
 
     pub(super) fn entries_mut(&mut self, index: TableIndex) -> &mut EntryWords {
+        #[cfg(target_os = "macos")]
+        self.mapping.write();
         let offset = self.entries_start + usize::from(index.0) * size_of::<EntryWords>();
         // SAFETY: same bounds as entries(), with exclusive ownership. No native
         // invocation or other table borrow exists during a mutation.
@@ -219,6 +230,8 @@ impl CodeArena {
     }
 
     pub fn publish(&mut self, words: &[u32]) -> Result<CodeHandle, CodeError> {
+        #[cfg(target_os = "macos")]
+        self.mapping.write();
         if words.is_empty() {
             return Err(CodeError::Empty);
         }
@@ -256,6 +269,8 @@ impl CodeArena {
         &mut self,
         code: &mut super::compile::CompiledBlock,
     ) -> Result<CodeHandle, CodeError> {
+        #[cfg(target_os = "macos")]
+        self.mapping.write();
         let hot_len = code.cold_word * 4;
         let cold_len = (code.words.len() - code.cold_word) * 4;
         let bytes = hot_len + cold_len;
@@ -312,6 +327,8 @@ impl CodeArena {
     }
 
     pub fn clear(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.mapping.write();
         // Links and native stacks must already be gone. Epochs reject old
         // handles; subsequent publication replaces the bytes and synchronizes
         // both aliases before the same virtual addresses can be called again.
@@ -329,6 +346,8 @@ impl CodeArena {
     /// addresses must belong to current published code; the page owner proves
     /// that source and target share validity and discards both on invalidation.
     pub fn patch_branch(&mut self, source: usize, target: usize) -> bool {
+        #[cfg(target_os = "macos")]
+        self.mapping.write();
         let offset = |address: usize| {
             address
                 .checked_sub(self.mapping.base.as_ptr() as usize)
@@ -364,6 +383,8 @@ impl CodeArena {
     /// arena. Publication checks bytes/capacity, not the semantics of native code.
     pub unsafe fn invoke(&self, handle: CodeHandle, frame: &mut Frame) -> Result<(), CodeError> {
         let address = self.address(handle, 0)?;
+        #[cfg(target_os = "macos")]
+        self.enter_execute();
         // SAFETY: checked handle lies inside published RX bytes. The caller
         // establishes that the entry has this exact ABI and code behavior.
         unsafe {
@@ -371,6 +392,16 @@ impl CodeArena {
             entry(frame);
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn enter_execute(&self) {
+        self.mapping.execute();
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn protection_report(&self) -> String {
+        self.mapping.report()
     }
 
     /// Address of an instruction in a published block, valid only until the next
@@ -444,6 +475,7 @@ mod tests {
 /// operations, but publication still orders stores and synchronizes execution.
 /// Consulted LLVM compiler-rt's clear_cache.c and Linux arm64/mm/cache.S for
 /// those feature bits; RW and RX aliases require their distinct addresses here.
+#[cfg(target_os = "linux")]
 unsafe fn synchronize_instructions(
     writer: *mut u8,
     executable: *const u8,

@@ -49,7 +49,7 @@ use alloc::{
 };
 use core::fmt::Write as _;
 
-/// Frontends enable the JIT by default only on ARM64 Linux; ARMv6K
+/// Frontends enable the JIT by default on ARM64 Linux and macOS; ARMv6K
 /// builds select it explicitly.
 pub const DEFAULT_JIT: bool = cfg!(a64_jit);
 const GUEST_PAGE_SIZE: usize = 4096;
@@ -972,7 +972,7 @@ impl Machine {
         #[cfg(not(any(a64_jit, all(feature = "jit", target_arch = "arm"))))]
         if enabled {
             Err(
-                "the JIT engine requires an ARM64 Linux or 32-bit ARM build with --features jit"
+                "the JIT engine requires an ARM64 Linux/macOS or 32-bit ARM build with --features jit"
                     .into(),
             )
         } else {
@@ -1266,7 +1266,10 @@ impl Machine {
     }
 
     pub fn trace_report(&self) -> String {
-        self.trace.report()
+        let report = self.trace.report();
+        #[cfg(all(feature = "host", target_vendor = "apple"))]
+        let report = report + &crate::host_counters::report(self.step);
+        report
     }
 
     pub fn perf_report(&self) -> Option<String> {

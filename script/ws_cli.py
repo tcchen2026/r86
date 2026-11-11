@@ -134,8 +134,12 @@ This policy does not suppress CPU exceptions or recover from device errors.
 failure snapshots: complete CPU state, device status, stop/error cause, VGA text,
 VGA register state (``vga_dump``, excluding VRAM),
 last 16 KiB of serial, the configured instruction trace and a ``jit`` report
-(empty if disabled), including native execution counts. With the interpreter,
-use --minimal-ring or --debug-ring at startup to retain execution history;
+(empty if disabled), including native execution counts.
+Apple builds append process-wide host instructions/cycles and guest steps to
+the trace text; zero counters mean unavailable (for example, a virtualized host).
+The macOS JIT report also includes write/execute permission transitions and their
+rate since arena creation. These counters are sampled only for diagnostics.
+With the interpreter, use --minimal-ring or --debug-ring at startup to retain execution history;
 the ARM64 JIT rejects those tracing modes. All execution commands
 use this failure path, independently of guest OS or installation stage. Invalid
 commands are reported as command errors, not guest crashes. An OS blue screen

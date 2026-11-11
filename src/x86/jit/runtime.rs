@@ -43,7 +43,6 @@ use crate::x86::{
 };
 use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use core::hash::{BuildHasherDefault, Hasher};
-#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 
 /// This bounded map hashes two addresses and segment facts, comparing the full
@@ -517,6 +516,8 @@ impl Engine {
             self.arena.capacity(),
             self.arena.table_capacity(),
         );
+        #[cfg(target_os = "macos")]
+        let result = result + &self.arena.protection_report();
         #[cfg(feature = "jit-profile")]
         {
             let mut ranked: Vec<_> = self

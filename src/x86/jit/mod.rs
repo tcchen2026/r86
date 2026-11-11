@@ -11,8 +11,10 @@
 //!
 //! The primary native target is AArch64. Instruction selection, flags, register
 //! allocation and calling conventions can use its properties directly. The
-//! emitter and architectural exit records use core/alloc; Linux executable
-//! mappings belong to the host adapter. [`arm32`] is a separate, smaller ARMv6K
+//! emitter and architectural exit records use core/alloc; Linux/macOS executable
+//! mappings belong to the host adapter. `a64_jit` selects host+jit on these two
+//! AArch64 targets only; iOS/watchOS remain interpreter-only.
+//! [`arm32`] is a separate, smaller ARMv6K
 //! backend for the 3DS that shares decoding, flag liveness and code validity.
 //!
 //! Cpu remains the persistent state owner. An invocation exclusively borrows it

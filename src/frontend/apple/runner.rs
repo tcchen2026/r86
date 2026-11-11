@@ -92,16 +92,6 @@ impl Running {
         if !r86::machine::DEFAULT_JIT || std::env::args().any(|arg| arg == "--no-jit") {
             vm.engine = "interp".into();
         }
-        let mut machine = vm.machine(&firmware, "vgabios-stdvga.bin")?;
-        let network = if vm.network {
-            machine.attach_network();
-            Some(UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
-        } else {
-            None
-        };
-        if vm.volume > 0 {
-            machine.enable_audio();
-        }
         let shared = Arc::new(Shared {
             input: Mutex::default(),
             wake: Condvar::new(),
@@ -113,20 +103,56 @@ impl Running {
                 messages: VecDeque::new(),
             }),
         });
-        let core = Core {
-            vm,
-            machine,
-            network,
-            shared: shared.clone(),
-            paused: false,
-            buttons: Ps2ButtonState::default(),
-            held: Vec::new(),
-            samples: Vec::new(),
-        };
+        let thread_shared = shared.clone();
+        let (ready, started) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("r86 core".into())
-            .spawn(move || core.run(lock_file))
+            .spawn(move || {
+                // MAP_JIT ownership starts here, including partial startup
+                // failures. Machine/Engine never move between app/core threads.
+                let core = (|| -> Result<Core, String> {
+                    let mut machine = vm.machine(&firmware, "vgabios-stdvga.bin")?;
+                    let network = if vm.network {
+                        machine.attach_network();
+                        Some(UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
+                    } else {
+                        None
+                    };
+                    if vm.volume > 0 {
+                        machine.enable_audio();
+                    }
+                    Ok(Core {
+                        vm,
+                        machine,
+                        network,
+                        shared: thread_shared,
+                        paused: false,
+                        buttons: Ps2ButtonState::default(),
+                        held: Vec::new(),
+                        samples: Vec::new(),
+                    })
+                })();
+                match core {
+                    Ok(core) => {
+                        if ready.send(Ok(())).is_ok() {
+                            core.run(lock_file);
+                        }
+                    }
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                    }
+                }
+            })
             .map_err(|err| format!("Cannot start the VM thread: {err}"))?;
+        // Preserve synchronous launch errors without constructing native state
+        // on the app thread. Stop/reset/media commands already use Shared.input.
+        if let Err(error) = started
+            .recv()
+            .unwrap_or_else(|_| Err("VM thread failed during startup".into()))
+        {
+            let _ = thread.join();
+            return Err(error);
+        }
         Ok(Self {
             shared,
             thread: Some(thread),
