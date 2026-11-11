@@ -3823,6 +3823,11 @@ impl Bus for HostBus {
     }
 
     #[inline(always)]
+    fn batch_interrupts_quiet(&self) -> bool {
+        !self.attention && self.pic.pending_irq().is_none()
+    }
+
+    #[inline(always)]
     fn read_phys_u8(&mut self, addr: PhysAddr) -> Result<u8, MemError> {
         let addr = self.cpu_phys_addr(addr);
         if let Some(value) = self.vga.memory_read(addr.0, 1) {
@@ -7026,16 +7031,19 @@ mod host_bus_tests {
                                     cpu.restore_interrupt_shadow(false);
                                 }
                                 let interpreted = engine.stats.interpreted_steps;
-                                // A shadow must force attention even when its
-                                // next instruction is CLI, with a larger caller
-                                // budget. A one-step caller keeps its own limit.
-                                let following_budget = if round % 2 != 0 && initial & 0x200 == 0 {
+                                // End at STI to retain its shadow, then check
+                                // expiry with both exact and larger budgets.
+                                let following_budget = if round % 2 != 0
+                                    && u32::from(cpl) <= iopl
+                                    && initial & 0x200 == 0
+                                {
                                     101
                                 } else {
+                                    // Virtual STI sets VIF without a shadow;
+                                    // cold JIT exits need not match a full batch.
                                     1
                                 };
-                                for (phase, budget) in
-                                    [101, following_budget].into_iter().enumerate()
+                                for (phase, budget) in [2, following_budget].into_iter().enumerate()
                                 {
                                     let reference = Interpreter::run_batch(
                                         &mut expected,
@@ -12772,38 +12780,231 @@ mod host_bus_tests {
         for prefix in [&[0xfb][..], &[0x8e, 0xd0][..], &[0x17][..]] {
             for trace in [TraceMode::Off, TraceMode::Minimal] {
                 for perf in [PerfMode::Disabled, PerfMode::Enabled] {
-                    let mut bus = HostBus::new(0x4000);
-                    let mut cpu = Cpu::new();
-                    cpu.eip = 0x1000;
-                    cpu.set_reg(Reg32::Esp, 0x2000);
-                    if prefix != [0xfb] {
-                        cpu.eflags |= EFLAGS_IF;
+                    for shadow_budget in [1, 2] {
+                        let mut bus = HostBus::new(0x4000);
+                        let mut cpu = Cpu::new();
+                        cpu.eip = 0x1000;
+                        cpu.set_reg(Reg32::Esp, 0x2000);
+                        if prefix != [0xfb] {
+                            cpu.eflags |= EFLAGS_IF;
+                        }
+                        cpu.idtr.limit = 0x03ff;
+                        bus.ram[0x1000..0x1000 + prefix.len()].copy_from_slice(prefix);
+                        bus.ram[0x1000 + prefix.len()..0x1002 + prefix.len()]
+                            .copy_from_slice(&[0x43, 0x41]); // inc bx; inc cx
+                        bus.ram[0x0080..0x0084].copy_from_slice(&[0x00, 0x30, 0x00, 0x00]);
+                        bus.ram[0x3000] = 0xf4; // IRQ handler: hlt
+                        bus.io_write_u8(0x21, 0xfe).unwrap();
+                        bus.pic.pulse(0);
+                        // The PIC is already latched; no bus attention is needed
+                        // to find it when the shadow expires.
+                        bus.refresh_interrupt_attention(0);
+                        let mut m = Machine::from_parts(cpu, bus, trace, perf);
+                        assert_eq!(m.run_steps(1).unwrap().ran, 1);
+                        assert!(m.cpu.interrupt_shadow());
+                        assert_eq!(m.cpu.eip, 0x1000 + prefix.len() as u32);
+                        assert_eq!(m.run_steps(shadow_budget).unwrap().ran, shadow_budget);
+                        if shadow_budget == 1 {
+                            assert_eq!(m.cpu.eip, 0x3000);
+                            assert_eq!(m.cpu.tsc(), 2);
+                            assert!(!m.cpu.halted);
+                            assert_eq!(m.run_steps(1).unwrap().ran, 1);
+                        }
+                        assert_eq!(m.cpu.eip, 0x3001);
+                        assert!(m.cpu.halted);
+                        assert_eq!(m.cpu.reg(Reg32::Ebx), 1);
+                        assert_eq!(m.cpu.reg(Reg32::Ecx), 0);
+                        let sp = m.cpu.reg(Reg32::Esp) as usize;
+                        let return_ip =
+                            u16::from_le_bytes(m.bus.ram[sp..sp + 2].try_into().unwrap());
+                        assert_eq!(return_ip, 0x1001 + prefix.len() as u16);
+                        assert_eq!(m.cpu.tsc(), 3);
+                        assert_eq!(m.bus.pic.pending_irq(), None);
                     }
-                    cpu.idtr.limit = 0x03ff;
-                    bus.ram[0x1000..0x1000 + prefix.len()].copy_from_slice(prefix);
-                    bus.ram[0x1000 + prefix.len()..0x1002 + prefix.len()]
-                        .copy_from_slice(&[0x43, 0x41]); // inc bx; inc cx
-                    bus.ram[0x0080..0x0084].copy_from_slice(&[0x00, 0x30, 0x00, 0x00]);
-                    bus.ram[0x3000] = 0xf4; // IRQ handler: hlt
-                    bus.io_write_u8(0x21, 0xfe).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_shadow_runs_the_following_instruction_in_the_same_batch() {
+        for prefix in [&[0xfb][..], &[0x8e, 0xd0][..], &[0x17][..]] {
+            for following in [&[0x90, 0x43][..], &[0xf4], &[0xe6, 0x80], &[0x0f, 0xff]] {
+                let mut cpu = Cpu::new();
+                cpu.eip = 0x1000;
+                cpu.set_reg(Reg32::Esp, 0x3000);
+                if prefix != [0xfb] {
+                    cpu.eflags |= EFLAGS_IF;
+                }
+                let mut bus = HostBus::new(0x4000);
+                bus.attention = false;
+                bus.next_attention_step = u64::MAX;
+                bus.ram[0x1000..0x1000 + prefix.len()].copy_from_slice(prefix);
+                bus.ram[0x1000 + prefix.len()..0x1000 + prefix.len() + following.len()]
+                    .copy_from_slice(following);
+                let batch = Interpreter::run_batch(&mut cpu, &mut bus, 0, 3);
+                let ran = if following[0] == 0x90 { 3 } else { 2 };
+                assert_eq!(batch.ran, ran);
+                assert_eq!(cpu.tsc(), ran);
+                assert!(!cpu.interrupt_shadow());
+                match following[0] {
+                    0x90 => {
+                        assert_eq!(batch.stop, BatchStop::Budget);
+                        assert_eq!(cpu.reg(Reg32::Ebx), 1);
+                    }
+                    0xf4 => assert!(matches!(
+                        batch.stop,
+                        BatchStop::Step {
+                            instruction_step: 1,
+                            reason: BatchStepStop::Halted,
+                            ..
+                        }
+                    )),
+                    0xe6 => assert!(matches!(
+                        batch.stop,
+                        BatchStop::Attention {
+                            instruction_step: 1,
+                            ..
+                        }
+                    )),
+                    _ => assert!(matches!(batch.stop, BatchStop::Step {
+                        instruction_step: 1, instruction_eip, reason: BatchStepStop::Error(_), ..
+                    } if instruction_eip == 0x1000 + prefix.len() as u32)),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_stays_visible_when_the_next_instruction_cannot_run_quietly() {
+        for prefix in [&[0xfb][..], &[0x8e, 0xd0][..], &[0x17][..]] {
+            // Short caller budget, due event, unserviced bus change, pending PIC.
+            for guard in 0..4 {
+                let mut cpu = Cpu::new();
+                cpu.eip = 0x1000;
+                cpu.set_reg(Reg32::Esp, 0x3000);
+                if prefix != [0xfb] {
+                    cpu.eflags |= EFLAGS_IF;
+                }
+                let mut bus = HostBus::new(0x4000);
+                bus.ram[0x1000..0x1000 + prefix.len()].copy_from_slice(prefix);
+                bus.ram[0x1000 + prefix.len()] = 0x43;
+                bus.io_write_u8(0x21, 0xfe).unwrap();
+                if guard == 3 {
                     bus.pic.pulse(0);
-                    // The PIC is already latched; no bus attention is needed
-                    // to find it when the shadow expires.
-                    bus.refresh_interrupt_attention(0);
-                    let mut m = Machine::from_parts(cpu, bus, trace, perf);
-                    assert_eq!(m.run_steps(1).unwrap().ran, 1);
-                    assert!(m.cpu.interrupt_shadow());
-                    assert_eq!(m.cpu.eip, 0x1000 + prefix.len() as u32);
-                    assert_eq!(m.run_steps(2).unwrap().ran, 2);
-                    assert_eq!(m.cpu.eip, 0x3001);
-                    assert!(m.cpu.halted);
-                    assert_eq!(m.cpu.reg(Reg32::Ebx), 1);
-                    assert_eq!(m.cpu.reg(Reg32::Ecx), 0);
-                    let sp = m.cpu.reg(Reg32::Esp) as usize;
-                    let return_ip = u16::from_le_bytes(m.bus.ram[sp..sp + 2].try_into().unwrap());
-                    assert_eq!(return_ip, 0x1001 + prefix.len() as u16);
-                    assert_eq!(m.cpu.tsc(), 3);
-                    assert_eq!(m.bus.pic.pending_irq(), None);
+                }
+                bus.attention = guard == 2;
+                bus.next_attention_step = if guard == 1 { 0 } else { u64::MAX };
+                let budget = if guard == 0 { 1 } else { 3 };
+                let batch = Interpreter::run_batch(&mut cpu, &mut bus, 0, budget);
+                assert_eq!(batch.ran, 1);
+                assert!(matches!(
+                    batch.stop,
+                    BatchStop::Attention {
+                        instruction_step: 0,
+                        ..
+                    }
+                ));
+                assert!(cpu.interrupt_shadow());
+                assert_eq!(cpu.reg(Reg32::Ebx), 0);
+                assert_eq!(cpu.tsc(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn quiet_sti_delivers_a_timer_irq_after_the_shadowed_instruction() {
+        let mut cpu = Cpu::new();
+        cpu.eip = 0x1000;
+        cpu.set_reg(Reg32::Esp, 0x3000);
+        cpu.idtr.limit = 0x03ff;
+        let mut bus = HostBus::new(0x4000);
+        bus.ram[0x1000..0x1003].copy_from_slice(&[0xfb, 0x43, 0x41]); // sti; inc bx; inc cx
+        bus.ram[0x80..0x84].copy_from_slice(&[0, 0x20, 0, 0]);
+        bus.ram[0x2000] = 0xf4;
+        bus.io_write_u8(0x21, 0xfe).unwrap();
+        bus.io_write_u8(0x43, 0x10).unwrap();
+        bus.io_write_u8(0x40, 3).unwrap();
+        bus.refresh_interrupt_attention(0);
+        let start = bus.next_attention_step - 1;
+        assert!(bus.batch_interrupts_quiet());
+        cpu.set_tsc(start);
+        let mut m = Machine::from_parts(cpu, bus, TraceMode::Off, PerfMode::Disabled);
+        m.step = start;
+        assert_eq!(m.run_steps(3).unwrap().ran, 3);
+        assert_eq!(m.cpu.eip, 0x2001);
+        assert!(m.cpu.halted);
+        assert_eq!(m.cpu.reg(Reg32::Ebx), 1);
+        assert_eq!(m.cpu.reg(Reg32::Ecx), 0);
+        let sp = m.cpu.reg(Reg32::Esp) as usize;
+        assert_eq!(&m.bus.ram[sp..sp + 2], &[0x02, 0x10]);
+        assert_eq!(m.cpu.tsc(), start + 3);
+    }
+
+    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[test]
+    fn jit_quiet_sti_continues_to_normal_halt_io_and_fault_boundaries() {
+        for following in [&[0x90, 0x43][..], &[0xf4], &[0xe6, 0x80], &[0x0f, 0xff]] {
+            let mut bus = HostBus::new(0x10000);
+            bus.ram[0x1000] = 0xfb;
+            bus.ram[0x1001..0x1001 + following.len()].copy_from_slice(following);
+            let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+            for round in 0..6 {
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1000, 0x8000);
+                bus.attention = false;
+                bus.next_attention_step = u64::MAX;
+                let native_before = engine.stats.native_steps;
+                let expected = if following[0] == 0x90 { 3 } else { 2 };
+                let mut ran = 0;
+                let mut calls = 0;
+                let batch = loop {
+                    let batch = engine.run_batch(&mut cpu, &mut bus, ran, 3 - ran).unwrap();
+                    ran += batch.ran;
+                    calls += 1;
+                    if ran == expected {
+                        break batch;
+                    }
+                    // Cold interpretation can retain STI and shadow-expiry
+                    // exits; the compiled path below must stay in one call.
+                    assert!(matches!(batch.stop, BatchStop::Attention { .. }));
+                    assert_eq!(cpu.interrupt_shadow(), ran == 1);
+                };
+                assert_eq!(cpu.tsc(), expected);
+                assert!(!cpu.interrupt_shadow());
+                match following[0] {
+                    0x90 => {
+                        assert_eq!(batch.stop, BatchStop::Budget);
+                        assert_eq!(cpu.reg(Reg32::Ebx), 1);
+                    }
+                    0xf4 => assert!(matches!(
+                        batch.stop,
+                        BatchStop::Step {
+                            instruction_step: 1,
+                            reason: BatchStepStop::Halted,
+                            ..
+                        }
+                    )),
+                    0xe6 => assert!(matches!(
+                        batch.stop,
+                        BatchStop::Attention {
+                            instruction_step: 1,
+                            ..
+                        }
+                    )),
+                    _ => assert!(matches!(
+                        batch.stop,
+                        BatchStop::Step {
+                            instruction_step: 1,
+                            instruction_eip: 0x1001,
+                            reason: BatchStepStop::Error(_),
+                            ..
+                        }
+                    )),
+                }
+                if round == 5 {
+                    assert_eq!(calls, 1);
+                    assert!(engine.stats.native_steps > native_before);
                 }
             }
         }

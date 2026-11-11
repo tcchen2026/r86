@@ -679,14 +679,24 @@ impl Interpreter {
         )
     ))]
     pub(crate) fn run_one<B: Bus>(cpu: &mut Cpu, bus: &mut B, start_step: u64) -> BatchResult {
-        Self::run_counted_batch::<B, true>(
+        let shadowed = cpu.interrupt_shadow();
+        let mut result = Self::run_counted_batch::<B, true>(
             cpu,
             bus,
             start_step,
             1,
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             None,
-        )
+        );
+        // Keep this single-step boundary outside the large instruction kernel.
+        // An exact budget still has to expose the newly deliverable PIC request.
+        if shadowed && matches!(result.stop, BatchStop::Budget) {
+            result.stop = BatchStop::Attention {
+                instruction_step: start_step,
+                was_interruptible: false,
+            };
+        }
+        result
     }
 
     /// Completion diagnostics are observed when execution returns to a caller.
@@ -807,7 +817,7 @@ impl Interpreter {
         }
         let attention_plan = bus.batch_attention_limit(start_step, budget);
         let (mut loop_budget, mut attention_at_limit) = attention_plan.unwrap_or((budget, false));
-        if cpu.interrupt_shadow() && loop_budget > 1 {
+        if !SINGLE && cpu.interrupt_shadow() && loop_budget != 0 {
             loop_budget = 1;
             attention_at_limit = true;
         }
@@ -926,7 +936,9 @@ impl Interpreter {
                     0xfa => step_try!(cli(cpu, start_eip)),
                     0xfb => {
                         step_try!(sti(cpu, start_eip));
-                        stop!(BatchStepStop::Attention);
+                        if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1) {
+                            stop!(BatchStepStop::Attention);
+                        }
                     }
                     0xf8 => cpu.set_flag(EFLAGS_CF, false),
                     0xf9 => cpu.set_flag(EFLAGS_CF, true),
@@ -967,7 +979,10 @@ impl Interpreter {
                         step_try!(pop_segment(cpu, bus, seg, operand16, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
-                            stop!(BatchStepStop::Attention);
+                            if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
+                            {
+                                stop!(BatchStepStop::Attention);
+                            }
                         }
                     }
                     0x58..=0x5f => {
@@ -1861,7 +1876,10 @@ impl Interpreter {
                         step_try!(load_segment(cpu, bus, seg, selector, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
-                            stop!(BatchStepStop::Attention);
+                            if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
+                            {
+                                stop!(BatchStepStop::Attention);
+                            }
                         }
                     }
                     0x8f => {
@@ -9726,6 +9744,22 @@ fn cli(cpu: &mut Cpu, eip: u32) -> Result<(), StepError> {
     }
     cpu.set_flag(EFLAGS_IF, false);
     Ok(())
+}
+
+/// Elide only an unobservable shadow: the following instruction must execute
+/// before this batch can yield. I/O, faults and HLT may end that instruction;
+/// device deadlines and a latched PIC request keep the ordinary shadow path.
+#[inline(never)]
+pub(crate) fn continue_after_interrupt_shadow<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &B,
+    next_fits: bool,
+) -> bool {
+    if !next_fits || !bus.batch_interrupts_quiet() {
+        return false;
+    }
+    cpu.restore_interrupt_shadow(false);
+    true
 }
 
 fn sti(cpu: &mut Cpu, eip: u32) -> Result<(), StepError> {

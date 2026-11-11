@@ -15,11 +15,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
 ## P1: large speed cost, or ordinary guests hit it
 
-- perf: the interpreter ends its batch after every far CALL/JMP, IRET,
-  IN/OUT, INS/OUTS, STI and SS load. STI and its one-instruction shadow
-  cause 98.9% of these returns (36M per 400M instructions of a real-mode
-  DOS game boot); each return costs about 27 ns of batch exit and re-entry
-  on the RPi 5 interpreter, about 12% of its CPU (`run_batch_inner`).
 - device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
   upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
   DA000-E7FFF through PAM, which r86 now enforces
@@ -44,12 +39,14 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   (`host` enables `bus-instruction-context`); cost not measured.
 - perf: every port write outside USB, sound and the NIC raises attention,
   making the next batch one instruction long.
+- perf: the interpreter ends its batch after every far CALL/JMP, IRET,
+  IN/OUT and INS/OUTS (STI and SS loads only when an IRQ is pending, a
+  device is due or the batch ends). Per 1M instructions: 24K returns in a
+  real-mode DOS game (far CALL/JMP 12K, IRET 6K), 32K in Floppy Bird (port
+  I/O 22K, IRET 5K); at about 27 ns each, about 3% of RPi 5 interpreter
+  CPU (`run_batch_inner`).
 - cpu: an instruction longer than 15 bytes with fewer than 15 prefixes
   executes instead of raising #GP(0).
-- cpu: when a batch's budget ends exactly where an STI or SS-load shadow
-  expires, the batch returns without polling, so a pending IRQ waits for
-  the next attention-causing instruction or device event
-  (`run_batch_inner` attention_at_limit, src/x86/interp.rs).
 - cpu: INT3 and INTO in virtual-8086 mode with IOPL < 3 raise #GP. [?]
 - cpu: byte and word read-modify-write instructions report a read page
   fault where a write fault is due; zero-count shifts skip the write

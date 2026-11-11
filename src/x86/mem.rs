@@ -357,6 +357,13 @@ pub trait Bus {
         false
     }
 
+    /// No pending interrupt or unserviced device change can become visible
+    /// before the current batch's attention limit. Buses without that bound
+    /// must retain interrupt-shadow exits.
+    fn batch_interrupts_quiet(&self) -> bool {
+        false
+    }
+
     fn read_phys_u8(&mut self, addr: PhysAddr) -> Result<u8, MemError>;
 
     fn read_phys_u16(&mut self, addr: PhysAddr) -> Result<u16, MemError> {

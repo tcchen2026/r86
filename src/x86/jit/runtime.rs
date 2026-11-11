@@ -1022,7 +1022,7 @@ impl Engine {
             let plan = bus.batch_attention_limit(start.wrapping_add(ran), budget - ran);
             let (limit, attention) = plan.unwrap_or((1, false));
             let native_limit = if shadowed { 1 } else { limit };
-            let native_attention = attention || (shadowed && limit > 1);
+            let native_attention = attention || shadowed;
             if eligible {
                 if let Some(NativeBlock { body }) = self
                     .lookup(cpu, bus)?
@@ -1118,6 +1118,13 @@ impl Engine {
                         // inhibition before Machine can inspect pending IRQs.
                         if frame.exit_kind == 6 {
                             cpu.inhibit_maskable_interrupts();
+                            if crate::x86::interp::continue_after_interrupt_shadow(
+                                cpu,
+                                bus,
+                                frame.completed < native_limit,
+                            ) {
+                                continue;
+                            }
                         }
                         return Ok(BatchResult {
                             ran,
@@ -1223,14 +1230,14 @@ impl Engine {
             } else if cpu.interrupt_shadow() {
                 // The ordinary batch truncates this state to one instruction.
                 // Reuse its single-instruction kernel, retaining the forced
-                // attention when shadow expiry shortened the caller's plan.
+                // attention at shadow expiry, including an exact caller limit.
                 // This also applies when the instruction clears IF; faults,
                 // halt and explicit attention keep their own precise result.
                 Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
             } else {
                 Interpreter::run_batch(cpu, bus, start.wrapping_add(ran), budget - ran)
             };
-            if shadowed && limit > 1 && matches!(batch.stop, BatchStop::Budget) {
+            if shadowed && matches!(batch.stop, BatchStop::Budget) {
                 batch.stop = BatchStop::Attention {
                     instruction_step: start.wrapping_add(ran),
                     was_interruptible: false,
