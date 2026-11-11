@@ -24,9 +24,10 @@ Installation follows the FreeDOS installer on the same media:
     (BIN\\COMMAND.COM equals the installer's English CMD-EN.COM). Both files
     retain the release bytes, including the kernel's default configuration.
   - Common startup settings are HIMEMX, DOS=HIGH,NOUMB and FILES=30; all
-    profiles report DOS 7.10. Win31 uses HIMEMX /METHOD:FAST and DOS=LOW,NOUMB.
-    Its INI step sets InDOSPolling and comments WfW's protected
-    file/cache/share drivers when present. Its RUN path loads SHARE immediately
+    profiles report DOS 7.10. Win31 and Win98 use HIMEMX /METHOD:FAST and
+    DOS=LOW,NOUMB for DOSX. Win98 skips Setup's false minimum-hardware failure
+    under FreeDOS with /NM. Win31's INI step sets InDOSPolling and comments WfW's
+    protected file/cache/share drivers when present. Its RUN path loads SHARE immediately
     before WIN; Setup remains separate. SHARE also has an on-demand helper.
     Mouse and CD-ROM drivers load on demand; setup loads CD-ROM as D:.
     The FreeDOS menu also offers JEMMEX and Windows 3.1 setup entries. The latter
@@ -841,6 +842,14 @@ s~^[ \t]*(DISK[0-9]+)\r?$~CALL C:\\R86\\COPYDISK.BAT D:\\\1~Ip
 def configure_win9x_setup(tree, directory, title):
     """Run the user's CD setup once and leave subsequent boot changes to it."""
     config = FDCONFIG.replace(" /E:1024 /P=", " /E:1024 /F /P=")
+    switches = "/IS /IQ"
+    if directory == "WIN98":
+        # DOSX needs switchable A20 with no DOS HMA allocation.
+        config = config.replace("HIMEMX.EXE\n", "HIMEMX.EXE /METHOD:FAST\n")
+        config = config.replace("DOS=HIGH,NOUMB\n", "DOS=LOW,NOUMB\n")
+        # FreeDOS triggers a false <16 MiB result, also reproduced in QEMU.
+        # /NM skips the CPU, memory and FPU minimum check (Microsoft KB189670).
+        switches += " /NM"
     tree.add("FDCONFIG.SYS", dos_text(config))
     startup = DOS_STARTUP.replace("@ECHO OFF\n", "")
     tree.add("AUTOEXEC.BAT", dos_text(r"""
@@ -870,7 +879,7 @@ ECHO Starting {title} setup from D:%R86SETUP%
 IF NOT EXIST C:\R86\SETUP.OK GOTO STATEFAIL
 D:
 CD %R86SETUP%
-SETUP /IS /IQ
+SETUP {switches}
 GOTO END
 :NOMEDIA
 ECHO No {title} SETUP.EXE was found on D: or D:\{directory}.
@@ -886,7 +895,7 @@ SET R86SETUP=
     note = ("ECHO Windows ME may need a disk larger than 512 MiB. Setup checks free space.\n"
             if directory == "WIN9X" else "")
     tree.add("R86/SETUP.BAT", dos_text(script.format(
-        directory=directory, title=title, space_note=note)))
+        directory=directory, title=title, space_note=note, switches=switches)))
 
 
 def write_tree(tree, destination):
@@ -1166,6 +1175,10 @@ REM Bundled SeaBIOS/VGA: fixed frame below DA000; scan shadow RAM for UMBs.
                 "playing_menu": "FreeDOS profile only: default 1 (HIMEMX), 2-second delay; "
                                 "optional 2 (JEMMEX with EMS and UMB), "
                                 "3 (switchable HIMEMX, DOS=LOW and SHARE; DOS prompt).",
+                "win98_setup": "HIMEMX /METHOD:FAST; DOS=LOW,NOUMB for DOSX. "
+                               "SETUP /IS /IQ /NM skips the false minimum-hardware failure "
+                               "under FreeDOS; /NM bypasses CPU, memory and FPU checks "
+                               "(Microsoft KB189670).",
                 "ems_firmware_limit": "The optional CA00-D9FF frame is for the bundled "
                                       "SeaBIOS with stdvga or handheld VGA ROM layouts. "
                                       "S=DA00-EFFF scans writable "

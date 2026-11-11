@@ -185,6 +185,7 @@
   "startup": {
     "default": "Playing profile: HIMEMX; DOS=HIGH,NOUMB; VERSION=7.10; FILES=30; BUFFERS=10; LASTDRIVE=E. No mouse, CD-ROM or power-management TSR autoload.",
     "playing_menu": "FreeDOS profile only: default 1 (HIMEMX), 2-second delay; optional 2 (JEMMEX with EMS and UMB), 3 (switchable HIMEMX, DOS=LOW and SHARE; DOS prompt).",
+    "win98_setup": "HIMEMX /METHOD:FAST; DOS=LOW,NOUMB for DOSX. SETUP /IS /IQ /NM skips the false minimum-hardware failure under FreeDOS; /NM bypasses CPU, memory and FPU checks (Microsoft KB189670).",
     "ems_firmware_limit": "The optional CA00-D9FF frame is for the bundled SeaBIOS with stdvga or handheld VGA ROM layouts. S=DA00-EFFF scans writable shadow RAM outside detected ROMs for UMBs. JEMMEX's non-16KiB-aligned frame warning remains visible.",
     "on_demand": "MOUSE.BAT loads CTMOUSE for PS/2. CDROM.BAT loads UDVD2 /H and SHSUCDX as D:; setup calls it only when installation is needed. SHARE.BAT loads the pinned SHARE.COM and forwards its options."
   },
