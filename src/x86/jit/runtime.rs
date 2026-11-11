@@ -1011,9 +1011,11 @@ impl Engine {
             let mut repeat = None;
             #[cfg(feature = "jit-profile")]
             let mut write_token_miss = false;
-            // These modes currently have no native lowering. Taking the normal
-            // interpreter batch also avoids a slow per-instruction real-mode
-            // path during BIOS startup. The next machine boundary retries JIT.
+            // 16-bit code segments and V86 are interpreter-only by design
+            // (KNOWN_ISSUES.md, Limits by design); TF has no native lowering.
+            // Taking the normal interpreter batch also avoids a slow
+            // per-instruction real-mode path during BIOS startup. The next
+            // machine boundary retries JIT.
             let shadowed = cpu.interrupt_shadow();
             let eligible = !cpu.halted
                 && !cpu.code_default16()
