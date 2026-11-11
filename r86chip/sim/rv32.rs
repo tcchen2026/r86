@@ -7,8 +7,8 @@
 //!
 //! The current ISA is RV32IM + Zifencei + Zba + private x86 arithmetic/status (0x0b),
 //! guest translation/context (0x2b), guest memory (0x5b), and address-calculation
-//! and bank-control (0x7b) instructions.
-//! All instructions occupy one little-endian
+//! and bank-control (0x7b) instructions, plus the translator words described
+//! under "Translator words" below. All instructions occupy one little-endian
 //! 32-bit word; there are no compressed instructions or internal instruction
 //! sequences. `step` fetches one word, reads its operands, checks its effects,
 //! and either completes it or returns a precise native trap.
@@ -143,8 +143,8 @@
 //! # Software-filled guest TLB: custom-1 (opcode 0x2b)
 //!
 //! Directly decoded words manage separate DATA and FETCH tables, shared by both
-//! RF banks. Both cache 4 KiB mappings and reset invalid. Data has 16 direct-mapped
-//! entries (linear index 15:12, tag 31:16); fetch has four (index 13:12, tag 31:14).
+//! RF banks. Both cache 4 KiB mappings and reset invalid. Data has 1024 direct-mapped
+//! entries (linear index 21:12, tag 31:22); fetch has four (index 13:12, tag 31:14).
 //! Fetch intent selects the fetch table; all other intents select data. There is
 //! no search of the other table on a miss. Software qualifies a mapping
 //! for the CURRENT guest access context before filling it. Entries contain no
@@ -424,6 +424,57 @@
 //! The scratch EAINFO is shared by RF banks; consume it in the same inline-asm
 //! primitive, not across arbitrary Rust calls. No guest EIP is held in hardware.
 //!
+//! # Translator words
+//!
+//! These serve generated code for 32-bit x86 code segments. They add no new
+//! guest state model: segment and page proofs, status and banks are the ones
+//! defined above. Exact decoding is in the opcode arms of `step`.
+//!
+//! | Instruction | Encoding | Effect |
+//! |---|---|---|
+//! | XLDD rd, imm(rs1) | opcode 0x07 (DS) or 0x47 (SS), I-type | Guest load at offset rs1+imm. funct3 0/1 sign-extend byte/word, 2 dword, 4/5 zero-extend byte/word, 3/6/7 dword/byte/word with write intent (R and W proofs) |
+//! | XSWD rs2, imm(rs1) | opcode 0x27 (DS) or 0x77 (SS), S-type, funct3 0/1/2 | Guest store of the low 8/16/32 bits of rs2 at offset rs1+imm |
+//! | XSWD.U rs2, imm(rs1) | same, funct3 4/5/6 | Same store; on success also rs1 = rs1+imm (PUSH with imm = -size). rs2 is read before the update |
+//! | XALUI rd, rs1, imm | opcode 0x1b, I-type, funct3 = XALU kind 0..6 | Dword XALU.C with a sign-extended immediate; rd=x0 gives CMP/TEST |
+//! | XINC/XDEC rd, rs1 | opcode 0x1b, funct3 7, imm 1 or -1 | Dword ADD/SUB of one, committed, CF preserved; other immediates are illegal |
+//! | XSH rd, rs1, count | opcode 0x3b, funct3 0..4 = SHL/SHR/SAR/ROL/ROR, funct7 0 = count in rs2's value, 1 = count in the rs2 field | Dword shift or rotate by count & 31, committed status; a zero count copies rs1 and changes no status |
+//! | XPUSHRET rs2, off(rs1) | opcode 0x77, funct3 7, S-type | Store dword rs2 at rs1-4 through SS; on success rs1 = rs1-4 and the return stack receives (rs2, PC + 4*off). The S-immediate is that signed word offset, not a displacement |
+//! | XJT rs1 | opcode 0x6b, funct3 0, rd=0, imm12=0 | Jump to the native target filled for guest EIP rs1; continue at PC+4 when there is none |
+//! | XJT.R rs1 | same, imm12=1 | Pop the return stack if it is not empty; when the popped EIP equals rs1 jump to its native address, otherwise behave as XJT |
+//! | XJTFILL rs1, rs2 | funct3 1, rd=0, funct7=0 | Fill the row of guest EIP rs1 with native target rs2 (four-byte aligned) |
+//! | XJTINV rs1 | funct3 2, rd=0, imm12=0 | Empty the row rs1 indexes, whatever EIP it holds |
+//! | XJTFLUSH | funct3 3, rd=rs1=0, imm12=0 | Empty the jump table |
+//! | XTICK n | funct3 4, rd=rs1=0, imm12=n unsigned | Bank 1 only. If the guest budget is at least n, subtract n. Otherwise leave bank 1 as XLEAVE does, with reason 0xfff and THIS word's PC recorded; the budget is unchanged |
+//! | XTSET rs1 | funct3 5, rd=0, imm12=0 | Guest budget = rs1 |
+//! | XTGET rd | funct3 6, rs1=0, imm12=0 | rd = guest budget |
+//!
+//! XLDD/XSWD apply the XLD/XSW checks in the same order, with two differences.
+//! The offset is (rs1+imm) modulo 2^32, and it is the value a service records.
+//! An access need not be naturally aligned: it must lie inside one linear
+//! 4 KiB page, otherwise the service reason is 3. No fetch, .C or
+//! register-segment form exists; other segments use XLD/XSW. A store to the
+//! address of a write-intent load that hit cannot request service, provided no
+//! table, context or segment word ran in between, so XALUI or XALU.C may
+//! commit status between them.
+//!
+//! Shift status follows the shared interpreter. SHL/SHR/SAR define CF (last bit
+//! shifted out), PF/ZF/SF from the result, clear AF, and set OF to CF xor the
+//! result sign (SHL), the operand sign when the count is one (SHR) or zero
+//! (SAR). ROL/ROR replace CF and OF only: CF is result bit 0 (ROL) or 31 (ROR),
+//! OF is bit 31 xor CF (ROL) or bit 31 xor bit 30 (ROR).
+//!
+//! The jump table has 1024 direct-mapped rows indexed by EIP bits 9:0 and
+//! tagged with the full EIP. It holds no context: software empties it when a
+//! translation it names dies or the meaning of an EIP changes (CS base, code
+//! size, address space). It is shared by both banks and resets empty.
+//!
+//! The return stack holds the newest eight XPUSHRET records; a ninth drops the
+//! oldest. XJTINV and XJTFLUSH empty it. A record promises that its native
+//! address is an entry for its EIP for as long as the record can be popped:
+//! emit the return block (or a stub that leaves with that EIP) at the recorded
+//! address and empty the stack with the jump table. A serviced XPUSHRET
+//! records nothing until its retry succeeds.
+//!
 //! # Execution environment and boundaries
 //!
 //! One hart owns a flat, byte-addressed physical RAM. Native accesses do not
@@ -479,6 +530,10 @@ mod ea_tests;
 #[path = "jit_isa_tests.rs"]
 mod jit_isa_tests;
 
+#[cfg(test)]
+#[path = "xlate_tests.rs"]
+mod xlate_tests;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct GuestSegment {
     base: u32,
@@ -494,6 +549,19 @@ struct GuestMapping {
     linear_page: u32,
     native_page: u32,
     rights: u32,
+}
+
+/// One guest access as XLD/XSW/XLDD/XSWD decode it. `span` selects the
+/// same-page rule; otherwise the linear address must be naturally aligned.
+#[derive(Clone, Copy)]
+struct GuestAccess {
+    offset: u32,
+    segment: usize,
+    bytes: u32,
+    store: bool,
+    rmw: bool,
+    fetch: bool,
+    span: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,7 +660,7 @@ pub struct Core {
     pending_flags: u32,
     /// Software-filled data table; ordinary RV fetches/loads/stores never use
     /// either guest table. Native bank switches preserve both tables.
-    guest_dtlb: [Option<GuestMapping>; 16],
+    guest_dtlb: Box<[Option<GuestMapping>; 1024]>,
     /// Execute-only translation capacity, not cached x86 bytes or decoded code.
     guest_itlb: [Option<GuestMapping>; 4],
     /// Native [base,limit) aperture for table fills, page aligned and nonwrapping.
@@ -609,6 +677,12 @@ pub struct Core {
     ea_regs: Option<u32>,
     /// Scratch result metadata; -1 means the latest legal XEA32 needs software.
     ea_info: u32,
+    /// XJT rows: (guest EIP, native target), indexed by EIP bits 9:0.
+    jump_table: Box<[Option<(u32, u32)>; 1024]>,
+    /// Guest instruction budget consumed by XTICK.
+    tick: u32,
+    /// XPUSHRET records, oldest first: (return EIP, native entry).
+    return_stack: Vec<(u32, u32)>,
     // Word-fetch cache deliberately exposes stale instruction visibility until
     // FENCE.I. This is not a model of the proposed RTL's line geometry/timing.
     fetched: [Option<(u32, u32)>; 256],
@@ -643,7 +717,7 @@ impl Core {
             return_pc: 0,
             flags: 0,
             pending_flags: 0,
-            guest_dtlb: [None; 16],
+            guest_dtlb: Box::new([None; 1024]),
             guest_itlb: [None; 4],
             guest_region: (0, 0),
             guest_context: None,
@@ -653,6 +727,9 @@ impl Core {
             guest_service_active: false,
             ea_regs: None,
             ea_info: u32::MAX,
+            jump_table: Box::new([None; 1024]),
+            tick: 0,
+            return_stack: Vec::new(),
             fetched: [None; 256],
         }
     }
@@ -669,7 +746,7 @@ impl Core {
         let table: &[_] = if fetch {
             &self.guest_itlb
         } else {
-            &self.guest_dtlb
+            &self.guest_dtlb[..]
         };
         table[(linear >> 12) as usize & (table.len() - 1)]
     }
@@ -680,7 +757,7 @@ impl Core {
                 diagnostic_kind,
                 self.guest_dtlb
                     .iter()
-                    .chain(&self.guest_itlb)
+                    .chain(self.guest_itlb.iter())
                     .flatten()
                     .count(),
             );
@@ -688,6 +765,69 @@ impl Core {
         self.guest_dtlb.fill(None);
         self.guest_itlb.fill(None);
     }
+    /// Qualify one guest access: the native byte address, or the service reason.
+    fn guest_qualify(&mut self, g: GuestAccess) -> Result<u32, u32> {
+        let required = if g.store {
+            2
+        } else if g.fetch {
+            4
+        } else if g.rmw {
+            3
+        } else {
+            1
+        };
+        let seg = self.guest_segments[g.segment];
+        let linear = seg.base.wrapping_add(g.offset);
+        let entry = self.guest_mapping(linear, g.fetch);
+        let bad_span = if g.span {
+            (linear & 0xfff) + g.bytes > 4096
+        } else {
+            linear & (g.bytes - 1) != 0
+        };
+        let reason = if !self.guest_context.is_some_and(|(ctl, _)| ctl & 9 == 1) {
+            1
+        } else if seg.rights & required != required
+            || u64::from(g.offset) + u64::from(g.bytes) - 1 > u64::from(seg.limit)
+        {
+            2
+        } else if bad_span {
+            3
+        } else if !entry
+            .is_some_and(|e| e.linear_page == linear & !0xfff && e.rights & required == required)
+        {
+            4
+        } else {
+            0
+        };
+        if let Some(stats) = &mut self.tlb_stats {
+            let intent = if g.store {
+                1
+            } else if g.fetch {
+                2
+            } else if g.rmw {
+                3
+            } else {
+                0
+            };
+            stats.probe(true, intent, entry, linear, reason);
+        }
+        if reason != 0 {
+            return Err(reason);
+        }
+        Ok(entry.unwrap().native_page | (linear & 0xfff))
+    }
+
+    /// Enter the same-bank service and return its entry, or stop when no
+    /// service can run. The word completes as a redirect with no data access.
+    fn guest_service(&mut self, word: u32, offset: u32, reason: u32) -> Result<u32, Trap> {
+        if self.guest_service_vector == 0 || self.guest_service_active {
+            return Err(self.trap(Cause::GuestService, offset));
+        }
+        self.guest_service = [self.pc, offset, word, reason];
+        self.guest_service_active = true;
+        Ok(self.guest_service_vector)
+    }
+
     /// Stopped-hart observation for native ISS/RTL comparisons. Return physical
     /// bank order, independent of which bank happens to be active. This is not
     /// an instruction, a new guest register mapping or a hardware read port.
@@ -1058,7 +1198,7 @@ impl Core {
             // the runtime branches to software while old guest state is intact.
             // Indexing the table cannot touch guest RAM or perform MMIO.
             0x2b => {
-                let index = ((a >> 12) & 15) as usize;
+                let index = ((a >> 12) & 1023) as usize;
                 match f {
                     0 if word >> 24 == 0 && (word >> 20) & 3 != 3 => {
                         let mode = word >> 20;
@@ -1090,7 +1230,7 @@ impl Core {
                     1 if d == 0 && k <= 1 && b & (if k == 0 { 0xffc } else { 0xffb }) == 0 => {
                         let page = b & !0xfff;
                         let table: &mut [_] = if k == 0 {
-                            &mut self.guest_dtlb
+                            &mut self.guest_dtlb[..]
                         } else {
                             &mut self.guest_itlb
                         };
@@ -1186,69 +1326,170 @@ impl Core {
                 {
                     return Ok(Some(illegal));
                 }
-                let bytes = 1 << (f & 3);
-                let required = if store {
-                    2
-                } else if fetch {
-                    4
-                } else if rmw {
-                    3
-                } else {
-                    1
+                let access = GuestAccess {
+                    offset: a,
+                    segment: segment as usize,
+                    bytes: 1 << (f & 3),
+                    store,
+                    rmw,
+                    fetch,
+                    span: unaligned_fetch,
                 };
-                let seg = self.guest_segments[segment as usize];
-                let linear = seg.base.wrapping_add(a);
-                let entry = self.guest_mapping(linear, fetch);
-                let bad_span = if unaligned_fetch {
-                    (linear & 0xfff) + bytes > 4096
-                } else {
-                    linear & (bytes - 1) != 0
-                };
-                let reason = if !self.guest_context.is_some_and(|(ctl, _)| ctl & 9 == 1) {
-                    1
-                } else if seg.rights & required != required
-                    || u64::from(a) + u64::from(bytes) - 1 > u64::from(seg.limit)
-                {
-                    2
-                } else if bad_span {
-                    3
-                } else if !entry.is_some_and(|e| {
-                    e.linear_page == linear & !0xfff && e.rights & required == required
-                }) {
-                    4
-                } else {
-                    0
-                };
-                if let Some(stats) = &mut self.tlb_stats {
-                    let intent = if store {
-                        1
-                    } else if fetch {
-                        2
-                    } else if rmw {
-                        3
-                    } else {
-                        0
-                    };
-                    stats.probe(true, intent, entry, linear, reason);
-                }
-                if reason != 0 {
-                    if self.guest_service_vector == 0 || self.guest_service_active {
-                        return Ok(Some(self.trap(Cause::GuestService, a)));
-                    }
-                    self.guest_service = [self.pc, a, word, reason];
-                    self.guest_service_active = true;
-                    next = self.guest_service_vector;
-                } else {
-                    let native = entry.unwrap().native_page | (linear & 0xfff);
-                    check!(self.address_range(m, native, bytes, store));
-                    if store {
-                        m.write(native, &b.to_le_bytes()[..bytes as usize])?;
-                        if extra {
-                            self.flags = self.pending_flags;
+                match self.guest_qualify(access) {
+                    Err(reason) => next = check!(self.guest_service(word, a, reason)),
+                    Ok(native) => {
+                        check!(self.address_range(m, native, access.bytes, store));
+                        if store {
+                            m.write(native, &b.to_le_bytes()[..access.bytes as usize])?;
+                            if extra {
+                                self.flags = self.pending_flags;
+                            }
+                        } else {
+                            result = Some(m.read(native, (access.bytes * 8) as u8));
                         }
-                    } else {
-                        result = Some(m.read(native, (bytes * 8) as u8));
                     }
+                }
+            }
+            // XLDD: guest load at rs1+imm through DS (0x07) or SS (0x47).
+            0x07 | 0x47 => {
+                let offset = a.wrapping_add(imm);
+                let access = GuestAccess {
+                    offset,
+                    segment: if word & 0x40 != 0 { 2 } else { 3 },
+                    bytes: [1, 2, 4, 4, 1, 2, 1, 2][f as usize],
+                    store: false,
+                    rmw: matches!(f, 3 | 6 | 7),
+                    fetch: false,
+                    span: true,
+                };
+                match self.guest_qualify(access) {
+                    Err(reason) => next = check!(self.guest_service(word, offset, reason)),
+                    Ok(native) => {
+                        check!(self.address_range(m, native, access.bytes, false));
+                        let v = m.read(native, (access.bytes * 8) as u8);
+                        result = Some(if f < 2 { sign(v, access.bytes * 8) } else { v });
+                    }
+                }
+            }
+            // XPUSHRET: PUSH of a return EIP that also records its native block.
+            0x77 if f == 7 => {
+                let offset = a.wrapping_sub(4);
+                let access = GuestAccess {
+                    offset,
+                    segment: 2,
+                    bytes: 4,
+                    store: true,
+                    rmw: false,
+                    fetch: false,
+                    span: true,
+                };
+                match self.guest_qualify(access) {
+                    Err(reason) => next = check!(self.guest_service(word, offset, reason)),
+                    Ok(native) => {
+                        check!(self.address_range(m, native, 4, true));
+                        m.write(native, &b.to_le_bytes())?;
+                        if a_reg != 0 {
+                            self.x[a_reg] = offset;
+                        }
+                        let words = sign((word >> 25) << 5 | (word >> 7) & 31, 12);
+                        if self.return_stack.len() == 8 {
+                            self.return_stack.remove(0);
+                        }
+                        self.return_stack
+                            .push((b, self.pc.wrapping_add(words << 2)));
+                    }
+                }
+            }
+            // XSWD: guest store at rs1+imm through DS (0x27) or SS (0x77).
+            // funct3 bit 2 writes the offset back to rs1 after the store.
+            0x27 | 0x77 if f & 3 != 3 => {
+                let offset = a.wrapping_add(sign((word >> 25) << 5 | (word >> 7) & 31, 12));
+                let access = GuestAccess {
+                    offset,
+                    segment: if word & 0x40 != 0 { 2 } else { 3 },
+                    bytes: 1 << (f & 3),
+                    store: true,
+                    rmw: false,
+                    fetch: false,
+                    span: true,
+                };
+                match self.guest_qualify(access) {
+                    Err(reason) => next = check!(self.guest_service(word, offset, reason)),
+                    Ok(native) => {
+                        check!(self.address_range(m, native, access.bytes, true));
+                        m.write(native, &b.to_le_bytes()[..access.bytes as usize])?;
+                        if f & 4 != 0 && a_reg != 0 {
+                            self.x[a_reg] = offset;
+                        }
+                    }
+                }
+            }
+            // XALUI and XINC/XDEC: dword XALU.C with an immediate operand.
+            0x1b => {
+                let (control, rhs) = match f {
+                    7 if imm == 1 => (0x28, 1),
+                    7 if imm == u32::MAX => (0x2d, 1),
+                    7 => return Ok(Some(illegal)),
+                    _ => (8 | f, imm),
+                };
+                let (value, flags) = xalu(a, rhs, 0, control, self.flags);
+                result = Some(value);
+                self.pending_flags = flags;
+                self.flags = flags;
+            }
+            // XSH: dword shifts and rotates with committed status.
+            0x3b if f < 5 && k < 2 => {
+                let count = if k == 1 { (word >> 20) & 31 } else { b & 31 };
+                result = Some(a);
+                if count != 0 {
+                    let (value, flags) = xshift(a, count, f, self.flags);
+                    result = Some(value);
+                    self.pending_flags = flags;
+                    self.flags = flags;
+                }
+            }
+            // Jump table and guest budget.
+            0x6b => {
+                let row = (a & 1023) as usize;
+                match f {
+                    0 if d == 0 && word >> 21 == 0 => {
+                        let popped = if word >> 20 == 1 {
+                            self.return_stack.pop()
+                        } else {
+                            None
+                        };
+                        if let Some((_, native)) = popped
+                            .filter(|e| e.0 == a)
+                            .or(self.jump_table[row].filter(|e| e.0 == a))
+                        {
+                            next = native;
+                        }
+                    }
+                    1 if d == 0 && k == 0 && b & 3 == 0 => self.jump_table[row] = Some((a, b)),
+                    2 if d == 0 && word >> 20 == 0 => {
+                        self.jump_table[row] = None;
+                        self.return_stack.clear();
+                    }
+                    3 if d == 0 && a_reg == 0 && word >> 20 == 0 => {
+                        self.jump_table.fill(None);
+                        self.return_stack.clear();
+                    }
+                    4 if self.bank && d == 0 && a_reg == 0 => {
+                        let n = word >> 20;
+                        if self.tick >= n {
+                            self.tick -= n;
+                        } else {
+                            self.pending_flags = self.flags;
+                            self.bank_reason = 0xfff;
+                            self.bank_pc = self.pc;
+                            self.bank = false;
+                            core::mem::swap(&mut self.x, &mut self.inactive);
+                            next = self.return_pc;
+                        }
+                    }
+                    5 if d == 0 && word >> 20 == 0 => self.tick = a,
+                    6 if a_reg == 0 && word >> 20 == 0 => result = Some(self.tick),
+                    _ => return Ok(Some(illegal)),
                 }
             }
             // Private context words, using ordinary RV operand positions. Each
@@ -1323,7 +1564,7 @@ impl Core {
                         match a_reg {
                             0 => self.bank_reason,
                             1 => self.bank_pc,
-                            2 => 0x4231_0008,
+                            2 => 0x4231_000a,
                             _ => return Ok(Some(illegal)),
                         }
                     });
@@ -1431,6 +1672,33 @@ fn xalu(a: u32, b: u32, lane: u32, control: u32, incoming: u32) -> (u32, u32) {
         flags = (flags & !1) | (incoming & 1);
     }
     ((a & !(mask << shift)) | (result << shift), flags)
+}
+
+/// XSH for a nonzero count below 32. kind: SHL, SHR, SAR, ROL, ROR.
+fn xshift(a: u32, count: u32, kind: u32, incoming: u32) -> (u32, u32) {
+    let result = match kind {
+        0 => a << count,
+        1 => a >> count,
+        2 => ((a as i32) >> count) as u32,
+        3 => a.rotate_left(count),
+        _ => a.rotate_right(count),
+    };
+    let top = result >> 31;
+    let (cf, of) = match kind {
+        0 => ((a >> (32 - count)) & 1, ((a >> (32 - count)) & 1) ^ top),
+        1 => ((a >> (count - 1)) & 1, u32::from(count == 1) & (a >> 31)),
+        2 => ((a >> (count - 1)) & 1, 0),
+        3 => (result & 1, top ^ (result & 1)),
+        _ => (top, top ^ ((result >> 30) & 1)),
+    };
+    let flags = if kind >= 3 {
+        incoming & 0xd4
+    } else {
+        u32::from((result as u8).count_ones().is_multiple_of(2)) << 2
+            | u32::from(result == 0) << 6
+            | top << 7
+    };
+    (result, flags | cf | of << 11)
 }
 
 /// The x86 condition numbering pairs each predicate with its negation. AF has

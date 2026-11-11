@@ -6,6 +6,8 @@ module core_tb;
     reg reset = 1;
     wire i_valid, d_valid;
     wire [31:0] i_addr, d_addr, d_wdata;
+    wire [31:0] i_next_addr, d_next_addr;
+    wire i_flush;
     wire [3:0] d_wstrb;
     reg i_ready = 0, d_ready = 0;
     reg [31:0] i_data = 0, d_rdata = 0;

@@ -5,6 +5,8 @@ import chisel3.util._
 
 class MulDivIO extends Bundle {
   val start = Input(Bool())
+  // Drop the operation in progress; its instruction was squashed.
+  val abort = Input(Bool())
   val operation = Input(UInt(3.W))
   val a = Input(UInt(32.W))
   val b = Input(UInt(32.W))
@@ -82,6 +84,10 @@ class MulDiv extends Module {
       busy := false.B
       done := true.B
     }
+  }
+  when(io.abort) {
+    busy := false.B
+    done := false.B
   }
   io.done := done
   io.result := result

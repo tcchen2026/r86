@@ -161,7 +161,7 @@ def main():
         command(["sbt", "-batch", f"runMain r86chip.Generate {args.rf_banks} {emitted}"], cwd=RTL, env=env)
         command(["verilator", "--cc", "--exe", "--build", "--savable", "--top-module", "r86_core",
                  "-O3", "-CFLAGS", "-O3 -std=c++17", "-j", "2", "--Mdir", args.out / "obj",
-                 emitted / "r86_core.sv", emitted / "MulDiv.sv", RTL / "r86_regfile.v",
+                 emitted / "r86_core.sv", emitted / "MulDiv.sv", RTL / "r86_regfile.v", RTL / "r86_ram.v",
                  RTL / "tests/machine_tb.cpp"])
         runner = [args.out / "obj/Vr86_core", args.out, args.cycles, args.seconds]
     return finish(args, runner)

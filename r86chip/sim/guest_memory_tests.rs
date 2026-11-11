@@ -707,7 +707,7 @@ fn invalid_guest_encodings_leave_all_architectural_effects_untouched() {
             c.pc,
             c.flags,
             c.pending_flags,
-            c.guest_dtlb,
+            c.guest_dtlb.clone(),
             c.guest_itlb,
             c.guest_segments,
             c.guest_context,
@@ -729,7 +729,7 @@ fn invalid_guest_encodings_leave_all_architectural_effects_untouched() {
                 c.pc,
                 c.flags,
                 c.pending_flags,
-                c.guest_dtlb,
+                c.guest_dtlb.clone(),
                 c.guest_itlb,
                 c.guest_segments,
                 c.guest_context,
@@ -747,7 +747,7 @@ fn invalid_guest_encodings_leave_all_architectural_effects_untouched() {
         put(&mut m, c.pc, &[word]);
         let before = (
             c.guest_context,
-            c.guest_dtlb,
+            c.guest_dtlb.clone(),
             c.guest_itlb,
             c.guest_segments,
             c.guest_service_vector,
@@ -759,7 +759,7 @@ fn invalid_guest_encodings_leave_all_architectural_effects_untouched() {
         assert_eq!(
             (
                 c.guest_context,
-                c.guest_dtlb,
+                c.guest_dtlb.clone(),
                 c.guest_itlb,
                 c.guest_segments,
                 c.guest_service_vector

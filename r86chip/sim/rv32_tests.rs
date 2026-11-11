@@ -76,7 +76,7 @@ fn b1_contexts_preserve_runtime_and_use_ordinary_rv_semantics() {
     assert_eq!(core.run(&mut memory, 100).unwrap().cause, Cause::Breakpoint);
     assert_eq!(
         &core.x[..8],
-        &[0, 0x200, 123, 128, 17, 0x20c, 0x42310008, 0]
+        &[0, 0x200, 123, 128, 17, 0x20c, 0x4231000a, 0]
     );
     assert_eq!(core.bank_enters, 1);
 }

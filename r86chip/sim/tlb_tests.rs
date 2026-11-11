@@ -48,14 +48,14 @@ fn guest_tlb_attribution_distinguishes_rights_churn_collisions_and_revocation() 
     fill_view(&mut c, &mut m, 0x4000, 0x10001, false);
     assert_eq!(lookup(&mut c, &mut m, 0x4000, 6), u32::MAX);
     fill_view(&mut c, &mut m, 0x4000, 0x11001, false);
-    fill_view(&mut c, &mut m, 0x14000, 0x10003, false);
+    fill_view(&mut c, &mut m, 0x404000, 0x10003, false);
     assert_eq!(lookup(&mut c, &mut m, 0x4000, 2), u32::MAX);
     assert_eq!(lookup(&mut c, &mut m, 0x14001, 1), u32::MAX);
-    assert_eq!(lookup(&mut c, &mut m, 0x14000, 14), 0x10000);
-    fill_view(&mut c, &mut m, 0x14000, 0x18001, false);
-    assert_eq!(lookup(&mut c, &mut m, 0x14000, 2), u32::MAX);
+    assert_eq!(lookup(&mut c, &mut m, 0x404000, 14), 0x10000);
+    fill_view(&mut c, &mut m, 0x404000, 0x18001, false);
+    assert_eq!(lookup(&mut c, &mut m, 0x404000, 2), u32::MAX);
     fill_view(&mut c, &mut m, 0x4000, 0x10001, false);
-    c.x[1] = 0x14000;
+    c.x[1] = 0x404000;
     execute(&mut c, &mut m, word(2, 0, 1, 0));
     execute(&mut c, &mut m, word(3, 0, 0, 0));
     let s = c.tlb_stats.as_ref().unwrap();
@@ -83,17 +83,17 @@ fn data_and_execute_proofs_have_independent_capacity_but_shared_invalidation() {
     assert_eq!(lookup(&mut c, &mut m, 0x4008, 10), 0x11008);
     // Data collision cannot evict a qualified fetch; fetch collision cannot
     // evict data. Capacity and tag widths differ, but view selection is explicit.
-    fill_view(&mut c, &mut m, 0x14000, 0x12003, false);
+    fill_view(&mut c, &mut m, 0x404000, 0x12003, false);
     assert_eq!(lookup(&mut c, &mut m, 0x4008, 2), u32::MAX);
     assert_eq!(lookup(&mut c, &mut m, 0x4008, 10), 0x11008);
     fill_view(&mut c, &mut m, 0x8000, 0x13004, true);
     assert_eq!(lookup(&mut c, &mut m, 0x4008, 10), u32::MAX);
-    assert_eq!(lookup(&mut c, &mut m, 0x14008, 14), 0x12008);
+    assert_eq!(lookup(&mut c, &mut m, 0x404008, 14), 0x12008);
     assert_eq!(lookup(&mut c, &mut m, 0x8008, 10), 0x13008);
     assert_eq!(lookup(&mut c, &mut m, 0x8008, 2), u32::MAX);
-    c.x[1] = 0x14000;
+    c.x[1] = 0x404000;
     execute(&mut c, &mut m, word(2, 0, 1, 0));
-    assert_eq!(lookup(&mut c, &mut m, 0x14008, 2), u32::MAX);
+    assert_eq!(lookup(&mut c, &mut m, 0x404008, 2), u32::MAX);
     assert_eq!(lookup(&mut c, &mut m, 0x8008, 10), u32::MAX);
     // Refused/zero-rights fills retire only their selected view's old proof.
     fill(&mut c, &mut m, 0x4000, 0x10007);
@@ -252,12 +252,12 @@ fn guest_tlb_collisions_invalidation_banks_and_watch_aliases() {
     for n in 0..16 {
         assert_eq!(lookup(&mut c, &mut m, n << 12, 2), 0x10000);
     }
-    fill(&mut c, &mut m, 0x10000, 0x11003);
+    fill(&mut c, &mut m, 0x400000, 0x11003);
     assert_eq!(lookup(&mut c, &mut m, 0, 2), u32::MAX);
-    assert_eq!(lookup(&mut c, &mut m, 0x10000, 2), 0x11000);
+    assert_eq!(lookup(&mut c, &mut m, 0x400000, 2), 0x11000);
     c.x[1] = 0; // invalidating colliding VPN also evicts the indexed entry
     execute(&mut c, &mut m, word(2, 0, 1, 0));
-    assert_eq!(lookup(&mut c, &mut m, 0x10000, 2), u32::MAX);
+    assert_eq!(lookup(&mut c, &mut m, 0x400000, 2), u32::MAX);
     assert_eq!(lookup(&mut c, &mut m, 0x1000, 2), 0x10000);
     execute(&mut c, &mut m, 0x0000_100f); // FENCE.I is not a TLB flush
     assert_eq!(lookup(&mut c, &mut m, 0x1000, 2), 0x10000);
@@ -311,7 +311,7 @@ fn guest_tlb_illegal_words_and_region_changes_are_precise() {
         let before = (
             c.x,
             c.pc,
-            c.guest_dtlb,
+            c.guest_dtlb.clone(),
             c.guest_itlb,
             c.guest_region,
             c.flags,
@@ -331,7 +331,7 @@ fn guest_tlb_illegal_words_and_region_changes_are_precise() {
             (
                 c.x,
                 c.pc,
-                c.guest_dtlb,
+                c.guest_dtlb.clone(),
                 c.guest_itlb,
                 c.guest_region,
                 c.flags,

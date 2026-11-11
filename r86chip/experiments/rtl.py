@@ -35,7 +35,8 @@ def run(command, cwd=None, env=None):
 
 
 def sources(banks):
-    return [OUT / f"b{banks}/r86_core.sv", OUT / f"b{banks}/MulDiv.sv", RTL / "r86_regfile.v"]
+    return [OUT / f"b{banks}/r86_core.sv", OUT / f"b{banks}/MulDiv.sv", RTL / "r86_regfile.v",
+            RTL / "r86_ram.v"]
 
 
 def build():
@@ -97,7 +98,8 @@ def synthesize(banks, gowin, datadir, library, mapper):
     run(["yosys", "-Q", "-T", "-l", "gowin.log", "gowin.ys"], out)
     module = json.loads((out / "mapped.json").read_text())["modules"]["r86_core"]
     cells = Counter(c["type"] for c in module["cells"].values())
-    assert cells["SDPX9B"] == 2, cells
+    # Two RF memories plus the guest mapping and jump tables.
+    assert cells["SDPX9B"] >= 2, cells
     return dict(banks=banks, generic_structure="passed",
                 logic_lut1_to_lut4=sum(cells[f"LUT{i}"] for i in range(1, 5)),
                 alu_carry_cells=cells["ALU"],
@@ -307,7 +309,7 @@ def reference(image, banks, fault_pc=-1):
                     page, offset = divmod(address, 4096)
                     required = (1, 2, 4, 3)[mode // 4]
                     entry = (guest_fetch_maps if mode // 4 == 2 else guest_maps).get(
-                        page % (4 if mode // 4 == 2 else 16))
+                        page % (4 if mode // 4 == 2 else 1024))
                     value = MASK
                     if (entry is not None and entry[0] == page and
                             entry[2] & required == required and offset % (1 << (mode % 4)) == 0):
@@ -320,14 +322,14 @@ def reference(image, banks, fault_pc=-1):
                         illegal()
                     page, offset = divmod(payload, 4096)
                     table = guest_fetch_maps if f7 else guest_maps
-                    index = address // 4096 % (4 if f7 else 16)
+                    index = address // 4096 % (4 if f7 else 1024)
                     table.pop(index, None)
                     if guest_base <= page * 4096 < guest_limit:
                         table[index] = (address // 4096, page * 4096, offset)
                 elif f3 == 2:
                     if rd or word >> 20:
                         illegal()
-                    guest_maps.pop(reg(r1) // 4096 % 16, None)
+                    guest_maps.pop(reg(r1) // 4096 % 1024, None)
                     guest_fetch_maps.pop(reg(r1) // 4096 % 4, None)
                 elif f3 == 3:
                     if rd or r1 or word >> 20:
@@ -391,7 +393,7 @@ def reference(image, banks, fault_pc=-1):
                 base, limit, rights = guest_segments[seg]
                 linear = (base + offset) & MASK
                 page, page_offset = divmod(linear, 4096)
-                mapping = (guest_fetch_maps if fetch else guest_maps).get(page % (4 if fetch else 16))
+                mapping = (guest_fetch_maps if fetch else guest_maps).get(page % (4 if fetch else 1024))
                 if guest_context is None or guest_context[0] & 9 != 1:
                     service_reason = 1
                 elif rights & required != required or offset + width - 1 > limit:
@@ -518,7 +520,7 @@ def reference(image, banks, fault_pc=-1):
                     if f7 == 0:
                         value = reg(r1, 1)
                     elif f7 == 1 and r1 < 3:
-                        value = (reason, guest_return, 0x42310008)[r1]
+                        value = (reason, guest_return, 0x4231000a)[r1]
                     else:
                         illegal()
                 elif f3 == 7 and bank == 0 and r2 == 0 and f7 == 0:
@@ -649,7 +651,7 @@ def tlb_cases():
         p.emit(it(0x2b, 4, 0, 1, 2))
     for page in range(16):
         fill(p, page << 12, 0x10007)
-    p.li(1, 0x104000); p.emit(it(0x2b, 0, 2, 1, 0)) # evict colliding slot 4
+    p.li(1, 0x404000); p.emit(it(0x2b, 0, 2, 1, 0)) # evict colliding slot 4
     for page in range(16):
         p.li(1, page << 12); p.emit(it(0x2b, 3, 0, 1, 2))
     p.emit(it(0x0f, 0, 1, 0, 0)) # FENCE.I must preserve guest mappings
@@ -685,12 +687,12 @@ def tlb_cases():
     fill_view(p, 0x4000, 0x10003)
     fill_view(p, 0x4000, 0x11004, True)
     probe_views(0x4004)
-    fill_view(p, 0x14000, 0x12003)
-    probe_views(0x4004); probe_views(0x14004)
+    fill_view(p, 0x404000, 0x12003)
+    probe_views(0x4004); probe_views(0x404004)
     fill_view(p, 0x8000, 0x13004, True)
-    probe_views(0x4004); probe_views(0x14004); probe_views(0x8004)
-    p.li(1, 0x14000); p.emit(it(0x2b, 0, 2, 1, 0))
-    probe_views(0x14004); probe_views(0x8004)
+    probe_views(0x4004); probe_views(0x404004); probe_views(0x8004)
+    p.li(1, 0x404000); p.emit(it(0x2b, 0, 2, 1, 0))
+    probe_views(0x404004); probe_views(0x8004)
     fill(p, 0x4000, 0x10007)
     fill_view(p, 0x4000, 0x18004, True)
     probe_views(0x4004)
@@ -1565,12 +1567,12 @@ def main():
             from rf_probe import prepare_library
             library, mapper, library_report = prepare_library(args.yosys_data.resolve(), OUT)
         mapped = [synthesize(b, args.gowin, args.yosys_data.resolve(), library, mapper) for b in (1, 2)]
-    inputs = [RTL / "build.sbt", RTL / "project/build.properties", RTL / "r86_regfile.v",
+    inputs = [RTL / "build.sbt", RTL / "project/build.properties", RTL / "r86_regfile.v", RTL / "r86_ram.v",
               *sorted((RTL / "src").rglob("*.scala")), *sorted((RTL / "tests").glob("*")),
               Path(__file__), HERE / "rf_probe.py", HERE.parent / "sim/rv32.rs",
               HERE.parent / "sim/native.rs", HERE.parent / "sim/memory.rs"]
     report = dict(scope="Native RV32, arithmetic/status, fresh-byte effective addresses, guest memory/context and same-bank software service; no full interpreter integration or caches",
-                  isa_identity="42310008",
+                  isa_identity="4231000a",
                   simulator=dict(path=str(SIMULATOR), sha256=hashlib.sha256(SIMULATOR.read_bytes()).hexdigest()),
                   simulations=len(rows), cases=len(programs), rust_signature=f"{signature:08x}",
                   verilator=run(["verilator", "--version"]).strip(),

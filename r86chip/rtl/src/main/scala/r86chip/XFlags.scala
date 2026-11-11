@@ -42,6 +42,34 @@ object XFlags {
     (merged, flags)
   }
 
+  // One funnel shifter for RV SLL/SRL/SRA and the x86 shifts and rotates.
+  // kind: 0 SHL, 1 SHR, 2 SAR, 3 ROL, 4 ROR; count is 0..31. Left forms shift
+  // the bit-reversed value right. Funnel bit 0 is the last bit shifted out.
+  // Status follows the shared interpreter: shifts define CF/PF/ZF/SF/OF and
+  // clear AF; rotates replace CF/OF only. The caller ignores status when the
+  // count is zero.
+  def shift(a: UInt, count: UInt, kind: UInt, incoming: UInt): (UInt, UInt) = {
+    val left = kind === 0.U || kind === 3.U
+    val rotate = kind === 3.U || kind === 4.U
+    val x = Mux(left, Reverse(a), a)
+    val fill = Mux(rotate, x, Fill(32, kind === 2.U && a(31)))
+    val funnel = (Cat(fill, x, 0.U(1.W)) >> count)(32, 0)
+    val result = Mux(left, Reverse(funnel(32, 1)), funnel(32, 1))
+    val last = funnel(0)
+    val cf = MuxLookup(kind, last)(Seq(3.U -> result(0), 4.U -> result(31)))
+    val of = MuxLookup(kind, false.B)(Seq(
+      0.U -> (last ^ result(31)),
+      1.U -> (count === 1.U && a(31)),
+      3.U -> (result(31) ^ result(0)),
+      4.U -> (result(31) ^ result(30))))
+    val pf = !result(7, 0).xorR
+    val zf = result === 0.U
+    val shifted = (cf.asUInt | (pf.asUInt << 2) | (zf.asUInt << 6) |
+      (result(31).asUInt << 7) | (of.asUInt << 11)).pad(32)
+    val rotated = (incoming & "h0d4".U(32.W)) | cf.asUInt | (of.asUInt << 11)
+    (result, Mux(rotate, rotated, shifted))
+  }
+
   def condition(cc: UInt, flags: UInt): Bool = {
     val cf = flags(0); val pf = flags(2); val zf = flags(6)
     val sf = flags(7); val of = flags(11)
