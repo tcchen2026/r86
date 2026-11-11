@@ -884,6 +884,7 @@ impl Args {
         let mut hdd = None;
         let mut hdd_writable = false;
         let mut hdd_frozen = false;
+        let mut no_jit = false;
         let mut net = false;
         let mut usb_tablet = false;
         let mut net_forward = Vec::new();
@@ -961,6 +962,7 @@ impl Args {
                 "--hdd" => hdd = Some(take_value(&mut args, "--hdd")?),
                 "--hdd-writable" => hdd_writable = true,
                 "--hdd-frozen" => hdd_frozen = true,
+                "--no-jit" => no_jit = true,
                 "--usb-tablet" => usb_tablet = true,
                 "--audio-wav" => audio_wav = Some(take_value(&mut args, "--audio-wav")?),
                 "--net" => {
@@ -1111,6 +1113,8 @@ impl Args {
             }
         };
         let firmware_boot = matches!(boot, BootMode::Firmware);
+        // A safety switch: it overrides --cpu-engine from the CLI or TOML.
+        let jit = jit && !no_jit;
         if hdd_frozen && hdd_writable {
             return Err("--hdd-frozen cannot be combined with --hdd-writable".into());
         }
@@ -1281,7 +1285,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]
@@ -1475,6 +1479,18 @@ mod tests {
         .unwrap();
         assert!(!explicit.jit);
         assert!(Args::parse(["--cpu-engine=invalid".to_string()].into_iter()).is_err());
+    }
+
+    #[test]
+    fn no_jit_overrides_the_engine_from_cli_and_toml() {
+        let config = TestConfig::new("cpu-engine = 'jit'\n");
+        assert!(config.parse(&[]).unwrap().jit);
+        assert!(!config.parse(&["--no-jit"]).unwrap().jit);
+        assert!(!config.parse(&["--cpu-engine=jit", "--no-jit"]).unwrap().jit);
+        assert!(config.parse(&["--no-jit=false"]).unwrap().jit);
+        let config = TestConfig::new("cpu-engine = 'jit'\nno-jit = true\n");
+        assert!(!config.parse(&[]).unwrap().jit);
+        assert!(config.parse(&["--no-jit=false"]).unwrap().jit);
     }
 
     #[test]

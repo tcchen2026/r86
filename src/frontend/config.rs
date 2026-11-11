@@ -16,6 +16,7 @@ fn kind(key: &str) -> Option<Kind> {
         | "no-vga-bios"
         | "hdd-writable"
         | "hdd-frozen"
+        | "no-jit"
         | "usb-tablet"
         | "do-not-exit-when-poweroff"
         | "host-decompress-kernel"

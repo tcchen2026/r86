@@ -86,8 +86,10 @@ impl Running {
     /// Lock the VM, build its machine and start the core thread.
     pub fn start(mut vm: Vm, firmware: PathBuf) -> Result<Self, String> {
         let lock_file = super::vm_store::lock_vm(&vm.directory)?;
-        if !r86::machine::DEFAULT_JIT {
-            // VMs made on the handheld may ask for the JIT this host lacks.
+        // VMs made on the handheld may ask for the JIT this host lacks.
+        // Launching the app with --no-jit (open -a r86 --args --no-jit)
+        // forces the interpreter for every VM.
+        if !r86::machine::DEFAULT_JIT || std::env::args().any(|arg| arg == "--no-jit") {
             vm.engine = "interp".into();
         }
         let mut machine = vm.machine(&firmware, "vgabios-stdvga.bin")?;
