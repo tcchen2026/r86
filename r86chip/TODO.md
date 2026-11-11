@@ -25,7 +25,7 @@ it (handoff 3: indexed link lookup).
 | Caches | Two-way, 32-byte lines, in the pipeline. `Cache.scala`, `CacheStore.scala`, `CacheSequencer.scala`, `WordAccess.scala`. Top level `System.scala` (`r86_system`) |
 | RTL check | `experiments/cache_rtl.py`: 236 images, 708 runs equal the ISS |
 | Translator | `jit/compile.rs`, `jit/runtime.rs`, `jit/native.rs`. Equal to the host interpreter over 20,000,000 TinyCore steps on the ISS |
-| Intern | tmux session `r86`, working on `tmp/r86chip/task4.txt` (ISS cache estimate, no linear scans, lookups within two cache lines); handoff expected in `tmp/r86chip/handoff4.txt`. The user resets its context, never you |
+| Intern | tmux session `r86`, working on the task in section B of this file; it writes its handoff into section 7. The user resets its context, never you |
 | Not done | Place and route, RAM back ends, board top level, devices, trap vector |
 
 Baselines to compare against. TinyCore, 24-clock RAM, caches 64 KiB + 64 KiB
@@ -58,8 +58,12 @@ request). Block RAM is plentiful (82 of about 340 cells used).
   (`0x4231000a`, in `rv32.rs`, `Core.scala` and the experiments that check
   it) with every ISA change.
 - **16-bit code is interpreter-only.** Do not add 16-bit translation.
-- **Roles:** you are the Lead. The Intern edits in the main tree, never
-  changes Git state, and hands off a patch; the Lead commits. Only the Intern
+- **Roles:** you are the Lead. The Intern edits in the main tree and never
+  changes Git state; the Lead commits. Tasks and handoffs live in this file
+  (sections B and 7), not under `tmp/`: the Intern leaves its edits in the
+  working tree, lists the files it changed and writes its results into
+  section 7. No patch files. Only bulky generated evidence (logs, RAM
+  images, profiles) goes under `tmp/r86chip/`, named in the handoff. Only the Intern
   touches `ssh rpi5`. Steer the Intern with one task file at a time; do not
   queue. Do not send it `/new`.
 - **Commit only when the user asks.** `*.md` is ignored by Git; documents
@@ -220,11 +224,46 @@ rules given with them.
 
 ### B. Intern: translator runtime
 
+**Current Intern task (task 4, ISS only), given 2026-11-11.** Evidence it
+starts from: the task-3 firmware on the RTL (two banks, 64 KiB + 64 KiB
+caches, 24-clock RAM), equal to the ISS at every endpoint.
+
+| Interval | Words per x86 | Clocks per x86 | Line fills | Firmware region / heap / guest |
+| --- | ---: | ---: | ---: | --- |
+| 1M-2M | 4.66 | 7.36 | 39,464 | 29,231 / 7,312 / 2,921 |
+| 2M-3M | 4.03 | 5.95 | 24,315 | 16,075 / 5,450 / 2,790 |
+| 3M-4M | 11.78 | 30.17 | 346,719 | 243,927 / 99,201 / 3,591 |
+
+"Firmware region" is native addresses below `0x02000000` (image, .bss,
+static tables). A cold line costs about 45 clocks. A 256 KiB instruction
+cache barely helps 3M-4M (27.4 clocks), so the fills are data lines: the
+runtime walks tables that do not fit a 64 KiB data cache.
+
+1. Give the ISS a cache estimate, statistics only: two-way, 32-byte lines,
+   64 KiB instruction and 64 KiB data, counting line fills for fetches and
+   for data accesses in the three regions. It must not change execution,
+   retired counts or any existing output field; add fields to the run
+   report. "Estimated clocks" = 1.15 * native words + 45 * line fills. Check
+   it against the table above (within about 15%). A hook in `sim/rv32.rs`
+   must be a counter call only.
+2. Remove the remaining linear scans from the runtime: service site lookup,
+   unlink and restoration scans, anything that visits more than a few
+   entries per event.
+3. Make every hot lookup touch at most two data cache lines: compact key
+   arrays separate from payloads, packed entries. Report each table's size
+   in bytes and lines touched per lookup.
+4. Measure 1M-2M, 3M-4M and 4M-10M: words and estimated clocks per x86
+   instruction, line fills by region and side, and the tables of handoff 3.
+   Target: 3M-4M at or below 15 estimated clocks per x86 instruction.
+
+No opcode coverage in this task. No change to word semantics or any RTL
+file.
+
 Handoff 3 showed that native words no longer predict cost: line fills do.
 Judge the runtime by clocks on the RTL (or the ISS cache estimate task 4
 adds: 1.15 clocks per word plus 45 per line fill).
 
-When `tmp/r86chip/handoff4.txt` arrives:
+When the Intern's handoff for the current task appears in section 7:
 
 1. Check its evidence (endpoint comparisons pass; cost table present; the
    ISS cache estimate changes no existing output). Run its firmware on the
@@ -386,3 +425,13 @@ on its path falls and clocks per word rises by less than 0.5%.
 - **A decision is not covered here.** Prefer the smaller hardware, keep the
   invariants, measure before and after, and write what you chose and why at
   the end of this file.
+
+## 7. Intern handoffs
+
+The Intern appends here, newest first: date, task, what changed (files),
+results with the tables the task asked for, what was run and passed, what is
+unverified, and where bulky evidence lies under `tmp/r86chip/`. Keep each
+handoff short; long tables belong in
+[experiments/JIT_COST.md](experiments/JIT_COST.md). Earlier handoffs, from
+before this section existed: `tmp/r86chip/handoff2.txt` (commit `d46ed01`),
+`tmp/r86chip/handoff3.txt` (commit `dbba770`).
