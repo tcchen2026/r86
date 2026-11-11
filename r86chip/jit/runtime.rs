@@ -2,9 +2,9 @@
 //! page walks with A/D writes, devices and unsupported instructions. Refills use
 //! its side-effect-free RAM proofs; they do not export resident registers.
 //!
-//! Only the current source page is installed in XJT. Replacement/context changes
-//! flush XJT (including its return stack) before dropping code. Watched source
-//! writes remain interpreter accesses; the existing code epoch retires the cache.
+//! XJT entries retain qualified fetch mappings until invalidation, including
+//! across code pages. Replacement/context changes flush XJT and its return stack
+//! before dropping code. Watched writes retire the cache through the code epoch.
 use super::{
     compile::{self, Block, End},
     native,
@@ -17,6 +17,9 @@ use alloc::{boxed::Box, vec::Vec};
 const SLOTS: usize = 2048;
 const CODE_LIMIT: usize = 8 * 1024 * 1024;
 const HOT: u8 = 3;
+fn index(eip: u32) -> usize {
+    ((eip ^ (eip >> 12) ^ (eip >> 4)) as usize) & (SLOTS / 2 - 1)
+}
 const SEGMENTS: [SegmentReg; 6] = [
     SegmentReg::Es,
     SegmentReg::Cs,
@@ -48,6 +51,8 @@ pub struct Stats {
     pub services: [u64; 5],
     /// Dynamic interpreter handoffs, indexed by first non-prefix opcode byte.
     pub unsupported: [u64; 256],
+    pub unsupported_f7: [u64; 8],
+    pub unsupported_0f: [u64; 256],
     /// Compiled endings: branch, unsupported, page/window, instruction cap.
     pub ends: [u64; 4],
 }
@@ -65,6 +70,8 @@ impl Default for Stats {
             leaves: [0; 4],
             services: [0; 5],
             unsupported: [0; 256],
+            unsupported_f7: [0; 8],
+            unsupported_0f: [0; 256],
             ends: [0; 4],
         }
     }
@@ -78,10 +85,14 @@ struct Context {
 }
 pub struct Engine {
     entries: Box<[Option<Entry>]>,
+    victims: [bool; SLOTS / 2],
+    linked: bool,
+    /// Conservative bounds of linear pages installed in XJT since its flush.
+    /// Holes/evicted entries may cause extra unlinking, never a missed expiry.
+    jump_pages: Option<(u32, u32)>,
     code_bytes: usize,
     code_epoch: u64,
     context: Option<Context>,
-    page: Option<u32>,
     pub stats: Stats,
 }
 impl Default for Engine {
@@ -96,10 +107,12 @@ impl Engine {
                 .map(|_| None)
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            victims: [false; SLOTS / 2],
+            linked: false,
+            jump_pages: None,
             code_bytes: 0,
             code_epoch: 0,
             context: None,
-            page: None,
             stats: Stats::default(),
         }
     }
@@ -108,7 +121,8 @@ impl Engine {
         // allocation can be freed while the hardware retains its address.
         native::flush_jumps();
         native::flush_data();
-        self.page = None;
+        self.linked = false;
+        self.jump_pages = None;
         for entry in &mut self.entries {
             *entry = None;
         }
@@ -120,10 +134,21 @@ impl Engine {
     fn sync_context(&mut self, cpu: &mut Cpu, bus: &HostBus) {
         // A single INVLPG is queued separately from the full mapping epoch.
         // Retire hardware proofs even when no software fetch row was present.
-        if cpu.take_jit_invalidated_range().is_some() {
-            native::flush_data();
-            self.unlink();
-            self.page = None;
+        if let Some((base, mask)) = cpu.take_jit_invalidated_range() {
+            if mask == 0xffff_f000 {
+                native::invalidate_data(base);
+            } else {
+                native::flush_data();
+            }
+            // INVLPG of ordinary data does not invalidate instruction fetches.
+            // Retire all jumps when the range can overlap an installed page;
+            // the conservative interval also covers large-page invalidations.
+            if self
+                .jump_pages
+                .is_some_and(|(lo, hi)| base <= hi && (base | !mask) >= lo)
+            {
+                self.unlink();
+            }
         }
         let control = (cpu.cr0 & 1)
             | ((cpu.cr0 >> 30) & 2)
@@ -166,7 +191,6 @@ impl Engine {
                 .is_none_or(|old| old.cs_base != next.cs_base)
         {
             self.unlink();
-            self.page = None;
         }
         macro_rules! seg {
             ($n:literal) => {{
@@ -190,7 +214,28 @@ impl Engine {
         let hit = cpu
             .fetch_cache_lookup(linear)
             .or_else(|| mmu::try_resident_fetch_translation(cpu, bus, linear))?;
-        let index = ((eip ^ (eip >> 12) ^ (hit.backing.0 as u32 >> 4)) as usize) & (SLOTS - 1);
+        let first = index(eip);
+        let second = first + SLOTS / 2;
+        let index = if self.entries[first].as_ref().is_some_and(|e| e.eip == eip) {
+            first
+        } else if self.entries[second].as_ref().is_some_and(|e| e.eip == eip) {
+            second
+        } else if self.entries[first]
+            .as_ref()
+            .is_none_or(|e| e.block.is_none())
+        {
+            first
+        } else if self.entries[second]
+            .as_ref()
+            .is_none_or(|e| e.block.is_none())
+        {
+            second
+        } else {
+            // Two probes, round-robin replacement. Cold/negative entries do
+            // not evict compiled code while the other way is available.
+            self.victims[first] = !self.victims[first];
+            if self.victims[first] { first } else { second }
+        };
         if !self.entries[index]
             .as_ref()
             .is_some_and(|e| e.eip == eip && e.backing == hit.backing.0)
@@ -251,17 +296,19 @@ impl Engine {
         }
         let entry = self.entries[index].as_ref().unwrap();
         let block = entry.block.as_ref().unwrap();
-        let page = linear.0 & !4095;
-        if self.page != Some(page) {
-            native::flush_jumps();
-            self.page = Some(page);
-        }
-        let pc = block.words.as_ptr() as u32;
-        native::fill_jump(eip, pc);
+        // An installed jump is an approved fetch mapping, not a lease on the
+        // last visited page. CR3/INVLPG, context or physical-mapping changes
+        // retire it through sync_context; code writes/replacement retire it
+        // before freeing code. Page changes alone do not change that proof.
+        let pc = block.words.as_ptr() as u32 + compile::ENTRY_OFFSET;
         Some(pc)
     }
     fn unlink(&mut self) {
         native::flush_jumps();
+        self.jump_pages = None;
+        if !self.linked {
+            return;
+        }
         for entry in self.entries.iter_mut().flatten() {
             if let Some(block) = &mut entry.block {
                 for link in &block.links {
@@ -272,11 +319,31 @@ impl Engine {
             }
         }
         native::publish();
+        self.linked = false;
     }
-    fn link(&mut self, leave: u32, target: u32, pc: u32, cs: u32) {
-        for entry in self.entries.iter_mut().flatten() {
-            if (entry.eip.wrapping_add(cs) ^ target.wrapping_add(cs)) & !4095 != 0 {
-                continue;
+    fn fill_jump(&mut self, eip: u32, pc: u32, cs: u32) {
+        let page = cs.wrapping_add(eip) & !4095;
+        self.jump_pages = Some(
+            self.jump_pages
+                .map_or((page, page), |(lo, hi)| (lo.min(page), hi.max(page))),
+        );
+        native::fill_jump(eip, pc);
+    }
+    fn link(&mut self, source: u32, leave: u32, target: u32, pc: u32) {
+        let first = index(source);
+        let slot = if self.entries[first]
+            .as_ref()
+            .is_some_and(|e| e.eip == source)
+        {
+            first
+        } else {
+            first + SLOTS / 2
+        };
+        if let Some(entry) = &mut self.entries[slot] {
+            // Target lookup may have displaced the source. Never patch a
+            // different allocation even when its direct-mapped slot matches.
+            if entry.eip != source {
+                return;
             }
             if let Some(block) = &mut entry.block {
                 let base = block.words.as_ptr() as u32;
@@ -289,6 +356,7 @@ impl Engine {
                     if let Some(word) = compile::jump(i64::from(pc) - i64::from(base + link.start))
                     {
                         block.words[link.start as usize / 4] = word;
+                        self.linked = true;
                         native::publish();
                     }
                     return;
@@ -348,7 +416,17 @@ impl Engine {
         if let Some(hit) = cpu.fetch_cache_lookup(linear) {
             let len = (4096 - (linear.0 & 4095)).min(15) as usize;
             let bytes = unsafe { core::slice::from_raw_parts(hit.backing.0 as *const u8, len) };
-            self.stats.unsupported[compile::opcode(bytes) as usize] += 1;
+            let opcode = compile::opcode_bytes(bytes);
+            if let Some(&first) = opcode.first() {
+                self.stats.unsupported[first as usize] += 1;
+                if let Some(&second) = opcode.get(1) {
+                    match first {
+                        0xf7 => self.stats.unsupported_f7[usize::from((second >> 3) & 7)] += 1,
+                        0x0f => self.stats.unsupported_0f[usize::from(second)] += 1,
+                        _ => (),
+                    }
+                }
+            }
         }
     }
     /// Keep bank-1 state across misses/refills. Only the final interpretation or
@@ -366,16 +444,21 @@ impl Engine {
             match exit.reason {
                 compile::MISS => {
                     self.stats.leaves[0] += 1;
-                    // Do not link across source pages in this batch. A runtime
-                    // dispatch may select another page after flushing XJT/RAS.
                     if done < budget {
                         let cs = cpu.seg(SegmentReg::Cs).base;
-                        // Cross-page links are excluded. Reject them before
-                        // searching the source block's native-PC side table.
-                        let same_page = self.page == Some(cs.wrapping_add(exit.eip) & !4095);
+                        // Every MISS has a source EIP at its saved leave PC.
+                        // Read it while the source is owned, before lookup can
+                        // clear/displace it. Generated code is immutable to the
+                        // guest; this is metadata, never an executed word.
+                        let source = unsafe { *(exit.pc as *const u32) };
+                        // Direct JAL links remain page-local. Other pages use
+                        // the qualified XJT entry, including CALL/RET chains.
+                        let same_page =
+                            (cs.wrapping_add(source) ^ cs.wrapping_add(exit.eip)) & !4095 == 0;
                         if let Some(next) = self.lookup(cpu, bus, exit.eip) {
+                            self.fill_jump(exit.eip, next, cs);
                             if same_page {
-                                self.link(exit.pc, exit.eip, next, cs);
+                                self.link(source, exit.pc, exit.eip, next);
                             }
                             pc = next;
                             continue;
@@ -401,8 +484,10 @@ impl Engine {
                 }
                 compile::TICK => {
                     self.stats.leaves[2] += 1;
-                    let (site, _) = self.site(exit.pc);
-                    break (site.eip, done);
+                    // XTICK names its own PC and has an immutable EIP header.
+                    // No lookup/allocation occurs between entry and this read.
+                    let eip = unsafe { *((exit.pc - compile::ENTRY_OFFSET) as *const u32) };
+                    break (eip, done);
                 }
                 compile::INTERPRET => {
                     self.stats.leaves[3] += 1;
@@ -449,9 +534,12 @@ impl Engine {
                 .batch_attention_limit(start.wrapping_add(ran), remaining)
                 .unwrap_or((1, false));
             if eligible && limit != 0 {
-                // Context must be synchronized before lookup installs XJT.
-                self.sync_context(cpu, bus);
                 if let Some(pc) = self.lookup(cpu, bus, cpu.eip) {
+                    // Cold/unsupported lookups do not enter bank 1. Publish
+                    // context only for native entry, before installing XJT.
+                    // lookup may compile but never publishes a jump mapping.
+                    self.sync_context(cpu, bus);
+                    self.fill_jump(cpu.eip, pc, cpu.seg(SegmentReg::Cs).base);
                     bus.begin_instruction(start.wrapping_add(ran), cpu.tsc());
                     cpu.begin_instruction();
                     cpu.segment_override = None;

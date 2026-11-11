@@ -1,112 +1,102 @@
 # Resident-bank translator on the ISS
 
-Intern implemented steps 2 and 3 of [TRANSLATOR.md](../design/TRANSLATOR.md).
-Lead review is pending. The emission table now runs through the real RV32 ISS;
-no host x86 callback executes translated instructions. This batch has **no RTL
-firmware evidence**. Instruction counts and their limits are in [JIT_COST.md](JIT_COST.md).
+Intern's task-3 implementation is pending Lead review. The ISA is unchanged;
+`sim/rv32.rs` remains its authority. This batch uses the ISS only. Current
+instruction counts and limits are in [JIT_COST.md](JIT_COST.md).
 
 ## Execution contract
 
 `jit/compile.rs` uses the shared x86 decoder. Bank 1 holds EAX..EDI in x8..x15,
-with x16 for indirect/slow exits. Blocks start with XTICK and end at a control
-transfer, unsupported instruction or approved code-page boundary (4095 decoded
-instructions maximum). Native words have a side table of guest EIP/instruction
-index. There is no frame pointer or generated import/export sequence.
+with x16 for indirect/slow exits. Each block starts at XTICK after one
+unexecuted source-EIP word. A block ends at a control transfer, unsupported
+instruction or approved code-page boundary (4095 instructions maximum).
+The native-PC side table records guest EIP/instruction index for service refunds.
+There is no frame pointer or generated import/export sequence.
 
-The emitter covers the guide's register moves/partial lanes, memory moves,
-MOVZX/MOVSX, arithmetic/compare/test, register and memory INC/DEC, dword register
-shifts/rotates, LEA, SETcc to a register, dword PUSH/POP/CALL/RET, and near branches.
-Other instructions use the shared interpreter, including NOT/NEG, LEAVE,
-strings, multiplication/division, narrow/memory shifts, RCL/RCR, system/segment
-operations and 16-bit stack operands. Real/VM86/CS16 execution and SS16 stacks
-stay interpreted. CS must currently have a full limit; data segments may be
-based or bounded. Unsupported segment descriptors receive no memory grant.
+The emitter covers register moves/partial lanes, memory moves, MOVZX/MOVSX,
+arithmetic/compare/test including immediates, register NOT/NEG, register and
+memory INC/DEC, dword register shifts/rotates, LEA, register/memory SETcc,
+dword PUSH/POP/CALL/RET, and near branches including rel32 Jcc. Other operations
+use the shared interpreter: memory NOT/NEG (not represented by the shared
+decoder), LEAVE, strings, multiplication/division, narrow/memory shifts,
+RCL/RCR, system/segment operations and 16-bit stack operands. Real/VM86/CS16
+execution and SS16 stacks stay interpreted. CS currently needs a full limit;
+data segments may be based or bounded. Unsupported descriptors receive no
+memory grant.
 
 `jit/runtime.rs` copies registers/status only around interpretation or an event
-boundary. XENTER/XLEAVE preserve bank 0. Miss dispatch and successful RAM refills
-retain bank-1 state. `jit/native.rs` contains the explicit array/word boundary;
-it does not address the layout of Rust's Cpu.
+boundary. Miss dispatch and successful RAM refills retain bank-1 state.
+`jit/native.rs` contains explicit array/word assembly boundaries, never Rust
+Cpu layout accesses. Context is published only when entering native code.
 
-- XTICK reserves a complete block. A service uses the native-PC table to refund
-  the unfinished suffix before interpretation. Expiry runs no instruction from
-  that block. Only completed native instructions advance guest TSC/counts.
-  Device deadlines bound reservations; shadows remain shared interpretation.
-- A service stub executes XLEAVE, then bank 0 ends the active service with XGRET
-  before reading its persistent record. TLB misses may refill approved ordinary
-  RAM and retry the recorded native word. Missing A/D bits, permission faults,
-  MMIO, unsupported segment proofs and page splits use the shared instruction.
-  Unexpected native faults are reported as firmware bugs.
-- RMW loads request write permission before committing status. Their matching
-  stores cannot fault after that proof. PUSH/CALL update ESP only with a
-  successful store. CALL captures its operand before changing ESP; XPUSHRET
-  names an adjacent stable return stub, and RET uses XJT.R.
-- Fetches and memory proofs reuse existing MMU caches/resident probes. Context
-  changes and the separate pending INVLPG range retire hardware mappings.
-  Segment publication occurs on a changed context/descriptor, not every entry.
-- The existing code-page watch/revoke protocol denies native writes to translated
-  source. Promotion also flushes older hardware write grants. A changed code
-  epoch flushes jumps/return addresses before dropping the cache and watches.
-- Only one guest code page is installed in XJT at a time. Direct same-page exits
-  can patch a JAL within its signed reach; other targets use XJT/miss dispatch.
-  Replacement or changed mappings restore external JAL exits before freeing or
-  reusing targets. FENCE.I publishes both code and patches. Cross-page links are
-  excluded before searching for a source link.
+- XTICK reserves a complete block. Expiry reads the immutable EIP immediately
+  before XTICK without searching entries. An unhandled service still searches
+  the native-PC side table to refund the unfinished suffix before interpretation.
+  Only completed instructions advance guest TSC/counts. Device deadlines bound
+  reservations; interrupt shadows remain shared interpretation.
+- The service stub executes XLEAVE. Bank 0 ends the active service with XGRET
+  before reading its persistent record. Approved RAM refills resume the exact
+  native word. Missing A/D bits, permission faults, MMIO, unsupported segment
+  proofs and page splits use the shared instruction. Native faults report bugs.
+- RMW loads request write permission before committing flags. Their matching
+  stores cannot fault after that proof. PUSH/CALL update ESP with a successful
+  store. CALL captures its operand before changing ESP; XPUSHRET names a stable
+  adjacent return stub. RET uses XJT.R.
+- Fetch/data proofs reuse shared MMU caches and resident probes. Mapping epochs,
+  CS/control changes and physical remapping retire jump proofs. Single-page
+  INVLPG uses existing XTINVAL; large ranges flush data proofs. Conservative
+  bounds of installed linear code pages allow data-only invalidations to retain
+  jumps. Any possible overlap flushes all jumps and external JAL links. Bounds
+  reset with every jump flush; holes/stale bounds only cause extra flushes.
+- Watched code pages cannot receive native write grants. Promotion flushes old
+  grants. A changed code epoch drops jumps/return addresses before freeing code.
+- XJT entries survive code-page changes while their fetch proofs remain valid.
+  Direct JAL links remain page-local and within signed native reach. Code-cache
+  replacement restores external links before freeing targets. A boolean avoids
+  scanning when none exist. FENCE.I publishes compilation and patches.
 
-The cache retains the previous third-visit threshold, 2048 entries and 8 MiB code
-limit. The firmware uses its fixed 4 KiB-aligned RAM arena. Runtime search,
-allocation/decoding costs, cache policy and scheduling-tail efficiency are not
-tuned in this batch. Cross-page links, full step-4 optimization, Windows boot,
-RTL clocks/caches and board execution remain separate work for Lead.
+## Indexed lookup
 
-## Functional evidence
+The cache has 2048 entries, two probes per guest-EIP hash, the existing third-visit
+threshold and 8 MiB code limit. Each entry still checks the approved backing
+address. Cold/negative entries yield to compiled entries; full sets replace in
+round-robin order. There is no additional allocated index.
 
-Local records: `tmp/r86chip/batch2/`; Intern's review package is
-`tmp/r86chip/handoff2.txt`. The emitter's 11 differential tests compare actual
-native execution with Interpreter::step across every implemented emission row.
-They check registers, flags, EIP and RAM, including old-register aliases, all Jcc
-conditions, partial lanes, immediate edges, based segments, stack operations,
-return-stack chaining, and precise service/XTICK boundaries.
+Every MISS has an unexecuted source-EIP word at its saved leave PC. Runtime reads
+it before target lookup can displace the source, then probes at most two source
+entries and their bounded link list. Full EIP, native offset and target tags
+must match before patching. No successful native branch executes the metadata.
+The source index replaces the former scan of all 2048 entries. Cache collisions,
+code writes, remapping and return stubs retain the same ownership rules.
 
-`jit_checks.py --engine iss` compares interpreter/JIT executions of protected-mode
-guests. Thirteen focused cases passed: cold entry, lanes/branches, SMC, physical
-alias, INVLPG remap, changed entry, immediate borrow, precise page fault,
-cross-page fetch, PIT/STI boundary, split-stack CALL/RET, based-FS reload and RMW
-write fault. The negative-entry fixture was then updated to use unsupported NEG
-replaced by NOPs; it passed separately. Every comparison includes guest RAM,
-EIP, GPRs, EFLAGS, TSC and steps; each guest asserts its expected outcome.
+## Evidence and reproduction
 
-The final firmware's 20M-step TinyCore prefix matched the host interpreter in
-all 9,159 boundary records, guest RAM and 4,445 bytes of kernel serial output,
-including registers/EIP/EFLAGS and TSC. Its matched cost endpoints also pass
-end-state comparisons (including completed/fault/repeat counts).
-Full boot remains unverified: Lead selected bounded evidence and the optional
-long run was stopped before its marker. Do not infer a boot pass from these
-gates or from the earlier frame-based translator's results.
+The local review package is `tmp/r86chip/handoff3.txt`; reports, firmware hashes,
+profiles and stage-specific test logs are in `tmp/r86chip/batch3/`. Twelve emitter
+tests compare actual native execution with Interpreter::step, including partial
+lanes, all flags/conditions, signed-width edges, RAM, aliases and precise service
+boundaries. Runtime fixtures cover SMC, physical aliases, INVLPG and CR3 remap,
+A20 changes, cache collisions, negative entries, page faults, cross-page fetch,
+PIT/STI boundaries, based segments and split-stack calls. The handoff identifies
+which firmware ran each check; unchanged checks are not repeated automatically.
 
-One integration failure found and fixed here: checking only the full MMU epoch
-missed a single pending INVLPG range. The precise-page-fault guest exposed the
-stale data proof. The runtime now consumes the existing invalidated-range hook.
-The initial unit harness also needed FENCE.I when replacing its setup word; no
-ISS or ISA semantics were changed.
+All requested TinyCore cost endpoints compare complete guest state/RAM, TSC,
+serial and completed/fault/repeat counts with the same firmware's interpreter.
+They establish bounded parity, not a full boot or Windows performance. The prior
+accepted 20M task-2 prefix is historical evidence in `tmp/r86chip/batch2/`; no
+new full-boot, RTL, board, Pi or Apple measurement is claimed here.
 
-Sources consulted: shared decoder/interpreter/MMU/cache-watch code; current
-translator guide and ISA source; tiny386 `i386.c:tlb_refill` for the simple
-paging/refill design. No external implementation was copied or translated.
-
-## Reproduction
-
-Use `CARGO_TARGET_DIR=tmp/target-intern` (or set SIM to another existing build).
-Build the firmware with the existing linker script and preserve its ELF/bin in
-TEMPLATE before running the experiment scripts:
+Sources consulted: shared decoder/interpreter/MMU/cache-watch code; translator
+guide and ISA source; tiny386 `i386.c` arithmetic/NOT/NEG and paging/refill design.
+No external implementation was copied or mechanically translated.
 
 ```sh
 CARGO_TARGET_DIR=tmp/target-intern cargo test --release --no-default-features --features r86chip --bin r86chip-sim b1_tests
-CARGO_TARGET_DIR=tmp/target-intern cargo build --release --no-default-features --features r86chip --bin r86chip-sim
-CARGO_TARGET_DIR=tmp/target-intern cargo rustc --release --no-default-features --features machine,r86chip --bin r86chip-machine --target riscv32im-unknown-none-elf -- -C link-arg=-Tr86chip/firmware/machine.ld -C link-arg=--no-relax -C relocation-model=static
-python3 r86chip/experiments/jit_checks.py --engine iss --simulator SIM --template TEMPLATE --out OUT
+CARGO_TARGET_DIR=tmp/target-intern CARGO_PROFILE_RELEASE_DEBUG=2 cargo rustc --release --no-default-features --features machine,r86chip --bin r86chip-machine --target riscv32im-unknown-none-elf -- -C link-arg=-Tr86chip/firmware/machine.ld -C link-arg=--no-relax -C relocation-model=static
+python3 r86chip/experiments/jit_checks.py --engine iss --simulator SIM --template TEMPLATE --out OUT --case CASE
 ```
 
-The input preparation and comparison protocols remain in `tinycore.py`,
-`firmware/machine.rs` and `compare_machine.py`. These scripts can also run RTL;
-this batch selected only ISS. Keep the firmware build separate from a baseline
-archive build because both use the single approved Cargo target directory.
+Input preparation and comparison protocols remain in `tinycore.py`,
+`firmware/machine.rs` and `compare_machine.py`. Preserve the built ELF/bin in
+TEMPLATE before running scripts. Debug info supports inline function attribution;
+it adds no profiling instructions to firmware. ISA/RTL files are unchanged.

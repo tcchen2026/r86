@@ -12,6 +12,8 @@ pub const SERVICE: u32 = 2;
 pub const INTERPRET: u32 = 3;
 pub const TICK: u32 = 0xfff;
 pub const PC: u32 = 16;
+/// An unexecuted source-EIP word precedes XTICK for constant-time expiry.
+pub const ENTRY_OFFSET: u32 = 4;
 const A: u32 = 1;
 const L: u32 = 2;
 const R: u32 = 3;
@@ -57,16 +59,19 @@ impl Block {
 }
 
 pub fn opcode(bytes: &[u8]) -> u8 {
-    bytes
+    opcode_bytes(bytes).first().copied().unwrap_or(0)
+}
+pub fn opcode_bytes(bytes: &[u8]) -> &[u8] {
+    let start = bytes
         .iter()
-        .copied()
-        .find(|b| {
+        .position(|b| {
             !matches!(
                 b,
                 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
             )
         })
-        .unwrap_or(0)
+        .unwrap_or(bytes.len());
+    &bytes[start..]
 }
 fn guest(r: Register) -> u32 {
     u32::from(r.index) + 8
@@ -78,6 +83,7 @@ fn small(value: u32) -> bool {
 struct Asm {
     words: Vec<u32>,
     links: Vec<Link>,
+    source: u32,
 }
 impl Asm {
     fn i(&mut self, op: u32, rd: u32, rs1: u32, f: u32, imm: u32) {
@@ -320,6 +326,11 @@ impl Asm {
     }
     fn leave(&mut self, reason: u32) {
         self.i(0x7b, 0, 0, 5, reason);
+        if reason == MISS {
+            // XINFO reports the PC after XLEAVE. This unexecuted word names
+            // the source cache entry, including indirect exits/return stubs.
+            self.words.push(self.source);
+        }
     }
     fn exit(&mut self, target: u32, reason: u32) {
         let start = self.words.len();
@@ -357,11 +368,10 @@ fn supported(op: Op) -> bool {
         | Op::IncDec { .. }
         | Op::MemoryAlu { .. }
         | Op::Lea { .. }
-        | Op::Extend { .. } => true,
-        Op::SetCondition {
-            dst: Value::Register(_),
-            ..
-        } => true,
+        | Op::Extend { .. }
+        | Op::Not { .. }
+        | Op::Negate { .. }
+        | Op::SetCondition { .. } => true,
         Op::Shift {
             dst: Value::Register(Register { bits: 32, .. }),
             kind: 0..=4,
@@ -403,11 +413,12 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
     let limit = limit.min(4095);
     let decoded = decode::block(bytes, eip, limit);
     let mut a = Asm {
-        words: alloc::vec![0],
+        words: alloc::vec![eip, 0],
         links: Vec::new(),
+        source: eip,
     };
     let mut sites = alloc::vec![Site {
-        offset: 0,
+        offset: ENTRY_OFFSET,
         eip,
         index: 0
     }];
@@ -498,6 +509,16 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
                 guest(dst),
                 true,
             ),
+            Op::Not { dst } => {
+                // Plain RV arithmetic leaves guest status unchanged. XMERGE
+                // preserves the other lanes, including NOT AH/CH/DH/BH.
+                a.i(0x13, V, guest(dst), 4, u32::MAX);
+                a.write(dst, V, dst.shift != 0);
+            }
+            Op::Negate { dst } => {
+                a.arithmetic(Alu::Sub, 0, dst.bits, false, Value::Register(dst), V, false);
+                a.write(dst, V, false);
+            }
             Op::Extend {
                 dst,
                 src: Value::Memory { address, .. },
@@ -542,6 +563,13 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
             } => {
                 a.i(0x0b, V, u32::from(condition), 7, 0);
                 a.write(dst, V, false);
+            }
+            Op::SetCondition {
+                dst: Value::Memory { address, bits },
+                condition,
+            } => {
+                a.i(0x0b, V, u32::from(condition), 7, 0);
+                a.store(address, bits, V);
             }
             Op::Push { src, .. } => {
                 let (source, _) = a.raw(src, V);
@@ -637,12 +665,13 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
             | (distance as u32 >> 5) << 25;
         a.exit(return_eip, MISS);
     }
-    a.words[0] = 0x6b | 4 << 12 | instructions << 20;
+    a.words[1] = 0x6b | 4 << 12 | instructions << 20;
     // A direct self-edge stays within the already qualified source page and
     // enters XTICK again, never the middle of a reserved instruction budget.
     for link in &a.links {
         if link.eip == eip {
-            a.words[link.start as usize / 4] = jump(-i64::from(link.start)).unwrap();
+            a.words[link.start as usize / 4] =
+                jump(i64::from(ENTRY_OFFSET) - i64::from(link.start)).unwrap();
         }
     }
     Some(Block {

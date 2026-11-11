@@ -9,10 +9,12 @@ as total native/x86. TinyCore is a bounded early-boot diagnostic; the synthetic
 register loop is deliberately favorable to JIT. Neither is a Windows average.
 """
 import argparse
+from collections import Counter
 import csv
 import hashlib
 import json
 import os
+import re
 from jit_diagnostics import HISTOGRAM_FLAGS, histogram, difference
 from pathlib import Path
 import shutil
@@ -63,6 +65,48 @@ def register_guest(directory):
     return struct.pack("<8I", 0x5238364d, 1, 0x1000, 0x90000, 128 << 20, 0, 0, 0)
 
 
+def attribute(directory, firmware, ranges, enters):
+    """Exclusive PC counts, retaining negative endpoint deltas.
+
+    Generated code and the four-byte service stub execute in bank 1; all other
+    linked text executes in bank 0. Prefer the innermost runtime frame for
+    inlined runtime work, otherwise the innermost r86 function. Debug info lets
+    the same ELF expose inline frames without inserting firmware instructions.
+    Out-of-line callees retain their own counts (no inferred inclusive cost).
+    """
+    rows = list(csv.DictReader((directory / "interval-profile.csv").open()))
+    linked = [r for r in rows if any(lo <= int(r["pc"], 16) < hi for lo, hi in ranges)]
+    output = subprocess.run(["llvm-symbolizer", "--output-style=JSON", "--inlines",
+                             "--no-debuginfod", f"--obj={firmware}"],
+                            input="".join(r["pc"] + "\n" for r in linked),
+                            text=True, capture_output=True, check=True)
+    symbols = [json.loads(line) for line in output.stdout.splitlines()]
+    assert len(linked) == len(symbols)
+    functions, service, service_pcs = Counter(), 0, set()
+    for row, symbol in zip(linked, symbols):
+        names = [re.sub(r"::h[0-9a-f]{16}$", "", s["FunctionName"])
+                 for s in symbol.get("Symbol", []) if s.get("FunctionName")]
+        count = int(row["retired_delta"])
+        if "r86::chipjit::native::service" in names:
+            service += count
+            service_pcs.add(row["pc"])
+            continue
+        name = next((n for n in names if n.startswith("r86::chipjit::runtime::")),
+                    next((n for n in names if n.startswith("r86::")), names[0] if names else "unknown"))
+        name = name.split("::_$u7b$$u7b$closure")[0].split("::{{closure}}")[0]
+        functions[name] += count
+    assert len(service_pcs) <= 1, "bank-1 service must remain one XLEAVE word"
+    bank0 = sum(functions.values())
+    assert bank0 + service == sum(int(r["retired_delta"]) for r in linked)
+    result = dict(bank0_native=bank0, bank1_service_native=service,
+                  bank0_native_per_xenter=bank0 / enters if enters else None,
+                  runtime_functions=[(n, c) for n, c in functions.most_common()
+                                     if n.startswith("r86::chipjit::runtime::")],
+                  functions=functions.most_common(), attribution=attribute.__doc__)
+    (directory / "functions.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
 def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
     samples = []
     for steps in endpoints:
@@ -95,8 +139,15 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
     completed = delta["x86_completed"]
     assert completed > 0
     translated = delta["jit_native_steps"]
+    costs = attribute(directory, firmware, ranges, delta["jit_invocations"])
+    hist = difference(samples[0]["histogram"], samples[1]["histogram"])
+    assert costs["bank1_service_native"] == hist["leaves"]["service"]
     report = dict(samples=samples, delta=delta, interval_profile=interval,
-                  histogram=difference(samples[0]["histogram"], samples[1]["histogram"]),
+                  histogram=hist,
+                  bank0_native=costs["bank0_native"],
+                  bank0_native_per_xenter=costs["bank0_native_per_xenter"],
+                  bank1_service_native=costs["bank1_service_native"],
+                  runtime_top5=costs["runtime_functions"][:5],
                   native_per_completed_x86=delta["retired_native"] / completed,
                   emitted_native=emitted, firmware_native=delta["retired_native"] - emitted,
                   jit_coverage=translated / completed,

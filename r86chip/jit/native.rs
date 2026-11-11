@@ -87,6 +87,11 @@ pub(super) fn flush_data() {
         asm!(".insn i 0x2b, 3, x0, x0, 0", options(nostack));
     }
 }
+pub(super) fn invalidate_data(linear: u32) {
+    unsafe {
+        asm!(".insn i 0x2b, 2, x0, {linear}, 0", linear = in(reg) linear, options(nostack));
+    }
+}
 pub(super) fn fill_data(linear: u32, native_rights: u32) {
     unsafe {
         asm!(".insn r 0x2b, 1, 0, x0, {0}, {1}", in(reg) linear, in(reg) native_rights, options(nostack));

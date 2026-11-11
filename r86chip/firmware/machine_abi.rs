@@ -68,4 +68,4 @@ pub fn boundary(step: u64, cpu: &r86::x86::Cpu) -> [u32; BOUNDARY_WORDS] {
 /// changes: the host runner already exports this buffer verbatim after EBREAK.
 pub const WORKLOAD_JIT_HISTOGRAM: u32 = 8;
 pub const JIT_HIST_MAGIC: u32 = 0x4a49_5432;
-pub const JIT_HIST_BYTES: usize = 2176; // 16-byte header + 269 u64 counters, padded to 64.
+pub const JIT_HIST_BYTES: usize = 4288; // 16-byte header + 533 u64 counters, padded to 64.

@@ -109,7 +109,7 @@ fn native_fixture(
     word(&mut core, &mut memory, i(0x6b, 5, 0, 1, 0), ticks, 0);
     words(&mut memory, 0x1000, &[i(0x7b, 4, 0, 10, 0), 0x00100073]);
     core.pc = 0x1000;
-    core.x[10] = 0x2000;
+    core.x[10] = 0x2000 + compile::ENTRY_OFFSET;
     (core, memory)
 }
 fn differential(bytes: &[u8], regs: [u32; 8], flags: u32, limit: usize) {
@@ -243,6 +243,53 @@ fn b1_native_register_lowering_matches_shared_interpreter() {
 }
 
 #[test]
+fn b1_unary_test_extend_and_near_conditions_match_interpreter() {
+    let mut programs = Vec::new();
+    for prefix in [&[][..], &[0x66][..]] {
+        for reg in 0..8 {
+            for group in [2, 3] {
+                programs.push([prefix, &[0xf7, 0xc0 | group << 3 | reg]].concat());
+                programs.push(vec![0xf6, 0xc0 | group << 3 | reg]);
+            }
+            let imm = if prefix.is_empty() {
+                &[0x81, 0x80, 0, 0x80][..]
+            } else {
+                &[0x81, 0x80][..]
+            };
+            programs.push([prefix, &[0xf7, 0xc0 | reg], imm].concat());
+            programs.push(vec![0xf6, 0xc0 | reg, 0x81]);
+            for opcode in [0xb6, 0xb7, 0xbe, 0xbf] {
+                programs.push([prefix, &[0x0f, opcode, 0xc0 | reg]].concat());
+            }
+        }
+    }
+    for value in [0, 1, 0x80, 0xff, 0x8000, 0xffff, 0x80000000, u32::MAX] {
+        for flags in [2, 0x8d7] {
+            for bytes in &programs {
+                differential(bytes, [value; 8], flags, 1);
+            }
+        }
+    }
+    for cc in 0..16 {
+        for status in 0..64 {
+            let flags = [0, 2, 4, 6, 7, 11]
+                .iter()
+                .enumerate()
+                .fold(2, |f, (i, bit)| f | ((status >> i) & 1) << bit);
+            differential(&[0x0f, 0x80 | cc, 0xff, 0xff, 0x7f, 0], [0; 8], flags, 1);
+            differential_memory(
+                &[0x0f, 0x90 | cc, 0x43, 4],
+                [0, 0, 0, 0x4080, 0, 0, 0, 0],
+                flags,
+                1,
+                &[(0x4084, 0x12345678)],
+                [0; 6],
+            );
+        }
+    }
+}
+
+#[test]
 fn b1_native_branches_match_all_status_combinations() {
     for condition in 0..16 {
         for bits in 0..64 {
@@ -309,8 +356,8 @@ fn b1_sign_extended_immediates_use_guest_width_for_carry_and_borrow() {
 #[test]
 fn b1_native_stops_before_unsupported_and_instruction_limits() {
     for bytes in [
-        &[0xf7, 0xd8][..],
-        &[0xf7, 0xd0],
+        &[0xf7, 0xe0][..], // MUL remains interpreted.
+        &[0xf7, 0xf0],     // DIV remains interpreted.
         &[0xcd, 0x80],
         &[0xfb],
         &[0xf4],
@@ -541,14 +588,14 @@ fn b1_call_jump_return_and_stack_aliases_match_interpreter() {
         &mut memory,
         r(0x6b, 1, 0, 0, 1, 2),
         0x1009,
-        0x6000,
+        0x6000 + compile::ENTRY_OFFSET,
     );
     word(
         &mut native,
         &mut memory,
         r(0x6b, 1, 0, 0, 1, 2),
         0x1005,
-        0x7000,
+        0x7000 + compile::ENTRY_OFFSET,
     );
     native.pc = 0x1000;
     assert_eq!(
@@ -589,7 +636,7 @@ fn b1_tick_and_service_keep_precise_instruction_boundaries() {
         word(&mut core, &mut memory, r(0x7b, 6, 1, 3, 0, 0), 0, 0);
         assert_eq!(core.x[3], compile::TICK);
         word(&mut core, &mut memory, r(0x7b, 6, 1, 3, 1, 0), 0, 0);
-        assert_eq!(core.x[3], 0x2000);
+        assert_eq!(core.x[3], 0x2000 + compile::ENTRY_OFFSET);
     }
     let (mut core, mut memory) = native_fixture(&block, regs, 0x203, &[0; 65536], [0; 6], 3);
     // Read-only data proof forces the RMW load to request service before either

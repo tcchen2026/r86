@@ -81,7 +81,7 @@ fn histogram(machine: &Machine) {
     }
     assert!(get(WORKLOAD_FLAGS) & WORKLOAD_BOUNDARIES != 0);
     put(BOUNDARIES, JIT_HIST_MAGIC);
-    put(BOUNDARIES + 4, 1);
+    put(BOUNDARIES + 4, 2);
     put(BOUNDARIES + 8, JIT_HIST_BYTES as u32);
     #[cfg(feature = "r86chip")]
     if let Some(stats) = machine.chip_jit_stats() {
@@ -91,6 +91,8 @@ fn histogram(machine: &Machine) {
             .chain(&stats.services)
             .chain(&stats.ends)
             .chain(&stats.unsupported)
+            .chain(&stats.unsupported_f7)
+            .chain(&stats.unsupported_0f)
             .enumerate()
         {
             put64(BOUNDARIES + 16 + i * 8, *value);

@@ -80,14 +80,14 @@ REMAP = """
     jmp success
 """
 NEGATIVE = """
-    ; NEG is outside this emission table, so its exact entry is negatively cached.
-    mov word [0x8000], 0xd8f7
+    ; MUL stays interpreted; replacing it must retire a negatively cached entry.
+    mov word [0x8000], 0xe0f7
     mov byte [0x8002], 0xc3
     mov ecx, 32
 .warm:
     mov eax, 7
     call 0x8000
-    cmp eax, -7
+    cmp eax, 49
     jne fail
     dec ecx
     jnz .warm
@@ -353,6 +353,37 @@ CASES = {
 }
 
 
+# Cross-page XJT entries must expire on both explicit and physical remapping.
+CASES["cr3-remap"] = PAGING + REMAP.replace("invlpg [0x8000]", "mov eax, cr3\n    mov cr3, eax")
+CASES["a20-remap"] = """
+    mov byte [0x8000], 0xb8
+    mov dword [0x8001], 1
+    mov byte [0x8005], 0xc3
+    mov byte [0x108000], 0xb8
+    mov dword [0x108001], 2
+    mov byte [0x108005], 0xc3
+    mov ecx, 32
+.warm:
+    call 0x108000
+    cmp eax, 2
+    jne fail
+    dec ecx
+    jnz .warm
+    xor eax, eax
+    out 0x92, al
+    mov ecx, 32
+.alias:
+    call 0x108000
+    cmp eax, 1
+    jne fail
+    dec ecx
+    jnz .alias
+    mov al, 2
+    out 0x92, al
+    jmp success
+"""
+
+
 # Runtime-specific service boundaries added with resident memory/stack lowering.
 CASES["split-stack-call"] = """
     mov ecx, 64
@@ -451,6 +482,39 @@ fault_handler:
     invlpg [0x600000]
     add esp, 4
     iretd
+"""
+
+
+# Three same-page entry addresses collide in the two-probe EIP index. Each
+# target is warmed before the next displacement; stale direct links must never
+# call freed/reused native storage. Revisit all three after warming.
+CASES["link-collision"] = """
+    mov dword [0x2000], 0xc301c083
+    mov dword [0x2444], 0xc302c083
+    mov dword [0x2888], 0xc303c083
+    xor eax, eax
+    mov edx, 8
+.round:
+    mov ecx, 32
+.first:
+    call 0x2000
+    dec ecx
+    jnz .first
+    mov ecx, 32
+.second:
+    call 0x2444
+    dec ecx
+    jnz .second
+    mov ecx, 32
+.third:
+    call 0x2888
+    dec ecx
+    jnz .third
+    dec edx
+    jnz .round
+    cmp eax, 1536
+    jne fail
+    jmp success
 """
 
 
