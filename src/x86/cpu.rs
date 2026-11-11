@@ -429,22 +429,15 @@ const FETCH_PHYS_FILTER_WORDS: usize = 64;
 const FETCH_PHYS_FILTER_BITS: u64 = (FETCH_PHYS_FILTER_WORDS as u64) * 64;
 const FETCH_CACHE_GENERATION_STEP: u64 = 1 << 32;
 const FETCH_CACHE_GENERATION_MASK: u64 = 0xffff_ffff_0000_0000;
-pub(crate) const LINEAR_TRANSLATION_CACHE_BITS: u8 = if cfg!(feature = "jit") { 11 } else { 9 };
+// One hot cache layout for interpreter and JIT builds. 2048 rows reduce
+// Windows boot misses; the DOS working set fits either measured size.
+pub(crate) const LINEAR_TRANSLATION_CACHE_BITS: u8 = 11;
 const LINEAR_TRANSLATION_CACHE_SLOTS: usize = 1 << LINEAR_TRANSLATION_CACHE_BITS;
 const LINEAR_TRANSLATION_PAGE_MASK: u32 = 0xffff_f000;
-#[cfg(feature = "jit")]
 type TranslationTag = u32;
-#[cfg(not(feature = "jit"))]
-type TranslationTag = u64;
-pub(crate) const LINEAR_TRANSLATION_USER: TranslationTag =
-    if cfg!(feature = "jit") { 1 } else { 4 };
-const LINEAR_TRANSLATION_GENERATION_STEP: TranslationTag =
-    if cfg!(feature = "jit") { 2 } else { 1u64 << 32 } as TranslationTag;
-const LINEAR_TRANSLATION_GENERATION_MASK: TranslationTag = if cfg!(feature = "jit") {
-    0xffe
-} else {
-    0xffff_ffff_0000_0000u64
-} as TranslationTag;
+pub(crate) const LINEAR_TRANSLATION_USER: TranslationTag = 1;
+const LINEAR_TRANSLATION_GENERATION_STEP: TranslationTag = 2;
+const LINEAR_TRANSLATION_GENERATION_MASK: TranslationTag = 0xffe;
 const LINEAR_TRANSLATION_WRITE_WORDS: usize = LINEAR_TRANSLATION_CACHE_SLOTS / 64;
 const FLAT_32BIT_STACK_MASK: u8 = 1 << 7;
 
@@ -518,11 +511,10 @@ pub struct LinearTranslationCacheEntry {
     // assumed, and wrapping arithmetic also supports physical-address tokens.
     pub(crate) bias: u64,
     pub(crate) tag: TranslationTag,
-    // JIT rows keep exact page/CPL plus eleven generation bits in each tag.
+    // Rows keep exact page/CPL plus eleven generation bits in each tag.
     // Generation wrap clears all rows before reusing a tag. A single LDP loads
     // the bias and both tags; stores compare the high tag, reads the low tag.
-    // Zero never grants write permission. Ordinary builds retain their u64 tag.
-    #[cfg(feature = "jit")]
+    // Zero never grants write permission; the row format is feature-independent.
     pub(crate) write_tag: u32,
 }
 
@@ -555,7 +547,6 @@ impl LinearTranslationCacheEntry {
     pub const EMPTY: Self = Self {
         bias: 0,
         tag: 0,
-        #[cfg(feature = "jit")]
         write_tag: 0,
     };
 
@@ -624,10 +615,7 @@ impl LinearTranslationCache {
                 == backing_page
             {
                 self.write_permissions[slot >> 6] &= !(1u64 << (slot & 63));
-                #[cfg(feature = "jit")]
-                {
-                    entry.write_tag = 0;
-                }
+                entry.write_tag = 0;
             }
         }
     }
@@ -695,7 +683,6 @@ impl LinearTranslationCache {
                 let entry = &mut self.entries[word * 64 + bit];
                 if entry.tag & LINEAR_TRANSLATION_GENERATION_MASK == old {
                     entry.tag = generation | (entry.tag & !LINEAR_TRANSLATION_GENERATION_MASK);
-                    #[cfg(feature = "jit")]
                     if entry.write_tag != 0 {
                         entry.write_tag = entry.tag;
                     }
@@ -848,7 +835,6 @@ impl LinearTranslationCache {
         self.entries[slot] = LinearTranslationCacheEntry {
             bias,
             tag: expected_identity,
-            #[cfg(feature = "jit")]
             write_tag: if write || preserve_write {
                 expected_identity
             } else {
@@ -1725,29 +1711,13 @@ impl Cpu {
 
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
-        any(
-            all(feature = "wasm-jit", target_arch = "wasm32"),
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                feature = "host",
-                target_os = "linux"
-            )
-        )
+        any(all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
     ))]
     pub(crate) fn jit_mapping_epoch(&self) -> u64 {
         self.jit_mapping_epoch
     }
 
-    #[cfg(any(
-        all(feature = "jit", target_arch = "arm"),
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            feature = "host",
-            target_os = "linux"
-        )
-    ))]
+    #[cfg(any(all(feature = "jit", target_arch = "arm"), a64_jit))]
     pub(crate) fn jit_global_epoch(&self) -> u64 {
         self.jit_global_epoch
     }
@@ -1755,12 +1725,7 @@ impl Cpu {
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            feature = "host",
-            target_os = "linux"
-        )
+        a64_jit
     ))]
     pub(crate) fn fetch_translation_is_global(&self, linear: LinearAddr) -> bool {
         self.fetch_cache.global_entries & (1 << FetchCache::slot(linear)) != 0
@@ -1768,15 +1733,7 @@ impl Cpu {
 
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
-        any(
-            all(feature = "wasm-jit", target_arch = "wasm32"),
-            all(
-                feature = "jit",
-                target_arch = "aarch64",
-                feature = "host",
-                target_os = "linux"
-            )
-        )
+        any(all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
     ))]
     pub(crate) fn take_jit_invalidated_range(&mut self) -> Option<(u32, u32)> {
         self.jit_invalidated_range.take()
@@ -1991,24 +1948,14 @@ impl Cpu {
         };
     }
 
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "aarch64",
-        feature = "host",
-        target_os = "linux"
-    ))]
+    #[cfg(a64_jit)]
     pub(crate) fn fetch_recheck(&self, linear: LinearAddr) -> TranslationRecheck {
         self.fetch_cache.rechecks[FetchCache::slot(linear)]
     }
 
     /// The JIT adapter has already validated this exact execute page/context.
     /// Restore its ordinary fetch entry without a second walk or new A/D work.
-    #[cfg(all(
-        feature = "jit",
-        target_arch = "aarch64",
-        feature = "host",
-        target_os = "linux"
-    ))]
+    #[cfg(a64_jit)]
     pub(crate) fn restore_fetch_translation(
         &mut self,
         linear: LinearAddr,
@@ -2838,7 +2785,7 @@ mod tests {
         assert_eq!(cpu.jit_invalidated_range, None);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_code_promotion_revokes_physical_aliases_only() {
         let mut cache = LinearTranslationCache::new();

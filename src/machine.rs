@@ -51,11 +51,7 @@ use core::fmt::Write as _;
 
 /// Frontends enable the JIT by default only on ARM64 Linux; ARMv6K
 /// builds select it explicitly.
-pub const DEFAULT_JIT: bool = cfg!(all(
-    feature = "jit",
-    target_arch = "aarch64",
-    target_os = "linux"
-));
+pub const DEFAULT_JIT: bool = cfg!(a64_jit);
 const GUEST_PAGE_SIZE: usize = 4096;
 /// Guest serial output retained for frontends (at least this many bytes).
 const SERIAL_KEEP: usize = 64 * 1024;
@@ -361,10 +357,7 @@ pub struct Machine {
     boots: u64,
     boot_image: Option<BootImage>,
     roms: Vec<(usize, Vec<u8>)>,
-    #[cfg(any(
-        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-        all(feature = "jit", target_arch = "arm")
-    ))]
+    #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
     jit: Option<crate::x86::jit::runtime::Engine>,
     #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
     chip_jit: Option<crate::chipjit::runtime::Engine>,
@@ -952,10 +945,7 @@ impl Machine {
             boots: 0,
             boot_image: None,
             roms: Vec::new(),
-            #[cfg(any(
-                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-                all(feature = "jit", target_arch = "arm")
-            ))]
+            #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
             jit: None,
             #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
             chip_jit: None,
@@ -970,10 +960,7 @@ impl Machine {
     /// selecting JIT must never silently select the interpreter instead.
     pub fn set_jit_enabled(&mut self, enabled: bool) -> Result<(), String> {
         self.clear_jit_code()?;
-        #[cfg(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        ))]
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
         {
             self.jit = if enabled {
                 Some(crate::x86::jit::runtime::Engine::new()?)
@@ -982,10 +969,7 @@ impl Machine {
             };
             Ok(())
         }
-        #[cfg(not(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        )))]
+        #[cfg(not(any(a64_jit, all(feature = "jit", target_arch = "arm"))))]
         if enabled {
             Err(
                 "the JIT engine requires an ARM64 Linux or 32-bit ARM build with --features jit"
@@ -1033,10 +1017,7 @@ impl Machine {
         if let Some(jit) = &self.chip_jit {
             return format!("chipjit: {:?}\n", jit.stats);
         }
-        #[cfg(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        ))]
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
         if let Some(jit) = &self.jit {
             return jit.report();
         }
@@ -1060,10 +1041,7 @@ impl Machine {
         if let Some(jit) = &mut self.chip_jit {
             jit.clear(&mut self.bus);
         }
-        #[cfg(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        ))]
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
         if let Some(jit) = &mut self.jit {
             jit.clear(&mut self.bus)?;
         }
@@ -1208,10 +1186,7 @@ impl Machine {
         {
             return Err("B1 JIT instruction tracing/perf diagnostics are not implemented".into());
         }
-        #[cfg(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        ))]
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
         if self.jit.is_some()
             && !matches!(
                 (&self.trace, &self.perf),
@@ -1227,10 +1202,7 @@ impl Machine {
                     &mut self.bus,
                     &mut self.step,
                     budget,
-                    #[cfg(any(
-                        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-                        all(feature = "jit", target_arch = "arm")
-                    ))]
+                    #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
                     self.jit.as_mut(),
                     #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
                     self.chip_jit.as_mut(),
@@ -1343,11 +1315,9 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
     bus: &mut HostBus,
     step: &mut u64,
     budget: u64,
-    #[cfg(any(
-        all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-        all(feature = "jit", target_arch = "arm")
-    ))]
-    mut jit: Option<&mut crate::x86::jit::runtime::Engine>,
+    #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))] mut jit: Option<
+        &mut crate::x86::jit::runtime::Engine,
+    >,
     #[cfg(all(feature = "r86chip", target_arch = "riscv32"))] mut chip_jit: Option<
         &mut crate::chipjit::runtime::Engine,
     >,
@@ -1367,10 +1337,7 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
         } else {
             Interpreter::run_batch(cpu, bus, *step, budget - ran)
         };
-        #[cfg(any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        ))]
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
         let batch = if let Some(jit) = jit.as_deref_mut() {
             jit.run_batch(cpu, bus, *step, budget - ran)?
         } else {
@@ -1385,10 +1352,7 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
         #[cfg(not(any(
             all(feature = "wasm-jit", target_arch = "wasm32"),
             all(feature = "r86chip", target_arch = "riscv32"),
-            any(
-                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-                all(feature = "jit", target_arch = "arm")
-            )
+            any(a64_jit, all(feature = "jit", target_arch = "arm"))
         )))]
         let batch = Interpreter::run_batch(cpu, bus, *step, budget - ran);
         if was_halted {
@@ -3017,20 +2981,14 @@ impl HostBus {
             && (!self.pci.vga_mem_enabled() || self.pci.vga_lfb_base() >= self.ram.len() as u64)
     }
 
-    #[cfg(any(
-        all(feature = "jit", target_arch = "arm"),
-        all(feature = "jit", target_arch = "aarch64", target_os = "linux")
-    ))]
+    #[cfg(any(all(feature = "jit", target_arch = "arm"), a64_jit))]
     pub(crate) fn jit_code_epoch(&self) -> u64 {
         self.jit_code_pages
             .as_ref()
             .map_or(0, |pages| pages.epoch())
     }
 
-    #[cfg(any(
-        all(feature = "jit", target_arch = "arm"),
-        all(feature = "jit", target_arch = "aarch64", target_os = "linux")
-    ))]
+    #[cfg(any(all(feature = "jit", target_arch = "arm"), a64_jit))]
     pub(crate) fn jit_single_retired_version(&self, previous_epoch: u64) -> Option<*const u64> {
         self.jit_code_pages
             .as_ref()
@@ -3041,10 +2999,7 @@ impl HostBus {
         all(feature = "wasm-jit", target_arch = "wasm32"),
         any(
             all(feature = "r86chip", target_arch = "riscv32"),
-            any(
-                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-                all(feature = "jit", target_arch = "arm")
-            )
+            any(a64_jit, all(feature = "jit", target_arch = "arm"))
         )
     ))]
     pub(crate) fn jit_release_code_pages(&mut self) {
@@ -3057,10 +3012,7 @@ impl HostBus {
         all(feature = "wasm-jit", target_arch = "wasm32"),
         any(
             all(feature = "r86chip", target_arch = "riscv32"),
-            any(
-                all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-                all(feature = "jit", target_arch = "arm")
-            )
+            any(a64_jit, all(feature = "jit", target_arch = "arm"))
         )
     ))]
     pub(crate) fn jit_code_stamp(
@@ -3089,10 +3041,7 @@ impl HostBus {
 
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        any(
-            all(feature = "jit", target_arch = "aarch64", target_os = "linux"),
-            all(feature = "jit", target_arch = "arm")
-        )
+        any(a64_jit, all(feature = "jit", target_arch = "arm"))
     ))]
     pub(crate) fn jit_code_bytes(&self, backing: u64, len: usize) -> &[u8] {
         // The execute-cache hit already approved this backing window. Borrowing
@@ -5436,7 +5385,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_matches_interpreter_across_budgets_memory_boundaries_and_code_changes() {
         fn machine(jit: bool) -> Machine {
@@ -5485,7 +5434,7 @@ mod host_bus_tests {
         assert!(stats.linked_edges > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_code_writes_retain_only_identical_native_dependencies() {
         let make = || {
@@ -5560,7 +5509,7 @@ mod host_bus_tests {
         assert!(engine.stats.linked_edges > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_negative_entries_recheck_changed_prefix_opcode_and_modrm() {
         for long_prefix in [false, true] {
@@ -5632,7 +5581,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_smc_revokes_an_existing_writable_alias_before_compiling_the_page() {
         let make = |jit| {
@@ -5691,7 +5640,7 @@ mod host_bus_tests {
         assert!(native.jit.as_ref().unwrap().stats.content_changes > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_lazy_tables_reclaim_only_for_another_native_page() {
         let make = || {
@@ -5743,7 +5692,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 300);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_capacity_reclamation_rewatches_the_block_being_published() {
         let make = || {
@@ -5782,7 +5731,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 4000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_reclaimed_code_can_be_written_as_data_and_promoted_again() {
         let make = |jit| {
@@ -5858,7 +5807,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_arithmetic_commits_values_and_flags_for_each_width() {
         for bits in [8, 16, 32] {
@@ -5908,7 +5857,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_full_multiply_reads_memory_before_committing_the_accumulator_pair() {
         for bits in [8, 16, 32] {
@@ -5959,7 +5908,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_ram_reads_addressing_segments_and_stack_returns_match_interpreter() {
         for (stack, leave16) in [(false, false), (true, false), (true, true)] {
@@ -6044,7 +5993,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_data_segment_loads_preserve_descriptors_and_fault_order() {
         for (segment, prefix) in [
@@ -6254,7 +6203,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_segment_pushes_store_only_a_word_and_commit_esp_after_faults() {
         for (segment, opcode) in [
@@ -6361,7 +6310,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_linked_code_obeys_changed_segment_permissions_and_stack_width() {
         for (segment, prefix) in [
@@ -6487,7 +6436,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_fs_gs_addresses_follow_base_changes_wrapping_and_operand_widths() {
         for (segment, prefix) in [(SegmentReg::Fs, 0x64), (SegmentReg::Gs, 0x65)] {
@@ -6557,7 +6506,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_based_segments_check_offset_limits_and_permissions_before_paging() {
         for (base, limit, access, offset, write, page_fault) in [
@@ -6646,7 +6595,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_shifts_match_widths_masked_counts_and_committed_flags() {
         for bits in [8, 16, 32] {
@@ -6703,7 +6652,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_scalar_strings_direction_pushflags_and_sign_extension_match_interpreter() {
         for bits in [8, 16, 32] {
@@ -6773,7 +6722,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_popflags_and_cli_preserve_privilege_and_interrupt_boundaries() {
         for bits in [16, 32] {
@@ -6855,7 +6804,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_scalar_io_preserves_width_permissions_faults_and_attention() {
         for opcode in [0xe4u8, 0xe5, 0xe6, 0xe7, 0xec, 0xed, 0xee, 0xef] {
@@ -6984,7 +6933,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_sti_preserves_privilege_shadow_and_following_faults() {
         for cpl in [0, 1, 3] {
@@ -7100,7 +7049,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_shadowed_native_entries_keep_one_instruction_and_partial_faults() {
         // Entries first compiled under a shadow contain one instruction.
@@ -7206,7 +7155,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_shadowed_instructions_keep_budget_attention_and_fault_boundaries() {
         for code16 in [false, true] {
@@ -7258,7 +7207,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_popflags_fault_keeps_stack_flags_and_split_read_effects() {
         for bits in [16, 32] {
@@ -7340,7 +7289,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_scalar_string_faults_preserve_indices_accumulator_and_flags() {
         for opcode in [0xa6, 0xac, 0xad, 0xaa, 0xab, 0xae, 0xaf] {
@@ -7398,7 +7347,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_repeated_strings_preserve_count_zero_conditions_and_tick_chunks() {
         for bits in [8u8, 16, 32] {
@@ -7489,7 +7438,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_division_preserves_page_fault_priority_and_dividend_on_error() {
         for case in 0..7 {
@@ -7564,7 +7513,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_repeated_strings_resume_page_misses_without_extending_attempt_budget() {
         for opcode in [0xa4, 0xa6, 0xaa, 0xac, 0xae] {
@@ -7654,7 +7603,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cmpsb_preserves_sub_flags_source_overrides_and_early_stops() {
         for prefix in [None, Some(0xf2), Some(0xf3)] {
@@ -7753,7 +7702,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cmpsb_page_fault_order_privilege_and_partial_budget() {
         // Unequal page offsets exercise each bound independently. The long
@@ -7867,7 +7816,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_repeated_string_page_faults_and_early_scans_match_committed_progress() {
         let scans = [1u32, 2, 4].into_iter().flat_map(|width| {
@@ -7940,7 +7889,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_movs_preserves_width_overlap_count_zero_and_repeat_tick_boundaries() {
         for bits in [8u8, 16, 32] {
@@ -8038,7 +7987,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_rep_movs_faults_keep_committed_elements_flags_and_one_attempted_tick() {
         for case in 0..3 {
@@ -8104,7 +8053,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_zero_memory_shift_reads_a_readonly_page_without_changing_flags() {
         for (bits, group, count, immediate) in [
@@ -8175,7 +8124,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_leave_fault_preserves_stack_frame_flags_and_prior_progress() {
         for operand16 in [false, true] {
@@ -8233,7 +8182,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_fault_exit_preserves_prior_flags_ticks_and_split_read_ad_effects() {
         for split in [false, true] {
@@ -8514,7 +8463,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_refills_preserve_live_state_across_read_write_collisions() {
         let make = || {
@@ -8568,7 +8517,7 @@ mod host_bus_tests {
         assert!(engine.stats.refilled_data > 4000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_stack_runs_keep_individual_commits_widths_and_esp_sources() {
         for (mut program, fault_addr) in [
@@ -8691,7 +8640,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_stack_transfers_keep_prior_push_pop_commits_before_later_faults() {
         for narrow in [false, true] {
@@ -8781,7 +8730,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_rechecks_changed_roots_against_current_tables_and_ad_bits() {
         let make = || {
@@ -8857,7 +8806,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 4000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_code_rechecks_require_current_mapping_accessed_and_content() {
         let make = || {
@@ -8926,7 +8875,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 9000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_resident_fetch_reenters_after_interpretation_and_keeps_fault_order() {
         for cpl in [0, 3] {
@@ -9027,7 +8976,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_interpreter_fetch_handoff_obeys_remapping_content_and_page_faults() {
         let make = || {
@@ -9102,7 +9051,7 @@ mod host_bus_tests {
         assert!(engine.stats.interpreted_steps > 1000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_overlapping_entries_preserve_instruction_boundaries_and_fault_progress() {
         let make = || {
@@ -9189,7 +9138,7 @@ mod host_bus_tests {
         assert!(engine.stats.content_changes > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_linked_backedges_obey_mapping_changes_code_versions_and_budgets() {
         let make = || {
@@ -9272,7 +9221,7 @@ mod host_bus_tests {
         assert_eq!(actual.cr2, 0x2000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cross_page_targets_obey_code_changes_after_dispatch_collision() {
         let make = || {
@@ -9346,7 +9295,7 @@ mod host_bus_tests {
         assert!(engine.stats.content_reuses > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cross_page_edges_revalidate_privilege_and_changed_cs_base() {
         let make = || {
@@ -9417,7 +9366,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 8000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_repeated_reads_obey_invlpg_cr3_and_privilege_changes() {
         let make = || {
@@ -9501,7 +9450,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 1000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_global_code_survives_cr3_but_obeys_invlpg_pge_and_content_writes() {
         let make = || {
@@ -9580,7 +9529,7 @@ mod host_bus_tests {
         assert!(engine.stats.global_link_retags > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_large_page_invlpg_retires_all_compiled_subpages() {
         let make = || {
@@ -9637,7 +9586,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_steps > 5000);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_page_entries_follow_cs_rebasing_revalidation_and_content_changes() {
         let make = || {
@@ -9690,7 +9639,7 @@ mod host_bus_tests {
         assert!(engine.stats.content_changes > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_exchange_families_preserve_write_faults_and_address_aliases() {
         for bits in [8, 16, 32] {
@@ -9789,7 +9738,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_ioram_bank_mode_and_dirty_changes_match_interpretation() {
         let make = || {
@@ -9847,7 +9796,7 @@ mod host_bus_tests {
         assert!(engine.stats.native_memory_writes > 0);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_framebuffer_accesses_preserve_bytes_dirty_pages_faults_and_pci_decode() {
         use crate::devices::vga::DEFAULT_LFB_BASE;
@@ -9989,7 +9938,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_segment_reads_refresh_selectors_and_store_only_a_word() {
         for operand16 in [false, true] {
@@ -10069,7 +10018,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_stack_read_page_survives_refills_and_checks_boundaries_and_reentry() {
         for address in [0, 0x6000, 0x6ffb, 0x6ffc, 0x6ffe, 0xffff_fffc, 0xffff_fffe] {
@@ -10153,7 +10102,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_split_ranges_preserve_both_page_permissions_and_backing() {
         for user in [false, true] {
@@ -10233,7 +10182,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_ranges_keep_fault_order_and_address_register_dependencies() {
         let programs: &[&[u8]] = &[
@@ -10463,7 +10412,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cross_page_calls_preserve_return_addresses_and_budget_boundaries() {
         for base in [0, 0x10000] {
@@ -10570,7 +10519,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_return_cache_handles_deep_recursion_and_modified_return_addresses() {
         for mismatch in [false, true] {
@@ -10631,7 +10580,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_returns_to_zero_without_a_native_call() {
         for code in [&[0x6a, 0, 0xc3][..], &[0x66, 0x6a, 0, 0x66, 0xc3][..]] {
@@ -10672,7 +10621,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_bit_strings_preserve_signed_offsets_splits_and_write_faults() {
         for bits in [16u8, 32] {
@@ -10910,7 +10859,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_cmpxchg8b_preserves_other_flags_aliases_and_write_faults() {
         for prefixes in [&[][..], &[0x66][..], &[0xf0][..], &[0xf0, 0x66][..]] {
@@ -11008,7 +10957,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_retained_kernel_tokens_still_fault_in_user_mode() {
         for (write, user_code) in [(false, true), (true, true), (false, false)] {
@@ -11088,7 +11037,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_memory_exits_preserve_flags_before_later_flag_writes() {
         let writers: &[&[u8]] = &[
@@ -11210,7 +11159,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_forward_comparisons_preserve_fault_flags_and_skipped_memory_effects() {
         for opcode in [0x39, 0x85] {
@@ -11288,7 +11237,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_write_faults_preserve_flags_stack_and_uncommitted_bytes() {
         for operation in 0..10 {
@@ -11762,7 +11711,7 @@ mod host_bus_tests {
         assert!(bus.ioram_page(PhysAddr(0xe9000), true).is_some());
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_firmware_pam_changes_match_interpretation() {
         let make = || {
@@ -12941,7 +12890,7 @@ mod host_bus_tests {
         assert_eq!(m.cpu.tsc(), start + 3);
     }
 
-    #[cfg(all(feature = "jit", target_os = "linux", target_arch = "aarch64"))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_quiet_sti_continues_to_normal_halt_io_and_fault_boundaries() {
         for following in [&[0x90, 0x43][..], &[0xf4], &[0xe6, 0x80], &[0x0f, 0xff]] {
@@ -14364,11 +14313,7 @@ mod pci_decode_cache_tests {
     use super::*;
 
     fn engines() -> &'static [bool] {
-        if cfg!(all(
-            feature = "jit",
-            target_arch = "aarch64",
-            target_os = "linux"
-        )) {
+        if cfg!(a64_jit) {
             &[false, true]
         } else {
             &[false]
@@ -14407,7 +14352,7 @@ mod pci_decode_cache_tests {
         m.cpu.eip = start as u32;
         m.run_steps(2000).unwrap();
         assert!(m.cpu.halted);
-        #[cfg(all(feature = "jit", target_arch = "aarch64", target_os = "linux"))]
+        #[cfg(a64_jit)]
         if let Some(jit) = &m.jit {
             assert!(jit.stats.native_steps > 0);
             std::println!("PCI decode native steps: {}", jit.stats.native_steps);

@@ -671,12 +671,7 @@ impl Interpreter {
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
         all(feature = "jit", feature = "machine", target_arch = "arm"),
-        all(
-            feature = "jit",
-            target_arch = "aarch64",
-            feature = "host",
-            target_os = "linux"
-        )
+        a64_jit
     ))]
     pub(crate) fn run_one<B: Bus>(cpu: &mut Cpu, bus: &mut B, start_step: u64) -> BatchResult {
         let shadowed = cpu.interrupt_shadow();
@@ -11931,15 +11926,7 @@ fn mark_segment_accessed<B: Bus>(
 /// all exceptional cases remain in the ordinary instruction path. v86's JIT
 /// (gen/generate_jit.js) instead spills GPR locals and calls the ordinary
 /// instructions.rs MOV Sreg helpers.
-#[cfg(any(
-    all(feature = "wasm-jit", target_arch = "wasm32"),
-    all(
-        feature = "jit",
-        target_arch = "aarch64",
-        feature = "host",
-        target_os = "linux"
-    )
-))]
+#[cfg(any(all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit))]
 #[cfg_attr(all(feature = "wasm-jit", target_arch = "wasm32"), inline(never))]
 pub(crate) fn try_load_cached_segment<B: Bus>(
     cpu: &mut Cpu,

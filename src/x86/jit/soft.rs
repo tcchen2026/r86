@@ -171,7 +171,7 @@ impl View {
     /// including A/D and host dirty bookkeeping. A write proof also permits
     /// reads. Native execution cannot change its mapping context, code watches
     /// or device decode; recreating the view discards this proof before reentry.
-    #[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
+    #[cfg(a64_jit)]
     pub(super) fn remember_refill(&mut self, tag: u32, write: bool, bias: u64) {
         if bias != 0 {
             self.refill_bias = bias;

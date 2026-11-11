@@ -99,10 +99,10 @@ pub mod validity;
 #[cfg(feature = "wasm-jit")]
 pub mod wasm;
 
-#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
+#[cfg(a64_jit)]
 pub mod code;
 
-#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
+#[cfg(a64_jit)]
 pub mod runtime;
 
 #[cfg(all(feature = "machine", target_arch = "arm"))]

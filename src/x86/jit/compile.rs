@@ -1406,7 +1406,7 @@ pub fn entry() -> Result<CompiledEntry, EmitError> {
 /// SUBS X27, X27, #1 at the start of a one-instruction block. The host may
 /// recognize this header for an interrupt-shadow invocation with budget one;
 /// an unrecognized entry simply declines that specialization.
-#[cfg(all(target_arch = "aarch64", feature = "host", target_os = "linux"))]
+#[cfg(a64_jit)]
 pub(super) const ONE_INSTRUCTION_ENTRY: u32 = 0xf100_077b;
 
 /// `block_facts` (flat segment qualifications) are
@@ -3035,5 +3035,5 @@ fn emit_edge(
     }
 }
 
-#[cfg(all(test, feature = "host", target_os = "linux", target_arch = "aarch64"))]
+#[cfg(all(test, a64_jit))]
 mod tests;

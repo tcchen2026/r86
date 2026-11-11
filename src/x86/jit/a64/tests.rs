@@ -125,7 +125,7 @@ fn unbound_target_is_a_compile_error() {
     assert_eq!(a.finish(), Err(EmitError::UnboundLabel));
 }
 
-#[cfg(all(feature = "host", target_os = "linux", target_arch = "aarch64"))]
+#[cfg(a64_jit)]
 mod native {
     use super::*;
     use crate::x86::cpu::Cpu;

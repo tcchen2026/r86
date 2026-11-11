@@ -390,11 +390,7 @@ fn translation_cache_target_is_ram<B: Bus>(bus: &B, phys: PhysAddr) -> bool {
 /// instead handles PAE/large pages itself and leaves the TLB unchanged.
 #[cfg(all(
     feature = "jit",
-    any(
-        test,
-        all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(target_arch = "aarch64", feature = "host", target_os = "linux")
-    )
+    any(test, all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
 ))]
 pub(crate) fn try_resident_data_translation<B: Bus>(
     cpu: &mut Cpu,
@@ -451,11 +447,7 @@ pub(crate) fn try_resident_data_translation<B: Bus>(
 
 #[cfg(all(
     feature = "jit",
-    any(
-        test,
-        all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(target_arch = "aarch64", feature = "host", target_os = "linux")
-    )
+    any(test, all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
 ))]
 struct ResidentPage {
     root: BackingToken,
@@ -469,13 +461,7 @@ struct ResidentPage {
 /// changing guest state. Non-PAE execution has the same page permissions as a
 /// read; reuse the resident proof, leaving A-bit work and faults to the walker.
 /// Devices are excluded even when they offer a transient native data pointer.
-#[cfg(all(
-    feature = "jit",
-    any(
-        test,
-        all(target_arch = "aarch64", feature = "host", target_os = "linux")
-    )
-))]
+#[cfg(all(feature = "jit", any(test, a64_jit)))]
 pub(crate) fn try_resident_fetch_translation<B: Bus>(
     cpu: &mut Cpu,
     bus: &mut B,
@@ -505,11 +491,7 @@ pub(crate) fn try_resident_fetch_translation<B: Bus>(
 // Read only stable RAM words; no x86 state, guest memory or device effects.
 #[cfg(all(
     feature = "jit",
-    any(
-        test,
-        all(feature = "wasm-jit", target_arch = "wasm32"),
-        all(target_arch = "aarch64", feature = "host", target_os = "linux")
-    )
+    any(test, all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
 ))]
 #[inline(always)]
 fn resident_page<B: Bus>(
