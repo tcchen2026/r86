@@ -44,7 +44,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   (`host` enables `bus-instruction-context`); cost not measured.
 - perf: every port write outside USB, sound and the NIC raises attention,
   making the next batch one instruction long.
-- perf: 16-bit, real-mode and virtual-8086 code is never compiled.
 - cpu: an instruction longer than 15 bytes with fewer than 15 prefixes
   executes instead of raising #GP(0).
 - cpu: when a batch's budget ends exactly where an STI or SS-load shadow
@@ -109,7 +108,9 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
 No SSE. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
 Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
-HID tablet.
+HID tablet. The JITs compile only 32-bit code segments outside
+virtual-8086 mode: real-mode, V86 and 16-bit protected-mode code always
+runs in the interpreter, including Windows 9x's 16-bit USER/GDI paths.
 
 ## Unexplained
 
