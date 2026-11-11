@@ -58,9 +58,6 @@ const SERIAL_KEEP: usize = 64 * 1024;
 // Match the selected CPU model's PAE/PSE36 physical address width.
 const PC_PHYS_LIMIT: u64 = 1 << 36;
 const A20_BIT: u64 = 1 << 20;
-const FDC_MSR_RQM: u8 = 0x80;
-const FDC_MSR_DIO: u8 = 0x40;
-const FDC_MSR_BUSY: u8 = 0x10;
 const CMOS_REG_A: u8 = 0x0a;
 const CMOS_REG_B: u8 = 0x0b;
 const CMOS_REG_C: u8 = 0x0c;
@@ -921,7 +918,6 @@ impl Machine {
             pic2_vector_base: bus.pic.vector_base(true),
             ps2_irq1: bus.pic.line(1),
             ps2_irq12: bus.pic.line(12),
-            fdc_irq6: bus.fdc.irq_asserted(),
             rtc_irq8: bus.rtc_irq8,
             cmos_status_a: bus.rtc_status_a(),
             cmos_status_b: bus.cmos_status_b,
@@ -929,8 +925,6 @@ impl Machine {
             rtc_next_tick: bus.rtc_next_tick,
             keyboard_dropped: bus.ps2.keyboard_dropped(),
             mouse_dropped: bus.ps2.mouse_dropped(),
-            fdc_dor: bus.fdc.dor,
-            fdc_status: bus.fdc.main_status(),
             reset_requested: bus.reset_requested,
         }
     }
@@ -1297,9 +1291,6 @@ pub struct DeviceStatus {
     pub ps2_irq12: bool,
     pub keyboard_dropped: u64,
     pub mouse_dropped: u64,
-    pub fdc_irq6: bool,
-    pub fdc_dor: u8,
-    pub fdc_status: u8,
     pub reset_requested: bool,
 }
 
@@ -1888,330 +1879,6 @@ struct TrackedWriteStats {
     page_table_frame: u64,
 }
 
-// An enhanced AT controller with no attached floppy drives. Keep discovery,
-// configuration and command/result/IRQ handshakes; media commands terminate
-// with an error, never a fake transfer. No motor/seek timer or DMA engine is
-// needed for this machine. Unsupported extended commands return invalid status.
-// tiny386 supplies the minimal model; v86 floppy.js resolves result handshakes
-// (result-phase IRQ clearing, four reset-sense replies) and Intel 82077AA
-// sections 2.2/5.3 configuration retention across reset, which v86 keeps
-// regardless of LOCK.
-#[derive(Clone, Debug)]
-struct NullFdc {
-    dor: u8,
-    dsr: u8,
-    ccr: u8,
-    command: [u8; 9],
-    command_len: usize,
-    command_needed: usize,
-    result: [u8; 16],
-    result_pos: usize,
-    result_len: usize,
-    reset_sense: u8,
-    status0: u8,
-    cylinder: [u8; 4],
-    specify: [u8; 2],
-    config: u8,
-    pretrk: u8,
-    perpendicular: u8,
-    locked: bool,
-    // Pending completion, before the DOR interrupt-enable gate.
-    irq6: bool,
-}
-
-impl NullFdc {
-    fn new() -> Self {
-        Self {
-            dor: 0x0c,
-            dsr: 0,
-            ccr: 0,
-            command: [0; 9],
-            command_len: 0,
-            command_needed: 0,
-            result: [0; 16],
-            result_pos: 0,
-            result_len: 0,
-            reset_sense: 0,
-            status0: 0x80,
-            cylinder: [0; 4],
-            specify: [0; 2],
-            config: 0x20,
-            pretrk: 0,
-            perpendicular: 0,
-            locked: false,
-            irq6: false,
-        }
-    }
-
-    fn irq_asserted(&self) -> bool {
-        self.irq6 && self.dor & 0x0c == 0x0c
-    }
-
-    fn read_u8(&mut self, port: u16) -> Option<u8> {
-        let value = match port {
-            0x3f0 | 0x3f1 => 0xff,
-            0x3f2 => self.dor,
-            0x3f3 => 0x20,
-            0x3f4 => self.main_status(),
-            0x3f5 => self.read_data(),
-            0x3f7 => 0x80, // No disk can clear the disk-change input.
-            _ => return None,
-        };
-        Some(value)
-    }
-
-    fn write_u8(&mut self, port: u16, value: u8) -> bool {
-        match port {
-            0x3f0 | 0x3f1 | 0x3f3 => true,
-            0x3f2 => {
-                let was_normal = (self.dor & 0x04) != 0;
-                let normal = (value & 0x04) != 0;
-                self.dor = value;
-                if !normal {
-                    self.clear_command_and_result();
-                    self.irq6 = false;
-                    self.reset_sense = 0;
-                    self.status0 = 0x80;
-                } else if !was_normal {
-                    self.start_reset();
-                }
-                true
-            }
-            0x3f4 => {
-                self.dsr = value & 0x7f;
-                // DSR resets the core, not the external motor/IRQ/drive latch.
-                // Holding DOR reset still takes precedence over this pulse.
-                if value & 0x80 != 0 && self.dor & 4 != 0 {
-                    self.start_reset();
-                }
-                true
-            }
-            0x3f5 => {
-                self.write_data(value);
-                true
-            }
-            0x3f7 => {
-                self.ccr = value & 0x03;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn main_status(&self) -> u8 {
-        if self.dor & 4 == 0 {
-            FDC_MSR_BUSY
-        } else if self.result_pos < self.result_len {
-            FDC_MSR_RQM | FDC_MSR_DIO | FDC_MSR_BUSY
-        } else if self.command_len != 0 {
-            FDC_MSR_RQM | FDC_MSR_BUSY
-        } else {
-            FDC_MSR_RQM
-        }
-    }
-
-    fn read_data(&mut self) -> u8 {
-        if self.result_pos >= self.result_len {
-            return 0xff;
-        }
-        let value = self.result[self.result_pos];
-        self.result_pos += 1;
-        if self.result_pos >= self.result_len {
-            self.result_pos = 0;
-            self.result_len = 0;
-            // v86/QEMU lower IRQ when the complete result has been consumed.
-            // PIC acknowledgement alone cannot acknowledge the device.
-            self.irq6 = false;
-        }
-        value
-    }
-
-    fn write_data(&mut self, value: u8) {
-        if self.dor & 4 == 0 || self.result_pos < self.result_len {
-            return;
-        }
-        if self.command_len == 0 {
-            self.command[0] = value;
-            self.command_len = 1;
-            self.command_needed = Self::command_size(value);
-        } else if self.command_len < self.command.len() {
-            self.command[self.command_len] = value;
-            self.command_len += 1;
-        }
-        if self.command_len >= self.command_needed {
-            self.execute_command();
-        }
-    }
-
-    fn command_size(command: u8) -> usize {
-        match Self::command_code(command) {
-            0x03 | 0x0f => 3,
-            0x04 | 0x07 | 0x0a | 0x12 => 2,
-            0x05 | 0x06 | 0x09 | 0x0c | 0x11 | 0x19 | 0x1d => 9,
-            0x0d => 6,
-            0x13 => 4,
-            _ => 1,
-        }
-    }
-
-    fn command_code(command: u8) -> u8 {
-        // Only data operations have MT/MFM/SK flags. Do not let an unknown
-        // opcode alias VERSION, SENSE INTERRUPT or an absolute SEEK.
-        match command {
-            0x03 | 0x04 | 0x07 | 0x08 | 0x0e | 0x0f | 0x10 | 0x12 | 0x13 | 0x14 | 0x94 => command,
-            _ => match command & 0x1f {
-                0x05 | 0x09 if command & 0x20 == 0 => command & 0x1f,
-                0x06 | 0x0c | 0x11 | 0x19 | 0x1d => command & 0x1f,
-                0x0a | 0x0d if command & 0xa0 == 0 => command & 0x1f,
-                _ => 0xff,
-            },
-        }
-    }
-
-    fn execute_command(&mut self) {
-        let base = Self::command_code(self.command[0]);
-        match base {
-            0x03 => {
-                self.specify = [self.command[1], self.command[2]];
-                self.enter_idle();
-            }
-            0x12 => {
-                let mode = self.command[1];
-                if mode & 0x80 != 0 {
-                    self.perpendicular = mode & 0x3f;
-                } else {
-                    self.perpendicular = (self.perpendicular & 0x3c) | (mode & 3);
-                }
-                self.enter_idle();
-            }
-            0x13 => {
-                self.config = self.command[2] & 0x7f;
-                self.pretrk = self.command[3];
-                self.enter_idle();
-            }
-            0x04 => {
-                // Enhanced ST3 bits 3/5 are fixed ones (also v86). An absent
-                // drive supplies no TRACK0 or write-protect signal; v86 sets
-                // TRACK0 at track zero even without media.
-                self.set_result(&[0x28 | (self.command[1] & 7)]);
-            }
-            0x07 => {
-                let drive = self.command[1] & 0x03;
-                self.cylinder[drive as usize] = 0;
-                self.status0 = 0x70 | drive; // Seek end, equipment check, abnormal.
-                self.reset_sense = 0;
-                self.irq6 = true;
-                self.enter_idle();
-            }
-            0x08 => {
-                let (drive, status0) = if self.reset_sense > 0 {
-                    let drive = 4 - self.reset_sense;
-                    self.reset_sense -= 1;
-                    (drive, 0xc0 | drive)
-                } else if self.irq6 {
-                    (self.status0 & 0x03, self.status0)
-                } else {
-                    self.set_result(&[0x80]);
-                    return;
-                };
-                self.irq6 = false;
-                self.set_result(&[status0, self.cylinder[drive as usize]]);
-            }
-            0x0e => {
-                let result = [
-                    self.cylinder[0],
-                    self.cylinder[1],
-                    self.cylinder[2],
-                    self.cylinder[3],
-                    self.specify[0],
-                    self.specify[1],
-                    0, // No sectors: there is no drive/media geometry.
-                    (u8::from(self.locked) << 7) | self.perpendicular,
-                    self.config,
-                    self.pretrk,
-                ];
-                self.set_result(&result);
-            }
-            0x0f => {
-                let drive = self.command[1] & 0x03;
-                let head = (self.command[1] >> 2) & 1;
-                // SEEK counts step pulses; unlike recalibration, it does not
-                // require TRACK0 feedback from a drive (also v86, whose
-                // RECALIBRATE also succeeds without media).
-                self.cylinder[drive as usize] = self.command[2];
-                self.status0 = 0x20 | (head << 2) | drive;
-                self.reset_sense = 0;
-                self.irq6 = true;
-                self.enter_idle();
-            }
-            0x10 => {
-                self.set_result(&[0x90]);
-            }
-            0x14 | 0x94 => {
-                self.locked = base & 0x80 != 0;
-                self.set_result(&[u8::from(self.locked) << 4]);
-            }
-            0x05 | 0x06 | 0x09 | 0x0a | 0x0c | 0x0d | 0x11 | 0x19 | 0x1d => {
-                let drive = self.command[1] & 0x03;
-                let head = (self.command[1] >> 2) & 1;
-                self.status0 = 0x40 | (head << 2) | drive;
-                let [c, h, r, n] = match base {
-                    0x0a => [self.cylinder[drive as usize], head, 1, 2],
-                    0x0d => [self.cylinder[drive as usize], head, 1, self.command[2]],
-                    _ => [
-                        self.command[2],
-                        self.command[3],
-                        self.command[4],
-                        self.command[5],
-                    ],
-                };
-                self.set_result(&[self.status0, 0x04, 0, c, h, r, n]);
-                self.reset_sense = 0;
-                self.irq6 = true;
-            }
-            _ => {
-                self.set_result(&[0x80]);
-            }
-        }
-    }
-
-    fn set_result(&mut self, bytes: &[u8]) {
-        self.result[..bytes.len()].copy_from_slice(bytes);
-        self.result_pos = 0;
-        self.result_len = bytes.len();
-        self.enter_idle();
-    }
-
-    fn enter_idle(&mut self) {
-        self.command_len = 0;
-        self.command_needed = 0;
-    }
-
-    fn clear_command_and_result(&mut self) {
-        self.command_len = 0;
-        self.command_needed = 0;
-        self.result_pos = 0;
-        self.result_len = 0;
-    }
-
-    fn start_reset(&mut self) {
-        self.clear_command_and_result();
-        self.cylinder = [0; 4];
-        // Software reset preserves SPECIFY and the perpendicular drive bits.
-        // LOCK protects EFIFO/FIFOTHR/PRETRK, not EIS/POLL or GAP/WGATE.
-        self.perpendicular &= 0x3c;
-        if self.locked {
-            self.config &= 0x2f;
-        } else {
-            self.config = 0x20;
-            self.pretrk = 0;
-        }
-        self.reset_sense = 4;
-        self.status0 = 0xc0;
-        self.irq6 = true;
-    }
-}
-
 #[cfg(feature = "host")]
 type MachineRam = Vec<u8>;
 #[cfg(not(feature = "host"))]
@@ -2276,7 +1943,6 @@ pub(crate) struct HostBus {
     rtc_next_tick: u64,
     rtc_last_tick: u64,
     rtc_periodic_epoch: u64,
-    fdc: NullFdc,
     reset_requested: bool,
     physical_mapping_changed: bool,
     last_cpu_shutdown: Option<CpuShutdown>,
@@ -2510,7 +2176,6 @@ impl HostBus {
             rtc_next_tick: u64::MAX,
             rtc_last_tick: 0,
             rtc_periodic_epoch: 0,
-            fdc: NullFdc::new(),
             reset_requested: false,
             physical_mapping_changed: false,
             last_cpu_shutdown: None,
@@ -2632,7 +2297,6 @@ impl HostBus {
         self.sync_pci_irq();
         self.sync_ide_irqs();
         self.drive_irq(4, self.serial_irq_asserted());
-        self.drive_irq(6, self.fdc.irq_asserted());
         self.drive_irq(8, self.rtc_irq8);
         self.drive_irq(9, self.acpi.irq());
     }
@@ -4519,10 +4183,9 @@ impl Bus for HostBus {
             self.set_attention();
             return Ok(value);
         }
-        if let Some(value) = self.fdc.read_u8(port) {
-            self.drive_irq(6, self.fdc.irq_asserted());
-            return Ok(value);
-        }
+        // No floppy controller, as in upstream tiny386. Windows 98 SE HSFLOP.PDR
+        // writes through a null request when a controller has no attached drives.
+        // 0x3f0..=0x3f5 and 0x3f7 are unclaimed; 0x3f6 remains IDE above.
         if let Some(value) = self.ide_bus_master_read_u8(port) {
             return Ok(value);
         }
@@ -4679,10 +4342,6 @@ impl Bus for HostBus {
         }
         if self.pci.ide_port_enabled(port) && self.ide.write_u8(port, value) {
             self.sync_ide_irqs();
-            return Ok(());
-        }
-        if self.fdc.write_u8(port, value) {
-            self.drive_irq(6, self.fdc.irq_asserted());
             return Ok(());
         }
         if self.ide_bus_master_write_u8(port, value) {
@@ -13904,153 +13563,25 @@ mod host_bus_tests {
         assert_eq!(bus.io_read_u8(0xd00a).unwrap() & 4, 0);
     }
 
-    fn floppy_command(bus: &mut HostBus, bytes: &[u8]) {
-        for &byte in bytes {
-            assert_eq!(bus.io_read_u8(0x3f4).unwrap() & 0xc0, 0x80);
-            bus.io_write_u8(0x3f5, byte).unwrap();
-        }
-    }
-
-    fn floppy_result(bus: &mut HostBus, expected: &[u8]) {
-        for &byte in expected {
-            assert_eq!(bus.io_read_u8(0x3f4).unwrap(), 0xd0);
-            assert_eq!(bus.io_read_u8(0x3f5).unwrap(), byte);
-        }
-        assert_eq!(bus.io_read_u8(0x3f4).unwrap(), 0x80);
-    }
-
     #[test]
-    fn floppy_irq_mask_and_result_ack_allow_consecutive_completions() {
-        let mut bus = HostBus::new(1024 * 1024);
-        bus.io_write_u8(0x21, !0x40).unwrap();
-
-        // The device completion survives DOR masking, independently of PIC EOI.
-        bus.io_write_u8(0x3f2, 0x04).unwrap();
-        floppy_command(&mut bus, &[0x4a, 0]); // READ ID, no drive attached.
+    fn floppy_ports_are_unclaimed_without_changing_ide_status() {
+        let mut bus = HostBus::new_firmware(2 * 1024 * 1024).unwrap();
+        bus.attach_hdd(vec![0; 512], true);
+        bus.io_write_u8(0x21, !0x40).unwrap(); // Observe any unexpected IRQ6.
+        bus.io_write_u8(0x3f2, 0).unwrap();
+        bus.io_write_u8(0x3f2, 0x0c).unwrap();
+        bus.io_write_u8(0x3f5, 0x0e).unwrap(); // DUMPREG must find no controller.
+        for port in [0x3f0, 0x3f1, 0x3f2, 0x3f3, 0x3f4, 0x3f5, 0x3f7] {
+            assert_eq!(bus.io_read_u8(port).unwrap(), 0xff, "port {port:x}");
+        }
         assert_eq!(bus.pic.pending_irq(), None);
-        bus.io_write_u8(0x3f2, 0x0c).unwrap();
-        for attempt in 0..2 {
-            if attempt != 0 {
-                floppy_command(&mut bus, &[0x4a, 0]);
-            }
-            assert_eq!(bus.pic.pending_irq(), Some(6));
-            assert_eq!(bus.pic.acknowledge(), 0x26);
-            bus.io_write_u8(0x20, 0x20).unwrap();
-            floppy_result(&mut bus, &[0x40, 4, 0, 0, 0, 1, 2]);
-            assert_eq!(bus.pic.pending_irq(), None);
-        }
-    }
-
-    #[test]
-    fn floppy_reset_sense_and_seek_report_the_completed_drive() {
-        let mut bus = HostBus::new(1024 * 1024);
-        bus.io_write_u8(0x3f2, 0).unwrap();
-        bus.io_write_u8(0x3f5, 0x10).unwrap(); // Held reset cannot execute VERSION.
-        assert_eq!(bus.io_read_u8(0x3f4).unwrap() & 0x80, 0);
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0xff);
-        bus.io_write_u8(0x3f2, 0x0c).unwrap();
-        for drive in 0..4 {
-            floppy_command(&mut bus, &[8]);
-            floppy_result(&mut bus, &[0xc0 | drive, 0]);
-        }
-        floppy_command(&mut bus, &[8]);
-        floppy_result(&mut bus, &[0x80]); // No phantom second result byte.
-
-        floppy_command(&mut bus, &[0x0f, 2, 37]);
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0xff); // No result phase yet.
-        // DOR still selects drive 0; SENSE must report the seek on drive 2.
-        floppy_command(&mut bus, &[8]);
-        floppy_result(&mut bus, &[0x22, 37]);
-        floppy_command(&mut bus, &[7, 1]); // No TRACK0 signal from an absent drive.
-        floppy_command(&mut bus, &[8]);
-        floppy_result(&mut bus, &[0x71, 0]);
-        floppy_command(&mut bus, &[4, 1]);
-        floppy_result(&mut bus, &[0x29]); // Enhanced ST3 constants, no TRACK0.
-        assert_eq!(bus.io_read_u8(0x3f7).unwrap() & 0x80, 0x80);
-
-        // A new completion replaces residual reset polling status.
-        bus.io_write_u8(0x3f4, 0x80).unwrap();
-        floppy_command(&mut bus, &[0x0f, 3, 11]);
-        floppy_command(&mut bus, &[8]);
-        floppy_result(&mut bus, &[0x23, 11]);
-        floppy_command(&mut bus, &[8]);
-        floppy_result(&mut bus, &[0x80]);
-    }
-
-    #[test]
-    fn floppy_fifo_direction_and_invalid_opcodes_do_not_destroy_results() {
-        let mut bus = HostBus::new(1024 * 1024);
-        floppy_command(&mut bus, &[0x4a, 0]);
-        bus.io_write_u8(0x3f5, 0x10).unwrap(); // Wrong direction: preserve READ ID.
-        floppy_result(&mut bus, &[0x40, 4, 0, 0, 0, 1, 2]);
-
-        floppy_command(&mut bus, &[3, 0xdf]);
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0xff);
-        floppy_command(&mut bus, &[2]); // Complete interrupted SPECIFY collection.
-        floppy_command(&mut bus, &[0x10]);
-        floppy_result(&mut bus, &[0x90]);
-        // Flag bits belong to particular commands, not a universal low-five mask.
-        for invalid in [0x30, 0x88, 0x25, 0x8f] {
-            floppy_command(&mut bus, &[invalid]);
-            floppy_result(&mut bus, &[0x80]);
-        }
-    }
-
-    #[test]
-    fn floppy_configuration_lock_and_reset_are_visible_through_dumpreg() {
-        let mut bus = HostBus::new(1024 * 1024);
-        floppy_command(&mut bus, &[3, 0xdf, 2]);
-        floppy_command(&mut bus, &[0x13, 0, 0x6b, 17]);
-        floppy_command(&mut bus, &[0x12, 0x8f]);
-        floppy_command(&mut bus, &[0x12, 1]); // Without OW, preserve drive enables.
-        floppy_command(&mut bus, &[0x94]);
-        floppy_result(&mut bus, &[0x10]);
-        floppy_command(&mut bus, &[0x0e]);
-        floppy_result(&mut bus, &[0, 0, 0, 0, 0xdf, 2, 0, 0x8d, 0x6b, 17]);
-
-        // DSR reset keeps DOR selection/motor/IRQ mask. LOCK protects FIFO fields.
-        bus.io_write_u8(0x3f2, 0x25).unwrap();
-        bus.io_write_u8(0x3f4, 0x80).unwrap();
-        assert_eq!(bus.io_read_u8(0x3f2).unwrap(), 0x25);
-        floppy_command(&mut bus, &[0x0e]);
-        floppy_result(&mut bus, &[0, 0, 0, 0, 0xdf, 2, 0, 0x8c, 0x2b, 17]);
-        floppy_command(&mut bus, &[0x14]);
-        floppy_result(&mut bus, &[0]);
-        bus.io_write_u8(0x3f2, 0).unwrap();
-        bus.io_write_u8(0x3f4, 0x80).unwrap(); // DOR reset takes precedence.
-        assert_eq!(bus.io_read_u8(0x3f2).unwrap(), 0);
-        bus.io_write_u8(0x3f2, 0x0c).unwrap();
-        floppy_command(&mut bus, &[0x0e]);
-        floppy_result(&mut bus, &[0, 0, 0, 0, 0xdf, 2, 0, 0x0c, 0x20, 0]);
-    }
-
-    #[test]
-    fn floppy_controller_absent_drive_probe_is_benign() {
-        let mut bus = HostBus::new(1024 * 1024);
-
-        bus.io_write_u8(0x3f2, 0).unwrap();
-        bus.io_write_u8(0x3f2, 0x0c).unwrap();
-
-        assert_eq!(bus.io_read_u8(0x3f2).unwrap(), 0x0c);
-        assert_eq!(bus.io_read_u8(0x3f4).unwrap(), 0x80);
-        assert!(bus.fdc.irq_asserted());
-
-        bus.io_write_u8(0x3f5, 0x08).unwrap();
-
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0xc0);
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0x00);
-        assert!(!bus.fdc.irq_asserted());
-    }
-
-    #[test]
-    fn floppy_version_command_reports_enhanced_controller() {
-        let mut bus = HostBus::new(1024 * 1024);
-
-        bus.io_write_u8(0x3f5, 0x10).unwrap();
-
-        assert_eq!(bus.io_read_u8(0x3f4).unwrap(), 0xd0);
-        assert_eq!(bus.io_read_u8(0x3f5).unwrap(), 0x90);
-        assert_eq!(bus.io_read_u8(0x3f4).unwrap(), 0x80);
+        let ata_status = bus.io_read_u8(0x1f7).unwrap();
+        assert_ne!(ata_status, 0xff);
+        assert_eq!(bus.io_read_u8(0x3f6).unwrap(), ata_status);
+        bus.io_write_u8(0x70, 0x10).unwrap();
+        assert_eq!(bus.io_read_u8(0x71).unwrap(), 0);
+        bus.io_write_u8(0x70, 0x14).unwrap();
+        assert_eq!(bus.io_read_u8(0x71).unwrap() & 1, 0);
     }
 
     #[test]
