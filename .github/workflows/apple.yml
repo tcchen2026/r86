@@ -52,14 +52,13 @@ jobs:
       - name: Tools
         run: |
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
-          brew install xcodegen
-          xcodebuild -version
+          swiftc --version
           rustc -V
 
       - name: Build
         run: |
           script/build_macos.sh
-          codesign -d --entitlements - apple/build/derived/Build/Products/Release/r86.app
+          codesign -d --entitlements - apple/build/r86.app
 
       - uses: actions/upload-artifact@v4
         with:

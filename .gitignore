@@ -15,9 +15,8 @@ tmp/
 *.qcow2
 *.raw
 
-# Mac app: the Rust library build and the XcodeGen-generated project.
+# Mac app: the Rust library, r86.app and r86.dmg.
 /apple/build/
-/apple/r86.xcodeproj/
 
 # Python caches and local virtual environments.
 __pycache__/

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build the r86 Rust library for the Mac app: apple/build/rust/libr86.a.
-# Run by Xcode before compiling Swift; also usable by hand.
+# Run by script/build_macos.sh before compiling Swift; also usable by hand.
 set -eu
 apple=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$apple")
