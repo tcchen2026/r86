@@ -3,3 +3,6 @@
 pub mod compile;
 #[cfg(all(feature = "machine", target_arch = "riscv32"))]
 pub mod runtime;
+
+#[cfg(all(feature = "machine", target_arch = "riscv32"))]
+mod native;

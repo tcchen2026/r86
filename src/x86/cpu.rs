@@ -1543,6 +1543,17 @@ impl Cpu {
         (self.flat_segment_write_mask & FLAT_32BIT_STACK_MASK) != 0
     }
 
+    /// Chip segment proofs reuse the interpreter's cached-descriptor qualification.
+    /// Hardware checks the actual base/limit; unsupported descriptors get no grant.
+    #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
+    pub(crate) fn chip_segment_rights(&self, seg: SegmentReg) -> u32 {
+        let mut cache = self.seg(seg);
+        cache.base = 0;
+        cache.limit = u32::MAX;
+        u32::from(flat_data_segment(cache, false))
+            | (u32::from(flat_data_segment(cache, true)) << 1)
+    }
+
     #[cfg(feature = "jit")]
     pub(crate) fn jit_segment_masks(&self) -> (u32, u32) {
         // The frame view uses bit 6 for SS's flat 32-bit stack qualification.
@@ -1711,6 +1722,7 @@ impl Cpu {
 
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
+        all(feature = "r86chip", target_arch = "riscv32"),
         any(all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
     ))]
     pub(crate) fn jit_mapping_epoch(&self) -> u64 {
@@ -1733,6 +1745,7 @@ impl Cpu {
 
     #[cfg(any(
         all(feature = "jit", target_arch = "arm"),
+        all(feature = "r86chip", target_arch = "riscv32"),
         any(all(feature = "wasm-jit", target_arch = "wasm32"), a64_jit)
     ))]
     pub(crate) fn take_jit_invalidated_range(&mut self) -> Option<(u32, u32)> {

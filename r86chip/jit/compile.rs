@@ -1,149 +1,286 @@
-//! Bounded register blocks using hardware x86 arithmetic/status and RV32 words.
-//!
-//! Bank-1 x1..x8 hold guest registers, x16 the software EFLAGS envelope, x17 EIP and x31 the frame
-//! pointer. Arithmetic status lives in the dedicated Xr86 state described in
-//! sim/rv32.rs, imported/exported with XFLOAD/XFGET. x9..x15 are scratch.
-//! No generated word dereferences guest memory.
-//! The dispatcher must approve the complete fetch window and event budget.
-//! Unsupported instructions end the block before their effects. Memory, faults,
-//! interrupt shadows and privileged operations remain interpreter boundaries.
-//!
-//! Undefined logic AF follows the shared r86 interpreter's zero. v86 arith.rs
-//! agrees on arithmetic flags, preserved INC/DEC CF and cleared logic AF.
-use crate::x86::jit::decode::{self, Alu, Op, Register, Value};
+//! Basic blocks for the resident bank-1 ABI: x8..x15 = EAX..EDI, x16 = next EIP.
+//! No Cpu layout or frame pointer enters generated code. XTICK reserves a whole
+//! block; runtime uses the per-instruction native offsets to refund an unfinished
+//! suffix on a service/fallback. Unsupported instructions execute in the shared
+//! interpreter. The caller supplies an approved, single-page CS32 fetch window.
+use crate::x86::cpu::SegmentReg;
+use crate::x86::jit::decode::{self, Address, Alu, BranchCondition, Op, Register, Value};
 use alloc::vec::Vec;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Frame {
-    pub regs: [u32; 8],
-    pub flags: u32,
-    pub eip: u32,
-    pub executed: u32,
-}
-const _: () = assert!(core::mem::size_of::<Frame>() == 44);
-const _: () = assert!(core::mem::offset_of!(Frame, flags) == 32);
-const _: () = assert!(core::mem::offset_of!(Frame, eip) == 36);
-const _: () = assert!(core::mem::offset_of!(Frame, executed) == 40);
+pub const MISS: u32 = 1;
+pub const SERVICE: u32 = 2;
+pub const INTERPRET: u32 = 3;
+pub const TICK: u32 = 0xfff;
+pub const PC: u32 = 16;
+const A: u32 = 1;
+const L: u32 = 2;
+const R: u32 = 3;
+const V: u32 = 4;
+const T: u32 = 5;
+const TARGET: u32 = 6;
+const RETURN: u32 = 7;
+const ESP: u32 = 12;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Site {
+    pub offset: u32,
+    pub eip: u32,
+    pub index: u32,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    Branch,
+    Unsupported(u8),
+    Window,
+    Limit,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Link {
+    pub offset: u32,
+    pub start: u32,
+    pub original: u32,
+    pub eip: u32,
+}
 pub struct Block {
     pub words: Vec<u32>,
     pub instructions: u32,
     pub source_bytes: usize,
+    pub sites: Vec<Site>,
+    pub links: Vec<Link>,
+    pub end: End,
+}
+impl Block {
+    pub fn site(&self, offset: u32) -> Site {
+        let at = self.sites.partition_point(|site| site.offset <= offset);
+        self.sites[at.saturating_sub(1)]
+    }
 }
 
-const L: u32 = 9;
-const R: u32 = 10;
-const V: u32 = 11;
-const T: u32 = 12;
-const FLAGS: u32 = 16;
-const PC: u32 = 17;
-const FRAME: u32 = 31;
+pub fn opcode(bytes: &[u8]) -> u8 {
+    bytes
+        .iter()
+        .copied()
+        .find(|b| {
+            !matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .unwrap_or(0)
+}
+fn guest(r: Register) -> u32 {
+    u32::from(r.index) + 8
+}
+fn small(value: u32) -> bool {
+    (-2048..=2047).contains(&(value as i32))
+}
 
-struct Asm(Vec<u32>);
+struct Asm {
+    words: Vec<u32>,
+    links: Vec<Link>,
+}
 impl Asm {
-    fn i(&mut self, op: u32, d: u32, a: u32, f: u32, n: u32) {
-        self.0
-            .push(op | d << 7 | f << 12 | a << 15 | (n & 4095) << 20);
+    fn i(&mut self, op: u32, rd: u32, rs1: u32, f: u32, imm: u32) {
+        self.words
+            .push(op | rd << 7 | f << 12 | rs1 << 15 | (imm & 4095) << 20);
     }
-    fn alu(&mut self, d: u32, a: u32, b: u32, f: u32, sub: bool) {
-        self.0
-            .push(0x33 | d << 7 | f << 12 | a << 15 | b << 20 | u32::from(sub) << 30);
+    fn r(&mut self, op: u32, f: u32, k: u32, rd: u32, rs1: u32, rs2: u32) {
+        self.words
+            .push(op | rd << 7 | f << 12 | rs1 << 15 | rs2 << 20 | k << 25);
     }
-    fn copy(&mut self, d: u32, a: u32) {
-        self.i(0x13, d, a, 0, 0);
+    fn s(&mut self, op: u32, f: u32, rs1: u32, rs2: u32, imm: u32) {
+        self.words.push(
+            op | (imm & 31) << 7 | f << 12 | rs1 << 15 | rs2 << 20 | ((imm >> 5) & 127) << 25,
+        );
     }
-    fn literal(&mut self, d: u32, value: u32) {
+    fn copy(&mut self, dst: u32, src: u32) {
+        if dst != src {
+            self.i(0x13, dst, src, 0, 0);
+        }
+    }
+    fn literal(&mut self, dst: u32, value: u32) {
         let low = ((value as i32) << 20 >> 20) as u32;
         let high = value.wrapping_sub(low);
         if high != 0 {
-            self.0.push(high | d << 7 | 0x37);
+            self.words.push(high | dst << 7 | 0x37);
         }
         if low != 0 || high == 0 {
-            self.i(0x13, d, if high == 0 { 0 } else { d }, 0, low);
+            self.i(0x13, dst, if high == 0 { 0 } else { dst }, 0, low);
         }
     }
-    fn shift(&mut self, d: u32, a: u32, count: u32, right: bool) {
-        self.i(0x13, d, a, if right { 5 } else { 1 }, count);
+    fn add(&mut self, dst: u32, lhs: u32, rhs: u32) {
+        self.r(0x33, 0, 0, dst, lhs, rhs);
     }
-    fn store(&mut self, a: u32, offset: u32) {
-        self.0.push(
-            0x23 | (offset & 31) << 7 | 2 << 12 | FRAME << 15 | a << 20 | (offset >> 5) << 25,
-        );
-    }
-    fn mask(&mut self, d: u32, bits: u8) {
-        if bits != 32 {
-            self.shift(d, d, 32 - u32::from(bits), false);
-            self.shift(d, d, 32 - u32::from(bits), true);
-        }
-    }
-    fn value(&mut self, value: Value, d: u32) {
-        match value {
-            Value::Register(r) => {
-                self.copy(d, u32::from(r.index) + 1);
-                if r.shift != 0 {
-                    self.shift(d, d, u32::from(r.shift), true);
-                }
-                self.mask(d, r.bits);
-            }
-            Value::Immediate(value) => self.literal(d, value),
-            Value::Memory { .. } => unreachable!("memory must end the native block"),
-        }
-    }
-    fn write(&mut self, reg: Register, source: u32, high_source: bool) {
-        let dst = u32::from(reg.index) + 1;
-        if reg.bits == 32 {
-            self.copy(dst, source);
-            return;
-        }
-        // Read the old destination container and raw source together, including
-        // AL/AH aliases. XMERGE leaves both committed and pending flags alone.
-        self.0.push(
-            0x0b | dst << 7
-                | Self::lane(reg.bits, reg.shift != 0) << 12
-                | dst << 15
-                | source << 20
-                | (0x40 | u32::from(high_source) << 4) << 25,
-        );
-    }
-    // XALU reads the original destination container itself, selects both lanes,
-    // and merges the partial result. A register operand needs no extraction or
-    // software flag sequence. Immediates are narrowed by the instruction.
-    fn raw(&mut self, value: Value, temp: u32) -> (u32, bool) {
-        match value {
-            Value::Register(r) => (u32::from(r.index) + 1, r.shift != 0),
-            Value::Immediate(value) => {
-                self.literal(temp, value);
-                (temp, false)
-            }
-            Value::Memory { .. } => unreachable!("memory ends the native block"),
+    fn add_imm(&mut self, dst: u32, lhs: u32, imm: u32) {
+        if small(imm) {
+            self.i(0x13, dst, lhs, 0, imm);
+        } else {
+            self.literal(T, imm);
+            self.add(dst, lhs, T);
         }
     }
     fn lane(bits: u8, high: bool) -> u32 {
         match bits {
             32 => 0,
             16 => 1,
-            8 => {
-                if high {
-                    3
-                } else {
-                    2
-                }
-            }
+            8 => 2 + u32::from(high),
             _ => unreachable!(),
         }
+    }
+    fn write(&mut self, dst: Register, src: u32, high: bool) {
+        if dst.bits == 32 {
+            self.copy(guest(dst), src);
+        } else {
+            self.r(
+                0x0b,
+                Self::lane(dst.bits, dst.shift != 0),
+                0x40 | (u32::from(high) << 4),
+                guest(dst),
+                guest(dst),
+                src,
+            );
+        }
+    }
+    fn raw(&mut self, value: Value, temp: u32) -> (u32, bool) {
+        match value {
+            Value::Register(r) => (guest(r), r.shift != 0),
+            Value::Immediate(n) => {
+                self.literal(temp, n);
+                (temp, false)
+            }
+            Value::Memory { address, bits } => {
+                self.load(address, bits, false, false, temp);
+                (temp, false)
+            }
+        }
+    }
+    fn value(&mut self, value: Value, dst: u32) {
+        let (src, high) = self.raw(value, dst);
+        self.copy(dst, src);
+        if let Value::Register(r) = value {
+            if high {
+                self.i(0x13, dst, dst, 5, 8);
+            }
+            if r.bits != 32 {
+                let shift = 32 - u32::from(r.bits);
+                self.i(0x13, dst, dst, 1, shift);
+                self.i(0x13, dst, dst, 5, shift);
+            }
+        }
+    }
+    fn address(&mut self, address: Address) -> (u32, u32) {
+        if address.index.is_none() && small(address.displacement) {
+            return (
+                address.base.map_or(0, |r| u32::from(r) + 8),
+                address.displacement,
+            );
+        }
+        if let Some(base) = address.base {
+            self.add_imm(A, u32::from(base) + 8, address.displacement);
+        } else {
+            self.literal(A, address.displacement);
+        }
+        if let Some(index) = address.index {
+            let index = u32::from(index) + 8;
+            if address.scale == 0 {
+                self.add(A, A, index);
+            } else {
+                self.r(0x33, u32::from(address.scale) * 2, 0x10, A, index, A);
+            }
+        }
+        (A, 0)
+    }
+    fn offset(&mut self, address: Address) -> u32 {
+        let (base, imm) = self.address(address);
+        if imm == 0 {
+            base
+        } else {
+            self.add_imm(A, base, imm);
+            A
+        }
+    }
+    fn load(&mut self, address: Address, bits: u8, signed: bool, write: bool, dst: u32) {
+        let width = match bits {
+            8 => 0,
+            16 => 1,
+            32 => 2,
+            _ => unreachable!(),
+        };
+        if matches!(address.segment, SegmentReg::Ds | SegmentReg::Ss) {
+            let (base, imm) = self.address(address);
+            let f = if write {
+                [6, 7, 3][width as usize]
+            } else if width == 2 || signed {
+                width
+            } else {
+                width + 4
+            };
+            self.i(
+                if address.segment == SegmentReg::Ss {
+                    0x47
+                } else {
+                    0x07
+                },
+                dst,
+                base,
+                f,
+                imm,
+            );
+        } else {
+            let base = self.offset(address);
+            self.r(
+                0x5b,
+                width,
+                address.segment as u32 | (u32::from(write) << 3),
+                dst,
+                base,
+                0,
+            );
+            if signed && bits != 32 {
+                self.extend(dst, bits, true);
+            }
+        }
+    }
+    fn store(&mut self, address: Address, bits: u8, src: u32) {
+        let width = match bits {
+            8 => 0,
+            16 => 1,
+            32 => 2,
+            _ => unreachable!(),
+        };
+        if matches!(address.segment, SegmentReg::Ds | SegmentReg::Ss) {
+            let (base, imm) = self.address(address);
+            self.s(
+                if address.segment == SegmentReg::Ss {
+                    0x77
+                } else {
+                    0x27
+                },
+                width,
+                base,
+                src,
+                imm,
+            );
+        } else {
+            let base = self.offset(address);
+            self.r(0x5b, width + 4, address.segment as u32, 0, base, src);
+        }
+    }
+    fn extend(&mut self, reg: u32, bits: u8, signed: bool) {
+        let shift = 32 - u32::from(bits);
+        self.i(0x13, reg, reg, 1, shift);
+        self.i(0x13, reg, reg, 5, shift | if signed { 0x400 } else { 0 });
     }
     fn arithmetic(
         &mut self,
         kind: Alu,
-        lhs: Value,
-        rhs: Value,
+        lhs: u32,
         bits: u8,
-        dst: Option<Register>,
-        preserve_carry: bool,
+        high: bool,
+        rhs: Value,
+        dst: u32,
+        carry: bool,
     ) {
-        let (a, high_a) = self.raw(lhs, L);
-        let (b, high_b) = self.raw(rhs, R);
         let op = match kind {
             Alu::Add => 0,
             Alu::Or => 1,
@@ -153,176 +290,367 @@ impl Asm {
             Alu::Sub | Alu::Cmp => 5,
             Alu::Xor => 6,
         };
-        let rd = dst.map_or(0, |r| u32::from(r.index) + 1);
-        // .C publishes result and status in the same word. These blocks contain
-        // only qualified, fault-free guest register operations. A future memory
-        // RMW must instead stage its flags until the store is irrevocable.
-        let control = op | 8 | u32::from(high_b) << 4 | u32::from(preserve_carry) << 5;
-        self.0.push(
-            0x0b | rd << 7 | Self::lane(bits, high_a) << 12 | a << 15 | b << 20 | control << 25,
+        if bits == 32 {
+            if carry && rhs == Value::Immediate(1) && matches!(kind, Alu::Add | Alu::Sub) {
+                self.i(
+                    0x1b,
+                    dst,
+                    lhs,
+                    7,
+                    if kind == Alu::Add { 1 } else { u32::MAX },
+                );
+                return;
+            }
+            if let Value::Immediate(imm) = rhs {
+                if small(imm) && !carry {
+                    self.i(0x1b, dst, lhs, op, imm);
+                    return;
+                }
+            }
+        }
+        let (rhs, high_rhs) = self.raw(rhs, R);
+        self.r(
+            0x0b,
+            Self::lane(bits, high),
+            op | 8 | (u32::from(high_rhs) << 4) | (u32::from(carry) << 5),
+            dst,
+            lhs,
+            rhs,
         );
     }
-    fn branch_skip(&mut self, at: usize, condition: u8) {
-        let distance = (self.0.len() - at) as u32 * 4;
-        assert!(distance < 4096 && distance & 3 == 0);
-        self.0[at] = 0x307b // XJcc, standard B-immediate, no temporary GPR
+    fn leave(&mut self, reason: u32) {
+        self.i(0x7b, 0, 0, 5, reason);
+    }
+    fn exit(&mut self, target: u32, reason: u32) {
+        let start = self.words.len();
+        self.literal(PC, target);
+        if reason == MISS {
+            self.links.push(Link {
+                offset: self.words.len() as u32 * 4,
+                start: start as u32 * 4,
+                original: self.words[start],
+                eip: target,
+            });
+            self.i(0x6b, 0, PC, 0, 0);
+        }
+        self.leave(reason);
+    }
+    fn branch(&mut self, at: usize, condition: u8) {
+        let off = (self.words.len() - at) as u32 * 4;
+        assert!(off < 4096);
+        self.words[at] = 0x307b
             | u32::from(condition) << 15
-            | ((distance >> 11) & 1) << 7
-            | ((distance >> 1) & 15) << 8
-            | ((distance >> 5) & 63) << 25
-            | ((distance >> 12) & 1) << 31;
+            | ((off >> 12) & 1) << 31
+            | ((off >> 11) & 1) << 7
+            | ((off >> 5) & 63) << 25
+            | ((off >> 1) & 15) << 8;
     }
 }
 
 fn supported(op: Op) -> bool {
-    if op.reads_memory() || op.writes_memory() {
-        return false;
-    }
-    matches!(
-        op,
+    match op {
         Op::Nop
-            | Op::Mov { .. }
-            | Op::Compare { .. }
-            | Op::IncDec { .. }
-            | Op::Not { .. }
-            | Op::Negate { .. }
-            | Op::Lea { .. }
-            | Op::Branch {
-                condition: None | Some(decode::BranchCondition::Flags(_)),
-                ..
-            }
-            | Op::Alu { .. }
+        | Op::Mov { .. }
+        | Op::Store { .. }
+        | Op::Alu { .. }
+        | Op::Compare { .. }
+        | Op::IncDec { .. }
+        | Op::MemoryAlu { .. }
+        | Op::Lea { .. }
+        | Op::Extend { .. } => true,
+        Op::SetCondition {
+            dst: Value::Register(_),
+            ..
+        } => true,
+        Op::Shift {
+            dst: Value::Register(Register { bits: 32, .. }),
+            kind: 0..=4,
+            ..
+        } => true,
+        Op::Push { bits: 32, .. }
+        | Op::Pop {
+            dst: Register { bits: 32, .. },
+        }
+        | Op::Call { bits: 32, .. }
+        | Op::Return { bits: 32, .. } => true,
+        Op::IndirectJump {
+            src: Value::Register(Register { bits: 32, .. }) | Value::Memory { bits: 32, .. },
+        } => true,
+        Op::Branch {
+            condition: None | Some(BranchCondition::Flags(_)),
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// A native JAL link is valid only after runtime has qualified its target page
+/// and code version. The caller retains the target allocation until unlinking.
+pub fn jump(offset: i64) -> Option<u32> {
+    if !(-1048576..1048576).contains(&offset) || offset & 3 != 0 {
+        return None;
+    }
+    let n = offset as u32;
+    Some(
+        0x6f | ((n >> 20) & 1) << 31
+            | ((n >> 1) & 1023) << 21
+            | ((n >> 11) & 1) << 20
+            | ((n >> 12) & 255) << 12,
     )
 }
 
-/// Compile at most `limit` instructions from an already approved fetch window.
-/// The returned code expects bank-1 x31 to point to a writable `Frame`.
 pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
-    let decoded = decode::block(bytes, eip, limit.min(16));
-    let mut a = Asm(Vec::new());
-    for reg in 0..8 {
-        a.i(0x03, reg + 1, FRAME, 2, reg * 4);
-    }
-    a.i(0x03, FLAGS, FRAME, 2, 32);
-    a.i(0x0b, 0, FLAGS, 4, 0); // XFLOAD: initialize both status values
+    let limit = limit.min(4095);
+    let decoded = decode::block(bytes, eip, limit);
+    let mut a = Asm {
+        words: alloc::vec![0],
+        links: Vec::new(),
+    };
+    let mut sites = alloc::vec![Site {
+        offset: 0,
+        eip,
+        index: 0
+    }];
     let mut instructions = 0;
-    let mut end = eip;
-    let mut branch = false;
+    let mut end_eip = eip;
+    let mut end = End::Window;
+    let mut terminal = false;
+    let mut return_stub = None;
     for instruction in decoded.instructions {
         if !supported(instruction.op) {
+            end = End::Unsupported(opcode(&bytes[instruction.eip.wrapping_sub(eip) as usize..]));
             break;
         }
+        sites.push(Site {
+            offset: a.words.len() as u32 * 4,
+            eip: instruction.eip,
+            index: instructions,
+        });
         match instruction.op {
             Op::Nop => (),
+            Op::Mov {
+                dst,
+                src: Value::Memory { address, bits },
+            } if dst.bits == 32 => a.load(address, bits, false, false, guest(dst)),
             Op::Mov { dst, src } => {
-                let (source, high) = a.raw(src, V);
-                a.write(dst, source, high);
+                let (src, high) = a.raw(src, V);
+                a.write(dst, src, high);
             }
-            Op::Alu { kind, dst, src } => {
-                let result = (!matches!(kind, Alu::Cmp | Alu::Test)).then_some(dst);
-                a.arithmetic(kind, Value::Register(dst), src, dst.bits, result, false);
+            Op::Store { address, bits, src } => {
+                let (src, high) = a.raw(src, V);
+                let source = if high {
+                    a.i(0x13, V, src, 5, 8);
+                    V
+                } else {
+                    src
+                };
+                a.store(address, bits, source);
             }
+            Op::Alu { kind, dst, src } => a.arithmetic(
+                kind,
+                guest(dst),
+                dst.bits,
+                dst.shift != 0,
+                src,
+                if matches!(kind, Alu::Cmp | Alu::Test) {
+                    0
+                } else {
+                    guest(dst)
+                },
+                false,
+            ),
             Op::Compare {
                 lhs,
                 rhs,
                 bits,
                 test,
             } => {
+                let (left, high) = a.raw(lhs, L);
                 a.arithmetic(
                     if test { Alu::Test } else { Alu::Cmp },
-                    lhs,
-                    rhs,
+                    left,
                     bits,
-                    None,
+                    high,
+                    rhs,
+                    0,
                     false,
                 );
             }
-            Op::IncDec { dst, decrement } => {
-                a.arithmetic(
-                    if decrement { Alu::Sub } else { Alu::Add },
-                    Value::Register(dst),
-                    Value::Immediate(1),
-                    dst.bits,
-                    Some(dst),
-                    true,
-                );
+            Op::MemoryAlu {
+                kind,
+                address,
+                bits,
+                src,
+                preserve_carry,
+            } => {
+                a.load(address, bits, false, true, L);
+                a.arithmetic(kind, L, bits, false, src, V, preserve_carry);
+                // The write-intent load proved this exact store; no proof or
+                // context operation can intervene, so committing flags is safe.
+                a.store(address, bits, V);
             }
-            Op::Not { dst } => {
-                a.value(Value::Register(dst), V);
-                a.i(0x13, V, V, 4, u32::MAX);
+            Op::IncDec { dst, decrement } => a.arithmetic(
+                if decrement { Alu::Sub } else { Alu::Add },
+                guest(dst),
+                dst.bits,
+                dst.shift != 0,
+                Value::Immediate(1),
+                guest(dst),
+                true,
+            ),
+            Op::Extend {
+                dst,
+                src: Value::Memory { address, .. },
+                source_bits,
+                signed,
+            } => {
+                let result = if dst.bits == 32 { guest(dst) } else { V };
+                a.load(address, source_bits, signed, false, result);
+                if dst.bits != 32 {
+                    a.write(dst, V, false);
+                }
+            }
+            Op::Extend {
+                dst,
+                src,
+                source_bits,
+                signed,
+            } => {
+                a.value(src, V);
+                a.extend(V, source_bits, signed);
                 a.write(dst, V, false);
-            }
-            Op::Negate { dst } => {
-                let reg = u32::from(dst.index) + 1;
-                a.0.push(
-                    0x0b | reg << 7
-                        | Asm::lane(dst.bits, dst.shift != 0) << 12
-                        | reg << 15
-                        | (7 | 8) << 25,
-                ); // XALU.C NEG, rs2=0
             }
             Op::Lea { dst, address } => {
-                a.literal(V, address.displacement);
-                if let Some(base) = address.base {
-                    a.alu(V, V, u32::from(base) + 1, 0, false);
+                let src = a.offset(address);
+                a.write(dst, src, false);
+            }
+            Op::Shift {
+                dst: Value::Register(dst),
+                kind,
+                count,
+            } => {
+                let kind = [0, 1, 2, 4, 3][kind as usize]; // decoder ROR/ROL order
+                match count {
+                    Value::Immediate(n) => a.r(0x3b, kind, 1, guest(dst), guest(dst), n & 31),
+                    Value::Register(reg) => a.r(0x3b, kind, 0, guest(dst), guest(dst), guest(reg)),
+                    _ => unreachable!(),
                 }
-                if let Some(index) = address.index {
-                    let index = u32::from(index) + 1;
-                    if address.scale == 0 {
-                        a.alu(V, V, index, 0, false);
-                    } else {
-                        // SH{1,2,3}ADD: accumulator already contains base+disp.
-                        // Keep the guest destination untouched until addressing
-                        // is complete, including destination/base/index aliases.
-                        a.0.push(
-                            0x20000033
-                                | V << 7
-                                | u32::from(address.scale) * 2 << 12
-                                | index << 15
-                                | V << 20,
-                        );
-                    }
-                }
+            }
+            Op::SetCondition {
+                dst: Value::Register(dst),
+                condition,
+            } => {
+                a.i(0x0b, V, u32::from(condition), 7, 0);
                 a.write(dst, V, false);
             }
-            Op::Branch { condition, target } => {
-                a.literal(PC, instruction.next_eip);
-                if let Some(decode::BranchCondition::Flags(c)) = condition {
-                    let skip = a.0.len();
-                    a.0.push(0);
-                    a.literal(PC, target);
-                    a.branch_skip(skip, c ^ 1);
-                } else {
-                    a.literal(PC, target);
+            Op::Push { src, .. } => {
+                let (source, _) = a.raw(src, V);
+                a.s(0x77, 6, ESP, source, (-4i32) as u32);
+            }
+            Op::Pop { dst } => {
+                a.load(Address::stack(), 32, false, false, guest(dst));
+                if dst.index != 4 {
+                    a.add_imm(ESP, ESP, 4);
                 }
-                branch = true;
+            }
+            Op::Call { target, .. } => {
+                if !matches!(target, Value::Immediate(_)) {
+                    a.value(target, TARGET); // capture even CALL ESP before the push
+                }
+                a.literal(RETURN, instruction.next_eip);
+                let push = a.words.len();
+                a.s(0x77, 7, ESP, RETURN, 0);
+                return_stub = Some((push, instruction.next_eip));
+                if let Value::Immediate(target) = target {
+                    a.exit(target, MISS);
+                } else {
+                    a.copy(PC, TARGET);
+                    a.i(0x6b, 0, PC, 0, 0);
+                    a.leave(MISS);
+                }
+                terminal = true;
+            }
+            Op::Return { pop, .. } => {
+                a.load(Address::stack(), 32, false, false, PC);
+                a.add_imm(ESP, ESP, 4 + u32::from(pop));
+                a.i(0x6b, 0, PC, 0, 1);
+                a.leave(MISS);
+                terminal = true;
+            }
+            Op::IndirectJump { src } => {
+                a.value(src, PC);
+                a.i(0x6b, 0, PC, 0, 0);
+                a.leave(MISS);
+                terminal = true;
+            }
+            Op::Branch { condition, target } => {
+                if let Some(BranchCondition::Flags(c)) = condition {
+                    let at = a.words.len();
+                    a.words.push(0);
+                    a.exit(instruction.next_eip, MISS);
+                    a.branch(at, c);
+                }
+                a.exit(target, MISS);
+                terminal = true;
             }
             _ => unreachable!(),
         }
         instructions += 1;
-        end = instruction.next_eip;
-        if branch {
+        end_eip = instruction.next_eip;
+        if terminal {
+            end = End::Branch;
             break;
         }
     }
     if instructions == 0 {
         return None;
     }
-    if !branch {
-        a.literal(PC, end);
+    let source_bytes = end_eip.wrapping_sub(eip) as usize;
+    if !terminal {
+        if instructions as usize == limit {
+            end = End::Limit;
+        } else if source_bytes < bytes.len() {
+            end = End::Unsupported(opcode(&bytes[source_bytes..]));
+        }
+        sites.push(Site {
+            offset: a.words.len() as u32 * 4,
+            eip: end_eip,
+            index: instructions,
+        });
+        a.exit(
+            end_eip,
+            if matches!(end, End::Unsupported(_)) {
+                INTERPRET
+            } else {
+                MISS
+            },
+        );
     }
-    for reg in 0..8 {
-        a.store(reg + 1, reg * 4);
+    if let Some((push, return_eip)) = return_stub {
+        let distance = a.words.len() - push;
+        assert!(distance < 2048);
+        a.words[push] = 0x77
+            | ((distance as u32 & 31) << 7)
+            | 7 << 12
+            | ESP << 15
+            | RETURN << 20
+            | (distance as u32 >> 5) << 25;
+        a.exit(return_eip, MISS);
     }
-    a.i(0x0b, FLAGS, FLAGS, 5, 0); // XFGET: preserve software control/system bits
-    a.store(FLAGS, 32);
-    a.store(PC, 36);
-    a.literal(T, instructions);
-    a.store(T, 40);
-    a.0.push(0x0000507b); // XLEAVE 0
+    a.words[0] = 0x6b | 4 << 12 | instructions << 20;
+    // A direct self-edge stays within the already qualified source page and
+    // enters XTICK again, never the middle of a reserved instruction budget.
+    for link in &a.links {
+        if link.eip == eip {
+            a.words[link.start as usize / 4] = jump(-i64::from(link.start)).unwrap();
+        }
+    }
     Some(Block {
-        words: a.0,
+        words: a.words,
         instructions,
-        source_bytes: end.wrapping_sub(eip) as usize,
+        source_bytes,
+        sites,
+        links: a.links,
+        end,
     })
 }

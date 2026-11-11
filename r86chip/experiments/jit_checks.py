@@ -2,12 +2,13 @@
 """Exercise same-core JIT validity, fault boundaries and timer interrupts.
 
 Use a --jit build of tinycore.py as --template. The same RV firmware is run with
-JIT disabled/enabled under both ISS and RTL. These are synthetic protected-mode
+JIT disabled/enabled under the selected ISS/RTL engines. These are synthetic protected-mode
 guests, distinct from the TinyCore boot gate; each guest checks its own results.
 """
 import argparse
 import json
 from pathlib import Path
+import os
 import shutil
 import struct
 import subprocess
@@ -79,28 +80,29 @@ REMAP = """
     jmp success
 """
 NEGATIVE = """
-    mov byte [0x8000], 0xa1
-    mov dword [0x8001], 0x18000
-    mov byte [0x8005], 0xc3
-    mov dword [0x18000], 7
+    ; NEG is outside this emission table, so its exact entry is negatively cached.
+    mov word [0x8000], 0xd8f7
+    mov byte [0x8002], 0xc3
     mov ecx, 32
 .warm:
+    mov eax, 7
     call 0x8000
-    cmp eax, 7
+    cmp eax, -7
     jne fail
     dec ecx
     jnz .warm
-    ; Only this separate, negatively cached source page changes.
-    mov byte [0x8000], 0xb8
+    mov word [0x8000], 0x9090
     mov ecx, 32
 .changed:
+    mov eax, 7
     call 0x8000
-    cmp eax, 0x18000
+    cmp eax, 7
     jne fail
     dec ecx
     jnz .changed
     jmp success
 """
+
 IMMEDIATE_BORROW = """
     mov eax, 0x1234ffff
     mov ecx, 32
@@ -351,6 +353,107 @@ CASES = {
 }
 
 
+# Runtime-specific service boundaries added with resident memory/stack lowering.
+CASES["split-stack-call"] = """
+    mov ecx, 64
+.loop:
+    mov ebp, esp
+    mov esp, 0x200002
+    mov eax, 0x89abcdef
+    call target
+    cmp esp, 0x200002
+    jne fail
+    cmp edx, 0x89abcdef
+    jne fail
+    mov esp, ebp
+    dec ecx
+    jnz .loop
+    jmp success
+target:
+    push eax
+    pop edx
+    ret
+"""
+CASES["based-fs-reload"] = """
+    mov dword [0x6020], 0x000000ff
+    mov dword [0x6024], 0x00409301
+    mov word [0x6200], 39
+    mov dword [0x6202], 0x6000
+    lgdt [0x6200]
+    mov dword [0x10080], 0x12345678
+    mov dword [0x20080], 0x89abcdef
+    mov ax, 0x20
+    mov fs, ax
+    mov ecx, 32
+.first:
+    call target
+    cmp edx, 0x12345678
+    jne fail
+    dec ecx
+    jnz .first
+    mov dword [0x6024], 0x00409302
+    mov fs, ax
+    mov ecx, 32
+.second:
+    call target
+    cmp edx, 0x89abcdef
+    jne fail
+    dec ecx
+    jnz .second
+    jmp success
+target:
+    mov edx, [fs:0x80]
+    ret
+"""
+CASES["rmw-write-fault"] = interrupt_tables(14, "fault_handler") + PAGING + """
+    mov dword [0x5800], 0xa003
+    mov dword [0xa000], 7
+    mov eax, cr0
+    or eax, 0x10000
+    mov cr0, eax
+    mov ecx, 32
+.warm:
+    call target
+    dec ecx
+    jnz .warm
+    mov dword [0x5800], 0xa001
+    invlpg [0x600000]
+    call target
+    cmp dword [0x10000], 1
+    jne fail
+    cmp dword [0xa000], 40
+    jne fail
+    jmp success
+target:
+    mov eax, 0x7fffffff
+    stc
+    inc eax
+faulting:
+    add dword [0x600000], byte 1
+    ret
+fault_handler:
+    cmp eax, 0x80000000
+    jne fail
+    cmp dword [esp], 3
+    jne fail
+    cmp dword [esp+4], faulting
+    jne fail
+    cmp dword [0xa000], 39
+    jne fail
+    push eax
+    mov eax, [esp+16]
+    and eax, 0x8d5
+    cmp eax, 0x895
+    jne fail
+    pop eax
+    inc dword [0x10000]
+    mov dword [0x5800], 0xa003
+    invlpg [0x600000]
+    add esp, 4
+    iretd
+"""
+
+
 def serial(text):
     # Unroll the observation code so the cold case cannot become hot merely
     # because a serial print loop revisits the same guest PC.
@@ -362,10 +465,13 @@ def main():
     parser.add_argument("--template", type=Path, default=OUT.parent / "tinycore-jit-checks-template")
     parser.add_argument("--out", type=Path, default=OUT)
     parser.add_argument("--case", action="append", choices=CASES)
+    parser.add_argument("--engine", action="append", choices=("iss", "rtl"), default=None)
+    parser.add_argument("--simulator", type=Path, default=ROOT / os.environ.get("CARGO_TARGET_DIR", "target") / "release/r86chip-sim")
     args = parser.parse_args()
     template = args.template.resolve()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
+    engines = args.engine or ["iss", "rtl"]
     results = {}
     for name, body in CASES.items():
         if args.case and name not in args.case:
@@ -379,22 +485,28 @@ def main():
         subprocess.run(["nasm", "-f", "bin", str(case / "guest.asm"), "-o", str(case / "guest.bin")], check=True)
         code = (case / "guest.bin").read_bytes()
         assert len(code) < 4096
-        guest = bytearray(128 << 20)
-        guest[0x1000:0x1000+len(code)] = code
+        guest = case / "guest.ram"
+        with guest.open("wb") as memory:
+            memory.truncate(128 << 20)
+            memory.seek(0x1000)
+            memory.write(code)
         reports = {}
         for jit in (False, True):
             directory = case / ("jit" if jit else "interp")
             directory.mkdir(exist_ok=True)
             for filename in ("firmware.bin", "firmware.elf"):
                 shutil.copyfile(template / filename, directory / filename)
-            (directory / "guest.ram").write_bytes(guest)
+            target = directory / "guest.ram"
+            target.unlink(missing_ok=True)
+            target.hardlink_to(guest)
             (directory / "config.bin").write_bytes(struct.pack("<8I", 0x5238364d, 1, 0x1000, 0x90000,
-                                                                   len(guest), 50000, 0, 2 if jit else 0))
+                                                                   128 << 20, 50000, 0, 2 if jit else 0))
             commands = {
-                "iss": [ROOT / "target/release/r86chip-sim", "machine", directory / "firmware.elf", directory, 500000000, 60],
+                "iss": [args.simulator.resolve(), "machine", directory / "firmware.elf", directory, 500000000, 60],
                 "rtl": [template / "obj/Vr86_core", directory, 1000000000, 120],
             }
-            for engine, command in commands.items():
+            for engine in engines:
+                command = commands[engine]
                 with (directory / f"{engine}-console.log").open("w") as output:
                     subprocess.run([str(x) for x in command], check=True, stdout=output, stderr=output)
                 report = json.loads((directory / f"{engine}-run.json").read_text())
@@ -406,13 +518,17 @@ def main():
                     if name in ("smc", "physical-alias", "negative-cache"):
                         assert report["jit_invalidations"] > 0, report
                 reports[(jit, engine)] = report
-            for field in ("ram_fnv64", "guest_ram_fnv64", "jit_native_steps", "jit_invocations"):
-                assert reports[(jit, "iss")][field] == reports[(jit, "rtl")][field], (name, jit, field)
-            assert reports[(jit, "iss")]["rv_instructions"] == reports[(jit, "rtl")]["rv_instructions"] + 1
+            if "iss" in engines and "rtl" in engines:
+                for field in ("ram_fnv64", "guest_ram_fnv64", "jit_native_steps", "jit_invocations"):
+                    assert reports[(jit, "iss")][field] == reports[(jit, "rtl")][field], (name, jit, field)
+                assert reports[(jit, "iss")]["rv_instructions"] == reports[(jit, "rtl")]["rv_instructions"] + 1
+            (directory / "guest.ram").unlink()
         for field in ("guest_ram_fnv64", "x86_steps", "x86_regs", "eflags", "eip", "tsc"):
             assert len({str(r[field]) for r in reports.values()}) == 1, (name, field, reports)
         results[name] = {f"{'jit' if j else 'interp'}-{e}": r for (j, e), r in reports.items()}
-        print(f"PASS {name}: x86={reports[(True, 'rtl')]['x86_steps']} native={reports[(True, 'rtl')]['jit_native_steps']}", flush=True)
+        sample = reports[(True, engines[0])]
+        print(f"PASS {name}: x86={sample['x86_steps']} native={sample['jit_native_steps']}", flush=True)
+        guest.unlink()
         (out / "report.json").write_text(json.dumps(results, indent=2) + "\n")
 
 

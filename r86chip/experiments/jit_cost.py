@@ -4,8 +4,7 @@
 Run identical firmware with JIT off/on at two completed guest-step endpoints.
 Subtract total retired counts to remove common startup work; compilation,
 dispatch, interpretation, devices and invalidation within the interval count.
-Host-only PC profiles additionally separate emitted code (including its frame
-loads/stores and return) from linked firmware. Never label that smaller count
+Host-only PC profiles additionally separate emitted code (including block heads and exits) from linked firmware. Never label that smaller count
 as total native/x86. TinyCore is a bounded early-boot diagnostic; the synthetic
 register loop is deliberately favorable to JIT. Neither is a Windows average.
 """
@@ -13,6 +12,8 @@ import argparse
 import csv
 import hashlib
 import json
+import os
+from jit_diagnostics import HISTOGRAM_FLAGS, histogram, difference
 from pathlib import Path
 import shutil
 import struct
@@ -67,7 +68,7 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
     for steps in endpoints:
         cfg = bytearray(config)
         # Disable boundary logging in both modes. Per-PC profiling is host-only.
-        struct.pack_into("<III", cfg, 20, steps, 0, 2 if jit else 0)
+        struct.pack_into("<III", cfg, 20, steps, 0, HISTOGRAM_FLAGS | (2 if jit else 0))
         (directory / "config.bin").write_bytes(cfg)
         with (directory / f"iss-{steps}.log").open("w") as log:
             subprocess.run([iss, "machine", firmware, directory, "20000000000", str(seconds), "--profile"],
@@ -80,6 +81,7 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
         assert bool(result["jit_native_steps"]) == jit, result
         for suffix in ("run.json", "profile.csv", "serial.log"):
             (directory / f"iss-{suffix}").replace(directory / f"iss-{steps}-{suffix}")
+        result["histogram"] = histogram(directory)
         samples.append(result)
     interval = profile_interval(directory, samples)
     delta = {key: samples[1][key] - samples[0][key] for key in (
@@ -94,6 +96,7 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
     assert completed > 0
     translated = delta["jit_native_steps"]
     report = dict(samples=samples, delta=delta, interval_profile=interval,
+                  histogram=difference(samples[0]["histogram"], samples[1]["histogram"]),
                   native_per_completed_x86=delta["retired_native"] / completed,
                   emitted_native=emitted, firmware_native=delta["retired_native"] - emitted,
                   jit_coverage=translated / completed,
@@ -109,7 +112,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--template", required=True, type=Path, help="current tinycore.py --jit output")
     parser.add_argument("--out", type=Path, default=ROOT / "r86chip/experiments/out/jit-cost")
-    parser.add_argument("--simulator", type=Path, default=ROOT / "target/release/r86chip-sim")
+    parser.add_argument("--simulator", type=Path, default=ROOT / os.environ.get("CARGO_TARGET_DIR", "target") / "release/r86chip-sim")
     parser.add_argument("--case", action="append", choices=("tinycore", "register-loop"))
     parser.add_argument("--start", type=int, default=1000000, help="first TinyCore endpoint")
     parser.add_argument("--end", type=int, default=2000000, help="second TinyCore endpoint")
@@ -130,7 +133,8 @@ def main():
         case = out / name
         case.mkdir(exist_ok=True)
         if name == "tinycore":
-            shutil.copyfile(template / "guest.ram", case / "guest.ram")
+            (case / "guest.ram").unlink(missing_ok=True)
+            (case / "guest.ram").hardlink_to(template / "guest.ram")
             config = (template / "config.bin").read_bytes()
             endpoints = (args.start, args.end)
         else:
@@ -140,8 +144,10 @@ def main():
         for jit in (False, True):
             directory = case / ("jit" if jit else "interp")
             directory.mkdir(exist_ok=True)
-            shutil.copyfile(case / "guest.ram", directory / "guest.ram")
+            (directory / "guest.ram").unlink(missing_ok=True)
+            (directory / "guest.ram").hardlink_to(case / "guest.ram")
             modes[directory.name] = measure(directory, firmware, iss, config, endpoints, jit, ranges, args.seconds)
+            (directory / "guest.ram").unlink()
         for index, steps in enumerate(endpoints):
             for key in (*FIELDS, "x86_completed", "x86_fault_attempts", "x86_repeat_chunks"):
                 assert modes["interp"]["samples"][index][key] == modes["jit"]["samples"][index][key], (name, steps, key)
@@ -149,6 +155,7 @@ def main():
             assert (case / "interp" / serial).read_bytes() == (case / "jit" / serial).read_bytes()
         report["cases"][name] = dict(endpoints=endpoints, modes=modes, guest_comparison_passed=True,
                                     guest_sha256=sha(case / "guest.ram"))
+        (case / "guest.ram").unlink()
         (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS: both endpoints agree in guest state, RAM, time, counts and serial", flush=True)
 

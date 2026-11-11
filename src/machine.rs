@@ -2973,6 +2973,14 @@ impl HostBus {
         }
     }
 
+    /// Fixed backing bounds for chip RAM grants; tokens outside it remain shared
+    /// interpreter accesses (including MMIO/IORAM). No Rust layout is exposed.
+    #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
+    pub(crate) fn chip_ram_bounds(&self) -> (u32, u32) {
+        let start = self.ram.as_ptr() as u32;
+        (start, start + self.ram.len() as u32)
+    }
+
     #[cfg(feature = "jit")]
     pub(crate) fn jit_rechecks_enabled(&self) -> bool {
         // PCI framebuffer decode may overlay ordinary RAM. Decline comparison
@@ -2984,7 +2992,11 @@ impl HostBus {
             && (!self.pci.vga_mem_enabled() || self.pci.vga_lfb_base() >= self.ram.len() as u64)
     }
 
-    #[cfg(any(all(feature = "jit", target_arch = "arm"), a64_jit))]
+    #[cfg(any(
+        all(feature = "jit", target_arch = "arm"),
+        a64_jit,
+        all(feature = "r86chip", target_arch = "riscv32")
+    ))]
     pub(crate) fn jit_code_epoch(&self) -> u64 {
         self.jit_code_pages
             .as_ref()

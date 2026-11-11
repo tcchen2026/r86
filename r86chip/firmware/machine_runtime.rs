@@ -75,6 +75,30 @@ fn emit(bytes: &[u8]) {
     }
     put(OUTPUT_LEN, end as u32);
 }
+fn histogram(machine: &Machine) {
+    if get(WORKLOAD_FLAGS) & WORKLOAD_JIT_HISTOGRAM == 0 {
+        return;
+    }
+    assert!(get(WORKLOAD_FLAGS) & WORKLOAD_BOUNDARIES != 0);
+    put(BOUNDARIES, JIT_HIST_MAGIC);
+    put(BOUNDARIES + 4, 1);
+    put(BOUNDARIES + 8, JIT_HIST_BYTES as u32);
+    #[cfg(feature = "r86chip")]
+    if let Some(stats) = machine.chip_jit_stats() {
+        for (i, value) in stats
+            .leaves
+            .iter()
+            .chain(&stats.services)
+            .chain(&stats.ends)
+            .chain(&stats.unsupported)
+            .enumerate()
+        {
+            put64(BOUNDARIES + 16 + i * 8, *value);
+        }
+    }
+    put(BOUNDARY_LEN, JIT_HIST_BYTES as u32);
+}
+
 fn finish(status: u32) -> ! {
     put(STATUS, status);
     unsafe { asm!("ebreak", options(noreturn)) }
@@ -117,7 +141,8 @@ extern "C" fn machine_main() -> ! {
         "JIT not compiled into this firmware"
     );
     assert_eq!(
-        get(WORKLOAD_FLAGS) & !(WORKLOAD_LUA | WORKLOAD_JIT | WORKLOAD_BOUNDARIES),
+        get(WORKLOAD_FLAGS)
+            & !(WORKLOAD_LUA | WORKLOAD_JIT | WORKLOAD_BOUNDARIES | WORKLOAD_JIT_HISTOGRAM),
         0,
         "unknown workload flags: rebuild inputs for the current firmware ABI"
     );
@@ -130,7 +155,8 @@ extern "C" fn machine_main() -> ! {
     put(STATUS, 2);
     let mut sent = 0;
     let mut observed = 0;
-    let trace_boundaries = get(WORKLOAD_FLAGS) & WORKLOAD_BOUNDARIES != 0;
+    let trace_boundaries =
+        get(WORKLOAD_FLAGS) & (WORKLOAD_BOUNDARIES | WORKLOAD_JIT_HISTOGRAM) == WORKLOAD_BOUNDARIES;
     let mut boundary_bytes = 0;
     while machine.step_count() < limit {
         let result = machine.run_until_serial_output((limit - machine.step_count()).min(4096));
@@ -176,6 +202,7 @@ extern "C" fn machine_main() -> ! {
             .windows(marker.len())
             .any(|x| x == marker)
         {
+            histogram(&machine);
             finish(3)
         }
         observed = sent.saturating_sub(marker.len() - 1);
@@ -187,5 +214,6 @@ extern "C" fn machine_main() -> ! {
             }
         }
     }
+    histogram(&machine);
     finish(4)
 }
