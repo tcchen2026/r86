@@ -24,8 +24,8 @@ implements it. Change the ISS and its tests first. See the Guide below and
 | Caches | Instruction and data, two-way, 64 KiB each in block RAM, write-back, one burst `RamPort` to the RAM back end. Core (two banks) plus caches: 9,463 logic LUTs (Yosys GW5A mapping) |
 | Logic depth | 17 LUT levels by mapping. **Nothing is placed or routed; there is no clock figure.** |
 | Interpreter firmware on RTL | TinyCore, 2,000,000 x86 steps through the caches with a 24-clock RAM, equal to the ISS. Second million steps: 77.5 native words and 90.2 clocks per x86 instruction |
-| Translated code on RTL | The translator firmware below, 2,000,000 TinyCore steps, equal to the ISS (RAM, guest RAM, retired count). Second million steps: 5.08 native words and 7.9 clocks per x86 instruction (7.0 with a 256 KiB instruction cache). Hand-translated loops: 1.75 to 2.40 |
-| Translator firmware | Rewritten for the translator words: resident guest registers, whole basic blocks, block links, XJT; equal to the host interpreter over 20,000,000 TinyCore steps on the ISS. Steps 3M-4M cost 320 native words per x86 instruction because of a linear lookup in its runtime; see [JIT_COST.md](experiments/JIT_COST.md) |
+| Translated code on RTL | The translator firmware below, 4,000,000 TinyCore steps, equal to the ISS at each million (RAM, guest RAM, retired count). Clocks per x86 instruction with 64 KiB + 64 KiB caches and a 24-clock RAM: 7.4 in steps 1M-2M, 6.0 in 2M-3M, 30.2 in 3M-4M, where half the clocks are data cache line fills in the runtime's tables. Hand-translated loops: 1.75 to 2.40 |
+| Translator firmware | Rewritten for the translator words: resident guest registers, whole basic blocks, block links, XJT, indexed link lookup; equal to the host interpreter over 20,000,000 TinyCore steps on the ISS. Native words per x86 instruction: 4.66 in steps 1M-2M, 11.78 in 3M-4M, 38.3 in 4M-10M; see [JIT_COST.md](experiments/JIT_COST.md). Work in progress: [TODO.md](TODO.md) |
 | RAM back ends, board top level, devices | Not started |
 
 Open work, ideas and who does what: [`PROFESSOR_JOB_LIST.md`](../PROFESSOR_JOB_LIST.md)
