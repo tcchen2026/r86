@@ -120,7 +120,11 @@ fn interrupt_attention_needed(
     cpu: &Cpu,
     bus: &HostBus,
 ) -> bool {
-    bus.interrupt_attention_due(step) || (!was_interruptible && cpu.maskable_interrupts_enabled())
+    // With no device event due, an IF transition only needs the poll when
+    // the PIC already has a deliverable request. The cached deadline still
+    // bounds execution while interrupts are masked or the PIC is quiet.
+    bus.interrupt_attention_due(step)
+        || (!was_interruptible && pending_external_irq(cpu, bus).is_some())
 }
 
 fn deliver_irq(cpu: &mut Cpu, bus: &mut HostBus, return_eip: u32) -> Result<(), String> {
@@ -12761,6 +12765,48 @@ mod host_bus_tests {
         assert_eq!(perf.full_device_scans, 1);
         assert_eq!(bus.pic.pending_irq(), None);
         assert_eq!(cpu.eip, 0x3000);
+    }
+
+    #[test]
+    fn latched_irq_waits_for_one_instruction_after_sti_or_ss_load() {
+        for prefix in [&[0xfb][..], &[0x8e, 0xd0][..], &[0x17][..]] {
+            for trace in [TraceMode::Off, TraceMode::Minimal] {
+                for perf in [PerfMode::Disabled, PerfMode::Enabled] {
+                    let mut bus = HostBus::new(0x4000);
+                    let mut cpu = Cpu::new();
+                    cpu.eip = 0x1000;
+                    cpu.set_reg(Reg32::Esp, 0x2000);
+                    if prefix != [0xfb] {
+                        cpu.eflags |= EFLAGS_IF;
+                    }
+                    cpu.idtr.limit = 0x03ff;
+                    bus.ram[0x1000..0x1000 + prefix.len()].copy_from_slice(prefix);
+                    bus.ram[0x1000 + prefix.len()..0x1002 + prefix.len()]
+                        .copy_from_slice(&[0x43, 0x41]); // inc bx; inc cx
+                    bus.ram[0x0080..0x0084].copy_from_slice(&[0x00, 0x30, 0x00, 0x00]);
+                    bus.ram[0x3000] = 0xf4; // IRQ handler: hlt
+                    bus.io_write_u8(0x21, 0xfe).unwrap();
+                    bus.pic.pulse(0);
+                    // The PIC is already latched; no bus attention is needed
+                    // to find it when the shadow expires.
+                    bus.refresh_interrupt_attention(0);
+                    let mut m = Machine::from_parts(cpu, bus, trace, perf);
+                    assert_eq!(m.run_steps(1).unwrap().ran, 1);
+                    assert!(m.cpu.interrupt_shadow());
+                    assert_eq!(m.cpu.eip, 0x1000 + prefix.len() as u32);
+                    assert_eq!(m.run_steps(2).unwrap().ran, 2);
+                    assert_eq!(m.cpu.eip, 0x3001);
+                    assert!(m.cpu.halted);
+                    assert_eq!(m.cpu.reg(Reg32::Ebx), 1);
+                    assert_eq!(m.cpu.reg(Reg32::Ecx), 0);
+                    let sp = m.cpu.reg(Reg32::Esp) as usize;
+                    let return_ip = u16::from_le_bytes(m.bus.ram[sp..sp + 2].try_into().unwrap());
+                    assert_eq!(return_ip, 0x1001 + prefix.len() as u16);
+                    assert_eq!(m.cpu.tsc(), 3);
+                    assert_eq!(m.bus.pic.pending_irq(), None);
+                }
+            }
+        }
     }
 
     #[test]
