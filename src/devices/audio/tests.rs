@@ -78,6 +78,35 @@ fn sound_reset_version_test_and_independent_irq_ack() {
 }
 
 #[test]
+fn sound_win98_dsp_start_probe() {
+    let mut s = Sound::default();
+    command(&mut s, &[0x0f, 0x09]);
+    assert_eq!(s.read(0x22a), 0xf8);
+
+    // SB16.VXD checks these values before it configures IRQ/DMA or starts.
+    for (address, expected) in [
+        (0x0e, 0xff),
+        (0x0f, 0x07),
+        (0x0b, 0),
+        (0x23, 0),
+        (0x24, 0),
+        (0x2b, 0),
+        (0x2c, 0),
+        (0x2d, 0),
+        (0x37, 0x38),
+    ] {
+        command(&mut s, &[0xf9]);
+        assert_eq!(s.read(0x22e) & 0x80, 0);
+        command(&mut s, &[address]);
+        assert_eq!(s.read(0x22e) & 0x80, 0x80);
+        assert_eq!(s.read(0x22a), expected);
+        assert_eq!(s.read(0x22e) & 0x80, 0);
+    }
+    assert!(!s.irq());
+    assert_eq!(s.next_event(), u64::MAX);
+}
+
+#[test]
 fn sound_dsp_register_commands_preserve_wdm_playback() {
     let mut s = Sound::default();
     s.write(0x226, 1);

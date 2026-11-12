@@ -410,6 +410,13 @@ impl Sb16 {
             0xf2 => self.irq_status |= 1,
             0xf3 => self.irq_status |= 2,
             0xf8 => self.reply(&[0]),
+            // DSP RAM reset values checked by the Windows 9x SB16 driver.
+            0xf9 => self.reply(&[match p[0] {
+                0x0e => 0xff,
+                0x0f => 0x07,
+                0x37 => 0x38,
+                _ => 0,
+            }]),
             // Unsupported/unknown commands produce no reply. Known commands
             // still consume their operands so the next command stays aligned.
             _ => {}

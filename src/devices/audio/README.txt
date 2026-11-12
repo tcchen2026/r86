@@ -2,8 +2,9 @@
 
 `devices/audio.rs` owns an AT DMA pair, Sound Blaster 16 DSP 4.05 and OPL2.
 The machine exposes SB16 at 220h, initially IRQ 5, DMA 1/5. DOS software can
-use `BLASTER=A220 I5 D1 H5 T6`. Windows 2000 SP4 in-box WDM playback is checked
-locally; other Windows drivers and host audio devices need separate validation.
+use `BLASTER=A220 I5 D1 H5 T6`. Windows 98 SE in-box VxD and Windows 2000 SP4
+in-box WDM playback are checked locally; other Windows drivers and host audio
+devices need separate validation.
 
 DMA address/count units are bytes on channels 0–3 and words on 5–7. Each
 controller has its own byte flip-flop. Transfers respect masks, direction,
@@ -26,8 +27,9 @@ consume their operands without transferring data. This is a compatibility
 limit, not an implementation of those formats. DSP register read/write commands
 (0Fh/0Eh) retain byte values for Windows WDM setup/stop; they do not implement
 ASP/CSP processing. Mode/codec setup commands consume their operands without
-starting playback. No MPU-401, PC speaker, CSP, tone filters, recording, DMA
-identification or OPL3 is provided.
+starting playback. F9h supplies fixed DSP RAM reset values for the Windows 98
+VxD's startup probe; it does not model DSP firmware or RAM writes. No MPU-401,
+PC speaker, CSP, tone filters, recording, DMA identification or OPL3 is provided.
 
 DMA and block IRQs advance on the machine's guest oscillator. Transfers copy
 bounded chunks and retain each sample's guest timestamp. PCM uses a hold
@@ -83,3 +85,5 @@ For DSP register framing/defaults, also consulted Bochs
 86Box `src/sound/snd_sb_dsp.c` (d2bbd6bc40456d2b110f3f3447ea93504a68b4d3),
 and tiny386 `sb16.c` (d47748e2b2d84597365c681e9e09c989cbce97c1). No reference
 code was copied. Windows 2000 port traffic supplies the regression sequence.
+The F9h reset values agree with tiny386, v86, Bochs and 86Box's DSP RAM defaults;
+the Windows 98 SB16.VXD probe supplies the corresponding regression sequence.
