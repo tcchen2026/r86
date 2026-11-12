@@ -10,6 +10,11 @@ install -m 0644 "$root/firmware/seabios/vgabios-handheld.bin" "$app/"
 # One archive keeps guest files, boot templates, corresponding sources and
 # provenance together.
 install -m 0644 "$root/tmp/freedos/share/dos.zip" "$app/"
+# The public guest tools disc (script/build_tools_iso.py; not in Git) carries
+# its own licenses. Without it the VM menu has no "Install r86 tools".
+if [ -f "$root/assets/r86_tools.iso" ]; then
+    install -m 0644 "$root/assets/r86_tools.iso" "$app/"
+fi
 
 licenses=$app/licenses
 install -D -m 0644 "$root/LICENSE" "$licenses/r86/LICENSE"

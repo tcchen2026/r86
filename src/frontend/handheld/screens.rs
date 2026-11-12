@@ -1488,6 +1488,7 @@ enum OverlayEntry {
     Sound,
     CtrlAltDel,
     Cd,
+    Tools,
     Remote,
     Help,
     PowerButton,
@@ -1508,6 +1509,8 @@ pub struct OverlayLabels {
     pub remote: Option<String>,
     /// Sound level in percent; 0 is muted.
     pub volume: u8,
+    /// The r86 tools disc, when this install has it.
+    pub tools: Option<PathBuf>,
 }
 
 impl VmOverlay {
@@ -1547,6 +1550,11 @@ impl VmOverlay {
             ),
             (OverlayEntry::CtrlAltDel, Item::new("Send Ctrl+Alt+Del")),
             (OverlayEntry::Cd, Item::new("CD").detail(cd)),
+        ]);
+        if l.tools.is_some() {
+            rows.push((OverlayEntry::Tools, Item::new("Install r86 tools")));
+        }
+        rows.extend([
             (
                 OverlayEntry::Remote,
                 Item::new("Remote management").detail(remote),
@@ -1613,6 +1621,8 @@ impl View for VmOverlay {
                         Some("Eject"),
                     )))
                 }
+                // Windows opens the installer from the disc's autorun.
+                OverlayEntry::Tools => Nav::Action(Action::Cd(self.labels.borrow().tools.clone())),
                 OverlayEntry::Remote => Nav::Action(Action::Remote),
                 OverlayEntry::Help => Nav::Push(Box::new(Help)),
                 OverlayEntry::PowerButton => Nav::Action(Action::PowerButton),

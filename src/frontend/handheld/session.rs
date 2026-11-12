@@ -10,7 +10,6 @@
 use std::cell::RefCell;
 use std::fs::File;
 use std::net::TcpListener;
-use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +34,8 @@ const TOAST: Duration = Duration::from_secs(4);
 /// The standard VGA BIOS plus 640x340 (twice the CardputerZero panel) and
 /// 300x200 RGB565 VBE modes; see firmware/seabios/handheld-modes.patch.
 const HANDHELD_VGA_BIOS: &str = "vgabios-handheld.bin";
+/// The guest tools disc, installed beside the firmware by ports/share.sh.
+const TOOLS_ISO: &str = "r86_tools.iso";
 /// Remote management listens on the first free port.
 const REMOTE_PORTS: std::ops::RangeInclusive<u16> = 8086..=8095;
 /// How often a held session checks for remote requests: quickly while a
@@ -151,7 +152,7 @@ pub fn run(
     audio.set_volume(&mut machine, vm.volume);
     let remote = if remote {
         machine.power_off()?;
-        Some(start_remote(&ctx.iso)?)
+        Some(start_remote(ctx)?)
     } else {
         None
     };
@@ -561,6 +562,7 @@ impl Session<'_> {
             }),
             remote: self.remote.as_ref().map(Remote::url),
             volume: self.vm.volume,
+            tools: Some(self.ctx.share.join(TOOLS_ISO)).filter(|iso| iso.is_file()),
         }
     }
 
@@ -858,7 +860,7 @@ impl Session<'_> {
                     remote.close(&mut self.machine);
                     self.notify("Remote management stopped");
                 } else {
-                    match start_remote(&self.ctx.iso) {
+                    match start_remote(self.ctx) {
                         Ok(mut remote) => {
                             remote.set_running(&self.machine, true);
                             self.remote = Some(remote);
@@ -887,10 +889,11 @@ pub fn console_listener() -> Result<TcpListener, String> {
         .ok_or_else(|| "No free network port (8086-8095).".into())
 }
 
-/// Discs from the browser are saved in `iso_dir`, beside the others.
-fn start_remote(iso_dir: &Path) -> Result<Remote, String> {
+/// Discs from the browser are saved in the CD folder, beside the others.
+fn start_remote(ctx: &Ctx) -> Result<Remote, String> {
     let listener = console_listener()?;
-    let remote = Remote::new(listener, SLICE_STEPS, None, false, Some(iso_dir.into()))?;
+    let (iso, tools) = (Some(ctx.iso.clone()), ctx.share.join(TOOLS_ISO));
+    let remote = Remote::new(listener, SLICE_STEPS, None, false, iso, tools)?;
     // The device log also gets the address, for setups without a view of the panel.
     eprintln!("r86-handheld: remote management at {}", remote.url());
     Ok(remote)

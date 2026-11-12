@@ -280,9 +280,7 @@ impl Service {
             media_name: None,
             remote: None,
             remote_stats: None,
-            tools_iso: std::env::current_exe()
-                .unwrap_or_default()
-                .with_file_name("r86_tools.iso"),
+            tools_iso: PathBuf::new(),
             save_dir: None,
             disc_change: None,
             file_put: None,
@@ -1487,13 +1485,15 @@ impl Remote {
     /// Serves the console on `listener`, open to the local network like a
     /// home BMC. `jobs` enables finite debugger jobs, which need a host loop
     /// that steps the machine for them. With `save_dir`, uploaded discs are
-    /// saved there instead of held in memory.
+    /// saved there instead of held in memory. `tools_iso` is the r86 tools
+    /// disc media-tools inserts; it may be missing.
     pub fn new(
         listener: TcpListener,
         slice_steps: u64,
         record_path: Option<&str>,
         jobs: bool,
         save_dir: Option<PathBuf>,
+        tools_iso: PathBuf,
     ) -> Result<Self, String> {
         let record = record_path
             .map(|path| {
@@ -1510,6 +1510,7 @@ impl Remote {
         let mut service = Service::new();
         service.jobs = jobs;
         service.save_dir = save_dir;
+        service.tools_iso = tools_iso;
         Ok(Self {
             rx,
             service,
@@ -1952,8 +1953,7 @@ pub fn serve_ws(
     let listener = TcpListener::bind(addr).map_err(|e| format!("web server {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("web console: http://{local}/ (WebSocket: ws://{local}/ws)");
-    let mut remote = Remote::new(listener, slice_steps, record_path, true, None)?;
-    remote.service.tools_iso = tools_iso;
+    let mut remote = Remote::new(listener, slice_steps, record_path, true, None, tools_iso)?;
     remote
         .service
         .event(machine, "start", "server ready; paused");
@@ -2148,7 +2148,7 @@ mod import_tests {
     fn remote_cd_socket_reply_bypasses_core_queue_and_disconnect_ejects() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut remote = Remote::new(listener, 1000, None, true, None).unwrap();
+        let mut remote = Remote::new(listener, 1000, None, true, None, PathBuf::new()).unwrap();
         let mut machine = Machine::new(0x10000);
         machine.attach_secondary_cdrom(Vec::new());
         let (close, close_rx) = mpsc::channel();
