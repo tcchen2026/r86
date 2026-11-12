@@ -19,6 +19,11 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
   DA000-E7FFF through PAM, which r86 now enforces
   (firmware/seabios/bios.config lacks `CONFIG_WRITABLE_UPPERMEMORY=y`).
+- device: a Windows 98 installed under the old SeaBIOS (PnP BIOS stub,
+  Code 24) has no PCI bus, so VMDisp9x and the PCI NE2000 are not found;
+  the current BIOS does not repair it. Add New Hardware's automatic
+  search finds the PCI bus; then remove the stale non-PCI "Standard
+  Display Adapter (VGA)" and restart.
 - perf: self-modifying code under the A64 JIT recompiles on every change;
   Doom costs 28% more cycles with the JIT than with the interpreter.
 - perf: MMX in JIT code calls a shared helper per instruction (38% of
