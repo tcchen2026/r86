@@ -11,8 +11,11 @@
  *   r86-tool install            copy the helper/docs to C:\R86 and start it
  *   r86-tool uninstall          stop it, remove its all-user Run entry/files
  *   r86-tool driver display [CDROOT]  install this OS's tools-CD VGA driver
- * No arguments runs the helper only from C:\R86\R86-TOOL.EXE; other copies
- * print usage until the installer dialog is supplied.
+ * No arguments: C:\R86\R86-TOOL.EXE runs the helper; any other copy (the
+ * tools CD) opens the installer window. It is a GUI program, so neither
+ * shows a console. Commands print to a redirected output, the parent console
+ * (AttachConsole, XP), or a new console that waits for Enter before closing.
+ * cmd.exe does not wait for GUI programs: use `start /wait` for the exit code.
  *
  * The Display control panel hides modes smaller than 640x480, such as the
  * handheld VGA BIOS's 640x340; EnumDisplaySettings and ChangeDisplaySettings
@@ -23,15 +26,18 @@
  *
  *   i686-w64-mingw32-gcc -Os -s -nostdlib -ffreestanding \
  *       -fno-asynchronous-unwind-tables -Wall -Wextra -o r86-tool.exe \
- *       tools/win/r86-tool.c -e _start -Wl,--subsystem,console:4.0 \
- *       -Wl,--major-os-version,4 -Wl,--minor-os-version,0 -lkernel32 -luser32 -ladvapi32
+ *       tools/win/r86-tool.c -e _start -Wl,--subsystem,windows:4.0 \
+ *       -Wl,--major-os-version,4 -Wl,--minor-os-version,0 -lkernel32 -luser32 \
+ *       -lgdi32 -ladvapi32
  */
 #include <windows.h>
 #define USE_SP_DRVINFO_DATA_V1 1
 #include <setupapi.h>
+#include <shlobj.h>
 #include "r86-tool.h"
 
 static HANDLE out;
+static int own_console;
 
 /* Constants mirror src/machine/magic.rs, the protocol authority. */
 #define MAGIC_PORT 0x5286
@@ -67,6 +73,24 @@ static struct magic_regs magic_call(DWORD command)
     return r;
 }
 
+/* Output for commands; the installer window and the helper never print. */
+static void open_output(void)
+{
+    BOOL (WINAPI *attach)(DWORD);
+    DWORD type;
+
+    out = GetStdHandle(STD_OUTPUT_HANDLE);
+    type = out && out != INVALID_HANDLE_VALUE ? GetFileType(out) : FILE_TYPE_UNKNOWN;
+    if (type == FILE_TYPE_DISK || type == FILE_TYPE_PIPE)
+        return;
+    attach = (void *)GetProcAddress(GetModuleHandleA("kernel32.dll"), "AttachConsole");
+    if (!attach || !attach((DWORD)-1)) {
+        AllocConsole();
+        own_console = 1;
+    }
+    out = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+}
+
 static void say(const char *format, ...)
 {
     char text[1024];
@@ -74,6 +98,8 @@ static void say(const char *format, ...)
     DWORD written;
     int length;
 
+    if (!out)
+        open_output();
     va_start(args, format);
     length = wvsprintfA(text, format, args);
     va_end(args);
@@ -801,6 +827,277 @@ DWORD r86_install_display(HWND parent, const char *directory, struct tool_result
     }
 }
 
+/* Installer window: R86-TOOL.EXE started from the tools CD. Plain controls
+ * on a fixed window; the mechanics above do the work and supply the text. */
+enum { ID_INTRO = 100, ID_HELPER, ID_DISPLAY, ID_VBEMP, ID_CHOOSE, ID_STATUS, ID_UNINSTALL, ID_REFRESH };
+
+static HWND window;
+static char vbemp_dir[MAX_PATH];
+static int display_kind; /* 0: by hand, 1: VMDisp9x, 2: VBEMP */
+
+static HWND control(DWORD ex, const char *cls, const char *text, DWORD style, int id,
+                    int x, int y, int w, int h)
+{
+    HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
+                             window, (HMENU)(UINT_PTR)id, GetModuleHandleA(NULL), NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+    return c;
+}
+
+static const char *windows_name(void)
+{
+    static char name[32];
+    OSVERSIONINFOA v;
+
+    memset(&v, 0, sizeof v);
+    v.dwOSVersionInfoSize = sizeof v;
+    GetVersionExA(&v);
+    if (v.dwPlatformId != VER_PLATFORM_WIN32_NT)
+        return v.dwMinorVersion >= 90 ? "Windows Me" : v.dwMinorVersion >= 10 ? "Windows 98" : "Windows 95";
+    if (v.dwMajorVersion == 5 && v.dwMinorVersion <= 1)
+        return v.dwMinorVersion ? "Windows XP" : "Windows 2000";
+    wsprintfA(name, "Windows NT %lu.%lu", v.dwMajorVersion, v.dwMinorVersion);
+    return name;
+}
+
+/* Finds the driver again (CD drives or the chosen folder) and shows the result.
+ * On 2000/XP without VBEMP the status explains why r86 does not include it. */
+static void show_display(void)
+{
+    struct tool_result r;
+    char inf[MAX_PATH], text[MAX_PATH + 16];
+    HWND box = GetDlgItem(window, ID_DISPLAY);
+    int found;
+
+    if (!display_kind) {
+        EnableWindow(box, FALSE);
+        return;
+    }
+    found = !display_source(vbemp_dir[0] ? vbemp_dir : NULL, display_kind == 2, inf, &r);
+    SendMessageA(box, BM_SETCHECK, found ? BST_CHECKED : BST_UNCHECKED, 0);
+    if (display_kind == 2) {
+        parent_dir(inf);
+        wsprintfA(text, "VBEMP: %s", found ? inf : "not found");
+        SetDlgItemTextA(window, ID_VBEMP, text);
+    }
+    SetDlgItemTextA(window, ID_STATUS, found ? "Choose what to install, then click Install. Windows "
+                                               "restarts once to start the display driver."
+                                             : r.message);
+}
+
+static void choose_vbemp(void)
+{
+    HMODULE shell = LoadLibraryA("shell32.dll");
+    LPITEMIDLIST (WINAPI *browse)(LPBROWSEINFOA);
+    BOOL (WINAPI *path)(LPCITEMIDLIST, LPSTR);
+    HRESULT (WINAPI *get_malloc)(LPMALLOC *);
+    BROWSEINFOA info;
+    LPITEMIDLIST item;
+    LPMALLOC allocator;
+    char dir[MAX_PATH];
+
+    if (!shell)
+        return;
+    browse = (void *)GetProcAddress(shell, "SHBrowseForFolderA");
+    path = (void *)GetProcAddress(shell, "SHGetPathFromIDListA");
+    get_malloc = (void *)GetProcAddress(shell, "SHGetMalloc");
+    if (browse && path && get_malloc) {
+        memset(&info, 0, sizeof info);
+        info.hwndOwner = window;
+        info.pszDisplayName = dir;
+        info.lpszTitle = "Choose the VBEMP package folder, or its VBE20\\W2K\\PNP folder.";
+        info.ulFlags = BIF_RETURNONLYFSDIRS;
+        item = browse(&info);
+        if (item) {
+            if (path(item, dir))
+                lstrcpyA(vbemp_dir, dir);
+            if (SUCCEEDED(get_malloc(&allocator))) {
+                allocator->lpVtbl->Free(allocator, item);
+                allocator->lpVtbl->Release(allocator);
+            }
+        }
+    }
+    FreeLibrary(shell);
+    show_display();
+}
+
+static void restart_windows(void)
+{
+    HMODULE advapi = GetModuleHandleA("advapi32.dll");
+    BOOL (WINAPI *open_token)(HANDLE, DWORD, PHANDLE);
+    BOOL (WINAPI *lookup)(LPCSTR, LPCSTR, PLUID);
+    BOOL (WINAPI *adjust)(HANDLE, BOOL, PTOKEN_PRIVILEGES, DWORD, PTOKEN_PRIVILEGES, PDWORD);
+    TOKEN_PRIVILEGES privilege;
+    HANDLE token;
+
+    /* NT needs the shutdown privilege; Windows 9x has no tokens. */
+    open_token = (void *)GetProcAddress(advapi, "OpenProcessToken");
+    lookup = (void *)GetProcAddress(advapi, "LookupPrivilegeValueA");
+    adjust = (void *)GetProcAddress(advapi, "AdjustTokenPrivileges");
+    if (!(GetVersion() & 0x80000000) && open_token && lookup && adjust &&
+        open_token(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        privilege.PrivilegeCount = 1;
+        privilege.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (lookup(NULL, SE_SHUTDOWN_NAME, &privilege.Privileges[0].Luid))
+            adjust(token, FALSE, &privilege, 0, NULL, NULL);
+        CloseHandle(token);
+    }
+    if (!ExitWindowsEx(EWX_REBOOT, 0))
+        MessageBoxA(window, "Windows did not restart. Restart it from the Start menu.",
+                    "r86 tools", MB_OK | MB_ICONEXCLAMATION);
+}
+
+static int checked(int id)
+{
+    return SendDlgItemMessageA(window, id, BM_GETCHECK, 0, 0) == BST_CHECKED;
+}
+
+static void report(char *text, const char *label, const struct tool_result *r, int *restart)
+{
+    int n = lstrlenA(text);
+    wsprintfA(text + n, "%s%s: %s", n ? "\r\n\r\n" : "", label, r->message);
+    *restart |= r->code == ERROR_SUCCESS_REBOOT_REQUIRED;
+}
+
+static void run(int install)
+{
+    static const int buttons[] = {IDOK, ID_UNINSTALL, IDCANCEL, ID_CHOOSE};
+    char text[2200];
+    struct tool_result r;
+    HCURSOR cursor;
+    int restart = 0;
+    unsigned i;
+
+    text[0] = 0;
+    for (i = 0; i < 4; i++)
+        EnableWindow(GetDlgItem(window, buttons[i]), FALSE);
+    SetDlgItemTextA(window, ID_STATUS, install ? "Installing..." : "Removing...");
+    UpdateWindow(window);
+    cursor = SetCursor(LoadCursorA(NULL, IDC_WAIT));
+    if (!install) {
+        r86_uninstall(&r);
+        report(text, "Helper", &r, &restart);
+        lstrcatA(text, "\r\n\r\nThe display driver stays installed; Device Manager can change it.");
+    } else {
+        if (checked(ID_HELPER)) {
+            r86_install(&r);
+            report(text, "Helper", &r, &restart);
+        }
+        if (checked(ID_DISPLAY)) {
+            r86_install_display(window, vbemp_dir[0] ? vbemp_dir : NULL, &r);
+            report(text, "Display driver", &r, &restart);
+        }
+        if (!text[0])
+            lstrcpyA(text, "Nothing is selected.");
+    }
+    SetCursor(cursor);
+    SetDlgItemTextA(window, ID_STATUS, text);
+    for (i = 0; i < 4; i++)
+        EnableWindow(GetDlgItem(window, buttons[i]), TRUE);
+    EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
+    if (restart && MessageBoxA(window, "Restart Windows now to finish?", "r86 tools",
+                               MB_YESNO | MB_ICONQUESTION) == IDYES)
+        restart_windows();
+}
+
+static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
+{
+    switch (message) {
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDOK: run(1); return 0;
+        case ID_UNINSTALL: run(0); return 0;
+        case ID_CHOOSE: choose_vbemp(); return 0;
+        case ID_REFRESH: show_display(); return 0;
+        case IDCANCEL: DestroyWindow(hwnd); return 0;
+        }
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, w, l);
+}
+
+static int installer(void)
+{
+    static const char helper[] = "r86 helper: mouse integration; installed in C:\\R86 and started at logon";
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD os = GetVersion();
+    RECT rect = {0, 0, 440, 246}, area;
+    WNDCLASSA c;
+    MSG message;
+    char text[96];
+    int y;
+
+    /* Autorun starts a copy on every insertion: reuse the open window, which
+     * looks for the driver on the new disc. */
+    window = FindWindowA("r86-tool", NULL);
+    if (window) {
+        SetForegroundWindow(window);
+        PostMessageA(window, WM_COMMAND, ID_REFRESH, 0);
+        return 0;
+    }
+    if (!(os & 0x80000000))
+        display_kind = LOBYTE(LOWORD(os)) == 5 && HIBYTE(LOWORD(os)) <= 1 ? 2 : 0;
+    else
+        display_kind = 1;
+    memset(&c, 0, sizeof c);
+    c.lpfnWndProc = window_proc;
+    c.hInstance = GetModuleHandleA(NULL);
+    c.hIcon = LoadIconA(NULL, IDI_APPLICATION);
+    c.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    c.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    c.lpszClassName = "r86-tool";
+    if (!RegisterClassA(&c))
+        return 1;
+    /* Centred in the work area: the handheld's 640x340 desktop must fit. */
+    AdjustWindowRect(&rect, style, FALSE);
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &area, 0);
+    rect.right -= rect.left;
+    rect.bottom -= rect.top;
+    window = CreateWindowExA(0, "r86-tool", "r86 tools", style,
+                             area.left + (area.right - area.left - rect.right) / 2,
+                             area.top + (area.bottom - area.top - rect.bottom) / 2,
+                             rect.right, rect.bottom, NULL, NULL, c.hInstance, NULL);
+    if (!window)
+        return 1;
+    wsprintfA(text, "Install the r86 tools for %s:", windows_name());
+    control(0, "STATIC", text, SS_LEFT, ID_INTRO, 12, 10, 416, 16);
+    control(0, "BUTTON", helper, BS_AUTOCHECKBOX | WS_TABSTOP, ID_HELPER, 12, 30, 416, 18);
+    control(0, "BUTTON", display_kind == 1 ? "Display driver: VMDisp9x, for more resolutions and colours"
+                       : display_kind == 2 ? "Display driver: VBEMP, used in 16-bit colour"
+                                           : "Display driver: install it by hand on this Windows version",
+            BS_AUTOCHECKBOX | WS_TABSTOP, ID_DISPLAY, 12, 50, 416, 18);
+    y = 76;
+    if (display_kind == 2) {
+        control(0, "STATIC", "", SS_LEFT | SS_PATHELLIPSIS, ID_VBEMP, 30, 78, 296, 16);
+        control(0, "BUTTON", "Choose folder...", BS_PUSHBUTTON | WS_TABSTOP, ID_CHOOSE, 332, 73, 96, 24);
+        y = 104;
+    }
+    control(WS_EX_CLIENTEDGE, "EDIT", "", ES_MULTILINE | ES_READONLY | WS_VSCROLL,
+            ID_STATUS, 12, y, 416, 206 - y);
+    control(0, "BUTTON", "Install", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 188, 214, 76, 24);
+    control(0, "BUTTON", "Uninstall", BS_PUSHBUTTON | WS_TABSTOP, ID_UNINSTALL, 270, 214, 76, 24);
+    control(0, "BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 352, 214, 76, 24);
+    SetDlgItemTextA(window, ID_STATUS, "Choose what to install, then click Install.");
+    SendDlgItemMessageA(window, ID_HELPER, BM_SETCHECK, BST_CHECKED, 0);
+    EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
+    show_display();
+    if (!r86_present()) {
+        SetDlgItemTextA(window, ID_STATUS, "This is not an r86 virtual machine. The r86 tools work only inside r86.");
+        EnableWindow(GetDlgItem(window, IDOK), FALSE);
+    }
+    ShowWindow(window, SW_SHOWNORMAL);
+    SetFocus(GetDlgItem(window, IsWindowEnabled(GetDlgItem(window, IDOK)) ? IDOK : IDCANCEL));
+    while (GetMessageA(&message, NULL, 0, 0) > 0)
+        if (!IsDialogMessageA(window, &message)) {
+            TranslateMessage(&message);
+            DispatchMessageA(&message);
+        }
+    return 0;
+}
+
 static int usage(void)
 {
     say("Usage: r86-tool modes\r\n"
@@ -821,7 +1118,6 @@ void start(void)
     DWORD width, height, bits = 16;
     int status;
 
-    out = GetStdHandle(STD_OUTPUT_HANDLE);
     /* Skip the program name, which may be quoted. */
     if (*s == '"') {
         for (s++; *s && *s != '"'; s++)
@@ -833,8 +1129,8 @@ void start(void)
             s++;
     }
     s = next_word(s, command, sizeof command);
-    if (!*command && installed_image())
-        status = mouse();
+    if (!*command)
+        status = installed_image() ? mouse() : installer();
     else if (!lstrcmpiA(command, "install") || !lstrcmpiA(command, "uninstall")) {
         if (*spaces(s)) status = usage();
         else {
@@ -872,5 +1168,12 @@ void start(void)
         status = set_mode(width, height, bits);
     } else
         status = usage();
+    if (own_console) {
+        char key[8];
+        DWORD n;
+        say("Press Enter to close.\r\n");
+        ReadFile(CreateFileA("CONIN$", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                             OPEN_EXISTING, 0, NULL), key, sizeof key, &n, NULL);
+    }
     ExitProcess((UINT)status);
 }

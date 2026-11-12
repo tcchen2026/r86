@@ -7,10 +7,14 @@ The public manifest contains redistributable tools. r86_tools_full.json adds
 local VBEMP and Super PI assets; r86_tools_full.iso must never be published.
 """
 import hashlib
+import io
 import json
 from pathlib import Path
 
 import pycdlib
+
+# Windows opens the installer window when the disc is inserted (Joliet names).
+AUTORUN = b'[autorun]\r\nopen=R86TOOL\\R86-TOOL.EXE\r\nlabel=r86 tools\r\n'
 
 
 def build(assets, roots, image_name):
@@ -34,6 +38,8 @@ def build(assets, roots, image_name):
     for directory in sorted(directories):
         iso.add_directory(iso_path='/' + directory.upper().replace('-', '_'),
                           joliet_path='/' + directory)
+    iso.add_fp(io.BytesIO(AUTORUN), len(AUTORUN), iso_path='/AUTORUN.INF;1',
+               joliet_path='/autorun.inf')
     for destination, source in sorted(files.items()):
         # ISO 9660 excludes hyphens; Joliet retains names such as r86-tool.exe.
         iso.add_file(str(source), iso_path='/' + destination.upper().replace('-', '_') + ';1',
@@ -45,7 +51,7 @@ def build(assets, roots, image_name):
     temporary.replace(output)
     digest = hashlib.sha256(output.read_bytes()).hexdigest()
     output.with_suffix('.sha256').write_text(f'{digest}  {output.name}\n')
-    print(f'{output}: {len(files)} files, {output.stat().st_size} bytes, SHA256 {digest}')
+    print(f'{output}: {len(files) + 1} files, {output.stat().st_size} bytes, SHA256 {digest}')
 
 
 def main():
