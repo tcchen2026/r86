@@ -624,6 +624,17 @@ impl Machine {
     pub fn change_file_cdrom(&mut self, file: std::fs::File) -> Result<(), String> {
         self.bus.ide.change_file_cdrom(file)
     }
+    #[cfg(feature = "host")]
+    pub fn change_remote_cdrom(
+        &mut self,
+        remote: crate::remote_cd::RemoteCd,
+    ) -> Result<(), &'static str> {
+        self.bus.ide.change_remote_cdrom(remote)
+    }
+    #[cfg(feature = "host")]
+    pub fn disconnect_cdrom(&mut self, remote: &crate::remote_cd::RemoteCd) {
+        self.bus.ide.disconnect_cdrom(remote);
+    }
     pub fn cdrom_state(&self) -> Option<CdromState> {
         self.bus.ide.cdrom_state()
     }

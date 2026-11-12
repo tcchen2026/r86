@@ -37,7 +37,7 @@ uses ``websockets.sync.client`` and does not use TLS or protocol extensions.
 
 Text frames carry UTF-8 JSON request/response objects. Server binary frames
 carry raw RGBA screenshots or display frames; client binary frames (at most
-1 MiB) carry virtual-media upload data.
+1 MiB) carry virtual-media upload data or remote-CD read replies.
 
 Connection lifecycle
 ====================
@@ -55,7 +55,9 @@ Each client request is one JSON text frame with a ``cmd`` field. The server
 replies with one JSON text frame. Wait for its complete reply (including any
 binary frame) before sending another request on the same connection. Request
 pipelining is rejected. Up to 32 connections share one machine; HTTP and slow
-WebSocket readers never hold the machine thread. Common response fields:
+WebSocket readers do not hold the machine thread, except that remote CD fetches
+wait synchronously for their source. The dedicated remote-CD connection uses
+the server-initiated read protocol described under Virtual media. Common response fields:
 
     ok: bool                  true on success
     type: str                 response type, often matching the command
@@ -205,6 +207,8 @@ Commands implemented by the current harness:
     {"cmd":"media-insert"}
     {"cmd":"media-cancel"}
     {"cmd":"media-eject"}
+    {"cmd":"media-remote", "name": NAME, "size": BYTES}
+    {"cmd":"media-tools"}
     {"cmd":"quit"}
 
 Disk files
@@ -230,9 +234,43 @@ Virtual media
 
 The CD drive works like a server BMC's virtual media. ``media`` reports
 ``drive``, ``inserted``, ``tray_open``, ``locked`` (by the guest), ``name``
-(only for a disc inserted through this server; null otherwise), ``limit`` and
+(only for a disc inserted through this server; null otherwise), ``remote``, ``tools``, ``saves``, ``limit`` and
 ``upload`` (null or ``kind``, ``name``, ``mine``, ``received``, ``files``).
 Every other media command replies with the same object.
+``saves`` is true when uploaded discs are saved as the VM's CD setting (the
+handheld's save directory), false otherwise. The page uploads ISOs when it is
+true and uses remote CD when it is false.
+
+On-demand CD: open a dedicated connection and send
+``{"cmd":"media-remote","name":NAME,"size":BYTES}``. BYTES must be a nonzero
+multiple of 2048 within host/ATAPI capacity; the upload ``limit`` does not apply.
+Insertion uses the same guest lock, busy-drive and UNIT ATTENTION rules as an
+upload insert. Each insertion reports medium-absent then medium-changed on
+successive commands other than INQUIRY, REQUEST SENSE, GET EVENT STATUS and
+GET CONFIGURATION. Those failing commands advance the sequence; REQUEST SENSE
+reports the last error and does not gate a retry. Polling guests notice even a
+direct replacement or an eject/insert between polls. The reply has ``remote:true``
+while the disc is inserted. Keep this connection open and serve each ``{"type":"media-read","id":N,
+"offset":O,"length":L}`` with one binary message of exactly L bytes, or
+``{"cmd":"media-read-error","id":N,"error":TEXT}``. Replies have no ack;
+only one read is outstanding. Use a fresh connection for each insertion.
+``media-eject`` on any connection uses the ordinary guest lock/busy rules.
+Connection loss, a bad reply, a read error or a 10-second timeout ejects even a
+locked disc; an active read fails with ATAPI MEDIUM ERROR. No reads are retried.
+
+The server fetches aligned 256 KiB chunks (short final chunk) into a 64 MiB FIFO
+cache. A fetch blocks the emulator core, including frame/input/audio service;
+the page's main connection stays independent. ``remote_stats`` is null before
+the first remote insertion, then reports ``requests``, successful ``chunks``
+and ``bytes``, total ``stall_us`` and ``max_stall_us``. These counters include
+fetch waits, survive eject, and reset on the next remote insertion. The CLI
+``media-remote PATH`` serves a local image until interrupted.
+
+``{"cmd":"media-tools"}`` inserts the server's public tools ISO with the name
+``r86 tools``, under the same insert rules. It is file-backed and read on demand.
+``--tools-iso PATH`` selects it; the default is ``r86_tools.iso`` beside the
+executable. Missing is allowed at startup. Hello and media report ``tools:true``
+when that file exists. The handheld uses the same executable-relative default.
 
 An upload belongs to the connection that sent ``media-begin``; one runs at a
 time across all clients, and its connection's disconnect discards it. Use a
@@ -271,7 +309,8 @@ image.
 medium change (UNIT ATTENTION). If the guest has locked the drive or a read is
 in flight, it fails and keeps the upload for another ``media-insert``.
 ``media-eject`` removes the disc. ``--ws-record`` logs both; replay applies
-ejects and stops at an insert, because the image is not recorded.
+ejects and stops at an upload, remote or tools insert, because the image is not
+recorded. Remote read traffic is not part of the replay stream.
 
 Input semantics
 ===============
@@ -378,6 +417,8 @@ For CI, prefer small scripts built on this client:
 """
 import argparse
 import json
+import os
+from pathlib import Path
 import struct
 import sys
 import time
@@ -548,8 +589,11 @@ def build_parser():
     sub.add_parser("hello")
     sub.add_parser("status")
     sub.add_parser("power-button")
-    for name in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes"):
+    for name in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes",
+                 "media", "media-tools", "media-eject"):
         sub.add_parser(name)
+    remote = sub.add_parser("media-remote", help="serve a local ISO on demand until interrupted")
+    remote.add_argument("path")
     logs = sub.add_parser("logs")
     logs.add_argument("--serial-from", type=int, default=0)
     logs.add_argument("--event-from", type=int, default=0)
@@ -632,7 +676,8 @@ def build_parser():
 def command_object(args):
     """Translate parsed CLI arguments into one protocol JSON command object."""
 
-    if args.command in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes"):
+    if args.command in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes",
+                        "media", "media-tools", "media-eject"):
         return {"cmd": args.command}
     if args.command == "logs":
         return {"cmd": "logs", "serial_from": args.serial_from, "event_from": args.event_from}
@@ -750,6 +795,43 @@ def synthetic_smoke(client, args):
     }
 
 
+def serve_remote(client, path):
+    """Serve one open ISO on this dedicated connection; never synthesize bytes."""
+    with open(path, "rb") as image:
+        size = os.fstat(image.fileno()).st_size
+        if not size or size % 2048:
+            raise WsError("remote ISO size must be a nonzero multiple of 2048")
+        response = require_ok(client.request({
+            "cmd": "media-remote", "name": Path(path).name, "size": size,
+        }), "media-remote")
+        print_json(response)
+        sys.stdout.flush()
+        client.timeout_sec = None  # An idle mounted disc has no lifetime limit.
+        try:
+            while True:
+                opcode, payload = client.recv_frame()
+                if opcode != 1:
+                    raise WsError("expected media-read JSON")
+                request = json.loads(payload)
+                if request.get("type") != "media-read":
+                    raise WsError(f"expected media-read, got {request}")
+                ident, offset, length = (request.get(k) for k in ("id", "offset", "length"))
+                if (any(type(n) is not int for n in (ident, offset, length)) or ident <= 0
+                        or offset < 0 or not 0 < length <= 256 * 1024 or offset + length > size):
+                    raise WsError(f"invalid media-read range: {request}")
+                try:
+                    image.seek(offset)
+                    data = image.read(length)
+                    if len(data) != length:
+                        raise OSError(f"short ISO read: {len(data)} of {length} bytes")
+                except OSError as exc:
+                    client.send_json({"cmd": "media-read-error", "id": ident, "error": str(exc)})
+                    raise
+                client.conn.send(data)
+        except KeyboardInterrupt:
+            return 0
+
+
 def main(argv):
     """CLI entry point used by both humans and test scripts."""
 
@@ -759,6 +841,8 @@ def main(argv):
         if args.command == "hello":
             print_json(client.hello)
             return 0
+        if args.command == "media-remote":
+            return serve_remote(client, args.path)
         if args.command == "synthetic-smoke":
             print_json(synthetic_smoke(client, args))
             return 0

@@ -33,11 +33,11 @@ fn kind(key: &str) -> Option<Kind> {
         }
         "serial-input" | "serial-input-file" | "serial-command" | "bootlocal-command"
         | "initrd-file" | "initrd-tree" | "net-forward" => Kind::Repeated,
-        "create-vhd" | "iso" | "bootsector" | "boot-linux-kernel" | "boot-linux-initrd"
-        | "bios" | "vga-bios" | "hdd" | "firmware-display" | "cmdline" | "serial-input-after"
-        | "expect-serial" | "dump-initrd" | "dump-prepared-iso" | "ws-listen" | "ws-record"
-        | "audio-wav" | "net" | "replay" | "expect-frame-hash" | "cpu-engine" | "boot-order"
-        | "clock" => Kind::Text,
+        "create-vhd" | "iso" | "tools-iso" | "bootsector" | "boot-linux-kernel"
+        | "boot-linux-initrd" | "bios" | "vga-bios" | "hdd" | "firmware-display" | "cmdline"
+        | "serial-input-after" | "expect-serial" | "dump-initrd" | "dump-prepared-iso"
+        | "ws-listen" | "ws-record" | "audio-wav" | "net" | "replay" | "expect-frame-hash"
+        | "cpu-engine" | "boot-order" | "clock" => Kind::Text,
         _ => return None,
     })
 }

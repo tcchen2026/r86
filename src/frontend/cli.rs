@@ -263,6 +263,7 @@ fn run_machine_output(
             addr,
             args.ws_slice_steps,
             args.ws_record.as_deref(),
+            args.tools_iso.clone(),
             machine,
             &mut network,
             audio,
@@ -760,6 +761,11 @@ impl ReplaySchedule {
             "power-button" => machine.press_power_button(),
             "reset" => machine.reboot()?,
             "media-eject" => machine.change_cdrom(Vec::new())?,
+            "media-insert" | "media-remote" | "media-tools" => {
+                return Err(format!(
+                    "cannot replay {cmd}: the CD image was not recorded"
+                ));
+            }
             "power-off" => machine.power_off()?,
             "power-on" => machine.reboot()?,
             "type" => {
@@ -814,6 +820,7 @@ struct Args {
     jit: bool,
     realtime_clock: bool,
     iso: Option<String>,
+    tools_iso: PathBuf,
     no_cdrom: bool,
     boot_order: Option<BootOrder>,
     boot: BootMode,
@@ -872,6 +879,7 @@ impl Args {
         let executable = env::current_exe()
             .map_err(|err| format!("failed to locate executable for BIOS paths: {err}"))?;
         let mut iso = None;
+        let mut tools_iso = executable.with_file_name("r86_tools.iso");
         let mut no_cdrom = false;
         let mut boot_order = None;
         let mut jit = DEFAULT_JIT;
@@ -927,6 +935,7 @@ impl Args {
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--iso" => iso = Some(take_value(&mut args, "--iso")?),
+                "--tools-iso" => tools_iso = take_value(&mut args, "--tools-iso")?.into(),
                 "--no-cdrom" => no_cdrom = true,
                 "--boot-order" => {
                     boot_order = Some(match take_value(&mut args, "--boot-order")?.as_str() {
@@ -1198,6 +1207,7 @@ impl Args {
             net_forward,
             audio_wav,
             iso,
+            tools_iso,
             no_cdrom,
             boot_order,
             jit,
@@ -1285,7 +1295,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\nCPU: JIT by default on supported ARM64 Linux/macOS builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--tools-iso FILE] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\n--tools-iso selects the web console tools disc; defaults to r86_tools.iso beside the executable, optional at startup.\nCPU: JIT by default on supported ARM64 Linux/macOS builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]
@@ -1690,6 +1700,24 @@ echo world
         assert_eq!(
             restored.vga_bios,
             Some(env::current_exe().unwrap().with_file_name(DEFAULT_VGA_BIOS))
+        );
+    }
+
+    #[test]
+    fn tools_iso_is_optional_and_accepts_config_and_cli() {
+        let args = Args::parse(std::iter::empty()).unwrap();
+        assert_eq!(
+            args.tools_iso,
+            env::current_exe().unwrap().with_file_name("r86_tools.iso")
+        );
+        let config = TestConfig::new("tools-iso = 'missing-tools.iso'\n");
+        assert_eq!(
+            config.parse(&[]).unwrap().tools_iso,
+            PathBuf::from("missing-tools.iso")
+        );
+        assert_eq!(
+            config.parse(&["--tools-iso=public.iso"]).unwrap().tools_iso,
+            PathBuf::from("public.iso")
         );
     }
 

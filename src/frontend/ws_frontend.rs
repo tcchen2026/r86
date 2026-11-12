@@ -1,5 +1,5 @@
-//! Browser and debugger share one machine, owned by this thread. Network I/O
-//! never runs here. Continuous execution and finite debugger jobs yield between
+//! Browser and debugger share one machine, owned by this thread. Socket workers
+//! deliver remote CD reads synchronously requested by the core. Execution jobs yield between
 //! instruction slices; display conversion happens only on explicit polls.
 //! Logs use caller-owned offsets, so readers never consume each other's data.
 use super::disk_files;
@@ -9,19 +9,21 @@ use super::protocol::*;
 use super::ws;
 use r86::devices::{Ps2ButtonState, Viewer};
 use r86::machine::{GuestStepStatus, Machine};
+use r86::remote_cd::{RemoteCd, Stats as RemoteStats};
 use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 
 #[derive(Default)]
 struct Reply {
     text: String,
     binary: Option<Arc<[u8]>>,
     close: bool,
+    unsolicited: bool,
 }
 impl Reply {
     fn text(text: String) -> Self {
@@ -155,10 +157,19 @@ fn record_line(file: Option<&fs::File>, line: &str) -> Result<(), String> {
 
 struct Client {
     session: WsSession,
-    reply: mpsc::SyncSender<Reply>,
+    reply: Arc<mpsc::SyncSender<Reply>>,
+    remote: Arc<Mutex<RemoteSlot>>,
 }
+
+#[derive(Default)]
+struct RemoteSlot {
+    // One insertion per dedicated connection: late binary data has no disc id.
+    disc: Option<RemoteCd>,
+    closed: bool,
+}
+
 enum Request {
-    Connect(usize, mpsc::SyncSender<Reply>),
+    Connect(usize, mpsc::SyncSender<Reply>, Arc<Mutex<RemoteSlot>>),
     Command(usize, String),
     /// A binary frame: the next chunk of this client's media upload.
     Data(usize, Vec<u8>),
@@ -193,6 +204,9 @@ struct Service {
     upload: Option<Upload>,
     /// Name of the disc inserted through this server, if any.
     media_name: Option<String>,
+    remote: Option<RemoteCd>,
+    remote_stats: Option<RemoteStats>,
+    tools_iso: PathBuf,
     /// Where uploaded discs are saved (the handheld VM's tmp folder); None keeps
     /// them in memory.
     save_dir: Option<PathBuf>,
@@ -264,6 +278,11 @@ impl Service {
             text_queue: VecDeque::new(),
             upload: None,
             media_name: None,
+            remote: None,
+            remote_stats: None,
+            tools_iso: std::env::current_exe()
+                .unwrap_or_default()
+                .with_file_name("r86_tools.iso"),
             save_dir: None,
             disc_change: None,
             file_put: None,
@@ -630,7 +649,8 @@ impl Service {
                 let mut hello = self.clients[&id].session.hello(machine);
                 hello.pop();
                 format!(
-                    "{hello},\"client_id\":{id},\"execution\":{}}}",
+                    "{hello},\"client_id\":{id},\"tools\":{},\"execution\":{}}}",
+                    self.tools_iso.is_file(),
                     self.state(machine)
                 )
             }
@@ -819,7 +839,9 @@ impl Service {
                 )
             }
             "media" | "media-begin" | "media-file" | "media-dir" | "media-cancel"
-            | "media-insert" | "media-eject" => self.media(machine, id, &cmd, message)?,
+            | "media-insert" | "media-eject" | "media-remote" | "media-tools" => {
+                self.media(machine, id, &cmd, message)?
+            }
             "power-on" => {
                 self.power_on(machine)?;
                 self.clients
@@ -881,6 +903,7 @@ impl Service {
                     ),
                     binary: if changed { self.frame.clone() } else { None },
                     close: false,
+                    unsolicited: false,
                 }));
             }
             _ => {
@@ -907,6 +930,7 @@ impl Service {
         result: &Result<r86::machine::RunReport, String>,
         reset_count: u64,
     ) {
+        self.check_remote(machine);
         self.collect_bus_warnings(machine);
         self.collect_cpu_shutdown(machine);
         match result {
@@ -934,6 +958,25 @@ impl Service {
         }
     }
 
+    fn retire_remote(&mut self, reason: &str) {
+        if let Some(remote) = self.remote.take() {
+            remote.disconnect(reason);
+            self.remote_stats = Some(remote.stats());
+        }
+    }
+
+    fn check_remote(&mut self, machine: &mut Machine) {
+        if let Some(remote) = &self.remote
+            && let Some(error) = remote.error()
+        {
+            machine.disconnect_cdrom(remote);
+            self.retire_remote(&error);
+            self.disc_change = Some(None);
+            self.media_name = None;
+            self.event(machine, "media", &format!("disc ejected: {error}"));
+        }
+    }
+
     /// Virtual media: status, uploads, insert and eject (see script/ws_cli.py).
     fn media(
         &mut self,
@@ -948,6 +991,53 @@ impl Service {
             .is_some_and(|upload| upload.owner == id);
         match cmd {
             "media" => {}
+            "media-remote" => {
+                let size = json_u64(message, "size")?.ok_or("media-remote missing size")?;
+                let name = json_string(message, "name")?.unwrap_or_default();
+                let client = &self.clients[&id];
+                let binding = client.remote.clone();
+                let mut slot = binding.lock().unwrap();
+                if slot.closed || slot.disc.is_some() {
+                    return Err(
+                        "Use a new dedicated connection for each remote CD insertion.".into(),
+                    );
+                }
+                let output = Arc::downgrade(&client.reply);
+                let remote = RemoteCd::new(size, move |request| {
+                    let reply = Reply {
+                        text: format!(
+                            "{{\"type\":\"media-read\",\"id\":{},\"offset\":{},\"length\":{}}}",
+                            request.id, request.offset, request.length
+                        ),
+                        unsolicited: true,
+                        ..Reply::default()
+                    };
+                    output
+                        .upgrade()
+                        .ok_or("Remote CD connection closed")?
+                        .try_send(reply)
+                        .map_err(|e| format!("Remote CD request failed: {e}"))
+                })?;
+                machine.change_remote_cdrom(remote.clone())?;
+                self.retire_remote("Remote CD replaced");
+                slot.disc = Some(remote.clone());
+                self.remote = Some(remote);
+                self.remote_stats = None;
+                self.disc_change = Some(None);
+                self.media_name = Some(name.clone());
+                self.media_event(machine, id, cmd, &name, size as usize)?;
+            }
+            "media-tools" => {
+                let file = fs::File::open(&self.tools_iso).map_err(|e| {
+                    format!("Cannot open r86 tools at {}: {e}", self.tools_iso.display())
+                })?;
+                let bytes = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+                machine.change_file_cdrom(file)?;
+                self.retire_remote("Remote CD replaced by r86 tools");
+                self.disc_change = Some(Some(self.tools_iso.clone()));
+                self.media_name = Some("r86 tools".into());
+                self.media_event(machine, id, cmd, "r86 tools", bytes)?;
+            }
             "media-begin" => {
                 if self.upload.is_some() && !mine {
                     return Err("Another client is uploading media.".into());
@@ -1001,12 +1091,14 @@ impl Service {
                         (bytes, Some(path))
                     }
                 };
+                self.retire_remote("Remote CD replaced by uploaded media");
                 self.disc_change = Some(path);
                 self.media_name = Some(name.clone());
                 self.media_event(machine, id, "media-insert", &name, bytes)?;
             }
             "media-eject" => {
                 machine.change_cdrom(Vec::new())?;
+                self.retire_remote("Remote CD ejected");
                 self.disc_change = Some(None);
                 self.media_name = None;
                 self.media_event(machine, id, "media-eject", "", 0)?;
@@ -1214,13 +1306,19 @@ impl Service {
                 upload.owner == id
             )
         });
+        let remote = inserted && self.remote.is_some();
+        let stats = self.remote.as_ref().map(RemoteCd::stats).or(self.remote_stats)
+            .map_or("null".into(), |s| format!("{{\"requests\":{},\"chunks\":{},\"bytes\":{},\"stall_us\":{},\"max_stall_us\":{}}}",
+                s.requests, s.chunks, s.bytes, s.stall_us, s.max_stall_us));
         format!(
-            "{{\"type\":\"media\",\"ok\":true,\"step\":{},\"drive\":{},\"inserted\":{inserted},\"tray_open\":{},\"locked\":{},\"name\":{name},\"limit\":{},\"upload\":{upload}}}",
+            "{{\"type\":\"media\",\"ok\":true,\"step\":{},\"drive\":{},\"inserted\":{inserted},\"tray_open\":{},\"locked\":{},\"name\":{name},\"limit\":{},\"upload\":{upload},\"remote\":{remote},\"tools\":{},\"saves\":{},\"remote_stats\":{stats}}}",
             machine.step_count(),
             drive.is_some(),
             state.is_some_and(|s| s.tray_open),
             state.is_some_and(|s| s.locked),
-            MEDIA_LIMIT
+            MEDIA_LIMIT,
+            self.tools_iso.is_file(),
+            self.save_dir.is_some()
         )
     }
 }
@@ -1463,6 +1561,8 @@ impl Remote {
     /// Records a disc change made on the device.
     #[allow(dead_code)]
     pub fn media_changed(&mut self, machine: &Machine, name: Option<String>) {
+        self.service
+            .retire_remote("Remote CD replaced on the device");
         let text = name
             .as_deref()
             .map_or("disc ejected".into(), |n| format!("inserted {n}"));
@@ -1480,6 +1580,10 @@ impl Remote {
     /// Stops serving, first releasing keys and buttons browsers still hold.
     #[allow(dead_code)]
     pub fn close(mut self, machine: &mut Machine) {
+        if let Some(remote) = &self.service.remote {
+            remote.disconnect("Remote console closed");
+        }
+        self.service.check_remote(machine);
         for id in self.service.clients.keys().copied().collect::<Vec<_>>() {
             let _ = self.service.release_input(machine, id);
         }
@@ -1500,6 +1604,7 @@ impl Remote {
 
     /// Handles every queued request without blocking.
     pub fn poll(&mut self, machine: &mut Machine) {
+        self.service.check_remote(machine);
         while let Ok(request) = self.rx.try_recv() {
             self.handle(machine, request);
         }
@@ -1525,16 +1630,25 @@ impl Remote {
 
     fn handle(&mut self, machine: &mut Machine, request: Request) {
         let service = &mut self.service;
+        service.check_remote(machine);
         match request {
-            Request::Connect(id, reply) => {
+            Request::Connect(id, reply, remote) => {
                 let session = WsSession::new(self.slice_steps, self.record.clone());
                 let mut hello = Reply::text(session.hello(machine));
                 hello.text.pop();
                 hello.text.push_str(&format!(
-                    ",\"client_id\":{id},\"execution\":{}}}",
+                    ",\"client_id\":{id},\"tools\":{},\"execution\":{}}}",
+                    service.tools_iso.is_file(),
                     service.state(machine)
                 ));
-                service.clients.insert(id, Client { session, reply });
+                service.clients.insert(
+                    id,
+                    Client {
+                        session,
+                        reply: Arc::new(reply),
+                        remote,
+                    },
+                );
                 service.reply(id, hello);
             }
             Request::Disconnect(id) => {
@@ -1595,6 +1709,7 @@ impl Remote {
 impl Drop for Remote {
     fn drop(&mut self) {
         // Dropping the service closes every client's reply channel.
+        self.service.retire_remote("Remote console closed");
         stop_listening(&self.stop, self.port);
     }
 }
@@ -1652,7 +1767,7 @@ impl Import {
 
     fn handle(&mut self, request: Request) {
         let (id, text) = match request {
-            Request::Connect(id, reply) => {
+            Request::Connect(id, reply, _) => {
                 self.clients.insert(id, reply);
                 let hello = format!(
                     "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"client_id\":{id},\"import\":\"{}\"}}",
@@ -1829,6 +1944,7 @@ pub fn serve_ws(
     addr: &str,
     slice_steps: u64,
     record_path: Option<&str>,
+    tools_iso: PathBuf,
     machine: &mut Machine,
     network: &mut Option<r86::network::UserNetwork>,
     audio: &mut r86::audio_output::AudioOutput,
@@ -1837,6 +1953,7 @@ pub fn serve_ws(
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("web console: http://{local}/ (WebSocket: ws://{local}/ws)");
     let mut remote = Remote::new(listener, slice_steps, record_path, true, None)?;
+    remote.service.tools_iso = tools_iso;
     remote
         .service
         .event(machine, "start", "server ready; paused");
@@ -1941,8 +2058,11 @@ fn connection(
     let Some(mut socket) = ws::WebSocket::accept(stream)? else {
         return Ok(());
     };
-    let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    tx.send(Request::Connect(id, reply_tx))
+    // The insert acknowledgement and the first unsolicited read may queue
+    // together before the writer runs. Control requests still cannot pipeline.
+    let (reply_tx, reply_rx) = mpsc::sync_channel(2);
+    let binding = Arc::new(Mutex::new(RemoteSlot::default()));
+    tx.send(Request::Connect(id, reply_tx, binding.clone()))
         .map_err(|e| e.to_string())?;
     let mut reader = socket.reader()?;
     let requests = tx.clone();
@@ -1953,19 +2073,55 @@ fn connection(
     let reader_thread = std::thread::spawn(move || {
         loop {
             let request = match reader.read_message() {
-                Ok(ws::Message::Text(text)) => Request::Command(id, text),
-                Ok(ws::Message::Binary(data)) => Request::Data(id, data),
+                Ok(ws::Message::Text(text)) => {
+                    if json_string(&text, "cmd").ok().flatten().as_deref()
+                        == Some("media-read-error")
+                    {
+                        let remote = binding.lock().unwrap().disc.clone();
+                        let result = (|| {
+                            let remote = remote.ok_or("No remote CD on this connection")?;
+                            let id = json_u64(&text, "id")?.ok_or("media-read-error missing id")?;
+                            let error = json_string(&text, "error")?
+                                .ok_or("media-read-error missing error")?;
+                            remote.read_error(id, &error)
+                        })();
+                        if result.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Request::Command(id, text)
+                }
+                Ok(ws::Message::Binary(data)) => {
+                    if let Some(remote) = binding.lock().unwrap().disc.clone() {
+                        if remote.reply(data).is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                    Request::Data(id, data)
+                }
                 _ => break,
             };
             if reading.swap(true, Ordering::SeqCst) || requests.send(request).is_err() {
                 break;
             }
         }
+        // Wake a blocked read before touching the core's command queue.
+        {
+            let mut slot = binding.lock().unwrap();
+            slot.closed = true;
+            if let Some(remote) = &slot.disc {
+                remote.disconnect("Remote CD connection closed");
+            }
+        }
         let _ = requests.send(Request::Disconnect(id));
     });
     let result = (|| {
         while let Ok(reply) = reply_rx.recv() {
-            in_flight.store(false, Ordering::SeqCst);
+            if !reply.unsolicited {
+                in_flight.store(false, Ordering::SeqCst);
+            }
             socket.send_text(&reply.text)?;
             if let Some(binary) = reply.binary {
                 socket.send_binary(&binary)?;
@@ -1987,6 +2143,127 @@ mod import_tests {
     use std::io::Read;
     use std::net::TcpStream;
     use std::time::Duration;
+
+    #[test]
+    fn remote_cd_socket_reply_bypasses_core_queue_and_disconnect_ejects() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut remote = Remote::new(listener, 1000, None, true, None).unwrap();
+        let mut machine = Machine::new(0x10000);
+        machine.attach_secondary_cdrom(Vec::new());
+        let (close, close_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut source = Browser::connect(port);
+            assert!(source.recv().contains("hello"));
+            let mut control = Browser::connect(port);
+            assert!(control.recv().contains("hello"));
+            assert!(
+                source
+                    .call(1, br#"{"cmd":"media-remote","name":"test","size":2048}"#)
+                    .contains("\"remote\":true")
+            );
+            let read = source.recv();
+            assert_eq!(json_u64(&read, "length").unwrap(), Some(2048));
+            source.send(2, &[0xa5; 2048]);
+            close_rx.recv().unwrap();
+            drop(source);
+            assert!(
+                control
+                    .call(1, br#"{"cmd":"media"}"#)
+                    .contains("\"ok\":true")
+            );
+        });
+        let start = std::time::Instant::now();
+        while remote.service.remote.is_none() {
+            remote.poll(&mut machine);
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let disc = remote.service.remote.as_ref().unwrap().clone();
+        let mut data = Vec::new();
+        // No poll while blocked: the socket worker must deliver this response.
+        disc.read_into(0, 2048, &mut data).unwrap();
+        assert_eq!(data, vec![0xa5; 2048]);
+        close.send(()).unwrap();
+        while !worker.is_finished() || machine.cdrom_state().unwrap().inserted {
+            remote.poll(&mut machine);
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        worker.join().unwrap();
+        assert!(machine.cdrom_state().unwrap().tray_open);
+    }
+
+    #[test]
+    fn remote_cd_and_tools_insert_preserve_media_on_error() {
+        let path = std::env::temp_dir().join(format!("r86-media-tools-{}.iso", std::process::id()));
+        let mut service = Service::new();
+        service.tools_iso = path.clone();
+        let (reply, _rx) = mpsc::sync_channel(2);
+        service.clients.insert(
+            1,
+            Client {
+                session: WsSession::new(1000, None),
+                reply: Arc::new(reply),
+                remote: Arc::new(Mutex::new(RemoteSlot::default())),
+            },
+        );
+        let mut machine = Machine::new(0x10000);
+        machine.attach_secondary_cdrom(Vec::new());
+        for saves in [false, true] {
+            service.save_dir = saves.then(std::env::temp_dir);
+            assert!(
+                service
+                    .media_json(&machine, 1)
+                    .contains(&format!("\"saves\":{saves}"))
+            );
+        }
+        service.save_dir = None;
+        assert!(
+            service
+                .command(&mut machine, 1, r#"{"cmd":"hello"}"#)
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("\"tools\":false")
+        );
+        // A remote image larger than the upload cap needs no whole-image allocation.
+        let insert = format!(
+            "{{\"cmd\":\"media-remote\",\"size\":{}}}",
+            MEDIA_LIMIT + 2048
+        );
+        assert!(
+            service
+                .command(&mut machine, 1, &insert)
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("\"remote\":true")
+        );
+        assert!(
+            service
+                .command(&mut machine, 1, r#"{"cmd":"media-tools"}"#)
+                .is_err()
+        );
+        assert!(machine.cdrom_state().unwrap().inserted);
+        let disc = service.remote.as_ref().unwrap().clone();
+        fs::write(&path, [0x5a; 2048]).unwrap();
+        let result = service
+            .command(&mut machine, 1, r#"{"cmd":"media-tools"}"#)
+            .unwrap()
+            .unwrap()
+            .text;
+        assert!(
+            result.contains("\"tools\":true")
+                && result.contains("\"remote\":false")
+                && result.contains("r86 tools")
+        );
+        assert!(disc.error().is_some());
+        machine.disconnect_cdrom(&disc);
+        assert!(machine.cdrom_state().unwrap().inserted);
+        assert!(service.command(&mut machine, 1, &insert).is_err()); // Fresh connection required.
+        fs::remove_file(path).unwrap();
+    }
 
     /// A browser reduced to what the import page sends.
     struct Browser(TcpStream);
@@ -2119,7 +2396,8 @@ mod usb_tests {
                 id,
                 Client {
                     session: WsSession::new(1000, Some(file.clone())),
-                    reply: mpsc::sync_channel(1).0,
+                    reply: Arc::new(mpsc::sync_channel(1).0),
+                    remote: Arc::new(Mutex::new(RemoteSlot::default())),
                 },
             );
         }

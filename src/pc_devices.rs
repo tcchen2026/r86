@@ -777,6 +777,38 @@ impl IdeBus {
         self.change_cdrom_image(iso, false).map_err(str::to_string)
     }
 
+    #[cfg(feature = "host")]
+    pub fn change_remote_cdrom(
+        &mut self,
+        remote: crate::remote_cd::RemoteCd,
+    ) -> Result<(), &'static str> {
+        self.change_cdrom_image(CdromImage::Remote(remote), false)
+    }
+
+    /// A vanished source cannot honor a guest lock or finish a PIO transfer.
+    /// Match the source so a late disconnect cannot eject a replacement disc.
+    #[cfg(feature = "host")]
+    pub fn disconnect_cdrom(&mut self, remote: &crate::remote_cd::RemoteCd) {
+        for channel in [&mut self.primary, &mut self.secondary] {
+            for unit in 0..channel.drives.len() {
+                let Some(drive) = &mut channel.drives[unit] else {
+                    continue;
+                };
+                if !drive.eject_remote(Some(remote)) {
+                    continue;
+                }
+                drive.media_change = MediaChange::UnitAttention;
+                drive.sense_key = 6;
+                drive.asc = 0x28;
+                if unit == channel.selected && channel.transfer_kind == IdeTransferKind::AtapiData {
+                    drive.media_change = MediaChange::None;
+                    channel.packet_error(3, 0x11);
+                }
+                return;
+            }
+        }
+    }
+
     /// Whether `change_cdrom` would accept a new medium now. Lets a caller keep
     /// an uploaded image when the guest refuses the change.
     pub fn cdrom_change_allowed(&self) -> Result<(), &'static str> {
@@ -822,11 +854,14 @@ impl IdeBus {
                 *iso = image;
                 *tray_open = empty;
                 *media_event = if empty { 3 } else { 2 };
-                // tiny386 ide_change_cd also reports UNIT ATTENTION / medium
-                // changed. Keep our existing polled ATAPI media-event contract;
-                // a host tray operation is not a guest command completion IRQ.
-                drive.sense_key = 6;
-                drive.asc = 0x28;
+                if empty {
+                    drive.media_change = MediaChange::UnitAttention;
+                    drive.sense_key = 6;
+                    drive.asc = 0x28;
+                } else {
+                    drive.media_inserted();
+                }
+                // A host tray operation is not a guest command completion IRQ.
                 return Ok(());
             }
         }
@@ -1633,6 +1668,11 @@ impl IdeChannel {
                     .read_into(range.start + start, len, &mut self.data)
                     .is_err()
                 {
+                    #[cfg(feature = "host")]
+                    self.drives[self.selected]
+                        .as_mut()
+                        .unwrap()
+                        .eject_remote(None);
                     self.packet_error(3, 0x11); // MEDIUM ERROR / unrecovered read error
                     return;
                 }
@@ -1793,9 +1833,52 @@ struct IdeDrive {
     kind: IdeDriveKind,
     sense_key: u8,
     asc: u8,
+    media_change: MediaChange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MediaChange {
+    None,
+    Removed,
+    UnitAttention,
 }
 
 impl IdeDrive {
+    fn media_inserted(&mut self) {
+        // Polling guests must observe absence even when eject/insert happened
+        // between polls. tiny386 and QEMU also retain this separate transition.
+        // Each failing command consumes one phase, even without REQUEST SENSE
+        // (UDVD2 reads the ATA error register). Last sense is separate from this
+        // notification. GET EVENT STATUS independently reports the new medium.
+        self.media_change = MediaChange::Removed;
+        self.sense_key = 0;
+        self.asc = 0;
+    }
+
+    #[cfg(feature = "host")]
+    fn eject_remote(&mut self, source: Option<&crate::remote_cd::RemoteCd>) -> bool {
+        let IdeDriveKind::Cdrom {
+            iso,
+            tray_open,
+            media_event,
+            ..
+        } = &mut self.kind
+        else {
+            return false;
+        };
+        let CdromImage::Remote(remote) = iso else {
+            return false;
+        };
+        if source.is_some_and(|source| !remote.same_disc(source)) {
+            return false;
+        }
+        *iso = CdromImage::Memory(Vec::new());
+        *tray_open = true;
+        *media_event = 3;
+        self.media_change = MediaChange::None;
+        true
+    }
+
     fn hdd(disk: Disk) -> Self {
         Self {
             kind: IdeDriveKind::Hdd {
@@ -1806,6 +1889,7 @@ impl IdeDrive {
             },
             sense_key: 0,
             asc: 0,
+            media_change: MediaChange::None,
         }
     }
 
@@ -1819,12 +1903,14 @@ impl IdeDrive {
             },
             sense_key: 0,
             asc: 0,
+            media_change: MediaChange::None,
         }
     }
 
     fn reset_control(&mut self) {
         self.sense_key = 0;
         self.asc = 0;
+        self.media_change = MediaChange::None;
         if let IdeDriveKind::Cdrom {
             locked,
             media_event,
@@ -1906,13 +1992,24 @@ impl IdeDrive {
     }
 
     fn exec_packet(&mut self, cdb: [u8; ATAPI_PACKET_LEN]) -> PacketReply {
-        // Inquiry, sense and event/configuration queries remain usable while
-        // a media-change condition is pending. REQUEST SENSE acknowledges it.
-        if self.sense_key == 6 && !matches!(cdb[0], 0x03 | 0x12 | 0x46 | 0x4a) {
-            return PacketReply::CheckCondition {
-                sense: 6,
-                asc: self.asc,
-            };
+        if !matches!(cdb[0], 0x03 | 0x12 | 0x46 | 0x4a) {
+            match self.media_change {
+                MediaChange::Removed => {
+                    self.media_change = MediaChange::UnitAttention;
+                    return PacketReply::CheckCondition {
+                        sense: 2,
+                        asc: 0x3a,
+                    };
+                }
+                MediaChange::UnitAttention => {
+                    self.media_change = MediaChange::None;
+                    return PacketReply::CheckCondition {
+                        sense: 6,
+                        asc: 0x28,
+                    };
+                }
+                MediaChange::None => {}
+            }
         }
         if matches!(cdb[0], 0x00 | 0x25 | 0x28 | 0x2b | 0x43 | 0xa8 | 0xbe)
             && self.cdrom_sector_count() == 0
@@ -2123,8 +2220,7 @@ impl IdeDrive {
                 2 // new media
             };
             if !open && iso.len() >= ATAPI_SECTOR_SIZE {
-                self.sense_key = 6;
-                self.asc = 0x28;
+                self.media_inserted();
             }
         }
         PacketReply::Ok
@@ -2328,6 +2424,8 @@ type CdromBacking = Vec<u8>;
 #[derive(Clone)]
 enum CdromImage {
     Memory(CdromBacking),
+    #[cfg(feature = "host")]
+    Remote(crate::remote_cd::RemoteCd),
     #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
     Browser {
         drive: u32,
@@ -2354,6 +2452,8 @@ impl CdromImage {
         match self {
             Self::Memory(bytes) => bytes.len(),
             #[cfg(feature = "host")]
+            Self::Remote(remote) => remote.len(),
+            #[cfg(feature = "host")]
             Self::File { bytes, .. } => *bytes,
             #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
             Self::Browser { bytes, .. } => *bytes,
@@ -2366,6 +2466,8 @@ impl CdromImage {
     fn read_into(&self, offset: usize, len: usize, out: &mut Vec<u8>) -> Result<(), DiskError> {
         match self {
             Self::Memory(bytes) => out.extend_from_slice(&bytes[offset..offset + len]),
+            #[cfg(feature = "host")]
+            Self::Remote(remote) => remote.read_into(offset, len, out)?,
             #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
             Self::Browser { drive, .. } => {
                 out.resize(len, 0);
@@ -2391,6 +2493,8 @@ impl core::fmt::Debug for CdromImage {
         // into the bounded state-export buffer. This hash is diagnostic only.
         let bytes = match self {
             Self::Memory(bytes) => bytes,
+            #[cfg(feature = "host")]
+            Self::Remote(remote) => return core::fmt::Debug::fmt(remote, f),
             #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
             Self::Browser { drive, bytes } => {
                 return f
@@ -2902,7 +3006,8 @@ mod tests {
         atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a); // reset does not close tray
         atapi_response(&mut ide, load);
         assert_eq!(&atapi_response(&mut ide, event)[4..6], &[2, 2]);
-        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28); // request sense acknowledges UA
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28); // REQUEST SENSE reports the last error
         atapi_response(&mut ide, [0; ATAPI_PACKET_LEN]);
         let data = atapi_response(&mut ide, [0x28, 0, 0, 0, 0, 3, 0, 0, 1, 0, 0, 0]);
         assert_eq!(data, vec![0x5a; ATAPI_SECTOR_SIZE]);
@@ -2925,6 +3030,7 @@ mod tests {
         ide.change_cdrom(vec![0xa5; ATAPI_SECTOR_SIZE * 4]).unwrap();
         assert_eq!(ide.read_u8(0x1f2), Some(37)); // no HDD/controller reset
         assert!(!ide.irq_asserted(IdeIrq::Secondary)); // not a completed command
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
         atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28);
         assert_eq!(&atapi_response(&mut ide, event)[4..6], &[2, 2]);
         assert_eq!(&atapi_response(&mut ide, event)[4..6], &[0, 2]);
@@ -2934,6 +3040,7 @@ mod tests {
         );
 
         ide.change_cdrom(vec![0x5a; ATAPI_SECTOR_SIZE * 2]).unwrap();
+        atapi_failure(&mut ide, read, 2, 0x3a);
         atapi_failure(&mut ide, read, 6, 0x28);
         let capacity = atapi_response(&mut ide, [0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(u32::from_be_bytes(capacity[..4].try_into().unwrap()), 1);
@@ -2957,6 +3064,41 @@ mod tests {
         assert!(primary.cdrom_state().unwrap().inserted);
         primary.change_cdrom(Vec::new()).unwrap();
         assert!(!primary.cdrom_state().unwrap().inserted);
+    }
+
+    #[test]
+    fn atapi_direct_replacement_retains_both_polling_notifications() {
+        let mut ide = IdeBus::new_enabled();
+        ide.attach_secondary_master_cdrom(vec![0xaa; ATAPI_SECTOR_SIZE]);
+        let tur = [0; ATAPI_PACKET_LEN];
+        let sense = [3, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0];
+        let event = [0x4a, 1, 0, 0, 0x10, 0, 0, 0, 8, 0, 0, 0];
+        for value in [0xbb, 0xcc] {
+            ide.change_cdrom(vec![value; ATAPI_SECTOR_SIZE]).unwrap();
+            // Queries must not consume either command-driven transition.
+            let mut header = event;
+            header[8] = 4;
+            atapi_response(&mut ide, header);
+            assert_eq!(&atapi_response(&mut ide, event)[4..6], &[2, 2]);
+            assert_eq!(&atapi_response(&mut ide, event)[4..6], &[0, 2]);
+            assert_eq!(atapi_response(&mut ide, sense)[2], 0);
+            start_atapi_command(&mut ide, tur, 2048);
+            assert_eq!(ide.read_u8(0x171).unwrap() >> 4, 2);
+            atapi_response(&mut ide, [0x12, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0, 0]);
+            atapi_response(&mut ide, [0x46, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0]);
+            atapi_response(&mut ide, event);
+            // A guest can retry after reading the ATA error register alone.
+            start_atapi_command(&mut ide, tur, 2048);
+            assert_eq!(ide.read_u8(0x171).unwrap() >> 4, 6);
+            atapi_response(&mut ide, tur); // No sense request needed to finish the transition.
+            let last_error = atapi_response(&mut ide, sense);
+            assert_eq!((last_error[2], last_error[12]), (6, 0x28));
+            atapi_response(&mut ide, tur);
+            assert_eq!(
+                atapi_response(&mut ide, [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]),
+                vec![value; ATAPI_SECTOR_SIZE]
+            );
+        }
     }
 
     #[test]
@@ -2991,10 +3133,64 @@ mod tests {
             0
         );
         ide.change_cdrom(vec![0xbb; ATAPI_SECTOR_SIZE]).unwrap();
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
         atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28);
         let mut one = read;
         one[8] = 1;
         assert_eq!(atapi_response(&mut ide, one), vec![0xbb; ATAPI_SECTOR_SIZE]);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn atapi_remote_timeout_is_medium_error_and_ejects_locked_disc() {
+        let remote = crate::remote_cd::RemoteCd::new(2048, |_| Ok(())).unwrap();
+        let mut ide = IdeBus::new_enabled();
+        ide.attach_secondary_master_cdrom(Vec::new());
+        ide.change_remote_cdrom(remote.clone()).unwrap();
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28);
+        atapi_response(&mut ide, [0x1e, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        assert!(ide.cdrom_state().unwrap().locked);
+        atapi_failure(&mut ide, [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0], 3, 0x11);
+        assert!(remote.error().unwrap().contains("timed out"));
+        let state = ide.cdrom_state().unwrap();
+        assert!(state.tray_open && !state.inserted);
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
+        assert_eq!(remote.stats().requests, 1);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn atapi_remote_disconnect_clears_inflight_data_and_cannot_eject_replacement() {
+        use crate::remote_cd::RemoteCd;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let remote = RemoteCd::new(2048, move |r| tx.send(r).map_err(|e| e.to_string())).unwrap();
+        let sender = remote.clone();
+        let worker = std::thread::spawn(move || {
+            let r = rx.recv().unwrap();
+            sender.reply(vec![0xa5; r.length]).unwrap();
+        });
+        let mut ide = IdeBus::new_enabled();
+        ide.attach_secondary_master_cdrom(Vec::new());
+        ide.change_remote_cdrom(remote.clone()).unwrap();
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 2, 0x3a);
+        atapi_failure(&mut ide, [0; ATAPI_PACKET_LEN], 6, 0x28);
+        start_atapi_command(&mut ide, [0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0], 2048);
+        worker.join().unwrap();
+        assert_ne!(ide.read_u8(0x177).unwrap() & ATA_STATUS_DRQ, 0);
+        remote.disconnect("connection closed");
+        ide.disconnect_cdrom(&remote);
+        assert!(ide.secondary.data.is_empty());
+        assert_eq!(
+            ide.read_u8(0x177).unwrap() & (ATA_STATUS_ERR | ATA_STATUS_DRQ),
+            ATA_STATUS_ERR
+        );
+        let sense = atapi_response(&mut ide, [3, 0, 0, 0, 18, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!((sense[2], sense[12]), (3, 0x11));
+        assert!(!ide.cdrom_state().unwrap().inserted);
+        ide.change_cdrom(vec![0xbb; 2048]).unwrap();
+        ide.disconnect_cdrom(&remote);
+        assert!(ide.cdrom_state().unwrap().inserted);
     }
 
     #[test]

@@ -116,7 +116,7 @@
   <button id="shot" title="Save the current screen as PNG">Screenshot</button>
   <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
   <span class="sep"></span>
-  <span id="media" title="Virtual CD: insert an ISO, or files and folders as a new disc. You can also drop them on this page.">
+  <span id="media" title="Virtual CD: an ISO stays on this computer and is read as the guest needs it (keep this page open); files and folders become a new disc. You can also drop them on this page.">
     <span id="media-state">CD</span>
     <label class="button off" id="pick-iso-label">ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
     <label class="button off" id="pick-files-label">Files…<input id="pick-files" type="file" multiple hidden></label>
@@ -572,7 +572,10 @@ function showMedia(info) {
   let text = "CD: —";
   if (info && !drive) text = "no CD drive";
   else if (info?.upload && !info.upload.mine) text = "CD: another client is uploading";
-  else if (info?.inserted) text = `CD: ${info.name ?? "disc inserted"}${info.locked ? " (locked)" : ""}`;
+  else if (info?.inserted) {
+    const from = info.remote ? (remoteDisc ? " · read from this page" : " · read from another page") : "";
+    text = `CD: ${info.name ?? "disc inserted"}${from}${info.locked ? " (locked)" : ""}`;
+  }
   else if (info) text = "CD: empty";
   $("media-state").textContent = text;
   $("media-state").title = text;
@@ -607,12 +610,58 @@ function mediaSocket() {
   });
 }
 
+// An ISO stays in this browser, like a server BMC's virtual media: r86 asks
+// for the bytes the guest reads on a connection of its own. Closing that
+// connection (or this page) ejects the disc.
+let remoteDisc = null;
+
+function insertRemote(file) {
+  if (file.size % 2048) { note(`CD: ${file.name} is not whole 2048-byte sectors`, true); return; }
+  remoteDisc?.sock.close();
+  const sock = openSocket();
+  const disc = remoteDisc = { sock };
+  let greeted = false, inserted = false;
+  sock.onmessage = async e => {
+    const json = JSON.parse(e.data);
+    if (!greeted) {
+      greeted = true;
+      sock.send(JSON.stringify({ cmd: "media-remote", name: file.name, size: file.size }));
+    } else if (json.type === "media-read") {
+      // One read is outstanding at a time, so replies stay in order.
+      try {
+        sock.send(await file.slice(json.offset, json.offset + json.length).arrayBuffer());
+      } catch (err) {
+        sock.send(JSON.stringify({ cmd: "media-read-error", id: json.id, error: String(err?.message ?? err) }));
+      }
+    } else if (json.ok) {
+      inserted = true;
+      showMedia(json);
+      note(`CD inserted: ${file.name}, read from this page as the guest needs it`);
+    } else {
+      note(`CD: ${json.error}`, true);
+      sock.close();
+    }
+  };
+  sock.onclose = async () => {
+    if (remoteDisc === disc) remoteDisc = null;
+    if (inserted) note(`CD: ${file.name} is no longer read from this page`);
+    const json = ready && await command({ cmd: "media" });
+    if (json) showMedia(json);
+  };
+}
+
+addEventListener("beforeunload", e => {
+  if (remoteDisc) e.preventDefault(); // Leaving ejects the CD this page supplies.
+});
+
 // items: [{ path: "DIR/NAME.EXT", file }] and [{ path: "DIR", dir: true }].
 // A single .iso file is inserted as it is; anything else becomes a new disc.
+// The handheld saves an ISO as the VM's CD, so it is uploaded there.
 async function insertMedia(items, label) {
   const files = items.filter(i => !i.dir);
   if (!files.length || uploading) return;
   const iso = items.length === 1 && /\.iso$/i.test(files[0].path);
+  if (iso && mediaInfo && "remote" in mediaInfo && !mediaInfo.saves) { insertRemote(files[0].file); return; }
   const total = files.reduce((n, i) => n + i.file.size, 0);
   if (mediaInfo && total > mediaInfo.limit) {
     note(`virtual media is limited to ${mediaInfo.limit >> 20} MiB`, true);
@@ -674,11 +723,13 @@ $("upload-retry").onclick = () => uploading?.choose?.(true);
 $("eject").onclick = async () => {
   const json = await command({ cmd: "media-eject" });
   if (json) showMedia(json);
+  if (json && !json.inserted) remoteDisc?.sock.close();
 };
 // The server's own tools ISO (r86_tools.iso beside r86-run): nothing to upload.
 $("tools").onclick = async () => {
   const json = await command({ cmd: "media-tools" });
   if (!json) return;
+  remoteDisc?.sock.close(); // The server has already released that disc.
   showMedia(json);
   note("CD inserted: r86 tools. Windows opens its installer; otherwise run R86-TOOL.EXE on the CD.");
 };

@@ -58,6 +58,8 @@ pub mod machine;
 #[cfg(feature = "host")]
 #[path = "frontend/network.rs"]
 pub mod network;
+#[cfg(feature = "host")]
+pub mod remote_cd;
 #[cfg(feature = "machine")]
 #[path = "pc_devices.rs"]
 mod run_devices;

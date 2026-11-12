@@ -10,7 +10,7 @@ pub const FRAME_VERSION: u16 = 1;
 pub const FRAME_TYPE_RGBA: u16 = 1;
 pub const PIXEL_FORMAT_RGBA: u32 = 1;
 pub const FRAME_HEADER_LEN: usize = 32;
-/// Largest client binary frame (one virtual-media upload chunk).
+/// Largest client binary message (an upload chunk or remote-CD reply).
 pub const MAX_BINARY_FRAME: u64 = 1 << 20;
 
 #[derive(Debug, Eq, PartialEq)]
@@ -147,7 +147,7 @@ impl WebSocket {
                 (0x8..=0xA, _) => return Err("invalid websocket control frame".into()),
                 (other, _) => return Err(format!("unsupported websocket opcode {other:#x}")),
             };
-            // Binary messages carry virtual-media upload chunks.
+            // Binary messages carry upload chunks or remote-CD read replies.
             let limit = match kind {
                 0x2 => MAX_BINARY_FRAME,
                 0x1 => 64 * 1024,
