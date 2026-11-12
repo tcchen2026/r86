@@ -3185,13 +3185,12 @@ impl HostBus {
             }
             CMOS_REG_D => 0x80,
             0x10 => 0,
-            0x12 => 0,
+            index @ (0x12 | 0x19..=0x2c) => self.ide.cmos_hdd_read(index),
             0x14 => 0x02,
             0x15 => base_kib as u8,
             0x16 => (base_kib >> 8) as u8,
             0x17 | 0x30 => ext_kib as u8,
             0x18 | 0x31 => (ext_kib >> 8) as u8,
-            0x19 | 0x1a => 47,
             0x2d => 0,
             0x2e | 0x2f => 0,
             0x32 => self.rtc_encode((time.year / 100) as u8),
@@ -13561,6 +13560,44 @@ mod host_bus_tests {
         assert_eq!(bus.io_read_u8(0xd00a).unwrap() & 4, 4);
         bus.io_write_u32(0xd008, 0x0004_0000).unwrap();
         assert_eq!(bus.io_read_u8(0xd00a).unwrap() & 4, 0);
+    }
+
+    #[test]
+    fn cmos_hard_disk_matches_identify_and_excludes_atapi() {
+        fn cmos(bus: &mut HostBus, index: u8) -> u8 {
+            bus.io_write_u8(0x70, index).unwrap();
+            bus.io_read_u8(0x71).unwrap()
+        }
+        let mut bus = HostBus::new_firmware(2 * 1024 * 1024).unwrap();
+        for optical in [false, true] {
+            if optical {
+                bus.attach_primary_cdrom(vec![0; 2048]);
+            }
+            for index in core::iter::once(0x12).chain(0x19..=0x2c) {
+                assert_eq!(cmos(&mut bus, index), 0, "CMOS {index:x}");
+            }
+        }
+        bus.attach_hdd(vec![0; 8 * 1024 * 1024], true);
+        bus.io_write_u8(0x1f7, 0xec).unwrap();
+        let identify: [u16; 256] = core::array::from_fn(|_| bus.io_read_u16(0x1f0).unwrap());
+        assert_eq!(cmos(&mut bus, 0x12), 0xf0);
+        assert_eq!(cmos(&mut bus, 0x19), 47);
+        assert_eq!(cmos(&mut bus, 0x1a), 0);
+        for (index, word) in [(0x1b, 1), (0x21, 1)] {
+            let cylinders = u16::from_le_bytes([cmos(&mut bus, index), cmos(&mut bus, index + 1)]);
+            assert_eq!(cylinders, identify[word]);
+        }
+        assert_eq!(u16::from(cmos(&mut bus, 0x1d)), identify[3]);
+        assert_eq!(u16::from(cmos(&mut bus, 0x23)), identify[6]);
+        assert_eq!(cmos(&mut bus, 0x1e), 0xff);
+        assert_eq!(cmos(&mut bus, 0x1f), 0xff);
+        assert_eq!(cmos(&mut bus, 0x20), 0xc8);
+        for index in 0x24..=0x2c {
+            assert_eq!(cmos(&mut bus, index), 0);
+        }
+        bus.reset(0);
+        assert_eq!(cmos(&mut bus, 0x12), 0xf0);
+        assert_eq!(cmos(&mut bus, 0x19), 47);
     }
 
     #[test]

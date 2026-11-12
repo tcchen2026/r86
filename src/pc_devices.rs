@@ -657,6 +657,39 @@ impl IdeBus {
         self.primary.reset_signature();
     }
 
+    /// Type-47 CMOS data for primary ATA disks, using IDENTIFY's physical CHS.
+    /// Windows 9x ESDI_506 rejects a BIOS disk whose CMOS drive type is absent.
+    pub(crate) fn cmos_hdd_read(&self, index: u8) -> u8 {
+        let sectors = |unit: usize| match self.primary.drives[unit].as_ref().map(|d| &d.kind) {
+            Some(IdeDriveKind::Hdd { disk, .. }) => Some(disk.sectors()),
+            _ => None,
+        };
+        if index == 0x12 {
+            return u8::from(sectors(0).is_some()) * 0xf0 | u8::from(sectors(1).is_some()) * 0x0f;
+        }
+        let (unit, field) = match index {
+            0x19 => (0, 9),
+            0x1a => (1, 9),
+            0x1b..=0x23 => (0, index - 0x1b),
+            0x24..=0x2c => (1, index - 0x24),
+            _ => return 0,
+        };
+        let Some(sectors) = sectors(unit) else {
+            return 0;
+        };
+        let cylinders = (sectors / (16 * 63)).min(16383) as u16;
+        match field {
+            0 | 6 => cylinders as u8,
+            1 | 7 => (cylinders >> 8) as u8,
+            2 => 16,
+            3 | 4 => 0xff, // No write precompensation.
+            5 => 0xc8,     // More than eight heads.
+            8 => 63,
+            9 => 47,
+            _ => unreachable!(),
+        }
+    }
+
     pub fn flush_disks(&mut self) -> Result<(), DiskError> {
         let mut result = Ok(());
         for channel in [&mut self.primary, &mut self.secondary] {
@@ -1284,6 +1317,11 @@ impl IdeChannel {
         };
         let is_packet = matches!(drive.kind, IdeDriveKind::Cdrom { .. });
         if packet != is_packet {
+            if is_packet {
+                // IDENTIFY DEVICE aborts on ATAPI but must restore its signature.
+                // Win9x clears the task file before probing and checks EB14h.
+                self.reset_signature();
+            }
             self.abort();
             return;
         }
@@ -2701,6 +2739,18 @@ mod tests {
         let mut ide = IdeBus::new_enabled();
         ide.attach_secondary_master_cdrom(vec![0xaa; ATAPI_SECTOR_SIZE * 4]);
         ide.write_u8(0x176, 0xa0);
+        // ESDI_506 probes a cleared task file with IDENTIFY DEVICE first.
+        for port in 0x172..=0x175 {
+            ide.write_u8(port, 0);
+        }
+        ide.write_u8(0x177, ATA_CMD_IDENTIFY);
+        assert!(ide.irq_asserted(IdeIrq::Secondary));
+        assert_eq!(ide.read_u8(0x171), Some(ATA_ERR_ABORT));
+        assert_ne!(ide.read_u8(0x177).unwrap() & ATA_STATUS_ERR, 0);
+        assert_eq!(ide.read_u8(0x172), Some(1));
+        assert_eq!(ide.read_u8(0x173), Some(1));
+        assert_eq!(ide.read_u8(0x174), Some(0x14));
+        assert_eq!(ide.read_u8(0x175), Some(0xeb));
         ide.write_u8(0x177, ATA_CMD_IDENTIFY_PACKET);
         assert_eq!(ide.read_u8(0x177).unwrap() & ATA_STATUS_DRQ, ATA_STATUS_DRQ);
         assert_eq!(ide.read_u16(0x170).unwrap(), 0x85c0);
