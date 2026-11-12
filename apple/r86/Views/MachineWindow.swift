@@ -80,6 +80,8 @@ struct MachineWindow: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Menu("CD", systemImage: "opticaldisc") {
                 Button("Insert CD Image…") { choosingCD = true }
+                Button("Install r86 Tools…") { library.insertTools(m.id) }
+                    .disabled(Library.toolsISO == nil)
                 Button("Eject") { library.changeCD(m.id, nil) }
                     .disabled(m.iso == nil)
             }

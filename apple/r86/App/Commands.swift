@@ -69,6 +69,11 @@ struct MachineCommands: Commands {
             }
             .disabled(machine?.status != .running)
 
+            Button("Install r86 Tools…") {
+                if let id = focusedID { library.insertTools(id) }
+            }
+            .disabled(!live || Library.toolsISO == nil)
+
             Divider()
 
             Button("Edit…") {

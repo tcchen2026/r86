@@ -119,6 +119,15 @@ final class Library {
         }
     }
 
+    /// The guest tools CD in the app's resources, if this build has it.
+    static let toolsISO = Bundle.main.url(forResource: "r86_tools", withExtension: "iso")
+
+    /// Insert the tools CD; the guest installs from R86-TOOL.EXE on it.
+    func insertTools(_ id: Machine.ID) {
+        guard let iso = Self.toolsISO else { return }
+        changeCD(id, iso)
+    }
+
     /// Turn every machine off now, flushing disks (used when quitting).
     func stopAll() {
         for (id, session) in sessions { finish(id, session) }

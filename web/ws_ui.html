@@ -121,6 +121,7 @@
     <label class="button off" id="pick-iso-label">ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
     <label class="button off" id="pick-files-label">Files…<input id="pick-files" type="file" multiple hidden></label>
     <label class="button off" id="pick-dir-label">Folder…<input id="pick-dir" type="file" webkitdirectory hidden></label>
+    <button id="tools" hidden title="Insert the r86 tools CD: display driver and mouse helper. Windows opens its installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 tools…</button>
     <button id="eject" disabled>Eject</button>
   </span>
   <div id="status"><span id="dot"></span><span id="state">connecting</span></div>
@@ -578,6 +579,8 @@ function showMedia(info) {
   const can = drive && !uploading;
   for (const id of ["pick-iso-label", "pick-files-label", "pick-dir-label"]) $(id).classList.toggle("off", !can);
   $("eject").disabled = !can || !info.inserted;
+  $("tools").hidden = !info?.tools;
+  $("tools").disabled = !can;
 }
 
 function mediaSocket() {
@@ -671,6 +674,13 @@ $("upload-retry").onclick = () => uploading?.choose?.(true);
 $("eject").onclick = async () => {
   const json = await command({ cmd: "media-eject" });
   if (json) showMedia(json);
+};
+// The server's own tools ISO (r86_tools.iso beside r86-run): nothing to upload.
+$("tools").onclick = async () => {
+  const json = await command({ cmd: "media-tools" });
+  if (!json) return;
+  showMedia(json);
+  note("CD inserted: r86 tools. Windows opens its installer; otherwise run R86-TOOL.EXE on the CD.");
 };
 function picked(input, label) {
   input.onchange = () => {

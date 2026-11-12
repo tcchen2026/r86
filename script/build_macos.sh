@@ -37,6 +37,11 @@ swiftc -O -whole-module-optimization -parse-as-library -swift-version 5 \
 
 cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" \
     "$app/Contents/Resources/"
+# Machine › Install r86 Tools… inserts the public tools CD. It is a local
+# asset (assets/README.md); builds without it disable that item.
+if [ -f "$root/assets/r86_tools.iso" ]; then
+    cp "$root/assets/r86_tools.iso" "$app/Contents/Resources/"
+fi
 printf 'APPL????' >"$app/Contents/PkgInfo"
 cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
