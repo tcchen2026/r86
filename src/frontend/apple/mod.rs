@@ -87,7 +87,7 @@ fn vm_json(vm: &Vm) -> String {
         concat!(
             "{{\"directory\":{},\"name\":{},\"os\":{},\"memoryMiB\":{},\"disk\":{},",
             "\"diskMiB\":{},\"iso\":{},\"cdrom\":{},\"bootOrder\":{},\"scale\":{},",
-            "\"volume\":{},\"network\":{},\"notes\":{}}}"
+            "\"volume\":{},\"network\":{},\"notes\":{},\"engine\":{}}}"
         ),
         json(&vm.directory.to_string_lossy()),
         json(&vm.name),
@@ -102,6 +102,11 @@ fn vm_json(vm: &Vm) -> String {
         vm.volume,
         vm.network,
         json(&vm.notes),
+        json(if vm.engine == "interp" {
+            "interpreter"
+        } else {
+            &vm.engine
+        }),
     )
 }
 
@@ -194,6 +199,7 @@ pub unsafe extern "C" fn r86_library_create(
         name.unwrap_or_default(),
         preset,
     );
+    vm.engine = "auto".into();
     vm.memory = memory_mib;
     vm.disk_mib = disk_mib;
     vm.iso = iso.filter(|p| !p.is_empty()).map(PathBuf::from);
@@ -205,7 +211,7 @@ pub unsafe extern "C" fn r86_library_create(
 
 /// Change one setting of a stopped VM. Keys and values as in vm.toml:
 /// os, memory-mib, boot-order, iso ("" ejects), cdrom, scale, volume,
-/// network, notes.
+/// network, notes, cpu-engine (auto | jit | interpreter; legacy interp accepted).
 ///
 /// # Safety
 /// All arguments are valid C strings.
@@ -232,6 +238,7 @@ pub unsafe extern "C" fn r86_library_set(
                 "volume" => vm.volume = number()?.min(100) as u8,
                 "network" => vm.network = flag()?,
                 "notes" => vm.notes = value,
+                "cpu-engine" => vm.engine = value,
                 _ => return Err(format!("Unknown setting {key}")),
             }
             if vm.iso.is_some() {
@@ -457,4 +464,100 @@ pub unsafe extern "C" fn r86_vm_audio_read(
         *slot = sample;
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn engine_choices_round_trip_through_the_c_api() {
+        let root = std::env::temp_dir().join(format!("r86-apple-engine-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let root_c = CString::new(root.to_str().unwrap()).unwrap();
+        let directory = root.join("VM");
+        let directory_c = CString::new(directory.to_str().unwrap()).unwrap();
+        // SAFETY: all arguments below are live C strings or the documented NULL.
+        unsafe {
+            assert!(
+                r86_library_create(
+                    root_c.as_ptr(),
+                    c"VM".as_ptr(),
+                    c"Windows 98".as_ptr(),
+                    16,
+                    1,
+                    std::ptr::null(),
+                )
+                .is_null()
+            );
+            assert_eq!(Vm::load(directory.clone()).unwrap().engine, "auto");
+            for engine in ["jit", "interpreter", "interp", "auto"] {
+                let value = CString::new(engine).unwrap();
+                assert!(
+                    r86_library_set(directory_c.as_ptr(), c"cpu-engine".as_ptr(), value.as_ptr())
+                        .is_null()
+                );
+                let vm = Vm::load(directory.clone()).unwrap();
+                assert_eq!(vm.engine, engine);
+                assert_eq!(
+                    vm.jit_enabled(),
+                    r86::machine::DEFAULT_JIT && matches!(engine, "jit" | "auto")
+                );
+                let listed = CString::from_raw(r86_library_list(root_c.as_ptr()));
+                let shown = if engine == "interp" {
+                    "interpreter"
+                } else {
+                    engine
+                };
+                assert!(
+                    listed
+                        .to_str()
+                        .unwrap()
+                        .contains(&format!("\"engine\":\"{shown}\""))
+                );
+            }
+            let error = r86_library_set(
+                directory_c.as_ptr(),
+                c"cpu-engine".as_ptr(),
+                c"unknown".as_ptr(),
+            );
+            assert!(!error.is_null());
+            assert!(
+                CString::from_raw(error)
+                    .to_str()
+                    .unwrap()
+                    .contains("Unknown CPU engine")
+            );
+            assert_eq!(Vm::load(directory.clone()).unwrap().engine, "auto");
+            let guard = vm_store::lock_vm(&directory).unwrap();
+            let error = r86_library_set(
+                directory_c.as_ptr(),
+                c"cpu-engine".as_ptr(),
+                c"jit".as_ptr(),
+            );
+            assert!(!error.is_null());
+            r86_string_free(error);
+            assert_eq!(Vm::load(directory.clone()).unwrap().engine, "auto");
+            drop(guard);
+        }
+        // Exercise every current preset by its public name, including unknown OSes.
+        let mut vm = Vm::load(directory).unwrap();
+        for os in [
+            "Windows 3.1",
+            "Windows 95",
+            "Windows 98",
+            "Windows ME",
+            "Windows 2000",
+            "Windows XP",
+            "ReactOS",
+        ] {
+            vm.os = os.into();
+            assert_eq!(vm.jit_enabled(), r86::machine::DEFAULT_JIT, "{os}");
+        }
+        for os in ["DOS", "Linux", "Other", "unknown"] {
+            vm.os = os.into();
+            assert!(!vm.jit_enabled(), "{os}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

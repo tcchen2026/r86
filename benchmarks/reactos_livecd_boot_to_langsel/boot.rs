@@ -123,6 +123,8 @@ fn run() -> Result<(), String> {
     }
     file.flush().map_err(|e| e.to_string())?;
     println!("{}", machine.jit_report());
+    #[cfg(target_os = "macos")]
+    println!("{}", machine.trace_report());
     println!(
         "final steps={} eip={:#010x} resets={}",
         machine.step_count(),

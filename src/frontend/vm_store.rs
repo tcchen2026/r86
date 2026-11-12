@@ -163,7 +163,10 @@ impl Vm {
         if !(1..=131072).contains(&self.disk_mib) {
             return Err("Disk capacity must be between 1 MiB and 128 GiB.".into());
         }
-        if !matches!(self.engine.as_str(), "interp" | "jit") {
+        if !matches!(
+            self.engine.as_str(),
+            "auto" | "interp" | "interpreter" | "jit"
+        ) {
             return Err("Unknown CPU engine.".into());
         }
         if !matches!(self.boot_order.as_str(), "disk" | "cdrom") {
@@ -415,10 +418,24 @@ impl Vm {
                 None => machine.attach_secondary_cdrom(Vec::new()),
             }
         }
-        machine.set_jit_enabled(self.engine == "jit")?;
+        machine.set_jit_enabled(self.jit_enabled())?;
         machine.use_realtime_clock()?;
         machine.reset_bios();
         Ok(machine)
+    }
+
+    /// Resolve the saved preference without rewriting it. A host without the
+    /// JIT runs every VM interpreted; VMs made on the handheld say "jit".
+    pub fn jit_enabled(&self) -> bool {
+        DEFAULT_JIT
+            && match self.engine.as_str() {
+                "jit" => true,
+                "auto" => matches!(
+                    super::guest_os::by_name(&self.os).id,
+                    "win31" | "win95" | "win98" | "winme" | "win2000" | "winxp" | "reactos"
+                ),
+                _ => false,
+            }
     }
 }
 

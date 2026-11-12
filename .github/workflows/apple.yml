@@ -14,35 +14,72 @@ on:
       - firmware/seabios/**
       - script/build_macos.sh
       - script/apple_jit_check.py
+      - benchmarks/reactos_livecd_boot_to_langsel/**
       - tests/roms/wasm_jit_lfb.asm
+      - tests/apple/jit_regions.rs
       - .github/workflows/apple.yml
   workflow_dispatch:
 
 jobs:
   jit:
     runs-on: macos-26
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Native arm64 tools
+        id: tools
         run: |
           test "$(uname -m)" = arm64
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
           brew install nasm
+          echo "::notice title=Mac host::arch=$(uname -m); macOS=$(sw_vers -productVersion); model=$(sysctl -n hw.model); rust=$(rustc -V); hosted runner, core placement unobserved"
       # Ordinary cargo executables are not Hardened Runtime apps. MAP_JIT must
       # work here without app entitlements; the signed app has its own build job.
       - name: Native JIT and ABI tests
         run: |
-          cargo test --locked --release --features apple,jit --lib -- \
-            x86::jit::a64::tests x86::jit::compile::tests x86::jit::code:: \
-            jit_data_segment_loads jit_cross_page_calls jit_return_cache \
-            jit_returns_to_zero jit_refills_preserve jit_code_rechecks \
-            jit_stack_read_page --test-threads=1
-      - name: Deterministic boot, JIT against --no-jit
+          python3 script/apple_jit_check.py tests
+      - name: Build CLI, ReactOS observer and region probe
+        id: binaries
+        if: ${{ !cancelled() && steps.tools.outcome == 'success' }}
         run: |
-          cargo build --locked --release --features apple,jit --bin r86-run
+          cargo build --locked --release --no-default-features --features apple,jit \
+            --bin r86-run --example reactos_boot_benchmark --example apple_jit_regions
+      - name: Deterministic boot, JIT against --no-jit
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
+        run: |
           # Hosted runners are virtual machines; their PMU counters may read zero.
           # The gate prints them; --require-host-counters is for real Macs.
-          python3 script/apple_jit_check.py target/release/r86-run
+          python3 script/apple_jit_check.py rom target/release/r86-run
+      # Hosted macOS runners have SIP off: these signing/region observations
+      # cannot establish Hardened Runtime enforcement on a regular Mac.
+      - name: Observe signed JIT with and without allow-jit (SIP off)
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
+        run: |
+          python3 script/apple_jit_check.py hardened target/release/r86-run
+      - name: Observe sequential and concurrent MAP_JIT regions (SIP off)
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
+        run: |
+          python3 script/apple_jit_check.py regions target/release/examples/apple_jit_regions
+      - name: Pinned ReactOS LiveCD
+        id: reactos
+        if: ${{ !cancelled() && steps.binaries.outcome == 'success' }}
+        run: |
+          python3 script/apple_jit_check.py download-reactos
+      - name: ReactOS language dialog and protection rate
+        if: ${{ !cancelled() && steps.reactos.outcome == 'success' }}
+        run: |
+          python3 script/apple_jit_check.py reactos \
+            target/release/examples/reactos_boot_benchmark \
+            tmp/apple-jit-ci/ReactOS.iso
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-jit-evidence
+          path: |
+            tmp/apple-jit-ci/*.log
+            tmp/apple-jit-ci/*.json
+            tmp/apple-jit-ci/*.ppm
+            tmp/apple-jit-ci/*.plist
 
   build:
     runs-on: macos-26

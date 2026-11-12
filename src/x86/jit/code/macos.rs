@@ -1,8 +1,11 @@
-//! One MAP_JIT mapping, owned and mutated by the VM's core thread.
+//! One process-lifetime MAP_JIT reservation, with sixteen fixed VM arena slots.
+//! Slots retain their backing when released; only their owning core may write
+//! or invoke them. The pool mutex is used at construction/drop, never execution.
 use super::CodeError;
 use core::cell::Cell;
 use core::ptr::NonNull;
 use std::io;
+use std::sync::Mutex;
 use std::thread::{self, ThreadId};
 use std::time::Instant;
 
@@ -19,10 +22,90 @@ thread_local! {
     static MODE: Cell<Option<Mode>> = const { Cell::new(None) };
 }
 
+const SLOT_COUNT: usize = 16;
+pub(super) const CODE_BYTES: usize = 256 * 1024 * 1024;
+const SLOT_BYTES: usize = 320 * 1024 * 1024;
+
+struct Pool {
+    // Exposed mmap address, not an owned Rust allocation. It is never unmapped.
+    // Each live Mapping owns a disjoint slot and remains !Send/!Sync.
+    base: usize,
+    slot_bytes: usize,
+    high_water: usize,
+    free: [usize; SLOT_COUNT],
+    free_len: usize,
+}
+
+static POOL: Mutex<Option<Pool>> = Mutex::new(None);
+
+impl Pool {
+    fn reserve(page_size: usize) -> Result<Self, CodeError> {
+        let slot_bytes = SLOT_BYTES
+            .checked_add(page_size - 1)
+            .ok_or(CodeError::Capacity)?
+            & !(page_size - 1);
+        let bytes = slot_bytes
+            .checked_mul(SLOT_COUNT)
+            .ok_or(CodeError::Capacity)?;
+        // SAFETY: one new anonymous reservation; the mutex serializes its first
+        // creation. Per-thread write protection applies to all slots together.
+        let base = unsafe {
+            libc::mmap(
+                core::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            let error = io::Error::last_os_error();
+            return Err(CodeError::Os(io::Error::new(
+                error.kind(),
+                format!(
+                    "mmap(MAP_JIT) failed: {error}; Hardened Runtime requires \
+                     com.apple.security.cs.allow-jit"
+                ),
+            )));
+        }
+        assert!(!base.is_null(), "JIT reservation returned address zero");
+        Ok(Self {
+            base: base.expose_provenance(),
+            slot_bytes,
+            high_water: 0,
+            free: [0; SLOT_COUNT],
+            free_len: 0,
+        })
+    }
+
+    fn take(&mut self) -> Result<(NonNull<u8>, usize), CodeError> {
+        let slot = if self.free_len != 0 {
+            self.free_len -= 1;
+            self.free[self.free_len]
+        } else if self.high_water < SLOT_COUNT {
+            let slot = self.high_water;
+            self.high_water += 1;
+            slot
+        } else {
+            return Err(CodeError::Os(io::Error::other(format!(
+                "macOS JIT VM limit reached: all {SLOT_COUNT} arena slots are in use"
+            ))));
+        };
+        let base = core::ptr::with_exposed_provenance_mut(self.base + slot * self.slot_bytes);
+        Ok((NonNull::new(base).expect("reserved JIT slot address"), slot))
+    }
+
+    fn release(&mut self, slot: usize) {
+        self.free[self.free_len] = slot;
+        self.free_len += 1;
+    }
+}
+
 pub(super) struct Mapping {
     pub(super) base: NonNull<u8>,
     pub(super) writable: NonNull<u8>,
-    mapped: usize,
+    slot: usize,
     owner: ThreadId,
     writes: Cell<u64>,
     executes: Cell<u64>,
@@ -41,7 +124,11 @@ impl Mapping {
     pub(super) fn new(capacity: usize, entry_bytes: usize) -> Result<(Self, usize), CodeError> {
         // SAFETY: sysconf reads a process-independent scalar.
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page_size <= 0 || !(page_size as usize).is_power_of_two() || capacity == 0 {
+        if page_size <= 0
+            || !(page_size as usize).is_power_of_two()
+            || capacity == 0
+            || capacity > CODE_BYTES
+        {
             return Err(CodeError::Capacity);
         }
         let page_size = page_size as usize;
@@ -52,31 +139,22 @@ impl Mapping {
         let mapped = entries_start
             .checked_add(entry_bytes)
             .ok_or(CodeError::Capacity)?;
-        // Dense entry tables store signed displacements to their native code.
-        if mapped > i32::MAX as usize {
+        // Slot-local entry-table displacements fit i32. A direct branch beyond
+        // its encoding's reach stays unchained in CodeArena::patch_branch.
+        // Small hosts use their existing smaller code/table layout in this slot.
+        if mapped > SLOT_BYTES {
             return Err(CodeError::Capacity);
         }
-        // SAFETY: new anonymous mapping; no fixed address or existing mapping.
-        // Thread-local write protection enforces W^X before any access below.
-        let base = unsafe {
-            libc::mmap(
-                core::ptr::null_mut(),
-                mapped,
-                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            return Err(CodeError::Os(io::Error::last_os_error()));
+        let mut pool = POOL.lock().expect("JIT reservation mutex poisoned");
+        if pool.is_none() {
+            *pool = Some(Pool::reserve(page_size)?);
         }
-        let base = NonNull::new(base.cast()).expect("JIT mapping returned address zero");
+        let (base, slot) = pool.as_mut().unwrap().take()?;
         Ok((
             Self {
                 base,
                 writable: base,
-                mapped,
+                slot,
                 owner: thread::current().id(),
                 writes: Cell::new(0),
                 executes: Cell::new(0),
@@ -128,9 +206,13 @@ impl Mapping {
 
 impl Drop for Mapping {
     fn drop(&mut self) {
+        check_owner(self.owner);
         self.execute();
-        // SAFETY: final owner on its core thread, with no native invocation.
-        unsafe { libc::munmap(self.base.as_ptr().cast(), self.mapped) };
+        POOL.lock()
+            .expect("JIT reservation mutex poisoned")
+            .as_mut()
+            .expect("JIT reservation exists")
+            .release(self.slot);
     }
 }
 
@@ -190,5 +272,63 @@ mod tests {
         assert_eq!(first.writes.get(), 2);
         second.execute();
         assert_eq!(second.executes.get(), 2);
+    }
+
+    // The CI native test invocation uses --test-threads=1, so all sixteen slots
+    // are available to this test; generated-code tests reuse them afterwards.
+    #[test]
+    fn pool_reuses_slots_and_reports_exhaustion() {
+        let mut live: Vec<_> = (0..SLOT_COUNT)
+            .map(|_| Mapping::new(CODE_BYTES, SLOT_BYTES - CODE_BYTES).unwrap().0)
+            .collect();
+        for (i, arena) in live.iter().enumerate() {
+            for other in &live[..i] {
+                assert!(
+                    arena
+                        .base
+                        .as_ptr()
+                        .addr()
+                        .abs_diff(other.base.as_ptr().addr())
+                        >= SLOT_BYTES
+                );
+            }
+        }
+        let last = live.pop().unwrap();
+        let address = last.base;
+        last.write();
+        // SAFETY: this live slot is in write mode and the test owns its bytes.
+        unsafe { last.writable.as_ptr().write(0xa5) };
+        drop(last);
+        let (reused, _) = Mapping::new(CODE_BYTES, SLOT_BYTES - CODE_BYTES).unwrap();
+        assert_eq!(reused.base, address);
+        // SAFETY: the new slot owner can read the initialized retained byte.
+        assert_eq!(unsafe { reused.base.as_ptr().read() }, 0xa5);
+        let error = match Mapping::new(4096, 0) {
+            Err(error) => error,
+            Ok(_) => panic!("arena beyond the slot limit was admitted"),
+        };
+        assert!(format!("{error:?}").contains("all 16 arena slots are in use"));
+    }
+
+    #[test]
+    fn released_slot_can_change_core_threads() {
+        let address = thread::spawn(|| {
+            let (arena, _) = Mapping::new(4096, 0).unwrap();
+            arena.write();
+            // SAFETY: this core thread owns the slot and has entered write mode.
+            unsafe { arena.writable.as_ptr().write(0x5a) };
+            arena.base.as_ptr().addr()
+        })
+        .join()
+        .unwrap();
+        thread::spawn(move || {
+            let (arena, _) = Mapping::new(4096, 0).unwrap();
+            assert_eq!(arena.base.as_ptr().addr(), address);
+            arena.execute();
+            // SAFETY: the prior owner finished before this slot was acquired.
+            assert_eq!(unsafe { arena.base.as_ptr().read() }, 0x5a);
+        })
+        .join()
+        .unwrap();
     }
 }

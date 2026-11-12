@@ -35,6 +35,8 @@
 //! object offsets into emitted code.
 //! Only one invocation owns the live CPU state. Commit/reload at a helper or
 //! machine boundary; do not let Rust observers read stale architectural state.
+//! On macOS each VM invokes within one of sixteen arena slots in a single
+//! process-wide MAP_JIT region (code/macos.rs); frames/links never cross slots.
 
 use super::a64::{Assembler, Reg, SP};
 use crate::x86::cpu::Cpu;

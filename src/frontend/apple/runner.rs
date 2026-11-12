@@ -84,14 +84,9 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Running {
     /// Lock the VM, build its machine and start the core thread.
-    pub fn start(mut vm: Vm, firmware: PathBuf) -> Result<Self, String> {
+    pub fn start(vm: Vm, firmware: PathBuf) -> Result<Self, String> {
         let lock_file = super::vm_store::lock_vm(&vm.directory)?;
-        // VMs made on the handheld may ask for the JIT this host lacks.
-        // Launching the app with --no-jit (open -a r86 --args --no-jit)
-        // forces the interpreter for every VM.
-        if !r86::machine::DEFAULT_JIT || std::env::args().any(|arg| arg == "--no-jit") {
-            vm.engine = "interp".into();
-        }
+        let no_jit = std::env::args().any(|arg| arg == "--no-jit");
         let shared = Arc::new(Shared {
             input: Mutex::default(),
             wake: Condvar::new(),
@@ -111,7 +106,9 @@ impl Running {
                 // MAP_JIT ownership starts here, including partial startup
                 // failures. Machine/Engine never move between app/core threads.
                 let core = (|| -> Result<Core, String> {
-                    let mut machine = vm.machine(&firmware, "vgabios-stdvga.bin")?;
+                    set_core_qos()?;
+                    let mut machine =
+                        launch_config(&vm, no_jit).machine(&firmware, "vgabios-stdvga.bin")?;
                     let network = if vm.network {
                         machine.attach_network();
                         Some(UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
@@ -174,9 +171,78 @@ impl Running {
     }
 }
 
+// Runtime overrides must not change the preference saved by media/volume edits.
+fn launch_config(vm: &Vm, no_jit: bool) -> Vm {
+    let mut config = vm.clone();
+    if no_jit {
+        config.engine = "interpreter".into();
+    }
+    config
+}
+
+fn set_core_qos() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: changes only this core thread's requested scheduling class.
+        let error = unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+        };
+        if error != 0 {
+            return Err(format!(
+                "Cannot set the VM thread's user-interactive QoS: {}",
+                std::io::Error::from_raw_os_error(error)
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl Drop for Running {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::guest_os;
+    use super::*;
+
+    #[test]
+    fn engine_override_preserves_the_saved_preference() {
+        let mut vm = Vm::new(
+            std::path::Path::new("unused"),
+            "VM".into(),
+            guest_os::by_name("Windows 98"),
+        );
+        for engine in ["auto", "jit", "interpreter", "interp"] {
+            vm.engine = engine.into();
+            assert_eq!(launch_config(&vm, false).engine, engine);
+            assert!(!launch_config(&vm, true).jit_enabled());
+            assert_eq!(vm.engine, engine);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn core_thread_requests_user_interactive_qos() {
+        std::thread::spawn(|| {
+            set_core_qos().unwrap();
+            let mut priority = 1;
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            // SAFETY: current pthread handle and matching writable scalars.
+            let error = unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+            };
+            assert_eq!(error, 0);
+            assert_eq!(
+                class as u32,
+                libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as u32
+            );
+            assert_eq!(priority, 0);
+        })
+        .join()
+        .unwrap();
     }
 }
 

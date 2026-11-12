@@ -97,3 +97,8 @@ required-features = ["host"]
 name = "softmmu_boot_benchmark"
 path = "benchmarks/tinycore_boot/softmmu_boot.rs"
 required-features = ["host"]
+
+[[example]]
+name = "apple_jit_regions"
+path = "tests/apple/jit_regions.rs"
+required-features = ["host"]

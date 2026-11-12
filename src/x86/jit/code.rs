@@ -1,7 +1,8 @@
 //! AArch64 code publication, packing and bounded entry-table ownership.
 //! The Linux mapping owner publishes through an RW/NX alias and executes
 //! through a distinct RO/RX alias, with no live writes.
-//! macOS uses one MAP_JIT address with per-thread write/execute protection.
+//! macOS uses fixed slots in one process-lifetime MAP_JIT reservation; see
+//! code/macos.rs for the pool limit. Protection remains per thread.
 //! Its write/invoke/drop gates require the creating core thread in release
 //! builds too. Mutable entry borrows must end before invoking any arena on that
 //! thread; Apple applies permission changes to all its MAP_JIT mappings.
@@ -55,7 +56,14 @@ pub(super) fn cache_limits() -> (usize, usize) {
     if macos::small_host() {
         return (32 * 1024 * 1024, 1024);
     }
-    (128 * 1024 * 1024, ENTRY_TABLES)
+    #[cfg(target_os = "macos")]
+    {
+        (macos::CODE_BYTES, ENTRY_TABLES)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        (128 * 1024 * 1024, ENTRY_TABLES)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -109,6 +117,8 @@ pub struct CodeArena {
     hot_cursor: usize,
     cold_cursor: usize,
     epoch: u64,
+    #[cfg(target_os = "macos")]
+    out_of_range_link_attempts: u64,
     _thread_owner: PhantomData<Rc<()>>,
 }
 
@@ -132,6 +142,8 @@ impl CodeArena {
             hot_cursor: 0,
             cold_cursor: 0,
             epoch: 1,
+            #[cfg(target_os = "macos")]
+            out_of_range_link_attempts: 0,
             _thread_owner: PhantomData,
         })
     }
@@ -364,6 +376,10 @@ impl CodeArena {
                 writer.cast::<u32>().read(),
                 target_offset as isize - source_offset as isize,
             ) else {
+                #[cfg(target_os = "macos")]
+                {
+                    self.out_of_range_link_attempts += 1;
+                }
                 return false;
             };
             writer.cast::<u32>().write(word);
@@ -401,7 +417,11 @@ impl CodeArena {
 
     #[cfg(target_os = "macos")]
     pub(super) fn protection_report(&self) -> String {
-        self.mapping.report()
+        format!(
+            "{}jit links: out_of_range_attempts={}\n",
+            self.mapping.report(),
+            self.out_of_range_link_attempts
+        )
     }
 
     /// Address of an instruction in a published block, valid only until the next
@@ -420,6 +440,31 @@ impl CodeArena {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn distant_link_keeps_the_original_branch_and_counts_the_attempt() {
+        let mut arena = CodeArena::with_limits(macos::CODE_BYTES, 1).unwrap();
+        // MOV W0, #37; B to the following RET. A failed link must retain this path.
+        let source = arena
+            .publish(&[0x5280_04a0, 0x1400_0001, 0xd65f_03c0])
+            .unwrap();
+        // Sparse unused padding places the next published word beyond B's reach
+        // without filling 128 MiB of test code. No instruction reads that gap.
+        arena.used = (1 << 27) + 16;
+        let target = arena.publish(&[0xd65f_03c0]).unwrap();
+        assert!(!arena.patch_branch(
+            arena.address(source, 4).unwrap(),
+            arena.address(target, 0).unwrap(),
+        ));
+        assert_eq!(arena.out_of_range_link_attempts, 1);
+        arena.enter_execute();
+        // SAFETY: the published words form a complete AAPCS64 leaf returning
+        // u32, touch only W0/LR, and reference no guest or Rust objects.
+        let leaf: unsafe extern "C" fn() -> u32 =
+            unsafe { core::mem::transmute(arena.address(source, 0).unwrap()) };
+        assert_eq!(unsafe { leaf() }, 37);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
