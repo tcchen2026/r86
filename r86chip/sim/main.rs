@@ -1,6 +1,9 @@
 //! Host entry for the current RV32/Xr86 instruction interpreter.
 #[cfg(test)]
+extern crate alloc;
+#[cfg(test)]
 mod b1_tests;
+mod cache_estimate;
 mod machine;
 mod memory;
 mod native;
@@ -13,7 +16,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     match args.first().map(String::as_str) {
         None | Some("--help") => {
             println!(
-                "r86chip-sim machine FIRMWARE.elf IMAGE_DIRECTORY RV_STEPS WALL_SECONDS [--profile] [--dump-guest] [--tlb-stats]\n\
+                "r86chip-sim machine FIRMWARE.elf IMAGE_DIRECTORY RV_STEPS WALL_SECONDS [--profile] [--dump-guest] [--tlb-stats] [--cache-stats]\n\
                  r86chip-sim native RAM_IMAGE.bin\n\
                  Executes RV32IM + Zifencei + Zba + Xr86 firmware and generated code.\n\
                  Functional ISA simulation; instruction counts are not hardware cycles.\n\

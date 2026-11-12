@@ -3,23 +3,17 @@
 //! its side-effect-free RAM proofs; they do not export resident registers.
 //!
 //! XJT entries retain qualified fetch mappings until invalidation, including
-//! across code pages. Replacement/context changes flush XJT and its return stack
-//! before dropping code. Watched writes retire the cache through the code epoch.
+//! across code pages. Key replacement retains code. Mapping changes or watched
+//! writes flush XJT/return addresses before retiring the whole code generation.
 use super::{
-    compile::{self, Block, End},
+    cache::{Cache, Value},
+    compile::{self, End},
     native,
 };
 use crate::machine::HostBus;
 use crate::x86::cpu::{SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
 use crate::x86::{BatchResult, BatchStop, Bus, Cpu, Interpreter, LinearAddr, mmu};
-use alloc::{boxed::Box, vec::Vec};
-
-const SLOTS: usize = 2048;
-const CODE_LIMIT: usize = 8 * 1024 * 1024;
-const HOT: u8 = 3;
-fn index(eip: u32) -> usize {
-    ((eip ^ (eip >> 12) ^ (eip >> 4)) as usize) & (SLOTS / 2 - 1)
-}
+const HOT: u32 = 3;
 const SEGMENTS: [SegmentReg; 6] = [
     SegmentReg::Es,
     SegmentReg::Cs,
@@ -29,12 +23,6 @@ const SEGMENTS: [SegmentReg; 6] = [
     SegmentReg::Gs,
 ];
 
-struct Entry {
-    eip: u32,
-    backing: u64,
-    heat: u8,
-    block: Option<Block>,
-}
 #[derive(Debug)]
 pub struct Stats {
     pub native_steps: u64,
@@ -76,23 +64,20 @@ impl Default for Stats {
         }
     }
 }
-#[derive(PartialEq, Eq)]
-struct Context {
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Mapping {
     epoch: u64,
     control: u32,
     cs_base: u32,
-    segments: [(u32, u32, u32); 6],
 }
 pub struct Engine {
-    entries: Box<[Option<Entry>]>,
-    victims: [bool; SLOTS / 2],
-    linked: bool,
-    /// Conservative bounds of linear pages installed in XJT since its flush.
-    /// Holes/evicted entries may cause extra unlinking, never a missed expiry.
-    jump_pages: Option<(u32, u32)>,
-    code_bytes: usize,
+    cache: Cache,
+    /// Conservative bounds include negative entries as well as native code.
+    /// An INVLPG may discard extra entries, never preserve a stale fetch proof.
+    code_pages: Option<(u32, u32)>,
     code_epoch: u64,
-    context: Option<Context>,
+    mapping: Option<Mapping>,
+    segments: Option<[(u32, u32, u32); 6]>,
     pub stats: Stats,
 }
 impl Default for Engine {
@@ -103,51 +88,38 @@ impl Default for Engine {
 impl Engine {
     pub fn new() -> Self {
         Self {
-            entries: (0..SLOTS)
-                .map(|_| None)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            victims: [false; SLOTS / 2],
-            linked: false,
-            jump_pages: None,
-            code_bytes: 0,
+            cache: Cache::new(),
+            code_pages: None,
             code_epoch: 0,
-            context: None,
+            mapping: None,
+            segments: None,
             stats: Stats::default(),
         }
     }
-    pub(crate) fn clear(&mut self, bus: &mut HostBus) {
-        // Return stubs and JAL self-edges point into these stable Vecs. No
-        // allocation can be freed while the hardware retains its address.
+    pub(crate) fn clear(&mut self, bus: &HostBus) {
+        // No native entry, return stub or direct edge survives arena reuse.
         native::flush_jumps();
         native::flush_data();
-        self.linked = false;
-        self.jump_pages = None;
-        for entry in &mut self.entries {
-            *entry = None;
-        }
-        self.code_bytes = 0;
-        bus.jit_release_code_pages();
+        self.cache.clear();
+        self.code_pages = None;
+        // Keep physical watches: an obsolete watch causes at most an extra
+        // invalidation when written. Scanning/releasing the shared watch table
+        // is unnecessary; Machine drops it when changing execution engines.
         self.code_epoch = bus.jit_code_epoch();
         self.stats.cache_clears += 1;
     }
-    fn sync_context(&mut self, cpu: &mut Cpu, bus: &HostBus) {
-        // A single INVLPG is queued separately from the full mapping epoch.
-        // Retire hardware proofs even when no software fetch row was present.
+    fn sync_mapping(&mut self, cpu: &mut Cpu, bus: &HostBus) {
         if let Some((base, mask)) = cpu.take_jit_invalidated_range() {
             if mask == 0xffff_f000 {
                 native::invalidate_data(base);
             } else {
                 native::flush_data();
             }
-            // INVLPG of ordinary data does not invalidate instruction fetches.
-            // Retire all jumps when the range can overlap an installed page;
-            // the conservative interval also covers large-page invalidations.
             if self
-                .jump_pages
+                .code_pages
                 .is_some_and(|(lo, hi)| base <= hi && (base | !mask) >= lo)
             {
-                self.unlink();
+                self.clear(bus);
             }
         }
         let control = (cpu.cr0 & 1)
@@ -155,46 +127,41 @@ impl Engine {
             | ((cpu.cr0 >> 14) & 4)
             | ((cpu.eflags >> 14) & 8)
             | (u32::from(cpu.cpl()) << 4);
-        let next = Context {
+        let next = Mapping {
             epoch: cpu.jit_mapping_epoch(),
             control,
             cs_base: cpu.seg(SegmentReg::Cs).base,
-            segments: SEGMENTS.map(|seg| {
-                let cache = cpu.seg(seg);
-                // No unchecked access while x86 alignment checking may apply.
-                let rights = if cpu.eflags & (1 << 18) != 0 && cpu.cr0 & (1 << 18) != 0 {
-                    0
-                } else {
-                    cpu.chip_segment_rights(seg)
-                };
-                (cache.base, cache.limit, rights)
-            }),
         };
-        if self.context.as_ref() == Some(&next) {
+        if self.mapping == Some(next) {
             return;
         }
-        let changed = self
-            .context
-            .as_ref()
-            .is_none_or(|old| old.epoch != next.epoch || old.control != next.control);
-        if changed {
-            let (start, end) = bus.chip_ram_bounds();
-            native::region(start, end);
-            // Epoch is u64; explicit flush also handles low-word reuse.
-            native::flush_data();
-            native::context(control, next.epoch as u32);
-        }
-        if changed
-            || self
-                .context
-                .as_ref()
-                .is_none_or(|old| old.cs_base != next.cs_base)
-        {
-            self.unlink();
+        // Qualify cached fetches BEFORE lookup. This also covers negative
+        // entries, which have no hardware jump-table row to invalidate.
+        self.clear(bus);
+        let (start, end) = bus.chip_ram_bounds();
+        native::region(start, end);
+        native::context(control, next.epoch as u32);
+        // XTCONTEXT retires the hardware segment descriptors as well as data
+        // proofs. Equal descriptor values still need republishing afterward.
+        self.segments = None;
+        self.mapping = Some(next);
+    }
+    fn sync_segments(&mut self, cpu: &Cpu) {
+        let next = SEGMENTS.map(|seg| {
+            let cache = cpu.seg(seg);
+            let rights = if cpu.eflags & (1 << 18) != 0 && cpu.cr0 & (1 << 18) != 0 {
+                0
+            } else {
+                cpu.chip_segment_rights(seg)
+            };
+            (cache.base, cache.limit, rights)
+        });
+        if self.segments == Some(next) {
+            return;
         }
         macro_rules! seg {
             ($n:literal) => {{
-                let (base, limit, rights) = next.segments[$n];
+                let (base, limit, rights) = next[$n];
                 native::segment::<$n>(base, limit, rights);
             }};
         }
@@ -204,80 +171,81 @@ impl Engine {
         seg!(3);
         seg!(4);
         seg!(5);
-        self.context = Some(next);
+        self.segments = Some(next);
     }
     fn lookup(&mut self, cpu: &mut Cpu, bus: &mut HostBus, eip: u32) -> Option<u32> {
-        if self.code_bytes >= CODE_LIMIT {
-            self.clear(bus);
+        let slot = self.cache.slot(eip);
+        let value = self.cache.value(slot);
+        if value.pc >= 4 {
+            // Generation guard, mapping synchronization and physical watches
+            // give this the same lifetime as a hardware fetch/jump proof.
+            return Some(value.pc);
         }
-        let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(eip));
+        if value.pc == HOT {
+            self.unsupported_backing(value.backing);
+            return None;
+        }
+        let cs = cpu.seg(SegmentReg::Cs).base;
+        let linear = LinearAddr(cs.wrapping_add(eip));
         let hit = cpu
             .fetch_cache_lookup(linear)
             .or_else(|| mmu::try_resident_fetch_translation(cpu, bus, linear))?;
-        let first = index(eip);
-        let second = first + SLOTS / 2;
-        let index = if self.entries[first].as_ref().is_some_and(|e| e.eip == eip) {
-            first
-        } else if self.entries[second].as_ref().is_some_and(|e| e.eip == eip) {
-            second
-        } else if self.entries[first]
-            .as_ref()
-            .is_none_or(|e| e.block.is_none())
-        {
-            first
-        } else if self.entries[second]
-            .as_ref()
-            .is_none_or(|e| e.block.is_none())
-        {
-            second
-        } else {
-            // Two probes, round-robin replacement. Cold/negative entries do
-            // not evict compiled code while the other way is available.
-            self.victims[first] = !self.victims[first];
-            if self.victims[first] { first } else { second }
-        };
-        if !self.entries[index]
-            .as_ref()
-            .is_some_and(|e| e.eip == eip && e.backing == hit.backing.0)
-        {
-            if let Some(old) = &self.entries[index] {
-                if let Some(block) = &old.block {
-                    self.code_bytes -= block.words.len() * 4;
-                }
-            }
-            // Direct links may name the displaced allocation. Restore their
-            // slow exits before replacing it; self-links die with their owner.
-            if self.entries[index]
-                .as_ref()
-                .is_some_and(|e| e.block.is_some())
-            {
-                self.unlink();
-            }
-            self.entries[index] = Some(Entry {
-                eip,
-                backing: hit.backing.0,
-                heat: 0,
-                block: None,
-            });
+        let heat = value.pc + 1;
+        if heat < HOT {
+            self.cache.put(
+                slot,
+                Value {
+                    pc: heat,
+                    backing: 0,
+                },
+            );
+            return None;
         }
-        let entry = self.entries[index].as_mut().unwrap();
-        if entry.heat < HOT {
-            entry.heat += 1;
-            if entry.heat < HOT {
-                return None;
+        bus.jit_code_stamp(cpu, hit.backing);
+        // Promotion revokes old hardware write grants as well as software ones.
+        native::flush_data();
+        let pc = self.compile_group(bus, eip, cs, hit.backing.0 as u32);
+        if pc == HOT {
+            self.unsupported_backing(hit.backing.0 as u32);
+            None
+        } else {
+            Some(pc)
+        }
+    }
+    /// A hot root and its direct successors admit at most eight blocks total.
+    /// Compilation has no guest effects; bounded batching amortizes FENCE.I
+    /// without another fetch proof, decoder or opcode coverage rule.
+    fn compile_group(&mut self, bus: &HostBus, eip: u32, cs: u32, backing: u32) -> u32 {
+        const BLOCKS: usize = 8;
+        let page = cs.wrapping_add(eip) & !4095;
+        let mut pending = [0; BLOCKS * 2 + 1];
+        pending[0] = eip;
+        let (mut head, mut tail, mut built) = (0, 1, 0);
+        let mut patches = [(0, 0); BLOCKS * 2];
+        let mut patch_count = 0;
+        let mut root = HOT;
+        while head < tail && built < BLOCKS {
+            let target = pending[head];
+            head += 1;
+            let mut slot = self.cache.slot(target);
+            if self.cache.value(slot).pc >= HOT {
+                continue;
             }
+            let linear = cs.wrapping_add(target);
+            let address = (backing & !4095) | (linear & 4095);
             let window =
-                u64::from(4096 - (linear.0 & 4095)).min(u64::from(u32::MAX - eip) + 1) as usize;
-            // Execute-cache tokens are stable ordinary RAM, approved by the
-            // shared fetcher. Never speculate across a guest code page.
-            let bytes = unsafe { core::slice::from_raw_parts(hit.backing.0 as *const u8, window) };
-            entry.block = compile::block(bytes, eip, 4095);
-            bus.jit_code_stamp(cpu, hit.backing);
-            // Promotion revokes software aliases; retire pre-promotion hardware
-            // write grants too. Subsequent RAM refills consult the same watch.
-            native::flush_data();
-            if let Some(block) = &entry.block {
-                self.code_bytes += block.words.len() * 4;
+                u64::from(4096 - (linear & 4095)).min(u64::from(u32::MAX - target) + 1) as usize;
+            let bytes = unsafe { core::slice::from_raw_parts(address as *const u8, window) };
+            let block = compile::block(bytes, target, cs, 4095);
+            if block.as_ref().is_some_and(|b| !self.cache.fits(b)) {
+                if built != 0 {
+                    break; // Retain this group's live root; next miss may reset.
+                }
+                self.clear(bus);
+                slot = self.cache.slot(target);
+            }
+            built += 1;
+            let pc = if let Some(block) = block {
                 self.stats.compiled_blocks += 1;
                 self.stats.ends[match block.end {
                     End::Branch => 0,
@@ -285,95 +253,47 @@ impl Engine {
                     End::Window => 2,
                     End::Limit => 3,
                 }] += 1;
-                native::publish();
+                let pc = self.cache.install(&block);
+                for link in &block.links {
+                    if cs.wrapping_add(link.eip) & !4095 == page {
+                        patches[patch_count] = (pc - compile::ENTRY_OFFSET + link.start, link.eip);
+                        patch_count += 1;
+                        pending[tail] = link.eip;
+                        tail += 1;
+                    }
+                }
+                pc
             } else {
                 self.stats.unsupported_entries += 1;
+                HOT
+            };
+            self.cache.put(
+                slot,
+                Value {
+                    pc,
+                    backing: address,
+                },
+            );
+            if built == 1 {
+                root = pc;
             }
         }
-        if entry.block.is_none() {
-            self.unsupported(cpu, eip);
-            return None;
-        }
-        let entry = self.entries[index].as_ref().unwrap();
-        let block = entry.block.as_ref().unwrap();
-        // An installed jump is an approved fetch mapping, not a lease on the
-        // last visited page. CR3/INVLPG, context or physical-mapping changes
-        // retire it through sync_context; code writes/replacement retire it
-        // before freeing code. Page changes alone do not change that proof.
-        let pc = block.words.as_ptr() as u32 + compile::ENTRY_OFFSET;
-        Some(pc)
-    }
-    fn unlink(&mut self) {
-        native::flush_jumps();
-        self.jump_pages = None;
-        if !self.linked {
-            return;
-        }
-        for entry in self.entries.iter_mut().flatten() {
-            if let Some(block) = &mut entry.block {
-                for link in &block.links {
-                    if link.eip != entry.eip {
-                        block.words[link.start as usize / 4] = link.original;
-                    }
-                }
+        // At most sixteen known edges, independent of the resident cache size.
+        for &(source, target) in &patches[..patch_count] {
+            if let Some(pc) = self.cache.find(target) {
+                self.link(source, pc);
             }
         }
-        native::publish();
-        self.linked = false;
-    }
-    fn fill_jump(&mut self, eip: u32, pc: u32, cs: u32) {
-        let page = cs.wrapping_add(eip) & !4095;
-        self.jump_pages = Some(
-            self.jump_pages
+        self.code_pages = Some(
+            self.code_pages
                 .map_or((page, page), |(lo, hi)| (lo.min(page), hi.max(page))),
         );
-        native::fill_jump(eip, pc);
+        root
     }
-    fn link(&mut self, source: u32, leave: u32, target: u32, pc: u32) {
-        let first = index(source);
-        let slot = if self.entries[first]
-            .as_ref()
-            .is_some_and(|e| e.eip == source)
-        {
-            first
-        } else {
-            first + SLOTS / 2
-        };
-        if let Some(entry) = &mut self.entries[slot] {
-            // Target lookup may have displaced the source. Never patch a
-            // different allocation even when its direct-mapped slot matches.
-            if entry.eip != source {
-                return;
-            }
-            if let Some(block) = &mut entry.block {
-                let base = block.words.as_ptr() as u32;
-                let offset = leave.wrapping_sub(base).wrapping_sub(8);
-                if let Some(link) = block
-                    .links
-                    .iter()
-                    .find(|l| l.offset == offset && l.eip == target)
-                {
-                    if let Some(word) = compile::jump(i64::from(pc) - i64::from(base + link.start))
-                    {
-                        block.words[link.start as usize / 4] = word;
-                        self.linked = true;
-                        native::publish();
-                    }
-                    return;
-                }
-            }
+    fn link(&mut self, source: u32, target: u32) {
+        if let Some(word) = compile::jump(i64::from(target) - i64::from(source)) {
+            self.cache.patch(source, word);
         }
-    }
-    fn site(&self, pc: u32) -> (compile::Site, u32) {
-        for entry in self.entries.iter().flatten() {
-            if let Some(block) = &entry.block {
-                let offset = pc.wrapping_sub(block.words.as_ptr() as u32);
-                if offset < block.words.len() as u32 * 4 {
-                    return (block.site(offset), block.instructions);
-                }
-            }
-        }
-        panic!("chip exit outside live native code: {pc:#x}");
     }
     fn refill(cpu: &mut Cpu, bus: &mut HostBus, offset: u32, word: u32) -> bool {
         let f = (word >> 12) & 7;
@@ -414,17 +334,20 @@ impl Engine {
     fn unsupported(&mut self, cpu: &mut Cpu, eip: u32) {
         let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(eip));
         if let Some(hit) = cpu.fetch_cache_lookup(linear) {
-            let len = (4096 - (linear.0 & 4095)).min(15) as usize;
-            let bytes = unsafe { core::slice::from_raw_parts(hit.backing.0 as *const u8, len) };
-            let opcode = compile::opcode_bytes(bytes);
-            if let Some(&first) = opcode.first() {
-                self.stats.unsupported[first as usize] += 1;
-                if let Some(&second) = opcode.get(1) {
-                    match first {
-                        0xf7 => self.stats.unsupported_f7[usize::from((second >> 3) & 7)] += 1,
-                        0x0f => self.stats.unsupported_0f[usize::from(second)] += 1,
-                        _ => (),
-                    }
+            self.unsupported_backing(hit.backing.0 as u32);
+        }
+    }
+    fn unsupported_backing(&mut self, backing: u32) {
+        let len = (4096 - (backing & 4095)).min(15) as usize;
+        let bytes = unsafe { core::slice::from_raw_parts(backing as *const u8, len) };
+        let opcode = compile::opcode_bytes(bytes);
+        if let Some(&first) = opcode.first() {
+            self.stats.unsupported[first as usize] += 1;
+            if let Some(&second) = opcode.get(1) {
+                match first {
+                    0xf7 => self.stats.unsupported_f7[usize::from((second >> 3) & 7)] += 1,
+                    0x0f => self.stats.unsupported_0f[usize::from(second)] += 1,
+                    _ => (),
                 }
             }
         }
@@ -438,6 +361,10 @@ impl Engine {
         native::ticks(budget);
         let old_vector = native::vector(native::service as *const () as u32);
         let (eip, completed) = loop {
+            if self.cache.dirty {
+                native::publish();
+                self.cache.dirty = false;
+            }
             let exit = native::enter(pc);
             self.stats.invocations += 1;
             let done = budget - exit.remaining;
@@ -446,19 +373,18 @@ impl Engine {
                     self.stats.leaves[0] += 1;
                     if done < budget {
                         let cs = cpu.seg(SegmentReg::Cs).base;
-                        // Every MISS has a source EIP at its saved leave PC.
-                        // Read it while the source is owned, before lookup can
-                        // clear/displace it. Generated code is immutable to the
-                        // guest; this is metadata, never an executed word.
+                        // Read before lookup can reset the arena. The footer
+                        // names a patch directly; no entry or link-list search.
                         let source = unsafe { *(exit.pc as *const u32) };
-                        // Direct JAL links remain page-local. Other pages use
-                        // the qualified XJT entry, including CALL/RET chains.
-                        let same_page =
-                            (cs.wrapping_add(source) ^ cs.wrapping_add(exit.eip)) & !4095 == 0;
+                        let generation = self.cache.epoch;
                         if let Some(next) = self.lookup(cpu, bus, exit.eip) {
-                            self.fill_jump(exit.eip, next, cs);
-                            if same_page {
-                                self.link(source, exit.pc, exit.eip, next);
+                            native::fill_jump(exit.eip, next);
+                            let distance = source & 4095;
+                            if generation == self.cache.epoch
+                                && distance != 0
+                                && cs.wrapping_add(exit.eip) & !4095 == source & !4095
+                            {
+                                self.link(exit.pc - distance, next);
                             }
                             pc = next;
                             continue;
@@ -475,10 +401,10 @@ impl Engine {
                         pc = retry;
                         continue;
                     }
-                    let (site, reserved) = self.site(retry);
+                    let site = self.cache.site(retry);
                     break (
                         site.eip,
-                        done.checked_sub(reserved - site.index)
+                        done.checked_sub(site.count)
                             .expect("chip refund exceeds reservation"),
                     );
                 }
@@ -534,12 +460,10 @@ impl Engine {
                 .batch_attention_limit(start.wrapping_add(ran), remaining)
                 .unwrap_or((1, false));
             if eligible && limit != 0 {
+                self.sync_mapping(cpu, bus);
                 if let Some(pc) = self.lookup(cpu, bus, cpu.eip) {
-                    // Cold/unsupported lookups do not enter bank 1. Publish
-                    // context only for native entry, before installing XJT.
-                    // lookup may compile but never publishes a jump mapping.
-                    self.sync_context(cpu, bus);
-                    self.fill_jump(cpu.eip, pc, cpu.seg(SegmentReg::Cs).base);
+                    self.sync_segments(cpu);
+                    native::fill_jump(cpu.eip, pc);
                     bus.begin_instruction(start.wrapping_add(ran), cpu.tsc());
                     cpu.begin_instruction();
                     cpu.segment_override = None;

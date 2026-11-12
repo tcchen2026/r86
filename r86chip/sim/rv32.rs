@@ -996,6 +996,7 @@ impl Core {
         // A native store does not update this table. Re-fetch may see an older
         // word until FENCE.I or a colliding fetch evicts it. The PC tag prevents
         // another address in the same slot from supplying the wrong instruction.
+        m.observe_fetch(self.pc);
         let slot = (self.pc as usize / 4) % self.fetched.len();
         let word = match self.fetched[slot] {
             Some((pc, w)) if pc == self.pc => w,
@@ -1005,6 +1006,7 @@ impl Core {
                 w
             }
         };
+        m.observe_operands();
         self.host_steps += 1;
         // RV field positions: opcode[6:0], rd[11:7], funct3[14:12],
         // rs1[19:15], rs2[24:20], funct7[31:25]. d/f/k are rd/funct3/funct7.
@@ -1144,6 +1146,7 @@ impl Core {
             // x86 TLB invalidation is implied by native instruction publication.
             0x0f if f == 1 => {
                 self.fetched.fill(None);
+                m.observe_fence_i();
                 self.fences += 1;
             }
             // Only these exact SYSTEM encodings exist. The faulting PC remains

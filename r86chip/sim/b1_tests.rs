@@ -3,6 +3,8 @@ use super::{
     rv32::{Cause, Core},
 };
 use r86::chipjit::compile;
+#[path = "../jit/cache.rs"]
+mod cache;
 use r86::x86::{Bus, Cpu, Interpreter, MemError, PhysAddr};
 
 struct Ram(Vec<u8>);
@@ -123,7 +125,7 @@ fn differential_memory(
     data: &[(usize, u32)],
     bases: [u32; 6],
 ) {
-    let block = compile::block(bytes, 0x1000, limit).expect("nonempty native block");
+    let block = compile::block(bytes, 0x1000, bases[1], limit).expect("nonempty native block");
     let mut oracle = Cpu::new();
     oracle.enter_protected_flat(0x1000, 0);
     oracle.regs = regs;
@@ -363,16 +365,19 @@ fn b1_native_stops_before_unsupported_and_instruction_limits() {
         &[0xf4],
         &[0xd0, 0xe0],
     ] {
-        assert!(compile::block(bytes, 0x1000, 16).is_none(), "{bytes:02x?}");
+        assert!(
+            compile::block(bytes, 0x1000, 0, 16).is_none(),
+            "{bytes:02x?}"
+        );
         let mut prefix = vec![0x40];
         prefix.extend_from_slice(bytes);
-        let block = compile::block(&prefix, 0x1000, 16).unwrap();
+        let block = compile::block(&prefix, 0x1000, 0, 16).unwrap();
         assert_eq!((block.instructions, block.source_bytes), (1, 1));
         differential(&prefix, [0; 8], 0x202, 16);
     }
-    assert!(compile::block(&[0x90], 0x1000, 0).is_none());
+    assert!(compile::block(&[0x90], 0x1000, 0, 0).is_none());
     assert_eq!(
-        compile::block(&[0x40; 32], 0x1000, 100)
+        compile::block(&[0x40; 32], 0x1000, 0, 100)
             .unwrap()
             .instructions,
         32
@@ -574,9 +579,9 @@ fn b1_call_jump_return_and_stack_aliases_match_interpreter() {
     // The hardware return stack returns into the caller's adjacent stable stub,
     // which dispatches the return block without copying any guest registers.
     let code = [0xe8, 4, 0, 0, 0, 0x83, 0xc0, 2, 0xf4, 0x83, 0xc0, 3, 0xc3];
-    let entry = compile::block(&code, 0x1000, 16).unwrap();
-    let target = compile::block(&code[9..], 0x1009, 16).unwrap();
-    let ret = compile::block(&code[5..9], 0x1005, 16).unwrap();
+    let entry = compile::block(&code, 0x1000, 0, 16).unwrap();
+    let target = compile::block(&code[9..], 0x1009, 0, 16).unwrap();
+    let ret = compile::block(&code[5..9], 0x1005, 0, 16).unwrap();
     let regs = [7, 0, 0, 0, 0x4800, 0, 0, 0];
     let mut ram = vec![0; 65536];
     ram[0x1000..0x1000 + code.len()].copy_from_slice(&code);
@@ -621,9 +626,27 @@ fn b1_call_jump_return_and_stack_aliases_match_interpreter() {
 }
 
 #[test]
+fn b1_direct_miss_footer_qualifies_based_cs_and_names_patch() {
+    // A based CS puts the source and target on different linear pages even
+    // though their EIPs share a page. The runtime must not make a direct link.
+    let code = [0xe9, 0xfb, 0x00, 0, 0]; // 1000 -> 1100
+    let block = compile::block(&code, 0x1000, 0xff0, 16).unwrap();
+    let footer = *block.words.last().unwrap();
+    assert_eq!(footer & !4095, 0x1000);
+    assert_eq!(0x1100u32.wrapping_add(0xff0) & !4095, 0x2000);
+    assert_eq!(
+        (block.words.len() as u32 - 1) * 4 - (footer & 4095),
+        block.links[0].start
+    );
+    // An indirect exit has no patch address, but keeps the source page tag.
+    let indirect = compile::block(&[0xff, 0xe0], 0x1000, 0xff0, 16).unwrap();
+    assert_eq!(*indirect.words.last().unwrap(), 0x1000);
+}
+
+#[test]
 fn b1_tick_and_service_keep_precise_instruction_boundaries() {
     let code = [0x40, 0x01, 0x0b, 0x42]; // INC; ADD [EBX],ECX; INC
-    let block = compile::block(&code, 0x1000, 16).unwrap();
+    let block = compile::block(&code, 0x1000, 0, 16).unwrap();
     let regs = [0x7fffffff, 1, 7, 0x4080, 0x4800, 0, 0, 0];
     for ticks in [0, 2] {
         let (mut core, mut memory) =

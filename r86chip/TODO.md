@@ -435,3 +435,67 @@ handoff short; long tables belong in
 [experiments/JIT_COST.md](experiments/JIT_COST.md). Earlier handoffs, from
 before this section existed: `tmp/r86chip/handoff2.txt` (commit `d46ed01`),
 `tmp/r86chip/handoff3.txt` (commit `dbba770`).
+
+### 2026-11-11 — Task 4 (Intern → Lead)
+
+Ready for review; edits remain in the working tree, no patch file. Based on
+`dbba770` (task 3); current HEAD `248c543` includes the handoff procedure.
+**The 15-clock target is not met.** Full requested tables and reproduction are
+in [JIT_COST.md](experiments/JIT_COST.md); contracts and byte/line sizes are in
+[B1_JIT.md](experiments/B1_JIT.md#lookup-and-code-ownership).
+
+| TinyCore interval | Task-3 estimated clocks/x86 | Task-4 estimate | Change |
+|---|---:|---:|---:|
+| 1M–2M | 7.039518 | 5.614778 | −20.24% |
+| 3M–4M | 28.770529 | 23.779750 | −17.35% |
+| 4M–10M | 63.359992 | 49.818195 | −21.37% |
+
+The Intern removed service-site and link-restoration scans. Paired key/payload
+arrays take two data lines total; direct native-PC refunds take one. An 8 MiB
+code arena and 16 MiB refund arena retain displaced code until generation reset;
+hardware jumps/return addresses are flushed before reuse. Physical watches stay
+conservative instead of being scanned on reset. Mapping identity is checked
+before lookup, including negative entries on INVLPG; segment publication is
+invalidated after XTCONTEXT. Page-local compile groups (eight blocks maximum)
+share publication. No opcode coverage, word semantics or RTL edits.
+
+The estimator uses the requested 64 KiB/side, two-way, 32-byte geometry. Saved
+same-ELF task-3 RTL clocks are within 4.4–4.8% of its estimates; existing output
+fields/retired counts/native RAM are unchanged. Per-PC profiling changes no
+execution field or fill count. Contrary to the initial region inference,
+3M–4M firmware traffic is mainly **instruction** fills. Task 4 cuts heap data
+fills from 88,844 to 20,902 and FENCE.I from 599 to 222, but retires 4.1% more
+words. Largest remaining fill sources: `compile::block` (18,173) and shared
+`Reader::instruction` (16,184). Lead's next RTL decision should use these counts.
+
+Passed: RV32 no_std release and host ISS builds; 14 focused emitter/arena tests;
+17 final-ELF runtime fixtures; all six requested interval endpoints versus the
+same firmware's interpreter (state, RAM, TSC, serial, completed/fault/repeat
+counts). Coverage includes SMC, aliases, CR3/A20/INVLPG remapping, negative
+entries, cache collisions, precise faults and timer/STI boundaries. Refunds,
+attention budgets and guest-time accounting keep their existing contracts.
+An initial library-test command hit a pre-existing decoder-test `alloc::vec`
+import error; the arena check runs in the simulator test binary instead.
+
+Unverified: task-4 RTL clocks/parity, full TinyCore or Windows boot, board/Pi/
+Apple performance, and full guest-driven arena exhaustion (unit rollover passes).
+A preliminary context-publication regression was found by the cost pilot and
+fixed before final runs. One extra conservative code invalidation occurs in
+4M–10M (3 versus 2). The reserved 24 MiB arena memory is an explicit tradeoff.
+
+Changed files: `jit/{cache.rs,compile.rs,mod.rs,runtime.rs}`;
+`sim/{cache_estimate.rs,memory.rs,machine.rs,main.rs,rv32.rs,b1_tests.rs}`;
+`experiments/{jit_checks.py,jit_cost.py,B1_JIT.md,JIT_COST.md}`; this `TODO.md`
+(all under `r86chip/`), and `src/machine.rs` (remove the chip-only build of the
+now-unused watch-release method; other engines retain it).
+
+Evidence: `tmp/r86chip/batch4/results.json`, `calibration*/report.json`,
+`final-{1m-2m,3m-4m,4m-10m}/report.json` and interval/function profiles,
+`final-checks/report.json`, `emitter-tests.log`, build logs, and the small
+`base-runtime.objdump` / `final-runtime.objdump`. Canonical final ELF/bin:
+`tmp/r86chip/batch4/group/firmware.{elf,bin}`, ELF SHA256
+`e546c0c3c5a754292509b764e6abf31108d754667313168b557a23ebacbc94b6`.
+Raw endpoint profiles, duplicate/superseded binaries and full objdumps are
+removed; cleanup manifests retain hashes. `format-equivalence.json` confirms
+the final comment/module-order cleanup builds the identical loaded image.
+Lead owns the same-ELF RTL review.

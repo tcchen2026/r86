@@ -2676,10 +2676,8 @@ impl HostBus {
 
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
-        any(
-            all(feature = "r86chip", target_arch = "riscv32"),
-            any(a64_jit, all(feature = "jit", target_arch = "arm"))
-        )
+        a64_jit,
+        all(feature = "jit", target_arch = "arm")
     ))]
     pub(crate) fn jit_release_code_pages(&mut self) {
         if let Some(pages) = &mut self.jit_code_pages {

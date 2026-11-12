@@ -355,6 +355,35 @@ CASES = {
 
 # Cross-page XJT entries must expire on both explicit and physical remapping.
 CASES["cr3-remap"] = PAGING + REMAP.replace("invlpg [0x8000]", "mov eax, cr3\n    mov cr3, eax")
+# Both MUL and operand-size RET are negative entries on this page. Unlike a
+# native RET, they never install a jump proof there. INVLPG still expires them.
+CASES["negative-invlpg"] = PAGING + """
+    mov word [0x8000], 0xe0f7
+    mov word [0x8002], 0xc366
+    mov byte [0x9000], 0xb8
+    mov dword [0x9001], 2
+    mov word [0x9005], 0xc366
+    mov ecx, 32
+.warm:
+    mov eax, 7
+    call 0x8000
+    add esp, 2
+    cmp eax, 49
+    jne fail
+    dec ecx
+    jnz .warm
+    mov dword [0x4020], 0x9003
+    invlpg [0x8000]
+    mov ecx, 32
+.remapped:
+    call 0x8000
+    add esp, 2
+    cmp eax, 2
+    jne fail
+    dec ecx
+    jnz .remapped
+    jmp success
+"""
 CASES["a20-remap"] = """
     mov byte [0x8000], 0xb8
     mov dword [0x8001], 1

@@ -38,9 +38,7 @@ pub enum End {
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Link {
-    pub offset: u32,
     pub start: u32,
-    pub original: u32,
     pub eip: u32,
 }
 pub struct Block {
@@ -84,6 +82,7 @@ struct Asm {
     words: Vec<u32>,
     links: Vec<Link>,
     source: u32,
+    source_page: u32,
 }
 impl Asm {
     fn i(&mut self, op: u32, rd: u32, rs1: u32, f: u32, imm: u32) {
@@ -327,24 +326,33 @@ impl Asm {
     fn leave(&mut self, reason: u32) {
         self.i(0x7b, 0, 0, 5, reason);
         if reason == MISS {
-            // XINFO reports the PC after XLEAVE. This unexecuted word names
-            // the source cache entry, including indirect exits/return stubs.
-            self.words.push(self.source);
+            // XINFO reports this unexecuted word. High bits qualify the source
+            // linear page; low bits are zero for an indirect/unpatchable exit.
+            self.words.push(self.source_page);
         }
     }
     fn exit(&mut self, target: u32, reason: u32) {
         let start = self.words.len();
+        if reason == MISS && target == self.source {
+            self.words
+                .push(jump(i64::from(ENTRY_OFFSET) - start as i64 * 4).unwrap());
+            return;
+        }
         self.literal(PC, target);
         if reason == MISS {
             self.links.push(Link {
-                offset: self.words.len() as u32 * 4,
                 start: start as u32 * 4,
-                original: self.words[start],
                 eip: target,
             });
             self.i(0x6b, 0, PC, 0, 0);
         }
         self.leave(reason);
+        if reason == MISS {
+            // Direct patch address = saved PC minus this short byte distance.
+            let distance = (self.words.len() - 1 - start) as u32 * 4;
+            assert!(distance < 4096);
+            *self.words.last_mut().unwrap() |= distance;
+        }
     }
     fn branch(&mut self, at: usize, condition: u8) {
         let off = (self.words.len() - at) as u32 * 4;
@@ -395,7 +403,7 @@ fn supported(op: Op) -> bool {
 }
 
 /// A native JAL link is valid only after runtime has qualified its target page
-/// and code version. The caller retains the target allocation until unlinking.
+/// and code version. The caller retains the entire code generation until reset.
 pub fn jump(offset: i64) -> Option<u32> {
     if !(-1048576..1048576).contains(&offset) || offset & 3 != 0 {
         return None;
@@ -409,13 +417,14 @@ pub fn jump(offset: i64) -> Option<u32> {
     )
 }
 
-pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
+pub fn block(bytes: &[u8], eip: u32, cs_base: u32, limit: usize) -> Option<Block> {
     let limit = limit.min(4095);
     let decoded = decode::block(bytes, eip, limit);
     let mut a = Asm {
         words: alloc::vec![eip, 0],
         links: Vec::new(),
         source: eip,
+        source_page: cs_base.wrapping_add(eip) & !4095,
     };
     let mut sites = alloc::vec![Site {
         offset: ENTRY_OFFSET,
@@ -666,14 +675,6 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Option<Block> {
         a.exit(return_eip, MISS);
     }
     a.words[1] = 0x6b | 4 << 12 | instructions << 20;
-    // A direct self-edge stays within the already qualified source page and
-    // enters XTICK again, never the middle of a reserved instruction budget.
-    for link in &a.links {
-        if link.eip == eip {
-            a.words[link.start as usize / 4] =
-                jump(i64::from(ENTRY_OFFSET) - i64::from(link.start)).unwrap();
-        }
-    }
     Some(Block {
         words: a.words,
         instructions,

@@ -76,25 +76,36 @@ def attribute(directory, firmware, ranges, enters):
     """
     rows = list(csv.DictReader((directory / "interval-profile.csv").open()))
     linked = [r for r in rows if any(lo <= int(r["pc"], 16) < hi for lo, hi in ranges)]
+    cache_rows = list(csv.DictReader((directory / "interval-cache-profile.csv").open()))
+    counts = {r["pc"]: int(r["retired_delta"]) for r in linked}
+    cache_counts = {r["pc"]: [int(r[k]) for k in CACHE_FIELDS] for r in cache_rows}
+    pcs = sorted(set(counts) | {pc for pc in cache_counts
+                               if any(lo <= int(pc, 16) < hi for lo, hi in ranges)})
     output = subprocess.run(["llvm-symbolizer", "--output-style=JSON", "--inlines",
                              "--no-debuginfod", f"--obj={firmware}"],
-                            input="".join(r["pc"] + "\n" for r in linked),
+                            input="".join(pc + "\n" for pc in pcs),
                             text=True, capture_output=True, check=True)
     symbols = [json.loads(line) for line in output.stdout.splitlines()]
-    assert len(linked) == len(symbols)
+    assert len(pcs) == len(symbols)
     functions, service, service_pcs = Counter(), 0, set()
-    for row, symbol in zip(linked, symbols):
+    cache_functions = {}
+    for pc, symbol in zip(pcs, symbols):
         names = [re.sub(r"::h[0-9a-f]{16}$", "", s["FunctionName"])
                  for s in symbol.get("Symbol", []) if s.get("FunctionName")]
-        count = int(row["retired_delta"])
-        if "r86::chipjit::native::service" in names:
-            service += count
-            service_pcs.add(row["pc"])
-            continue
+        count = counts.get(pc, 0)
         name = next((n for n in names if n.startswith("r86::chipjit::runtime::")),
                     next((n for n in names if n.startswith("r86::")), names[0] if names else "unknown"))
         name = name.split("::_$u7b$$u7b$closure")[0].split("::{{closure}}")[0]
+        dest = cache_functions.setdefault(name, [0] * 6)
+        for n, fills in enumerate(cache_counts.get(pc, [0] * 6)): dest[n] += fills
+        if "r86::chipjit::native::service" in names:
+            service += count
+            service_pcs.add(pc)
+            continue
         functions[name] += count
+    cache_functions["generated-code"] = [sum(f[n] for pc, f in cache_counts.items()
+                                              if not any(lo <= int(pc, 16) < hi for lo, hi in ranges))
+                                          for n in range(6)]
     assert len(service_pcs) <= 1, "bank-1 service must remain one XLEAVE word"
     bank0 = sum(functions.values())
     assert bank0 + service == sum(int(r["retired_delta"]) for r in linked)
@@ -102,9 +113,28 @@ def attribute(directory, firmware, ranges, enters):
                   bank0_native_per_xenter=bank0 / enters if enters else None,
                   runtime_functions=[(n, c) for n, c in functions.most_common()
                                      if n.startswith("r86::chipjit::runtime::")],
-                  functions=functions.most_common(), attribution=attribute.__doc__)
+                  functions=functions.most_common(), attribution=attribute.__doc__,
+                  cache_fields=CACHE_FIELDS,
+                  cache_functions=sorted(cache_functions.items(), key=lambda p: -sum(p[1])))
     (directory / "functions.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
+
+
+CACHE_FIELDS = ("i_firmware", "i_heap", "i_guest", "d_firmware", "d_heap", "d_guest")
+
+
+def cache_interval(directory, endpoints):
+    profiles = []
+    for steps in endpoints:
+        with (directory / f"iss-{steps}-cache-profile.csv").open() as source:
+            profiles.append({r["pc"]: [int(r[k]) for k in CACHE_FIELDS] for r in csv.DictReader(source)})
+    a, b = profiles
+    with (directory / "interval-cache-profile.csv").open("w") as output:
+        writer = csv.writer(output)
+        writer.writerow(("pc", *CACHE_FIELDS))
+        for pc in sorted(a.keys() | b.keys()):
+            delta = [y - x for x, y in zip(a.get(pc, [0] * 6), b.get(pc, [0] * 6))]
+            if any(delta): writer.writerow((pc, *delta))
 
 
 def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
@@ -115,7 +145,7 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
         struct.pack_into("<III", cfg, 20, steps, 0, HISTOGRAM_FLAGS | (2 if jit else 0))
         (directory / "config.bin").write_bytes(cfg)
         with (directory / f"iss-{steps}.log").open("w") as log:
-            subprocess.run([iss, "machine", firmware, directory, "20000000000", str(seconds), "--profile"],
+            subprocess.run([iss, "machine", firmware, directory, "20000000000", str(seconds), "--profile", "--cache-stats"],
                            check=True, stdout=log, stderr=log)
         result = json.loads((directory / "iss-run.json").read_text())
         assert result["status"] == 4 and result["x86_steps"] == steps, result
@@ -123,11 +153,12 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
         assert result["x86_completed"] > 0, result
         assert result["bank_enters"] == result["jit_invocations"], result
         assert bool(result["jit_native_steps"]) == jit, result
-        for suffix in ("run.json", "profile.csv", "serial.log"):
+        for suffix in ("run.json", "profile.csv", "cache-profile.csv", "serial.log"):
             (directory / f"iss-{suffix}").replace(directory / f"iss-{steps}-{suffix}")
         result["histogram"] = histogram(directory)
         samples.append(result)
     interval = profile_interval(directory, samples)
+    cache_interval(directory, endpoints)
     delta = {key: samples[1][key] - samples[0][key] for key in (
         "retired_native", "x86_steps", "x86_completed", "jit_native_steps", "jit_invocations",
         "jit_compiled_blocks", "jit_invalidations", "x86_fault_attempts", "x86_repeat_chunks")}
@@ -139,15 +170,26 @@ def measure(directory, firmware, iss, config, endpoints, jit, ranges, seconds):
     completed = delta["x86_completed"]
     assert completed > 0
     translated = delta["jit_native_steps"]
+    cache = {}
+    for side in ("instruction", "data"):
+        cache[side] = {region: samples[1]["cache_estimate"][side]["fills"][region]
+                      - samples[0]["cache_estimate"][side]["fills"][region]
+                      for region in ("firmware", "heap", "guest")}
+    cache["line_fills"] = sum(sum(cache[side].values()) for side in ("instruction", "data"))
+    cache["estimated_clocks"] = 1.15 * delta["retired_native"] + 45 * cache["line_fills"]
     costs = attribute(directory, firmware, ranges, delta["jit_invocations"])
+    assert sum(sum(f) for _, f in costs["cache_functions"]) == cache["line_fills"]
     hist = difference(samples[0]["histogram"], samples[1]["histogram"])
     assert costs["bank1_service_native"] == hist["leaves"]["service"]
     report = dict(samples=samples, delta=delta, interval_profile=interval,
                   histogram=hist,
+                  cache_estimate=cache,
+                  estimated_clocks_per_x86=cache["estimated_clocks"] / completed,
                   bank0_native=costs["bank0_native"],
                   bank0_native_per_xenter=costs["bank0_native_per_xenter"],
                   bank1_service_native=costs["bank1_service_native"],
                   runtime_top5=costs["runtime_functions"][:5],
+                  cache_top5=costs["cache_functions"][:5],
                   native_per_completed_x86=delta["retired_native"] / completed,
                   emitted_native=emitted, firmware_native=delta["retired_native"] - emitted,
                   jit_coverage=translated / completed,

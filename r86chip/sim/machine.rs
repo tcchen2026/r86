@@ -85,12 +85,15 @@ impl Profile {
 
 pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.len() < 5
-        || args[5..]
-            .iter()
-            .any(|a| a != "--profile" && a != "--dump-guest" && a != "--tlb-stats")
+        || args[5..].iter().any(|a| {
+            !matches!(
+                a.as_str(),
+                "--profile" | "--dump-guest" | "--tlb-stats" | "--cache-stats"
+            )
+        })
     {
         return Err(
-            "machine FIRMWARE.elf IMAGE_DIRECTORY RV_INSTRUCTION_LIMIT WALL_SECONDS [--profile] [--dump-guest] [--tlb-stats]"
+            "machine FIRMWARE.elf IMAGE_DIRECTORY RV_INSTRUCTION_LIMIT WALL_SECONDS [--profile] [--dump-guest] [--tlb-stats] [--cache-stats]"
                 .into(),
         );
     }
@@ -108,6 +111,12 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     memory.write(abi::GUEST as u32, &guest)?;
     memory.write(abi::CONFIG as u32, &fs::read(dir.join("config.bin"))?)?;
+    if args[5..].iter().any(|a| a == "--cache-stats") {
+        memory.cache_estimate = Some(Default::default());
+        if args[5..].iter().any(|a| a == "--profile") {
+            memory.cache_estimate.as_mut().unwrap().get_mut().profile();
+        }
+    }
     // Start from the ELF entry. The firmware's native startup code initializes
     // its stack and runtime; no x86 execution or translation is delegated to host.
     let mut core = rv32::Core::new(entry);
@@ -127,11 +136,17 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         // Chunking bounds host observation latency only. StepLimit resumes the
         // same core state; no reset, interrupt or guest instruction is injected.
         let chunk = (limit - core.host_steps).min(1_000_000);
+        if let Some(e) = &mut memory.cache_estimate {
+            e.get_mut().active = true;
+        }
         let trap = if let Some(profile) = &mut profile {
             profile.run(&mut core, &mut memory, chunk)?
         } else {
             core.run(&mut memory, chunk)?
         };
+        if let Some(e) = &mut memory.cache_estimate {
+            e.get_mut().active = false;
+        }
         // The producer publishes its byte count after writing output. Accept
         // only monotonically growing, in-range data; a broken ABI is an error,
         // never silently repaired by clipping or restarting the firmware.
@@ -175,6 +190,11 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(profile) = profile {
         profile.write(&dir.join("iss-profile.csv"), core.retired_steps)?;
+        if let Some(cache) = &memory.cache_estimate {
+            cache
+                .borrow()
+                .write_profile(&dir.join("iss-cache-profile.csv"))?;
+        }
     }
     if memory.read(abi::WORKLOAD_FLAGS as u32, 32) & abi::WORKLOAD_BOUNDARIES != 0 {
         let len = memory.read(abi::BOUNDARY_LEN as u32, 32) as usize;
@@ -214,7 +234,7 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .any(|s| s == abi::LUA_MARKER);
     let marker = boot_marker
         && (memory.read(abi::WORKLOAD_FLAGS as u32, 32) & abi::WORKLOAD_LUA == 0 || lua_marker);
-    let summary = format!(
+    let mut summary = format!(
         "{{\"engine\":\"rust-rv32-functional\",\"rv_instructions\":{},\"x86_steps\":{},\"eip\":{},\"pc\":{},\"status\":{},\"marker\":{},\"boot_marker\":{},\"lua_marker\":{},\"seconds\":{:.3},\"trap\":\"{:?}\",\"ram_fnv64\":\"{:016x}\",\"guest_ram_fnv64\":\"{:016x}\",\"bank_enters\":{},\"jit_native_steps\":{},\"jit_invocations\":{},\"jit_compiled_blocks\":{},\"jit_user_steps\":{},\"jit_invalidations\":{},\"x86_regs\":{:?},\"eflags\":{},\"tsc\":{},\"retired_native\":{},\"chip_extensions\":{},\"xalu_ops\":{},\"tlb_lookups\":{},\"tlb_hits\":{},\"tlb_fills\":{},\"xld_ops\":{},\"xld_hits\":{},\"xea_ops\":{},\"xea_hits\":{},\"x86_completed\":{},\"x86_fault_attempts\":{},\"x86_repeat_chunks\":{},\"x86_halted_polls\":{}}}\n",
         core.host_steps,
         steps,
@@ -252,6 +272,14 @@ pub fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         read64(abi::X86_REPEAT_CHUNKS),
         read64(abi::X86_HALTED_POLLS)
     );
+    // Append an observation field without changing any existing report field.
+    summary.truncate(summary.len() - 2); // final brace and newline
+    summary.push_str(",\"cache_estimate\":");
+    summary.push_str(&memory.cache_estimate.as_ref().map_or_else(
+        || "null".to_owned(),
+        |e| e.borrow().json(core.retired_steps),
+    ));
+    summary.push_str("}\n");
     fs::write(dir.join("iss-run.json"), &summary)?;
     eprint!("{summary}");
     if stop.is_some_and(|t| t.cause != rv32::Cause::Breakpoint) || matches!(status, 5..=7) {
