@@ -44,6 +44,8 @@ Windows media is supplied separately; no Microsoft files are included.
 Usage: python3 script/build_freedos_image.py [--share-dir tmp/freedos/share]
 The published kit is a GitHub Release asset (tag freedos-kit-<first 8 hex>);
 assets/freedos-kit.sha256 pins it. Update the pin when uploading a new kit.
+The pin lags this script between releases: a kit built from the current tree
+is newer than the pinned one, and local runs use it.
 Downloads stay in tmp/freedos/dl and tmp/downloads/{fdkernel,freedos-boot,ecm}.
 """
 
