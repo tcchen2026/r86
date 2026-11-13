@@ -183,6 +183,7 @@ Commands implemented by the current harness:
     {"cmd":"send-scancodes", "hex": HEX_BYTES}
     {"cmd":"mouse-move", "dx": DX, "dy": DY}
     {"cmd":"mouse-button", "button": "left|right|middle", "down": BOOL}
+    {"cmd":"mouse-mode", "mode": optional "auto|relative"}
     {"cmd":"usb-tablet", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"pointer", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"text-snapshot"}
@@ -348,6 +349,15 @@ Its acknowledgement includes ``guest_pointer_active``. This diagnostic command
 uses one input source; it does not combine buttons or release on disconnect.
 Queue-full errors require retrying the same transition. Input is replayable.
 The guest call protocol is defined in ``src/machine/magic.rs``.
+
+``mouse-mode`` sets, or without ``mode`` reports, the console's mouse mode,
+shared by all clients: ``auto`` (the default) or ``relative`` (for games that
+read relative motion). Its reply and ``status`` carry ``mouse_mode`` and
+``mouse_absolute``, true in auto mode while the guest tool polls
+(``guest_pointer_active``). Clients then send ``pointer`` with the host
+cursor's position across the guest screen instead of capturing the mouse, and
+``mouse-move``/``mouse-button`` otherwise. The mode guides clients; the server
+accepts both inputs in either mode.
 
 ``usb-tablet`` requires the opt-in ``--usb-tablet`` / TOML ``usb-tablet = true``.
 X and Y are absolute coordinates 0..32767 (left/top to right/bottom); normalize
@@ -653,6 +663,8 @@ def build_parser():
     button = mouse_sub.add_parser("button")
     button.add_argument("button", choices=["left", "right", "middle"])
     button.add_argument("state", choices=["down", "up"])
+    mode = mouse_sub.add_parser("mode")
+    mode.add_argument("mode", nargs="?", choices=["auto", "relative"])
 
     sub.add_parser("text-snapshot")
     sub.add_parser("hash-frame")
@@ -723,6 +735,8 @@ def command_object(args):
     if args.command == "mouse":
         if args.mouse_command == "move":
             return {"cmd": "mouse-move", "dx": args.dx, "dy": args.dy}
+        if args.mouse_command == "mode":
+            return {"cmd": "mouse-mode", **({"mode": args.mode} if args.mode else {})}
         return {"cmd": "mouse-button", "button": args.button, "down": args.state == "down"}
     if args.command == "text-snapshot":
         return {"cmd": "text-snapshot"}

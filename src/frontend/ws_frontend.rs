@@ -216,6 +216,9 @@ struct Service {
     file_put: Option<FilePut>,
     /// Finite debugger jobs are available (r86-run's own loop steps them).
     jobs: bool,
+    /// mouse-mode "relative": clients capture the mouse even while the guest
+    /// tool takes absolute input. Shared by all clients.
+    mouse_relative: bool,
 }
 
 /// A file being copied onto the powered-off VM's disk.
@@ -285,6 +288,7 @@ impl Service {
             disc_change: None,
             file_put: None,
             jobs: false,
+            mouse_relative: false,
         }
     }
     fn pending_text_bytes(&self) -> usize {
@@ -611,6 +615,15 @@ impl Service {
         }
         Ok(())
     }
+    /// Clients send absolute `pointer` input while mouse_absolute is true and
+    /// capture the mouse for relative motion otherwise.
+    fn mouse_json(&self, machine: &Machine) -> String {
+        let (mode, absolute) = match self.mouse_relative {
+            true => ("relative", false),
+            false => ("auto", machine.guest_pointer_active()),
+        };
+        format!("\"mouse_mode\":\"{mode}\",\"mouse_absolute\":{absolute}")
+    }
     fn cancel_job(&mut self, machine: &Machine, reason: &str) {
         if let Some(job) = self.job.take() {
             self.reply(
@@ -756,6 +769,18 @@ impl Service {
                     machine.guest_pointer_active()
                 )
             }
+            "mouse-mode" => {
+                match json_string(message, "mode")?.as_deref() {
+                    None => {}
+                    Some("auto") => self.mouse_relative = false,
+                    Some("relative") => self.mouse_relative = true,
+                    Some(other) => return Err(format!("mouse mode {other}: use auto or relative")),
+                }
+                format!(
+                    "{{\"type\":\"mouse-mode\",\"ok\":true,{}}}",
+                    self.mouse_json(machine)
+                )
+            }
             "mouse-move" => {
                 let dx = clamp_i64_to_i16(json_i64(message, "dx")?.unwrap_or(0));
                 let dy = clamp_i64_to_i16(json_i64(message, "dy")?.unwrap_or(0));
@@ -782,7 +807,11 @@ impl Service {
             "status" => {
                 let mut json = status_json(machine, true);
                 json.pop();
-                format!("{json},\"execution\":{}}}", self.state(machine))
+                format!(
+                    "{json},{},\"execution\":{}}}",
+                    self.mouse_json(machine),
+                    self.state(machine)
+                )
             }
             "diagnostics" => {
                 let current = self.snapshot(machine);

@@ -8,7 +8,7 @@
   :root {
     color-scheme: dark;
     --bg: #101012; --panel: #18181b; --line: #2a2a2f; --text: #e4e4e7;
-    --muted: #8b8b94; --accent: #5b9cff; --ok: #3fb950; --bad: #f85149;
+    --muted: #8b8b94; --accent: #5b9cff; --pick: #2c4a7a; --ok: #3fb950; --bad: #f85149;
     --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -17,37 +17,63 @@
     display: flex; flex-direction: column; background: var(--bg); color: var(--text);
     font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
-  header {
-    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-    padding: 8px 12px; border-bottom: 1px solid var(--line);
-  }
-  h1 { font-size: 16px; margin: 0 10px 0 0; letter-spacing: .5px; }
   button {
     background: var(--panel); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 5px 11px; font: inherit; cursor: pointer;
   }
   button:hover:not(:disabled) { border-color: var(--muted); }
   button:disabled { opacity: .35; cursor: default; }
-  button.primary:not(:disabled) { border-color: var(--accent); color: var(--accent); }
   .sep { width: 1px; height: 20px; background: var(--line); margin: 0 4px; }
-  #status { margin-left: auto; display: flex; align-items: center; gap: 8px;
-    color: var(--muted); font: 12px var(--mono); }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
-  #dot.on { background: var(--ok); }
+  label.button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 5px 11px; cursor: pointer; }
+  label.button:hover { border-color: var(--muted); }
+  .muted { color: var(--muted); font-size: 12px; }
+  [hidden] { display: none !important; }
+
+  /* Menu bar, like a server BMC's console viewer. */
+  #menubar { display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 6px;
+    background: var(--panel); border-bottom: 1px solid var(--line); user-select: none; }
+  #menubar h1 { font-size: 14px; margin: 0 10px 0 6px; letter-spacing: .5px; }
+  nav { display: flex; gap: 2px; }
+  .menu { position: relative; }
+  .menu > .title { background: none; border: 0; border-radius: 4px; padding: 4px 10px; }
+  .menu > .title:hover, .menu.open > .title { background: var(--line); }
+  .items { display: none; position: absolute; top: calc(100% + 3px); left: 0; z-index: 20;
+    min-width: 250px; padding: 4px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; box-shadow: 0 10px 28px rgba(0, 0, 0, .5); }
+  .menu.right .items { left: auto; right: 0; }
+  .menu.open .items { display: block; }
+  .items > button, .items > label {
+    position: relative; display: flex; justify-content: space-between; gap: 24px; width: 100%;
+    background: none; border: 0; border-radius: 4px; padding: 6px 12px 6px 28px;
+    color: var(--text); font: inherit; text-align: left; white-space: nowrap; cursor: pointer;
+  }
+  .items > button:hover:not(:disabled), .items > label:hover { background: var(--pick); }
+  .items > label.off { opacity: .35; pointer-events: none; }
+  .items [aria-checked="true"]::before { content: "\2713"; position: absolute; left: 10px; }
+  .items .key { color: var(--muted); font-size: 12px; }
+  .items hr { border: 0; border-top: 1px solid var(--line); margin: 4px 2px; }
+
+  #upload { display: flex; align-items: center; gap: 8px; padding: 4px 12px;
+    border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
+  #upload progress { flex: 1; height: 6px; }
+  #drop { position: fixed; inset: 0; display: none; place-items: center; z-index: 10;
+    font-size: 22px; background: rgba(91, 156, 255, .18); border: 3px dashed var(--accent);
+    pointer-events: none; }
+  body.dragging #drop { display: grid; }
+
   main { flex: 1; display: flex; min-height: 0; }
   #left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-  #wrap { flex: 1; position: relative; min-height: 0; overflow: hidden; }
-  canvas {
-    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
-    background: #000; outline: 1px solid var(--line); cursor: pointer;
-  }
+  #stage { flex: 1; position: relative; min-height: 0; }
+  /* Auto margins centre the screen and still let 1:1 view scroll to its edges. */
+  #wrap { position: absolute; inset: 0; display: flex; overflow: auto; }
+  canvas { margin: auto; background: #000; outline: 1px solid var(--line); flex: none; }
   canvas:focus { outline-color: var(--accent); }
-  #hint { position: absolute; left: 0; right: 0; bottom: 6px; text-align: center;
-    color: var(--muted); font-size: 12px; pointer-events: none; }
   #typebar { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); }
   #text { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 6px 10px; font: 13px var(--mono); }
   #text:focus { outline: none; border-color: var(--accent); }
+
   aside { width: min(440px, 40vw); display: flex; flex-direction: column;
     border-left: 1px solid var(--line); }
   #tabs { display: flex; border-bottom: 1px solid var(--line); }
@@ -59,20 +85,17 @@
     word-break: break-all; font: 12px/1.45 var(--mono); }
   #events .err { color: var(--bad); }
   #events .step { color: var(--muted); }
-  #media { display: flex; align-items: center; gap: 6px; }
-  #media-state { color: var(--muted); font: 12px var(--mono); max-width: 220px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  label.button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-    padding: 5px 11px; cursor: pointer; }
-  label.button:hover { border-color: var(--muted); }
-  label.button.off { opacity: .35; pointer-events: none; }
-  #upload { display: flex; align-items: center; gap: 8px; padding: 4px 12px;
-    border-bottom: 1px solid var(--line); font: 12px var(--mono); color: var(--muted); }
-  #upload progress { flex: 1; height: 6px; }
-  #drop { position: fixed; inset: 0; display: none; place-items: center; z-index: 10;
-    font-size: 22px; background: rgba(91, 156, 255, .18); border: 3px dashed var(--accent);
-    pointer-events: none; }
-  body.dragging #drop { display: grid; }
+
+  #statusbar { display: flex; align-items: center; gap: 14px; height: 24px; padding: 0 12px;
+    background: var(--panel); border-top: 1px solid var(--line); color: var(--muted);
+    font: 12px var(--mono); white-space: nowrap; overflow: hidden; }
+  #statusbar > span { overflow: hidden; text-overflow: ellipsis; }
+  #statusbar .bar { width: 1px; height: 12px; background: var(--line); flex: none; }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); flex: none; }
+  #dot.on { background: var(--ok); }
+  #message { flex: 1; text-align: right; }
+  #message.err { color: var(--bad); }
+
   #files { position: absolute; inset: 0; overflow: auto; padding: 12px 16px; }
   #files .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
   #drives button.on { border-color: var(--accent); color: var(--accent); }
@@ -87,10 +110,16 @@
   #files td.acts button { padding: 2px 8px; font-size: 12px; }
   #f-status { min-height: 1.4em; color: var(--muted); }
   #f-status.err { color: var(--bad); }
-  .muted { color: var(--muted); font-size: 12px; }
-  [hidden] { display: none !important; }
+
+  dialog { max-width: 520px; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 8px; padding: 18px 22px; }
+  dialog::backdrop { background: rgba(0, 0, 0, .5); }
+  dialog h2 { font-size: 16px; margin: 0 0 10px; }
+  dialog ul { padding-left: 18px; margin: 0 0 14px; }
+  dialog li { margin: 5px 0; }
+
   /* Import mode: the device's New VM wizard waits for one image. */
-  body.import header > :not(h1):not(#status), body.import main { display: none; }
+  body.import nav, body.import main, body.import #statusbar .vm { display: none; }
   #import { margin: 12vh auto 0; max-width: 440px; padding: 0 20px; text-align: center; }
   #import h2 { font-size: 20px; margin: 0 0 8px; }
   #import label.button { display: inline-block; margin: 18px 0 8px; padding: 9px 18px;
@@ -100,31 +129,87 @@
     main { flex-direction: column; }
     aside { width: auto; height: 35vh; border-left: 0; border-top: 1px solid var(--line); }
   }
+  @media (max-width: 600px) {
+    #menubar h1 { display: none; }
+    .menu > .title { padding: 4px 6px; }
+  }
 </style>
 </head>
 <body>
-<header>
+<header id="menubar">
   <h1>r86</h1>
-  <button id="poweron" class="primary" hidden>Power on</button>
-  <button id="resume" class="primary" disabled>Resume</button>
-  <button id="pause" disabled>Pause</button>
-  <button id="reset" disabled>Reset</button>
-  <button id="power" disabled title="ACPI power button: the guest shuts itself down">Shut down</button>
-  <button id="poweroff" disabled title="Cut power now, without warning the guest">Power off</button>
-  <span class="sep"></span>
-  <button id="cad" disabled>Ctrl+Alt+Del</button>
-  <button id="shot" title="Save the current screen as PNG">Screenshot</button>
-  <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
-  <span class="sep"></span>
-  <span id="media" title="Virtual CD: an ISO stays on this computer and is read as the guest needs it (keep this page open); files and folders become a new disc. You can also drop them on this page.">
-    <span id="media-state">CD</span>
-    <label class="button off" id="pick-iso-label">ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
-    <label class="button off" id="pick-files-label">Files…<input id="pick-files" type="file" multiple hidden></label>
-    <label class="button off" id="pick-dir-label">Folder…<input id="pick-dir" type="file" webkitdirectory hidden></label>
-    <button id="tools" hidden title="Insert the r86 tools CD: display driver and mouse helper. Windows opens its installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 tools…</button>
-    <button id="eject" disabled>Eject</button>
-  </span>
-  <div id="status"><span id="dot"></span><span id="state">connecting</span></div>
+  <nav role="menubar">
+    <div class="menu">
+      <button class="title">Power</button>
+      <div class="items" role="menu">
+        <button id="poweron" disabled>Power on</button>
+        <button id="power" disabled title="ACPI power button: the guest shuts itself down">Shut down</button>
+        <button id="reset" disabled>Reset</button>
+        <button id="poweroff" disabled title="Cut power now, without warning the guest">Power off now…</button>
+        <hr>
+        <button id="resume" disabled>Resume</button>
+        <button id="pause" disabled>Pause</button>
+      </div>
+    </div>
+    <div class="menu">
+      <button class="title">Virtual Media</button>
+      <div class="items" role="menu">
+        <label id="pick-iso-label" class="off" title="The ISO stays on this computer; the guest reads it through this page, so keep the page open">Insert ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
+        <label id="pick-files-label" class="off">Insert files as a CD…<input id="pick-files" type="file" multiple hidden></label>
+        <label id="pick-dir-label" class="off">Insert a folder as a CD…<input id="pick-dir" type="file" webkitdirectory hidden></label>
+        <button id="tools" hidden title="Display driver and mouse helper. Windows opens the installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 tools</button>
+        <hr>
+        <button id="eject" disabled>Eject</button>
+      </div>
+    </div>
+    <div class="menu">
+      <button class="title">Keyboard</button>
+      <div class="items" role="menu">
+        <button data-keys="controlleft altleft delete" disabled>Ctrl+Alt+Del</button>
+        <button data-keys="controlleft escape" disabled>Ctrl+Esc <span class="key">Start menu</span></button>
+        <button data-keys="altleft tab" disabled>Alt+Tab</button>
+        <button data-keys="altleft f4" disabled>Alt+F4</button>
+        <button data-keys="metaleft" disabled>Windows key</button>
+        <hr>
+        <button id="type-open" disabled>Type text…</button>
+        <button id="release" disabled title="Release every key and mouse button this page holds">Release all keys</button>
+      </div>
+    </div>
+    <div class="menu">
+      <button class="title">Mouse</button>
+      <div class="items" role="menu">
+        <button data-mode="auto" role="menuitemradio" disabled>Auto <span class="key">1:1 with r86 tools</span></button>
+        <button data-mode="relative" role="menuitemradio" disabled>Captured <span class="key">for games</span></button>
+        <hr>
+        <button id="mouse-release" disabled>Release the mouse <span class="key">Esc</span></button>
+      </div>
+    </div>
+    <div class="menu">
+      <button class="title">View</button>
+      <div class="items" role="menu">
+        <button data-view="fit" role="menuitemradio" aria-checked="true">Fit to window</button>
+        <button data-view="1x" role="menuitemradio">Actual size</button>
+        <hr>
+        <button id="fullscreen" role="menuitemcheckbox">Full screen</button>
+      </div>
+    </div>
+    <div class="menu right">
+      <button class="title">Tools</button>
+      <div class="items" role="menu">
+        <button id="shot">Screenshot</button>
+        <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
+        <hr>
+        <button data-panel="serial">Serial console</button>
+        <button data-panel="events">Event log</button>
+      </div>
+    </div>
+    <div class="menu right">
+      <button class="title">Help</button>
+      <div class="items" role="menu">
+        <button id="help-open">Using the console</button>
+      </div>
+    </div>
+  </nav>
 </header>
 <div id="upload" hidden>
   <span id="upload-text"></span><progress id="upload-bar" max="1" value="0"></progress>
@@ -141,9 +226,8 @@
 </section>
 <main>
   <div id="left">
-    <div id="wrap">
-      <canvas id="screen" width="720" height="400" tabindex="0"></canvas>
-      <div id="hint">Click the screen to capture keyboard and mouse. Esc releases the mouse.</div>
+    <div id="stage">
+      <div id="wrap"><canvas id="screen" width="720" height="400" tabindex="0"></canvas></div>
       <div id="files" hidden>
         <div class="bar">
           <strong>Hard disk</strong><span id="drives"></span>
@@ -165,22 +249,45 @@
           names (hover a name). Power on when done.</p>
       </div>
     </div>
-    <div id="typebar">
+    <div id="typebar" hidden>
       <input id="text" autocomplete="off" spellcheck="false" disabled
-             placeholder="Type text into the guest; Enter sends it with a newline">
+             placeholder="Type text into the guest; Enter sends it with a newline, Esc closes">
+      <button id="type-close">Close</button>
     </div>
   </div>
-  <aside>
+  <aside id="panel" hidden>
     <div id="tabs">
       <button data-tab="serial" class="active">Serial</button>
       <button data-tab="events">Events</button>
       <span class="grow"></span>
       <button id="clear" title="Clear this panel">Clear</button>
+      <button id="panel-close" title="Close the panel">Close</button>
     </div>
     <pre id="serial"></pre>
     <pre id="events" hidden></pre>
   </aside>
 </main>
+<footer id="statusbar">
+  <span id="dot"></span><span id="state">connecting</span>
+  <span class="bar vm"></span><span id="media-state" class="vm">CD</span>
+  <span class="bar vm"></span><span id="mouse-state" class="vm">Mouse</span>
+  <span id="message"></span>
+</footer>
+<dialog id="help">
+  <h2>Using the console</h2>
+  <ul>
+    <li>Click the screen to type into the guest.</li>
+    <li>Mouse: with the r86 tools helper running in Windows (Virtual Media → Install
+      r86 tools), the guest pointer follows yours 1:1. Otherwise, or with Mouse →
+      Captured, a click captures the mouse and Esc releases it.</li>
+    <li>Virtual Media → Insert ISO reads the image from this computer as the guest needs
+      it: keep this page open. Files and folders become a new CD.</li>
+    <li>Drop an ISO, files or folders on the page to insert them as a CD. While the VM is
+      off, dropped files are copied to its hard disk.</li>
+    <li>Keyboard has the key combinations a browser keeps for itself, such as Ctrl+Alt+Del.</li>
+  </ul>
+  <form method="dialog"><button>Close</button></form>
+</dialog>
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
@@ -379,6 +486,7 @@ async function pollStatus() {
   lastStep = json.step; lastTime = now;
   running = json.execution.running;
   showPower(json.powered_off);
+  showMouse(json);
   showMedia((await request({ cmd: "media" })).json);
   const mode = `${json.vga.mode} ${json.vga.width}x${json.vga.height}`;
   const run = json.powered_off ? "powered off" : json.execution.busy ? "busy" : running ? "running" : "paused";
@@ -404,33 +512,46 @@ function event(ev) {
   append(eventsPre, line);
 }
 
+// Notes go to the Events tab and show in the status bar for a while.
+let messageTimer = 0;
 function note(message, error = false) {
   (error ? console.error : console.log)(`r86: ${message}`);
   const line = document.createElement("div");
   if (error) line.className = "err";
   line.textContent = `ui: ${message}`;
   append(eventsPre, line);
-  if (error) $("state").textContent = message;
+  $("message").textContent = message;
+  $("message").title = message;
+  $("message").className = error ? "err" : "";
+  clearTimeout(messageTimer);
+  messageTimer = setTimeout(() => { $("message").textContent = ""; }, error ? 15000 : 6000);
 }
 
-for (const tab of document.querySelectorAll("#tabs [data-tab]")) {
-  tab.onclick = () => {
-    for (const t of document.querySelectorAll("#tabs [data-tab]")) {
-      t.classList.toggle("active", t === tab);
-      $(t.dataset.tab).hidden = t !== tab;
-    }
-  };
+function showTab(name) {
+  for (const t of document.querySelectorAll("#tabs [data-tab]")) {
+    t.classList.toggle("active", t.dataset.tab === name);
+    $(t.dataset.tab).hidden = t.dataset.tab !== name;
+  }
 }
+for (const tab of document.querySelectorAll("#tabs [data-tab]")) tab.onclick = () => showTab(tab.dataset.tab);
+for (const item of document.querySelectorAll("[data-panel]")) {
+  item.onclick = () => { $("panel").hidden = false; showTab(item.dataset.panel); };
+}
+$("panel-close").onclick = () => { $("panel").hidden = true; };
 $("clear").onclick = () => { (serialPre.hidden ? eventsPre : serialPre).textContent = ""; };
 
 // --- Controls
 function setUi(on) {
   $("dot").classList.toggle("on", on);
-  $("resume").disabled = !on || running;
+  $("resume").disabled = !on || running || poweredOff;
   $("pause").disabled = !on || !running;
-  for (const id of ["reset", "cad", "diag", "text"]) $(id).disabled = !on;
-  for (const id of ["power", "poweroff"]) $(id).disabled = !on || poweredOff;
-  $("resume").disabled ||= poweredOff;
+  $("poweron").disabled = !on || !poweredOff;
+  for (const id of ["reset", "power", "poweroff"]) $(id).disabled = !on || poweredOff;
+  for (const item of document.querySelectorAll("[data-keys], #type-open, #release, #text")) {
+    item.disabled = !on || poweredOff;
+  }
+  for (const item of document.querySelectorAll("[data-mode]")) item.disabled = !on;
+  $("diag").disabled = !on;
   if (!on) showMedia(null);
 }
 
@@ -452,10 +573,18 @@ $("poweroff").onclick = () => {
   if (confirm("Cut power now? Like pulling the plug, unsaved guest data is lost.")) command({ cmd: "power-off" });
 };
 $("poweron").onclick = () => command({ cmd: "power-on" });
-$("cad").onclick = () => {
-  for (const key of ["controlleft", "altleft", "delete"]) command({ cmd: "keydown", key });
-  for (const key of ["delete", "altleft", "controlleft"]) command({ cmd: "keyup", key });
-};
+// Key combinations the browser keeps for itself: press in order, release in reverse.
+for (const item of document.querySelectorAll("[data-keys]")) {
+  item.onclick = () => {
+    const keys = item.dataset.keys.split(" ");
+    for (const key of keys) command({ cmd: "keydown", key });
+    for (const key of keys.reverse()) command({ cmd: "keyup", key });
+  };
+}
+$("release").onclick = () => { held.clear(); command({ cmd: "release-input" }); };
+$("type-open").onclick = () => { $("typebar").hidden = false; $("text").focus(); };
+$("type-close").onclick = () => { $("typebar").hidden = true; canvas.focus(); };
+$("help-open").onclick = () => $("help").showModal();
 $("shot").onclick = () => canvas.toBlob(blob => {
   download(blob, `r86-${lastStep ?? 0}.png`);
 });
@@ -473,6 +602,7 @@ function download(blob, name) {
 }
 
 $("text").onkeydown = e => {
+  if (e.key === "Escape") { $("type-close").click(); return; }
   if (e.key !== "Enter") return;
   e.preventDefault();
   const text = e.target.value + "\n";
@@ -480,15 +610,59 @@ $("text").onkeydown = e => {
   command({ cmd: "type", text });
 };
 
-// --- Screen sizing: scale to fit, crisp pixels when enlarged.
+// --- View: fit the window or actual size; crisp pixels when enlarged.
+let view = "fit";
 function fit() {
-  const box = $("wrap").getBoundingClientRect();
-  const scale = Math.min((box.width - 24) / canvas.width, (box.height - 48) / canvas.height);
+  const box = $("stage").getBoundingClientRect();
+  const scale = view === "fit"
+    ? Math.min((box.width - 16) / canvas.width, (box.height - 16) / canvas.height) : 1;
   canvas.style.width = `${Math.floor(canvas.width * scale)}px`;
   canvas.style.height = `${Math.floor(canvas.height * scale)}px`;
   canvas.style.imageRendering = scale >= 1 ? "pixelated" : "auto";
 }
-new ResizeObserver(fit).observe($("wrap"));
+new ResizeObserver(fit).observe($("stage"));
+for (const item of document.querySelectorAll("[data-view]")) {
+  item.onclick = () => {
+    view = item.dataset.view;
+    for (const v of document.querySelectorAll("[data-view]")) v.setAttribute("aria-checked", v === item);
+    fit();
+  };
+}
+$("fullscreen").onclick = () =>
+  document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+document.addEventListener("fullscreenchange", () =>
+  $("fullscreen").setAttribute("aria-checked", !!document.fullscreenElement));
+
+// --- Menu bar: a click opens a menu; while one is open, pointing at another
+// title switches to it. Choosing an item, Esc or a click elsewhere closes it,
+// and the screen gets the keyboard back unless the item took the focus.
+// A click on the title the pointer just switched to keeps that menu open.
+let openMenu = null, switched = null;
+function setMenu(menu) {
+  openMenu?.classList.remove("open");
+  openMenu = menu;
+  menu?.classList.add("open");
+}
+for (const menu of document.querySelectorAll(".menu")) {
+  const title = menu.querySelector(".title");
+  title.onclick = () => {
+    if (switched !== menu) setMenu(openMenu === menu ? null : menu);
+    switched = null;
+  };
+  title.onpointerenter = () => {
+    if (openMenu && openMenu !== menu) { setMenu(menu); switched = menu; }
+  };
+  title.onpointerleave = () => { if (switched === menu) switched = null; };
+  menu.querySelector(".items").addEventListener("click", e => {
+    if (!e.target.closest("button:not(:disabled), label")) return;
+    setMenu(null);
+    if (menu.contains(document.activeElement) && !poweredOff) canvas.focus();
+  });
+}
+addEventListener("pointerdown", e => { if (openMenu && !openMenu.contains(e.target)) setMenu(null); });
+addEventListener("keydown", e => {
+  if (e.key === "Escape" && openMenu) { setMenu(null); e.stopPropagation(); }
+}, true);
 
 // --- Keyboard: KeyboardEvent.code to r86 PS/2 key names.
 const KEYS = {
@@ -529,37 +703,100 @@ canvas.addEventListener("keyup", e => key(e, false));
 canvas.addEventListener("blur", releaseKeys);
 window.addEventListener("blur", releaseKeys);
 
-// --- Mouse: relative PS/2 motion under pointer lock; moves are coalesced
-// while waiting in the queue.
+// --- Mouse. While the guest's r86 tools helper takes absolute input
+// (mouse_absolute in status), the guest pointer follows the host pointer 1:1;
+// otherwise relative PS/2 motion under pointer lock. mouse-mode "relative"
+// keeps capturing, for games. Moves are coalesced while waiting in the queue.
 const BUTTONS = ["left", "middle", "right"];
+let mouseMode = "auto", absolute = false, pressed = 0, wheelCarry = 0, lastPointer = null;
+function showMouseState() {
+  const locked = document.pointerLockElement === canvas;
+  $("mouse-state").textContent = absolute ? "Mouse: 1:1"
+    : locked ? "Mouse: captured · Esc releases" : "Mouse: click the screen to capture";
+  $("mouse-release").disabled = !locked;
+}
+function showMouse(json) {
+  if (!json?.mouse_mode) return;
+  mouseMode = json.mouse_mode;
+  absolute = json.mouse_absolute;
+  if (absolute && document.pointerLockElement === canvas) document.exitPointerLock();
+  canvas.style.cursor = absolute ? "crosshair" : "";
+  for (const item of document.querySelectorAll("[data-mode]")) {
+    item.setAttribute("aria-checked", item.dataset.mode === mouseMode);
+  }
+  showMouseState();
+}
+for (const item of document.querySelectorAll("[data-mode]")) {
+  item.onclick = async () => showMouse(await command({ cmd: "mouse-mode", mode: item.dataset.mode }));
+}
+$("mouse-release").onclick = () => document.exitPointerLock();
+
 canvas.addEventListener("click", () => {
   canvas.focus();
-  if (document.pointerLockElement !== canvas) canvas.requestPointerLock();
+  if (!absolute && document.pointerLockElement !== canvas) canvas.requestPointerLock();
 });
 canvas.addEventListener("contextmenu", e => e.preventDefault());
-document.addEventListener("pointerlockchange", () => {
-  $("hint").hidden = document.pointerLockElement === canvas;
-});
-// Movement is in CSS pixels; convert to guest pixels so the guest pointer
-// tracks the hand as the screen is shown scaled. Fractions carry over.
+document.addEventListener("pointerlockchange", showMouseState);
+
+// Absolute positions are 0..65535 across the guest screen. Only a pending
+// move is coalesced; a button or wheel message keeps its place in order.
+function sendPointer(e, move, wheel = 0) {
+  lastPointer = { clientX: e.clientX, clientY: e.clientY };
+  const r = canvas.getBoundingClientRect();
+  const at = (v, start, size) => Math.round(Math.min(Math.max((v - start) / size, 0), 1) * 65535);
+  const x = at(e.clientX, r.left, r.width), y = at(e.clientY, r.top, r.height);
+  if (move && mouse?.cmd === "pointer") { mouse.x = x; mouse.y = y; return; }
+  const msg = { cmd: "pointer", x, y, buttons: pressed, wheel };
+  mouse = move ? msg : null;
+  command(msg);
+}
+
+// Relative movement is in CSS pixels; convert to guest pixels so the guest
+// pointer tracks the hand as the screen is shown scaled. Fractions carry over.
 let carryX = 0, carryY = 0;
 canvas.addEventListener("mousemove", e => {
-  if (document.pointerLockElement !== canvas || !ready) return;
+  if (!ready) return;
+  if (absolute) return sendPointer(e, true);
+  if (document.pointerLockElement !== canvas) return;
   carryX += e.movementX * canvas.width / canvas.clientWidth;
   carryY += e.movementY * canvas.height / canvas.clientHeight;
   const dx = Math.trunc(carryX), dy = Math.trunc(carryY);
   carryX -= dx; carryY -= dy;
   if (!dx && !dy) return;
-  if (mouse) { mouse.dx += dx; mouse.dy += dy; return; }
+  if (mouse?.cmd === "mouse-move") { mouse.dx += dx; mouse.dy += dy; return; }
   mouse = { cmd: "mouse-move", dx, dy };
   command(mouse);
 });
-for (const [type, down] of [["mousedown", true], ["mouseup", false]]) {
-  canvas.addEventListener(type, e => {
-    if (document.pointerLockElement !== canvas || !BUTTONS[e.button] || !ready) return;
+// e.buttons has the protocol's bits: 1 left, 2 right, 4 middle.
+function mouseButton(e, down) {
+  if (!ready || !BUTTONS[e.button]) return;
+  if (absolute) {
+    if (!down && !pressed) return;
+    pressed = e.buttons & 7;
+    sendPointer(e, false);
+  } else if (document.pointerLockElement === canvas) {
+    mouse = null;
     command({ cmd: "mouse-button", button: BUTTONS[e.button], down });
-  });
+  }
 }
+canvas.addEventListener("mousedown", e => mouseButton(e, true));
+// A release outside the screen still ends an absolute drag.
+window.addEventListener("mouseup", e => mouseButton(e, false));
+window.addEventListener("blur", () => {
+  if (!absolute || !pressed || !lastPointer) return;
+  pressed = 0;
+  sendPointer(lastPointer, false);
+});
+// Wheel notches: about 100 pixels or 3 lines each; up is positive.
+canvas.addEventListener("wheel", e => {
+  if (!absolute || !ready) return;
+  e.preventDefault();
+  wheelCarry -= e.deltaMode ? e.deltaY / 3 : e.deltaY / 100;
+  const steps = Math.trunc(wheelCarry);
+  if (!steps) return;
+  wheelCarry -= steps;
+  sendPointer(e, false, steps);
+}, { passive: false });
 
 // --- Virtual media. Uploads use their own connection, one request at a
 // time, so the screen keeps updating. 1 MiB binary frames carry the data.
@@ -814,7 +1051,6 @@ function showPower(off) {
   $("poweron").hidden = !off;
   $("files").hidden = !off;
   canvas.hidden = off;
-  $("hint").hidden = off || document.pointerLockElement === canvas;
   $("drop").textContent = off ? "Drop files or folders to copy them to the hard disk"
                               : "Drop an ISO, files or folders to insert them as a CD";
   setUi(ready);
