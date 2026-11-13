@@ -43,6 +43,7 @@ __pycache__/
 /assets/*
 !/assets/freedos.json
 !/assets/freedos-kit.sha256
+!/assets/r86_tools.json
 /private_docs/
 /private/
 
@@ -51,3 +52,4 @@ __pycache__/
 *.md
 !/README.md
 !/KNOWN_ISSUES.md
+!/assets/README.md
