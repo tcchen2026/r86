@@ -96,6 +96,11 @@
   #message { flex: 1; text-align: right; }
   #message.err { color: var(--bad); }
 
+  #off { position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; }
+  #off h2 { font-size: 20px; font-weight: normal; margin: 0; color: var(--muted); }
+  #off .buttons { display: flex; gap: 8px; }
+  #off button { padding: 8px 16px; }
   #files { position: absolute; inset: 0; overflow: auto; padding: 12px 16px; }
   #files .bar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-bottom: 8px; }
   #drives button.on { border-color: var(--accent); color: var(--accent); }
@@ -165,7 +170,6 @@
         <label id="pick-iso-label" class="off" title="The ISO stays on this computer; the guest reads it through this page, so keep the page open">Insert ISO…<input id="pick-iso" type="file" accept=".iso" hidden></label>
         <label id="pick-files-label" class="off">Insert files as a CD…<input id="pick-files" type="file" multiple hidden></label>
         <label id="pick-dir-label" class="off">Insert a folder as a CD…<input id="pick-dir" type="file" webkitdirectory hidden></label>
-        <button id="tools" hidden title="Display driver and mouse helper. Windows opens the installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 tools</button>
         <hr>
         <button id="eject" disabled>Eject</button>
       </div>
@@ -208,6 +212,7 @@
       <div class="items" role="menu">
         <button id="shot">Screenshot</button>
         <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
+        <button id="tools" hidden title="Display driver and mouse helper. Windows opens the installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 Tools…</button>
         <hr>
         <button data-panel="serial">Serial console</button>
         <button data-panel="events">Event log</button>
@@ -238,6 +243,18 @@
   <div id="left">
     <div id="stage">
       <div id="wrap"><canvas id="screen" width="720" height="400" tabindex="0"></canvas></div>
+      <div id="off" hidden>
+        <svg width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="r86">
+          <rect width="96" height="96" rx="18" fill="#000080"/>
+          <text x="48" y="60" fill="#fff" text-anchor="middle"
+            style="font: bold 34px system-ui, sans-serif">r86</text>
+        </svg>
+        <h2>Powered off</h2>
+        <div class="buttons">
+          <button id="off-poweron">Power on</button>
+          <button id="off-files">Files on Disk…</button>
+        </div>
+      </div>
       <div id="files" hidden>
         <div class="bar">
           <strong>Hard disk</strong><span id="drives"></span>
@@ -247,6 +264,7 @@
           <label class="button">Upload files<input id="f-pick" type="file" multiple hidden></label>
           <label class="button">Upload a folder<input id="f-pick-dir" type="file" webkitdirectory hidden></label>
           <button id="f-refresh">Refresh</button>
+          <button id="f-close">Close</button>
         </div>
         <div id="crumbs"></div>
         <div id="f-status"></div>
@@ -287,8 +305,8 @@
   <h2>Using the console</h2>
   <ul>
     <li>Click the screen to type into the guest.</li>
-    <li>Mouse: with the r86 tools helper running in Windows (Virtual Media → Install
-      r86 tools), the guest pointer follows yours 1:1. Otherwise, or with Mouse →
+    <li>Mouse: with the r86 tools helper running in Windows (Tools → Install r86
+      Tools), the guest pointer follows yours 1:1. Otherwise, or with Mouse →
       Captured, a click captures the mouse and Esc releases it.</li>
     <li>Virtual Media → Insert ISO reads the image from this computer as the guest needs
       it: keep this page open. Files and folders become a new CD.</li>
@@ -320,8 +338,8 @@
     Windows offers it after a restart. Windows 2000/XP offer only the VGA BIOS's modes.</p>
   <form id="display-add-form" method="dialog">
     <label for="display-w">Size</label>
-    <span><input id="display-w" type="number" min="8" max="1920" step="8" value="640"> ×
-      <input id="display-h" type="number" min="8" max="1600" value="340"></span>
+    <span><input id="display-w" type="number" min="320" max="1920" step="8" value="640"> ×
+      <input id="display-h" type="number" min="170" max="1600" value="340"></span>
     <label for="display-bits">Colour</label>
     <select id="display-bits">
       <option value="8">256 colours</option><option value="16" selected>16-bit</option>
@@ -593,7 +611,7 @@ function setUi(on) {
   $("dot").classList.toggle("on", on);
   $("resume").disabled = !on || running || poweredOff;
   $("pause").disabled = !on || !running;
-  $("poweron").disabled = !on || !poweredOff;
+  $("poweron").disabled = $("off-poweron").disabled = $("off-files").disabled = !on || !poweredOff;
   for (const id of ["reset", "power", "poweroff"]) $(id).disabled = !on || poweredOff;
   for (const item of document.querySelectorAll("[data-keys], #type-open, #release, #text")) {
     item.disabled = !on || poweredOff;
@@ -661,7 +679,10 @@ function showDisplay(json) {
     const mode = `${r.width} × ${r.height}, ${r.bits <= 8 ? "256 colours" : r.bits + "-bit"}`;
     if (adding && r.result in addText) {
       adding = false;
-      msgbox("Add custom resolution", `${mode} ${addText[r.result]}`);
+      const small = (r.width < 640 || r.height < 480) && (r.result === "added" || r.result === "listed")
+        ? " Sizes under 640 × 480 need the display driver from a current r86 tools CD: Install r86 "
+          + "Tools, Update with the display driver ticked." : "";
+      msgbox("Add custom resolution", `${mode} ${addText[r.result]}${small}`);
     } else {
       note(`Guest resolution ${mode}: ${displayText[r.result] ?? r.result}`,
         r.result === "failed" || r.result === "unavailable");
@@ -694,11 +715,12 @@ $("display-apply").onclick = async () => {
 };
 $("display-add-open").onclick = () => $("display-add").showModal();
 $("display-add-close").onclick = () => $("display-add").close();
-// r86's display card: widths are multiples of 8 up to 1920, heights up to 1600.
+// The r86 tools CD's VMDisp9x takes 320x170 and up; r86's display card takes
+// widths in multiples of 8 up to 1920 and heights up to 1600.
 $("display-add-apply").onclick = async () => {
   const [width, height, bits] = ["display-w", "display-h", "display-bits"].map(id => Number($(id).value));
-  if (!(width >= 8 && width <= 1920 && width % 8 === 0 && height >= 8 && height <= 1600)) {
-    msgbox("Add custom resolution", "The width must be a multiple of 8 from 8 to 1920, and the height from 8 to 1600.");
+  if (!(width >= 320 && width <= 1920 && width % 8 === 0 && height >= 170 && height <= 1600)) {
+    msgbox("Add custom resolution", "The width must be a multiple of 8 from 320 to 1920, and the height from 170 to 1600.");
     return;
   }
   if (await command({ cmd: "display-mode", add: true, width, height, bits })) {
@@ -1085,6 +1107,8 @@ $("eject").onclick = async () => {
 };
 // The server's own tools ISO (r86_tools.iso beside r86-run): nothing to upload.
 $("tools").onclick = async () => {
+  if (mediaInfo?.inserted && mediaInfo.name !== "r86 tools"
+      && !confirm(`Replace ${mediaInfo.name ?? "the inserted CD"} with the r86 tools CD?`)) return;
   const json = await command({ cmd: "media-tools" });
   if (!json) return;
   remoteDisc?.sock.close(); // The server has already released that disc.
@@ -1164,19 +1188,28 @@ $("import-pick").onchange = () => {
   $("import-pick").value = "";
 };
 
-// --- Power state. While off, the screen area shows the hard disk's files.
+// --- Power state. While off, the screen area shows a powered-off panel; its
+// Files on Disk opens the hard disk's files.
 let poweredOff = false;
 function showPower(off) {
   if (off === poweredOff) return;
   poweredOff = off;
   $("poweron").hidden = !off;
-  $("files").hidden = !off;
+  $("off").hidden = !off;
+  $("files").hidden = true;
   canvas.hidden = off;
   $("drop").textContent = off ? "Drop files or folders to copy them to the hard disk"
                               : "Drop an ISO, files or folders to insert them as a CD";
   setUi(ready);
-  if (off) loadDrives();
 }
+async function showFiles(open) {
+  $("off").hidden = open;
+  $("files").hidden = !open;
+  if (open) await loadDrives();
+}
+$("off-poweron").onclick = () => command({ cmd: "power-on" });
+$("off-files").onclick = () => showFiles(true);
+$("f-close").onclick = () => showFiles(false);
 
 let drive = null, folder = [], driveFree = {};
 const diskPath = parts => `${drive}:/${parts.join("/")}`;
@@ -1369,7 +1402,11 @@ addEventListener("drop", async e => {
   for (const entry of entries) await collect(entry, "", items);
   if (importing) { importImage(items.find(i => !i.dir)?.file); return; }
   if (uploading) { note("an upload is already running", true); return; }
-  if (poweredOff) { copyToDisk(items); return; }
+  if (poweredOff) {
+    if ($("files").hidden) await showFiles(true);
+    copyToDisk(items);
+    return;
+  }
   if (!mediaInfo?.drive) { note("CD: this VM has no CD drive", true); return; }
   const label = entries.length === 1 && entries[0].isDirectory ? entries[0].name : "FILES";
   insertMedia(items, label);
