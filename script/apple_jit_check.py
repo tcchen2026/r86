@@ -169,7 +169,7 @@ def sign(binary, work, name, entitlements):
     subprocess.run(["codesign", "--force", "--sign", "-", "--options", "runtime",
                     "--timestamp=none", "--entitlements", plist, signed], check=True)
     subprocess.run(["codesign", "--verify", "--strict", signed], check=True)
-    actual = subprocess.check_output(["codesign", "-d", "--entitlements", "-", signed])
+    actual = subprocess.check_output(["codesign", "-d", "--entitlements", "-", "--xml", signed])
     require(plistlib.loads(actual) == entitlements, "signed entitlements differ")
     flags = subprocess.run(["codesign", "-dv", signed], text=True,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True).stdout

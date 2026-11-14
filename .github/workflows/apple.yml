@@ -3,21 +3,6 @@
 name: Mac app
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - apple/**
-      - src/**
-      - Cargo.toml
-      - Cargo.lock
-      - build.rs
-      - firmware/seabios/**
-      - script/build_macos.sh
-      - script/apple_jit_check.py
-      - benchmarks/reactos_livecd_boot_to_langsel/**
-      - tests/roms/wasm_jit_lfb.asm
-      - tests/apple/jit_regions.rs
-      - .github/workflows/apple.yml
   workflow_dispatch:
 
 jobs:
