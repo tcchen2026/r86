@@ -1982,7 +1982,7 @@ fn stop_listening(stop: &AtomicBool, port: u16) {
 }
 
 /// The address other devices reach this host at: the source address of the
-/// default route (connecting a UDP socket sends nothing), else, on a LAN
+/// default route (connecting a UDP socket sends nothing), else, on a Unix LAN
 /// without one, an interface's IPv4 address, preferring interfaces that are up.
 #[allow(dead_code)]
 fn lan_address() -> Option<String> {
@@ -1992,9 +1992,13 @@ fn lan_address() -> Option<String> {
         let ip = socket.local_addr().ok()?.ip();
         (!ip.is_unspecified()).then(|| ip.to_string())
     };
-    routed().or_else(interface_address)
+    #[cfg(unix)]
+    return routed().or_else(interface_address);
+    #[cfg(not(unix))]
+    routed()
 }
 
+#[cfg(unix)]
 #[allow(dead_code)]
 fn interface_address() -> Option<String> {
     let mut list: *mut libc::ifaddrs = std::ptr::null_mut();

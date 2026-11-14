@@ -1,0 +1,67 @@
+// r86-win.exe's resources: icon, manifest, the library and New VM dialogs
+// and version (build.rs compiles them with windres; R86_FILEVERSION and
+// R86_VERSION come from there). Control IDs match main.rs.
+#include <windows.h>
+
+1 ICON "r86.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "r86-win.manifest"
+
+// The library: the app's main window
+100 DIALOGEX 0, 0, 330, 190
+STYLE DS_CENTER | WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CAPTION "r86"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT "Virtual machines", -1, 7, 7, 196, 9
+    LISTBOX 10, 7, 18, 196, 165, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON "&New...", 11, 210, 18, 113, 15
+    DEFPUSHBUTTON "&Start", IDOK, 210, 36, 113, 15
+    PUSHBUTTON "&Delete...", 12, 210, 54, 113, 15
+    PUSHBUTTON "Show &files", 13, 210, 72, 113, 15
+    LTEXT "", 14, 210, 96, 113, 87
+END
+
+// New virtual machine
+101 DIALOGEX 0, 0, 260, 126
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "New virtual machine"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT "&Name", -1, 7, 9, 70, 9
+    EDITTEXT 20, 80, 7, 173, 13, ES_AUTOHSCROLL
+    LTEXT "&Operating system", -1, 7, 27, 70, 9
+    COMBOBOX 21, 80, 25, 173, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "&CD image", -1, 7, 45, 70, 9
+    EDITTEXT 22, 80, 43, 119, 13, ES_AUTOHSCROLL
+    PUSHBUTTON "&Browse...", 23, 203, 42, 50, 15
+    LTEXT "&Memory (MB)", -1, 7, 63, 70, 9
+    EDITTEXT 24, 80, 61, 45, 13, ES_NUMBER
+    LTEXT "&Disk (MB)", -1, 140, 63, 50, 9
+    EDITTEXT 25, 195, 61, 58, 13, ES_NUMBER
+    LTEXT "Memory and disk follow the operating system. With a CD image, the VM starts from it to install.", -1, 7, 81, 246, 18
+    DEFPUSHBUTTON "Create", IDOK, 147, 105, 50, 15
+    PUSHBUTTON "Cancel", IDCANCEL, 203, 105, 50, 15
+END
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION R86_FILEVERSION
+PRODUCTVERSION R86_FILEVERSION
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "FileDescription", "r86"
+            VALUE "FileVersion", R86_VERSION
+            VALUE "OriginalFilename", "r86-win.exe"
+            VALUE "ProductName", "r86"
+            VALUE "ProductVersion", R86_VERSION
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

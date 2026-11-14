@@ -1,10 +1,12 @@
 //! One running VM: its core thread and the state the app thread may touch.
 //! The core thread owns the Machine, disks, network and VM lock. The app
 //! queues input and commands, copies the latest frame and pulls audio.
+//! Shared by the Mac app (apple/) and the Windows app (win32/).
 
 use std::collections::VecDeque;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -30,7 +32,12 @@ pub enum Command {
     ReleaseInput,
     Key(InputKey, bool),
     Mouse(i32, i32, Ps2ButtonState),
+    /// Absolute position, 0..=65535 across the screen, buttons (1 left, 2
+    /// right, 4 middle) and wheel steps, for the guest's r86 tools helper.
+    #[cfg_attr(feature = "apple", allow(dead_code))] // The Mac app does not send it yet.
+    Pointer(u16, u16, u8, i16),
     Cd(Option<PathBuf>),
+    #[cfg_attr(feature = "win32-frontend", allow(dead_code))] // no volume control on Windows yet
     Volume(u8),
 }
 
@@ -70,6 +77,8 @@ pub struct Shared {
     pub frame: Mutex<Frame>,
     pub audio: Mutex<VecDeque<i16>>,
     pub status: Mutex<Status>,
+    /// The guest's r86 tools helper takes absolute pointer input.
+    pub pointer: AtomicBool,
 }
 
 pub struct Running {
@@ -97,6 +106,7 @@ impl Running {
                 ips: 0,
                 messages: VecDeque::new(),
             }),
+            pointer: AtomicBool::new(false),
         });
         let thread_shared = shared.clone();
         let (ready, started) = std::sync::mpsc::sync_channel(1);
@@ -319,6 +329,7 @@ impl Core {
             }
             let report = self.machine.run_steps(SLICE_STEPS)?;
             self.pump_audio();
+            (self.shared.pointer).store(self.machine.guest_pointer_active(), Ordering::Relaxed);
             let now = Instant::now();
             if now >= next_frame && self.machine.vga().whole_frame_dirty() {
                 self.publish_frame();
@@ -396,6 +407,11 @@ impl Core {
                         break;
                     }
                 }
+            }
+            Command::Pointer(x, y, buttons, wheel) => {
+                // The only failure, a full queue once the helper stops
+                // polling, drops this transition; the PS/2 mouse takes over.
+                let _ = self.machine.inject_pointer(x, y, buttons & 7, wheel);
             }
             Command::Cd(path) => {
                 let result = match &path {

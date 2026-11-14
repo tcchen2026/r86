@@ -14,6 +14,7 @@ mod keymap;
 #[path = "../keys.rs"]
 #[allow(dead_code)]
 mod keys;
+#[path = "../runner.rs"]
 mod runner;
 #[path = "../vm_store.rs"]
 #[allow(dead_code)]

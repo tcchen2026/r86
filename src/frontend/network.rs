@@ -84,12 +84,6 @@ impl UserNetwork {
     /// Forward listeners bind host loopback only. Call Machine::attach_network
     /// before boot, then poll here on the same core thread each frontend slice.
     pub fn new(forwards: &[PortForward]) -> io::Result<Self> {
-        if !cfg!(unix) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "user networking needs a Unix host",
-            ));
-        }
         let mut listeners = Vec::new();
         for fwd in forwards {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, fwd.host_port))?;
@@ -927,33 +921,53 @@ const WRITABLE: i16 = 4;
 const ERROR: i16 = 8;
 const HANGUP: i16 = 16;
 
-#[cfg(unix)]
+/// What each listener, then each connection, is ready for (READABLE, ...).
 fn readiness(listeners: &[(TcpListener, u16)], connections: &[Connection]) -> io::Result<Vec<i16>> {
-    use std::os::fd::AsRawFd;
-    let mut fds: Vec<libc::pollfd> = listeners
+    let mut wanted: Vec<(Option<Raw>, i16)> = listeners
         .iter()
-        .map(|(s, _)| libc::pollfd {
-            fd: s.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        })
+        .map(|(s, _)| (Some(raw(s)), READABLE))
         .collect();
     for c in connections {
         let mut events = 0;
         if c.phase == Phase::Established {
             if c.sent.is_none() && c.window != 0 && !c.host_fin {
-                events |= libc::POLLIN;
+                events |= READABLE;
             }
             if !c.to_host.is_empty() || c.fin_pending {
-                events |= libc::POLLOUT;
+                events |= WRITABLE;
             }
         }
-        fds.push(libc::pollfd {
-            fd: c.socket.as_ref().map_or(-1, AsRawFd::as_raw_fd),
-            events,
-            revents: 0,
-        });
+        wanted.push((c.socket.as_ref().map(raw), events));
     }
+    poll(&wanted)
+}
+
+#[cfg(unix)]
+type Raw = std::os::fd::RawFd;
+#[cfg(unix)]
+fn raw(socket: &impl std::os::fd::AsRawFd) -> Raw {
+    socket.as_raw_fd()
+}
+
+/// Polls without waiting; a socket of None is skipped and reports nothing.
+#[cfg(unix)]
+fn poll(wanted: &[(Option<Raw>, i16)]) -> io::Result<Vec<i16>> {
+    let mut fds: Vec<libc::pollfd> = wanted
+        .iter()
+        .map(|&(fd, events)| libc::pollfd {
+            fd: fd.unwrap_or(-1),
+            events: if events & READABLE != 0 {
+                libc::POLLIN
+            } else {
+                0
+            } | if events & WRITABLE != 0 {
+                libc::POLLOUT
+            } else {
+                0
+            },
+            revents: 0,
+        })
+        .collect();
     if fds.iter().any(|f| f.fd >= 0) {
         // poll reads/writes only this initialized array; it retains no pointers.
         let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 0) };
@@ -985,12 +999,61 @@ fn readiness(listeners: &[(TcpListener, u16)], connections: &[Connection]) -> io
         .collect())
 }
 
-#[cfg(not(unix))]
-fn readiness(_: &[(TcpListener, u16)], _: &[Connection]) -> io::Result<Vec<i16>> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "user networking needs a Unix host",
-    ))
+#[cfg(windows)]
+type Raw = std::os::windows::io::RawSocket;
+#[cfg(windows)]
+fn raw(socket: &impl std::os::windows::io::AsRawSocket) -> Raw {
+    socket.as_raw_socket()
+}
+
+/// Polls without waiting (WSAPoll); a socket of None is skipped.
+#[cfg(windows)]
+fn poll(wanted: &[(Option<Raw>, i16)]) -> io::Result<Vec<i16>> {
+    use windows::Win32::Networking::WinSock::*;
+    let mut fds: Vec<WSAPOLLFD> = wanted
+        .iter()
+        .map(|&(socket, events)| WSAPOLLFD {
+            fd: socket.map_or(INVALID_SOCKET, |s| SOCKET(s as usize)),
+            events: WSAPOLL_EVENT_FLAGS(
+                if events & READABLE != 0 {
+                    POLLRDNORM.0
+                } else {
+                    0
+                } | if events & WRITABLE != 0 {
+                    POLLWRNORM.0
+                } else {
+                    0
+                },
+            ),
+            revents: WSAPOLL_EVENT_FLAGS(0),
+        })
+        .collect();
+    if fds.iter().any(|f| f.fd != INVALID_SOCKET) {
+        // SAFETY: WSAPoll reads/writes only this initialized array.
+        if unsafe { WSAPoll(fds.as_mut_ptr(), fds.len() as u32, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(fds
+        .into_iter()
+        .map(|f| {
+            let r = f.revents.0;
+            let mut ready = 0;
+            if r & POLLRDNORM.0 != 0 {
+                ready |= READABLE;
+            }
+            if r & POLLWRNORM.0 != 0 {
+                ready |= WRITABLE;
+            }
+            if r & (POLLERR.0 | POLLNVAL.0) != 0 {
+                ready |= ERROR;
+            }
+            if r & POLLHUP.0 != 0 {
+                ready |= HANGUP;
+            }
+            ready
+        })
+        .collect())
 }
 
 fn abort_socket(socket: TcpStream) {
@@ -1010,6 +1073,30 @@ fn abort_socket(socket: TcpStream) {
                 libc::SO_LINGER,
                 (&linger as *const libc::linger).cast(),
                 std::mem::size_of_val(&linger) as libc::socklen_t,
+            );
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{
+            LINGER, SO_LINGER, SOCKET, SOL_SOCKET, setsockopt,
+        };
+        let linger = LINGER {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY: setsockopt copies the option bytes before returning.
+        unsafe {
+            let bytes = std::slice::from_raw_parts(
+                (&linger as *const LINGER).cast::<u8>(),
+                size_of::<LINGER>(),
+            );
+            setsockopt(
+                SOCKET(socket.as_raw_socket() as usize),
+                SOL_SOCKET,
+                SO_LINGER,
+                Some(bytes),
             );
         }
     }

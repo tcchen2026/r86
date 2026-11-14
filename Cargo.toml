@@ -8,7 +8,7 @@ autobins = false
 
 [features]
 default = ["host", "jit"]
-host = ["machine", "bus-instruction-context", "dep:flate2", "dep:toml", "dep:libc", "dep:fatfs", "dep:chrono"]
+host = ["machine", "bus-instruction-context", "dep:flate2", "dep:toml", "dep:libc", "dep:fatfs", "dep:chrono", "dep:windows"]
 machine = ["dep:font8x8"]
 web-frontend = ["machine"]
 wasm-jit = ["web-frontend", "jit"]
@@ -24,9 +24,15 @@ handheld-frontend = ["host", "toml/display"]
 handheld-sdl = ["handheld-frontend"]
 # The C API linked into the Mac app (apple/), built as a staticlib.
 apple = ["host", "toml/display"]
+# The Windows app (win32/, amd64 and arm64): VM library and VM windows on
+# Win32 and GDI, built with MinGW.
+win32-frontend = ["host", "toml/display"]
 jit = ["dep:hashbrown", "dep:dlmalloc"]
 # Compilation timing and unsupported-opcode counts, excluded from timing builds.
 jit-profile = ["jit"]
+# Thumb-2 backend for Armv7-M/Armv8-M Mainline cores (Cortex-M33 class). On
+# 32-bit ARM targets it replaces the ARMv6K backend.
+jit-t32 = ["jit"]
 # Standalone, non-production FPGA instruction-set experiment.
 r86chip = ["jit"]
 # Compile the same x86 interpreter with chip arithmetic/translation primitives.
@@ -43,6 +49,25 @@ sdl2 = { version = "0.37", optional = true }
 
 [dev-dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Windows hosts: guest networking's sockets, and the Windows app's Win32 and
+# GDI calls (win32-frontend).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Controls_Dialogs",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
@@ -63,6 +88,11 @@ required-features = ["host"]
 name = "r86-handheld"
 path = "src/frontend/handheld/main.rs"
 required-features = ["handheld-frontend"]
+
+[[bin]]
+name = "r86-win"
+path = "src/frontend/win32/main.rs"
+required-features = ["win32-frontend"]
 
 [[bin]]
 name = "r86-web"

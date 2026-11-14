@@ -325,16 +325,43 @@ fn safe_stem(name: &str, ext: &str) -> String {
     }
 }
 
-/// Fails before the upload when `dir` cannot hold `size` more bytes.
-fn check_space(dir: &Path, size: u64) -> Result<(), String> {
+/// Bytes available to this user in `dir`'s file system.
+#[cfg(unix)]
+fn free_space(dir: &Path) -> std::io::Result<u64> {
     use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: `path` is NUL-terminated and `stat` is a writable statvfs.
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
-        return Err(save_error(std::io::Error::last_os_error()));
+        return Err(std::io::Error::last_os_error());
     }
-    let free = stat.f_bavail as u64 * stat.f_frsize as u64;
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+
+#[cfg(windows)]
+fn free_space(dir: &Path) -> std::io::Result<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            dir: *const u16,
+            free: *mut u64,
+            total: *mut u64,
+            all: *mut u64,
+        ) -> i32;
+    }
+    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    let mut free = 0;
+    let null = std::ptr::null_mut();
+    // SAFETY: `path` is NUL-terminated; `free` is writable and the others may be NULL.
+    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, null, null) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(free)
+}
+
+/// Fails before the upload when `dir` cannot hold `size` more bytes.
+fn check_space(dir: &Path, size: u64) -> Result<(), String> {
+    let free = free_space(dir).map_err(save_error)?;
     if size > free {
         return Err(format!(
             "Not enough space on this device: {} MiB free.",

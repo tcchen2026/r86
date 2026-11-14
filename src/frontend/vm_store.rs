@@ -323,7 +323,11 @@ impl Vm {
             )?;
             file.sync_all()?;
             fs::rename(&temp, self.directory.join(CONFIG))?;
-            File::open(&self.directory)?.sync_all()
+            // Makes the rename durable. Windows cannot open a directory as a
+            // file and std offers no equivalent there.
+            #[cfg(unix)]
+            File::open(&self.directory)?.sync_all()?;
+            Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(temp);
