@@ -1,27 +1,38 @@
 //! One running VM: its core thread and the state the app thread may touch.
-//! The core thread owns the Machine, disks, network and VM lock. The app
-//! queues input and commands, copies the latest frame and pulls audio.
-//! Shared by the Mac app (apple/) and the Windows app (win32/).
+//! The core thread owns the Machine, disks, network, VM lock, the run's log
+//! (run_log.rs) and, while remote management is on, the web console
+//! (ws_frontend::Remote). The app queues input and commands, copies the
+//! latest frame and pulls audio. Shared by the Mac app (apple/) and the
+//! Windows app (win32/).
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::path::PathBuf;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use r86::devices::{Ps2ButtonState, RenderMode};
+use r86::devices::{Ps2ButtonState, RenderMode, VgaModeInfo};
 use r86::machine::{GuestStepStatus, Machine};
 use r86::network::UserNetwork;
 
 use super::keys::{self, InputKey};
+use super::run_log;
 use super::vm_store::Vm;
+use super::ws_frontend::Remote;
 
 const SLICE_STEPS: u64 = 200_000;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
 /// About a quarter second of 48 kHz stereo; older samples are dropped.
 const AUDIO_SAMPLES: usize = 48_000 / 4 * 2;
+/// The guest tools disc beside the firmware, for the console's media tools.
+const TOOLS_ISO: &str = "r86_tools.iso";
+/// Remote management listens on the first free port.
+const REMOTE_PORTS: std::ops::RangeInclusive<u16> = 8086..=8095;
+/// The longest a waiting core leaves a connected browser's requests queued.
+const REMOTE_POLL: Duration = Duration::from_millis(20);
 
 pub enum Command {
     Pause(bool),
@@ -37,8 +48,10 @@ pub enum Command {
     #[cfg_attr(feature = "apple", allow(dead_code))] // The Mac app does not send it yet.
     Pointer(u16, u16, u8, i16),
     Cd(Option<PathBuf>),
-    #[cfg_attr(feature = "win32-frontend", allow(dead_code))] // no volume control on Windows yet
     Volume(u8),
+    /// Start or stop remote management: the web console, for this computer
+    /// only, at Status::remote. It ends with the VM.
+    Remote(bool),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -63,6 +76,10 @@ pub struct Status {
     /// Guest instructions per second over the last second.
     pub ips: u64,
     pub messages: VecDeque<String>,
+    /// The web console's address while remote management is on.
+    pub remote: Option<String>,
+    /// The report of the fatal error that ended the run (run_log.rs).
+    pub log: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -92,8 +109,9 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Running {
-    /// Lock the VM, build its machine and start the core thread.
-    pub fn start(vm: Vm, firmware: PathBuf) -> Result<Self, String> {
+    /// Lock the VM, build its machine and start the core thread. A fatal
+    /// error's report goes to `logs` (run_log.rs).
+    pub fn start(vm: Vm, firmware: PathBuf, logs: PathBuf) -> Result<Self, String> {
         let lock_file = super::vm_store::lock_vm(&vm.directory)?;
         let no_jit = std::env::args().any(|arg| arg == "--no-jit");
         let shared = Arc::new(Shared {
@@ -105,6 +123,8 @@ impl Running {
                 state: State::Running,
                 ips: 0,
                 messages: VecDeque::new(),
+                remote: None,
+                log: None,
             }),
             pointer: AtomicBool::new(false),
         });
@@ -113,12 +133,13 @@ impl Running {
         let thread = std::thread::Builder::new()
             .name("r86 core".into())
             .spawn(move || {
+                let config = launch_config(&vm, no_jit);
+                run_log::start(&logs, &config);
                 // MAP_JIT ownership starts here, including partial startup
                 // failures. Machine/Engine never move between app/core threads.
                 let core = (|| -> Result<Core, String> {
                     set_core_qos()?;
-                    let mut machine =
-                        launch_config(&vm, no_jit).machine(&firmware, "vgabios-stdvga.bin")?;
+                    let mut machine = config.machine(&firmware, "vgabios-stdvga.bin")?;
                     machine.enable_boot_splash();
                     let network = if vm.network {
                         machine.attach_network();
@@ -133,8 +154,12 @@ impl Running {
                         vm,
                         machine,
                         network,
+                        remote: None,
+                        tools_iso: firmware.join(TOOLS_ISO),
                         shared: thread_shared,
                         paused: false,
+                        boots: 0,
+                        display: None,
                         buttons: Ps2ButtonState::default(),
                         held: Vec::new(),
                         samples: Vec::new(),
@@ -147,9 +172,11 @@ impl Running {
                         }
                     }
                     Err(error) => {
+                        run_log::fatal(&error, None, None);
                         let _ = ready.send(Err(error));
                     }
                 }
+                run_log::end();
             })
             .map_err(|err| format!("Cannot start the VM thread: {err}"))?;
         // Preserve synchronous launch errors without constructing native state
@@ -261,8 +288,14 @@ struct Core {
     vm: Vm,
     machine: Machine,
     network: Option<UserNetwork>,
+    remote: Option<Remote>,
+    tools_iso: PathBuf,
     shared: Arc<Shared>,
     paused: bool,
+    /// The machine's reset count, to notice the guest's resets.
+    boots: u64,
+    /// The last display mode shown, for the run's events.
+    display: Option<VgaModeInfo>,
     buttons: Ps2ButtonState,
     /// Keys the app holds down in the guest, released on pause and reset.
     held: Vec<InputKey>,
@@ -285,15 +318,21 @@ impl Core {
                 (State::Failed, Some(format!("r86 internal error: {text}")))
             }
         };
-        let flushed = self.machine.flush_disks().err();
+        let flushed =
+            (self.machine.flush_disks().err()).map(|err| format!("Disk flush failed: {err}"));
+        // A stop or panic already wrote the run's report.
+        let log = match message.as_ref().or(flushed.as_ref()) {
+            Some(error) => run_log::fatal(error, Some(&mut self.machine), None),
+            None => None,
+        };
         drop(lock_file);
         let mut status = lock(&shared.status);
         status.state = state;
         status.ips = 0;
+        status.remote = None;
+        status.log = log;
         status.messages.extend(message);
-        status
-            .messages
-            .extend(flushed.map(|err| format!("Disk flush failed: {err}")));
+        status.messages.extend(flushed);
     }
 
     fn execute(&mut self) -> Result<(), String> {
@@ -310,15 +349,42 @@ impl Core {
             for command in commands {
                 self.apply(command)?;
             }
+            if let Some(remote) = &mut self.remote {
+                remote.poll(&mut self.machine);
+                if let Some(iso) = remote.take_disc_change() {
+                    let name = iso.as_deref().and_then(Path::file_name);
+                    let name = name.map_or("ejected or in memory".into(), |n| n.to_string_lossy());
+                    self.event(&format!("CD from the web console: {name}"));
+                    self.vm.cdrom = true;
+                    self.vm.iso = iso;
+                    // This thread holds the VM lock.
+                    self.vm.save_locked()?;
+                }
+                // The console's Power off ends the session, like the app's.
+                if self.machine.powered_off() {
+                    self.event("powered off from the web console");
+                    return Ok(());
+                }
+                // Its Pause and Resume are the app's.
+                let paused = !self.remote.as_ref().is_some_and(Remote::running);
+                if paused != self.paused {
+                    self.event(if paused {
+                        "paused from the web console"
+                    } else {
+                        "resumed from the web console"
+                    });
+                }
+                if paused && !self.paused {
+                    self.release_input();
+                }
+                self.paused = paused;
+            }
             if self.paused {
                 self.publish_state(State::Paused, 0);
+                let wait = self.remote_wait(Duration::from_millis(200));
                 let input = lock(&self.shared.input);
                 if input.commands.is_empty() && !input.stop {
-                    drop(
-                        self.shared
-                            .wake
-                            .wait_timeout(input, Duration::from_millis(200)),
-                    );
+                    drop(self.shared.wake.wait_timeout(input, wait));
                 }
                 second = (Instant::now(), self.machine.step_count());
                 continue;
@@ -328,8 +394,15 @@ impl Core {
                     .poll(&mut self.machine)
                     .map_err(|e| format!("network: {e}"))?;
             }
-            let report = self.machine.run_steps(SLICE_STEPS)?;
+            let report = match &mut self.remote {
+                Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
+                None => self.machine.run_steps(SLICE_STEPS)?,
+            };
             self.pump_audio();
+            if self.machine.reset_count() != self.boots {
+                self.boots = self.machine.reset_count();
+                self.event("reset by the guest");
+            }
             (self.shared.pointer).store(self.machine.guest_pointer_active(), Ordering::Relaxed);
             let now = Instant::now();
             if now >= next_frame && self.machine.vga().whole_frame_dirty() {
@@ -346,15 +419,21 @@ impl Core {
                 Some(GuestStepStatus::Halted) => {
                     let wait = self.machine.halted_wait_duration();
                     let wait = self.network.as_ref().map_or(wait, |n| n.limit_wait(wait));
+                    let wait = self.remote_wait(wait);
                     let input = lock(&self.shared.input);
                     if input.commands.is_empty() && !input.stop {
                         drop(self.shared.wake.wait_timeout(input, wait));
                     }
                 }
-                Some(GuestStepStatus::PoweredOff) => return Ok(()),
+                Some(GuestStepStatus::PoweredOff) => {
+                    self.event("powered off by the guest");
+                    return Ok(());
+                }
                 Some(GuestStepStatus::Stopped { message, eip }) => {
                     let at = eip.map_or(String::new(), |eip| format!(" at EIP {eip:#010x}"));
-                    return Err(format!("The VM stopped{at}: {message}"));
+                    let error = format!("The VM stopped{at}: {message}");
+                    run_log::fatal(&error, Some(&mut self.machine), eip);
+                    return Err(error);
                 }
                 _ => {}
             }
@@ -364,18 +443,33 @@ impl Core {
     fn apply(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::Pause(paused) => {
+                if paused != self.paused {
+                    self.event(if paused { "paused" } else { "resumed" });
+                }
                 self.paused = paused;
+                if let Some(remote) = &mut self.remote {
+                    remote.set_running(&self.machine, !paused);
+                }
                 if paused {
                     self.release_input();
                 }
             }
             Command::Reset => {
-                self.machine.reboot()?;
+                self.event("reset");
+                match &mut self.remote {
+                    Some(remote) => remote.reset(&mut self.machine)?,
+                    None => self.machine.reboot()?,
+                }
+                self.boots = self.machine.reset_count();
                 self.held.clear();
                 self.buttons = Ps2ButtonState::default();
             }
-            Command::PowerButton => self.machine.press_power_button(),
+            Command::PowerButton => {
+                self.event("power button");
+                self.machine.press_power_button();
+            }
             Command::CtrlAltDel => {
+                self.event("Ctrl+Alt+Del");
                 for name in ["controlleft", "altleft", "delete"] {
                     keys::inject_named_key(&mut self.machine, name, true)?;
                 }
@@ -415,6 +509,8 @@ impl Core {
                 let _ = self.machine.inject_pointer(x, y, buttons & 7, wheel);
             }
             Command::Cd(path) => {
+                let name = path.as_deref().and_then(Path::file_name);
+                let name = name.map(|n| n.to_string_lossy().into_owned());
                 let result = match &path {
                     Some(path) => File::open(path)
                         .map_err(|err| format!("Cannot open {}: {err}", path.display()))
@@ -424,20 +520,30 @@ impl Core {
                         .change_cdrom(Vec::new())
                         .map_err(str::to_string),
                 };
-                let message = match result {
-                    Ok(()) => {
-                        self.vm.cdrom = true;
-                        self.vm.iso = path;
-                        // This thread holds the VM lock.
-                        self.vm.save_locked()?;
-                        if self.vm.iso.is_some() {
-                            "CD inserted".into()
-                        } else {
-                            "CD ejected".into()
+                let message =
+                    match result {
+                        Ok(()) => {
+                            self.event(&name.as_ref().map_or("CD ejected".into(), |name| {
+                                format!("CD inserted: {name}")
+                            }));
+                            if let Some(remote) = &mut self.remote {
+                                remote.media_changed(&self.machine, name);
+                            }
+                            self.vm.cdrom = true;
+                            self.vm.iso = path;
+                            // This thread holds the VM lock.
+                            self.vm.save_locked()?;
+                            if self.vm.iso.is_some() {
+                                "CD inserted".into()
+                            } else {
+                                "CD ejected".into()
+                            }
                         }
-                    }
-                    Err(err) => err,
-                };
+                        Err(err) => {
+                            self.event(&err);
+                            err
+                        }
+                    };
                 lock(&self.shared.status).messages.push_back(message);
             }
             Command::Volume(volume) => {
@@ -454,8 +560,65 @@ impl Core {
                 }
                 self.vm.save_locked()?;
             }
+            Command::Remote(on) => {
+                if on == self.remote.is_some() {
+                    return Ok(());
+                }
+                let message = match self.remote.take() {
+                    Some(remote) => {
+                        remote.close(&mut self.machine);
+                        "Remote management stopped".to_string()
+                    }
+                    None => match self.start_remote() {
+                        Ok(remote) => {
+                            let message = format!("Remote management: open {}", remote.url());
+                            self.remote = Some(remote);
+                            message
+                        }
+                        Err(err) => err,
+                    },
+                };
+                self.event(&message);
+                let mut status = lock(&self.shared.status);
+                status.remote = self.remote.as_ref().map(Remote::url);
+                status.messages.push_back(message);
+            }
         }
         Ok(())
+    }
+
+    /// Serves the web console to this computer only: other devices cannot
+    /// connect, and Windows' firewall does not ask. Uploaded discs stay in
+    /// memory.
+    fn start_remote(&self) -> Result<Remote, String> {
+        let listener = REMOTE_PORTS
+            .clone()
+            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .ok_or("No free port for remote management (8086-8095).")?;
+        let mut remote = Remote::new(
+            listener,
+            SLICE_STEPS,
+            None,
+            false,
+            None,
+            self.tools_iso.clone(),
+        )?;
+        remote.set_running(&self.machine, !self.paused);
+        Ok(remote)
+    }
+
+    /// Records an event of this run (run_log.rs), in memory.
+    fn event(&self, text: &str) {
+        run_log::event(self.machine.step_count(), text);
+    }
+
+    /// `wait`, cut short while a browser is connected so that its requests
+    /// are answered promptly.
+    fn remote_wait(&self, wait: Duration) -> Duration {
+        match &self.remote {
+            Some(remote) if remote.clients() > 0 => wait.min(REMOTE_POLL),
+            _ => wait,
+        }
     }
 
     /// Release everything the app holds in the guest, as on focus loss.
@@ -491,6 +654,15 @@ impl Core {
 
     fn publish_frame(&mut self) {
         let info = self.machine.vga().mode_info();
+        // Blanking flickers during mode sets; the modes themselves are events.
+        if info.mode != RenderMode::Blank && self.display != Some(info) {
+            self.display = Some(info);
+            let mode = format!(
+                "{:?} {}x{}x{}",
+                info.mode, info.width, info.height, info.bpp
+            );
+            self.event(&format!("display {mode}"));
+        }
         let (width, height) = (u32::from(info.width), u32::from(info.height));
         let mut frame = lock(&self.shared.frame);
         frame.rgba.resize(width as usize * height as usize * 4, 0);

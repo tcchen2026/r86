@@ -7,6 +7,8 @@
 //!   call the r86_vm_* functions; the audio callback only reads audio.
 //! - Strings are UTF-8. Every returned string is freed with r86_string_free.
 
+#[path = "../disk_files.rs"]
+mod disk_files;
 #[path = "../guest_os.rs"]
 #[allow(dead_code)] // Shared with the other frontends.
 mod guest_os;
@@ -14,11 +16,24 @@ mod keymap;
 #[path = "../keys.rs"]
 #[allow(dead_code)]
 mod keys;
+#[path = "../media.rs"]
+mod media;
+#[path = "../protocol.rs"]
+#[allow(dead_code)]
+mod protocol;
+#[path = "../run_log.rs"]
+mod run_log;
 #[path = "../runner.rs"]
 mod runner;
 #[path = "../vm_store.rs"]
 #[allow(dead_code)]
 mod vm_store;
+#[path = "../ws.rs"]
+mod ws;
+// Remote management; r86-run's server loop and debugger jobs are unused.
+#[path = "../ws_frontend.rs"]
+#[allow(dead_code)]
+mod ws_frontend;
 
 use std::ffi::{CStr, CString, c_char};
 use std::fmt::Write as _;
@@ -366,21 +381,25 @@ pub unsafe extern "C" fn r86_string_free(s: *mut c_char) {
     }
 }
 
-/// Start the VM in `directory` with ROMs from `firmware`. On failure returns
-/// NULL and stores an error string in `*error`.
+/// Start the VM in `directory` with ROMs from `firmware`; a fatal error's
+/// report goes to `logs` (run_log.rs). On failure returns NULL and stores an
+/// error string in `*error`.
 ///
 /// # Safety
-/// `directory` and `firmware` are valid C strings; `error` is writable.
+/// `directory`, `firmware` and `logs` are valid C strings; `error` is
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r86_vm_start(
     directory: *const c_char,
     firmware: *const c_char,
+    logs: *const c_char,
     error: *mut *mut c_char,
 ) -> *mut R86Vm {
     // SAFETY: forwarded caller contract.
-    let (directory, firmware) = unsafe { (text(directory), text(firmware)) };
-    let started = Vm::load(PathBuf::from(directory.unwrap_or_default()))
-        .and_then(|vm| Running::start(vm, PathBuf::from(firmware.unwrap_or_default())));
+    let (directory, firmware, logs) = unsafe { (text(directory), text(firmware), text(logs)) };
+    let path = |s: Option<String>| PathBuf::from(s.unwrap_or_default());
+    let started =
+        Vm::load(path(directory)).and_then(|vm| Running::start(vm, path(firmware), path(logs)));
     match started {
         Ok(running) => Box::into_raw(Box::new(R86Vm(running))),
         Err(err) => {
@@ -470,6 +489,43 @@ pub unsafe extern "C" fn r86_vm_set_volume(vm: *const R86Vm, percent: u32) {
     unsafe { &*vm }
         .0
         .send(Command::Volume(percent.min(100) as u8));
+}
+
+/// Start or stop remote management: the web console, for this Mac only.
+/// The outcome arrives as a message; it ends when the VM turns off.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_set_remote(vm: *const R86Vm, on: bool) {
+    // SAFETY: caller contract.
+    unsafe { &*vm }.0.send(Command::Remote(on));
+}
+
+/// The report of the fatal error that ended the VM's run, else NULL.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_log(vm: *const R86Vm) -> *mut c_char {
+    // SAFETY: caller contract.
+    let shared = &unsafe { &*vm }.0.shared;
+    let log = runner::lock(&shared.status).log.clone();
+    log.map_or(std::ptr::null_mut(), |path| {
+        out(path.to_string_lossy().into_owned())
+    })
+}
+
+/// The web console's address while remote management is on, else NULL.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_remote_url(vm: *const R86Vm) -> *mut c_char {
+    // SAFETY: caller contract.
+    let shared = &unsafe { &*vm }.0.shared;
+    let url = runner::lock(&shared.status).remote.clone();
+    url.map_or(std::ptr::null_mut(), out)
 }
 
 /// # Safety

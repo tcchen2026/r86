@@ -19,6 +19,10 @@ enum R86 {
     /// app's resources.
     static var firmware: String { Bundle.main.resourcePath ?? "" }
 
+    /// $HOME/r86/logs: a VM's fatal error report, <VM folder>.log, written
+    /// only when its run fails.
+    static let logs = URL.homeDirectory.appending(path: "r86/logs", directoryHint: .isDirectory)
+
     /// Take ownership of a string returned by the library.
     static func take(_ s: UnsafeMutablePointer<CChar>?) -> String? {
         guard let s else { return nil }

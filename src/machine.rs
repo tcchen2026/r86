@@ -956,6 +956,56 @@ impl Machine {
         }
     }
 
+    /// One line for stop reports: CS:EIP, CS's descriptor cache, GDTR, the
+    /// general registers and EFLAGS.
+    pub fn cpu_summary(&self) -> String {
+        let cpu = &self.cpu;
+        let cs = cpu.seg(SegmentReg::Cs);
+        format!(
+            "eip={:#010x} cs={:#06x} cs_base={:#010x} cs_limit={:#010x} cs_flags={:#06x} gdtr={:#010x}:{:#06x} eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x} esi={:#010x} edi={:#010x} ebp={:#010x} esp={:#010x} eflags={:#010x}",
+            cpu.eip,
+            cs.selector,
+            cs.base,
+            cs.limit,
+            cs.architectural_flags(),
+            cpu.gdtr.base,
+            cpu.gdtr.limit,
+            cpu.reg(Reg32::Eax),
+            cpu.reg(Reg32::Ebx),
+            cpu.reg(Reg32::Ecx),
+            cpu.reg(Reg32::Edx),
+            cpu.reg(Reg32::Esi),
+            cpu.reg(Reg32::Edi),
+            cpu.reg(Reg32::Ebp),
+            cpu.reg(Reg32::Esp),
+            cpu.effective_eflags()
+        )
+    }
+
+    /// The code bytes from 24 before CS-relative `eip` to 40 after it, `??`
+    /// where fetching faults, for stop reports.
+    pub fn code_bytes_report(&mut self, eip: u32) -> String {
+        let start = eip.saturating_sub(24);
+        let cs = self.cpu.seg(SegmentReg::Cs);
+        let linear = cs.base.wrapping_add(start);
+        let mut dump = format!(
+            "bytes near {eip:#010x} from {start:#010x} \
+             (cs={:#06x} base={:#010x} linear={linear:#010x}):",
+            cs.selector, cs.base
+        );
+        let mut bytes = [None; 64];
+        self.guest_code_bytes(linear, &mut bytes, false);
+        for byte in bytes {
+            match byte {
+                Some(byte) => {
+                    let _ = write!(dump, " {byte:02x}");
+                }
+                None => dump.push_str(" ??"),
+            }
+        }
+        dump
+    }
+
     pub fn guest_stack_words(&mut self, out: &mut [Option<u32>]) {
         let mut probe = self.cpu.clone();
         let start = self.cpu.reg(Reg32::Esp);

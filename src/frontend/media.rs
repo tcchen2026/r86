@@ -340,22 +340,11 @@ fn free_space(dir: &Path) -> std::io::Result<u64> {
 
 #[cfg(windows)]
 fn free_space(dir: &Path) -> std::io::Result<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    unsafe extern "system" {
-        fn GetDiskFreeSpaceExW(
-            dir: *const u16,
-            free: *mut u64,
-            total: *mut u64,
-            all: *mut u64,
-        ) -> i32;
-    }
-    let path: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    use windows::core::HSTRING;
     let mut free = 0;
-    let null = std::ptr::null_mut();
-    // SAFETY: `path` is NUL-terminated; `free` is writable and the others may be NULL.
-    if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, null, null) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    // SAFETY: the path is NUL-terminated and `free` is writable.
+    unsafe { GetDiskFreeSpaceExW(&HSTRING::from(dir), Some(&mut free), None, None) }?;
     Ok(free)
 }
 

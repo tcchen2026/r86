@@ -1,5 +1,7 @@
 //! One VM in its own window: the guest screen scaled with GDI, a menu bar
-//! like the web console's and a one-line status bar. A click captures the
+//! like the web console's and a one-line status bar. Tools follows the
+//! handheld's in-VM menu: sound, the r86 tools CD and remote management (the
+//! web console on 127.0.0.1, runner.rs Command::Remote). A click captures the
 //! mouse and Ctrl+Alt releases it; while the guest's r86 tools helper runs,
 //! the pointer follows the host's 1:1 without capture.
 //!
@@ -23,9 +25,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU, VK_RETURN,
 };
 use windows::Win32::UI::Input::*;
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 use super::audio::Audio;
 use super::keys::{self, InputKey};
@@ -54,6 +58,17 @@ const ID_RELEASE_KEYS: u32 = 124;
 const ID_FIT: u32 = 130;
 const ID_ACTUAL: u32 = 131;
 const ID_FULL_SCREEN: u32 = 132;
+const ID_REMOTE: u32 = 140;
+const ID_CONSOLE: u32 = 141;
+/// ID_SOUND + i sets SOUND_LEVELS[i].
+const ID_SOUND: u32 = 150;
+const SOUND_LEVELS: [(u8, &str); 5] = [
+    (100, "&100%"),
+    (75, "&75%"),
+    (50, "&50%"),
+    (25, "&25%"),
+    (0, "&Off"),
+];
 
 struct VmWindow {
     hwnd: HWND,
@@ -62,6 +77,8 @@ struct VmWindow {
     name: String,
     firmware: PathBuf,
     tools_iso: PathBuf,
+    /// Where a fatal error's report goes (run_log.rs).
+    logs: PathBuf,
     running: Option<Running>,
     audio: Option<Audio>,
     /// The latest guest frame as GDI's BGRX.
@@ -71,9 +88,15 @@ struct VmWindow {
     serial: u64,
     state: State,
     ips: u64,
+    /// The web console's address while remote management is on.
+    remote: Option<String>,
+    /// Sound level in percent, as saved in the VM.
+    volume: u8,
     /// The last message from the VM or the app, shown for a few seconds.
     note: Option<(String, Instant)>,
     error: Option<String>,
+    /// The report of the error, when one was written.
+    log: Option<PathBuf>,
     captured: bool,
     absolute: bool,
     buttons: Ps2ButtonState,
@@ -94,10 +117,15 @@ impl Drop for VmWindow {
 }
 
 /// Starts the VM in `directory` and opens its window.
-pub fn open(directory: PathBuf, firmware: PathBuf, tools_iso: PathBuf) -> Result<HWND, String> {
+pub fn open(
+    directory: PathBuf,
+    firmware: PathBuf,
+    tools_iso: PathBuf,
+    logs: PathBuf,
+) -> Result<HWND, String> {
     let vm = Vm::load(directory.clone())?;
-    let name = vm.name.clone();
-    let running = Running::start(vm, firmware.clone())?;
+    let (name, volume) = (vm.name.clone(), vm.volume);
+    let running = Running::start(vm, firmware.clone(), logs.clone())?;
     let audio = Audio::start(running.shared.clone());
     let class = w!("r86Vm");
     // SAFETY: plain Win32 window creation; the class and title strings live
@@ -139,6 +167,7 @@ pub fn open(directory: PathBuf, firmware: PathBuf, tools_iso: PathBuf) -> Result
             name,
             firmware,
             tools_iso,
+            logs,
             running: Some(running),
             audio: Some(audio),
             pixels: Vec::new(),
@@ -147,8 +176,11 @@ pub fn open(directory: PathBuf, firmware: PathBuf, tools_iso: PathBuf) -> Result
             serial: 0,
             state: State::Running,
             ips: 0,
+            remote: None,
+            volume,
             note: None,
             error: None,
+            log: None,
             captured: false,
             absolute: false,
             buttons: Ps2ButtonState::default(),
@@ -185,8 +217,6 @@ fn build_menu() -> HMENU {
             "&CD",
             &[
                 (ID_INSERT_CD, "&Insert a CD image..."),
-                (ID_TOOLS, "Install r86 &Tools"),
-                (0, ""),
                 (ID_EJECT, "&Eject"),
             ],
         ),
@@ -211,21 +241,53 @@ fn build_menu() -> HMENU {
             ],
         ),
     ];
+    let sound: Vec<(u32, &str)> = (ID_SOUND..)
+        .zip(SOUND_LEVELS)
+        .map(|(id, (_, text))| (id, text))
+        .collect();
+    // The handheld's in-VM menu, less what the other menus have.
+    let tools = popup(&[
+        (ID_TOOLS, "Install r86 &Tools"),
+        (0, ""),
+        (ID_REMOTE, "&Remote management"),
+        (ID_CONSOLE, "&Open the web console"),
+    ]);
     // SAFETY: plain menu construction; the bar belongs to the window.
     unsafe {
+        let _ = InsertMenuW(
+            tools,
+            0,
+            MF_BYPOSITION | MF_POPUP,
+            popup(&sound).0 as usize,
+            w!("&Sound"),
+        );
         let bar = CreateMenu().unwrap_or_default();
         for (title, entries) in items {
-            let popup = CreatePopupMenu().unwrap_or_default();
-            for &(id, text) in entries {
-                let _ = if id == 0 {
-                    AppendMenuW(popup, MF_SEPARATOR, 0, None)
-                } else {
-                    AppendMenuW(popup, MF_STRING, id as usize, &HSTRING::from(text))
-                };
-            }
-            let _ = AppendMenuW(bar, MF_POPUP, popup.0 as usize, &HSTRING::from(title));
+            let _ = AppendMenuW(
+                bar,
+                MF_POPUP,
+                popup(entries).0 as usize,
+                &HSTRING::from(title),
+            );
         }
+        let _ = AppendMenuW(bar, MF_POPUP, tools.0 as usize, w!("&Tools"));
         bar
+    }
+}
+
+/// A popup menu of (command, text) entries; command 0 is a separator.
+fn popup(entries: &[(u32, &str)]) -> HMENU {
+    // SAFETY: plain menu construction; the caller attaches the popup.
+    unsafe {
+        let popup = CreatePopupMenu().unwrap_or_default();
+        for &(id, text) in entries {
+            let _ = if id == 0 {
+                AppendMenuW(popup, MF_SEPARATOR, 0, None)
+            } else {
+                AppendMenuW(popup, MF_STRING, id as usize, &HSTRING::from(text))
+            };
+        }
+        popup
     }
 }
 
@@ -454,12 +516,17 @@ impl VmWindow {
         if resized && self.actual_size {
             self.fit_window();
         }
-        let (state, ips, message) = {
+        let (state, ips, message, remote) = {
             let mut status = lock(&shared.status);
             let message = status.messages.pop_back();
             status.messages.clear();
-            (status.state, status.ips, message)
+            self.log = status.log.clone();
+            (status.state, status.ips, message, status.remote.clone())
         };
+        if remote != self.remote {
+            self.remote = remote;
+            changed = true;
+        }
         if let Some(message) = message {
             if state == State::Failed {
                 self.error = Some(message.clone());
@@ -500,6 +567,7 @@ impl VmWindow {
         self.release_mouse();
         self.audio = None;
         self.running = None;
+        self.remote = None;
         self.absolute = false;
         self.invalidate();
         library_changed();
@@ -510,11 +578,13 @@ impl VmWindow {
             return Ok(());
         }
         let vm = Vm::load(self.directory.clone())?;
-        let running = Running::start(vm, self.firmware.clone())?;
+        self.volume = vm.volume;
+        let running = Running::start(vm, self.firmware.clone(), self.logs.clone())?;
         self.audio = Some(Audio::start(running.shared.clone()));
         self.running = Some(running);
         self.state = State::Running;
         self.error = None;
+        self.log = None;
         self.serial = 0;
         self.width = 0;
         self.invalidate();
@@ -653,7 +723,13 @@ impl VmWindow {
     /// The r86 icon, the state and a hint, centred in the black screen.
     fn paint_off(&self, dc: HDC, screen: RECT) {
         let (title, hint) = match (&self.error, self.running.is_some()) {
-            (Some(error), _) => ("Stopped".to_string(), error.clone()),
+            (Some(error), _) => {
+                let log = self.log.as_ref();
+                let details = log.map_or(String::new(), |log| {
+                    format!("\n\nDetails: {}", log.display())
+                });
+                ("Stopped".to_string(), format!("{error}{details}"))
+            }
             (None, false) => (
                 "Powered off".to_string(),
                 "Power > Power on starts it again.".to_string(),
@@ -702,13 +778,18 @@ impl VmWindow {
                 DT_CENTER | DT_SINGLELINE | DT_VCENTER,
             );
             SetTextColor(dc, COLORREF(0x0090_9090));
-            rect.top += line;
-            rect.bottom += line;
+            // An error and its report's path take a few lines.
+            let mut rect = RECT {
+                left: screen.left + self.scale(24),
+                right: screen.right - self.scale(24),
+                top: rect.top + line,
+                bottom: screen.bottom,
+            };
             draw_text(
                 dc,
                 &hint,
                 &mut rect,
-                DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS,
             );
         }
     }
@@ -722,6 +803,13 @@ impl VmWindow {
                 format!("Running, {} MIPS", self.ips / 1_000_000)
             }
             (_, State::Running) => "Running".to_string(),
+        };
+        let state = match &self.remote {
+            Some(url) => {
+                let address = url.trim_start_matches("http://").trim_end_matches('/');
+                format!("{state}, web console at {address}")
+            }
+            None => state,
         };
         let hint = if let Some((note, _)) = &self.note {
             note.as_str()
@@ -981,6 +1069,11 @@ impl VmWindow {
             enable(id, on);
         }
         enable(ID_TOOLS, on && self.tools_iso.is_file());
+        enable(ID_REMOTE, on);
+        enable(ID_CONSOLE, self.remote.is_some());
+        for id in (ID_SOUND..).take(SOUND_LEVELS.len()) {
+            enable(id, on);
+        }
         for id in [
             ID_CTRL_ALT_DEL,
             ID_CTRL_ESC,
@@ -1005,6 +1098,10 @@ impl VmWindow {
             };
         };
         check(ID_PAUSE, self.state == State::Paused);
+        check(ID_REMOTE, self.remote.is_some());
+        for (id, (level, _)) in (ID_SOUND..).zip(SOUND_LEVELS) {
+            check(id, level == self.volume);
+        }
         check(ID_FIT, !self.actual_size);
         check(ID_ACTUAL, self.actual_size);
         check(ID_FULL_SCREEN, self.windowed.is_some());
@@ -1022,6 +1119,26 @@ impl VmWindow {
                 );
             }
             ID_EJECT => self.send(Command::Cd(None)),
+            ID_REMOTE => self.send(Command::Remote(self.remote.is_none())),
+            ID_CONSOLE => {
+                if let Some(url) = &self.remote {
+                    // SAFETY: the strings live across the call.
+                    unsafe {
+                        ShellExecuteW(
+                            Some(self.hwnd),
+                            w!("open"),
+                            &HSTRING::from(url.as_str()),
+                            PCWSTR::null(),
+                            PCWSTR::null(),
+                            SW_SHOW,
+                        )
+                    };
+                }
+            }
+            id if (ID_SOUND..ID_SOUND + SOUND_LEVELS.len() as u32).contains(&id) => {
+                self.volume = SOUND_LEVELS[(id - ID_SOUND) as usize].0;
+                self.send(Command::Volume(self.volume));
+            }
             ID_CTRL_ALT_DEL => self.send(Command::CtrlAltDel),
             ID_CTRL_ESC => self.press(&["controlleft", "escape"]),
             ID_ALT_TAB => self.press(&["altleft", "tab"]),

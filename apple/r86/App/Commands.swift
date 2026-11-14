@@ -64,6 +64,8 @@ struct MachineCommands: Commands {
             }
             .disabled(!live)
 
+            Divider()
+
             Button("Send Ctrl+Alt+Del") {
                 if let id = focusedID { library.ctrlAltDel(id) }
             }
@@ -73,6 +75,17 @@ struct MachineCommands: Commands {
                 if let id = focusedID { library.insertTools(id) }
             }
             .disabled(!live || Library.toolsISO == nil)
+
+            Divider()
+
+            Toggle("Remote Management", isOn: Binding(get: { machine?.remoteURL != nil },
+                                                     set: { on in if let id = focusedID { library.setRemote(id, on) } }))
+            .disabled(!live)
+
+            Button("Open Web Console") {
+                if let id = focusedID { library.openConsole(id) }
+            }
+            .disabled(machine?.remoteURL == nil)
 
             Divider()
 

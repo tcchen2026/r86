@@ -46,7 +46,7 @@ struct MachineWindow: View {
         }
         .overlay(alignment: .top) { ToastOverlay() }
         .navigationTitle(m.name)
-        .navigationSubtitle("\(m.os) · \(m.memoryText) · \(m.statusText)")
+        .navigationSubtitle(subtitle(m))
         .toolbar { windowToolbar(m) }
         .focusedSceneValue(\.machineID, m.id)
         .confirmationDialog("Shut down \(m.name)?", isPresented: $confirmStop, titleVisibility: .visible) {
@@ -58,6 +58,15 @@ struct MachineWindow: View {
         .fileImporter(isPresented: $choosingCD, allowedContentTypes: CDImage.types) { result in
             if case .success(let url) = result { library.changeCD(m.id, url) }
         }
+    }
+
+    /// OS, memory and state, and the web console's address while it is on.
+    private func subtitle(_ m: Machine) -> String {
+        var parts = [m.os, m.memoryText, m.statusText]
+        if let url = m.remoteURL, let host = url.host(), let port = url.port {
+            parts.append("Web console at \(host):\(port)")
+        }
+        return parts.joined(separator: " · ")
     }
 
     @ToolbarContentBuilder
@@ -80,8 +89,6 @@ struct MachineWindow: View {
         ToolbarItemGroup(placement: .primaryAction) {
             Menu("CD", systemImage: "opticaldisc") {
                 Button("Insert CD Image…") { choosingCD = true }
-                Button("Install r86 Tools…") { library.insertTools(m.id) }
-                    .disabled(Library.toolsISO == nil)
                 Button("Eject") { library.changeCD(m.id, nil) }
                     .disabled(m.iso == nil)
             }
@@ -94,9 +101,19 @@ struct MachineWindow: View {
                 }
                 .pickerStyle(.inline)
             }
-            Button("Ctrl+Alt+Del", systemImage: "command") { library.ctrlAltDel(m.id) }
-                .help("Send Ctrl+Alt+Del")
-                .disabled(m.status != .running)
+            // The handheld's in-VM menu, less what the toolbar has.
+            Menu("Tools", systemImage: "ellipsis.circle") {
+                Button("Send Ctrl+Alt+Del") { library.ctrlAltDel(m.id) }
+                    .disabled(m.status != .running)
+                Button("Install r86 Tools…") { library.insertTools(m.id) }
+                    .disabled(Library.toolsISO == nil)
+                Divider()
+                Toggle("Remote Management", isOn: Binding(get: { m.remoteURL != nil },
+                                                         set: { library.setRemote(m.id, $0) }))
+                Button("Open Web Console") { library.openConsole(m.id) }
+                    .disabled(m.remoteURL == nil)
+            }
+            .disabled(!m.isLive)
         }
     }
 }

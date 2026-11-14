@@ -54,8 +54,8 @@ use r86::iso9660::{Iso9660, replace_file, replace_file_in_place};
 use r86::linux_boot::BootConfig;
 use r86::machine::{BootOrder, DEFAULT_JIT, GuestStepStatus, Machine, PerfMode, TraceMode};
 use r86::network::{PortForward, UserNetwork};
+use r86::x86::Reg32;
 use r86::x86::cpu::SegmentReg;
-use r86::x86::{Cpu, Reg32};
 
 const DEFAULT_MEM_MIB: usize = 128;
 const DEFAULT_STEPS: u64 = 0;
@@ -400,11 +400,7 @@ fn run_machine_output(
         }
     }
     if completed_budget && args.steps != 0 {
-        println!(
-            "completed {} steps: {}",
-            args.steps,
-            cpu_summary(machine.cpu())
-        );
+        println!("completed {} steps: {}", args.steps, machine.cpu_summary());
         let eip = machine.cpu().eip;
         print_guest_bytes(machine, eip);
         print_guest_stack_if_requested(machine);
@@ -542,29 +538,6 @@ fn compress_gzip_stream(bytes: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("failed to finish firmware initrd compression: {err}"))
 }
 
-fn cpu_summary(cpu: &Cpu) -> String {
-    let cs = cpu.seg(SegmentReg::Cs);
-    format!(
-        "eip={:#010x} cs={:#06x} cs_base={:#010x} cs_limit={:#010x} cs_flags={:#06x} gdtr={:#010x}:{:#06x} eax={:#010x} ebx={:#010x} ecx={:#010x} edx={:#010x} esi={:#010x} edi={:#010x} ebp={:#010x} esp={:#010x} eflags={:#010x}",
-        cpu.eip,
-        cs.selector,
-        cs.base,
-        cs.limit,
-        cs.architectural_flags(),
-        cpu.gdtr.base,
-        cpu.gdtr.limit,
-        cpu.reg(Reg32::Eax),
-        cpu.reg(Reg32::Ebx),
-        cpu.reg(Reg32::Ecx),
-        cpu.reg(Reg32::Edx),
-        cpu.reg(Reg32::Esi),
-        cpu.reg(Reg32::Edi),
-        cpu.reg(Reg32::Ebp),
-        cpu.reg(Reg32::Esp),
-        cpu.effective_eflags()
-    )
-}
-
 fn print_machine_stop(machine: &mut Machine, status: &GuestStepStatus) {
     match status {
         GuestStepStatus::Continue => {}
@@ -572,7 +545,7 @@ fn print_machine_stop(machine: &mut Machine, status: &GuestStepStatus) {
             println!(
                 "halted after {} steps: {}",
                 machine.step_count(),
-                cpu_summary(machine.cpu())
+                machine.cpu_summary()
             );
             print_guest_bytes(machine, machine.cpu().eip);
         }
@@ -580,7 +553,7 @@ fn print_machine_stop(machine: &mut Machine, status: &GuestStepStatus) {
             println!(
                 "guest requested reset after {} steps: {}",
                 machine.step_count(),
-                cpu_summary(machine.cpu())
+                machine.cpu_summary()
             );
             print_guest_bytes(machine, machine.cpu().eip);
         }
@@ -592,7 +565,7 @@ fn print_machine_stop(machine: &mut Machine, status: &GuestStepStatus) {
                 "stopped after {} steps: {} {}",
                 machine.step_count(),
                 message,
-                cpu_summary(machine.cpu())
+                machine.cpu_summary()
             );
             print_guest_bytes(machine, eip.unwrap_or(machine.cpu().eip));
         }
@@ -604,31 +577,7 @@ fn print_machine_stop(machine: &mut Machine, status: &GuestStepStatus) {
 }
 
 fn print_guest_bytes(machine: &mut Machine, eip: u32) {
-    println!("{}", guest_bytes_dump(machine, eip));
-}
-
-fn guest_bytes_dump(machine: &mut Machine, eip: u32) -> String {
-    use std::fmt::Write as _;
-
-    let start = eip.saturating_sub(24);
-    let cs = machine.cpu().seg(SegmentReg::Cs);
-    let linear = cs.base.wrapping_add(start);
-    let mut dump = format!(
-        "bytes near {eip:#010x} from {start:#010x} \
-         (cs={:#06x} base={:#010x} linear={linear:#010x}):",
-        cs.selector, cs.base
-    );
-    let mut bytes = [None; 64];
-    machine.guest_code_bytes(linear, &mut bytes, false);
-    for byte in bytes {
-        match byte {
-            Some(byte) => {
-                let _ = write!(dump, " {byte:02x}");
-            }
-            None => dump.push_str(" ??"),
-        }
-    }
-    dump
+    println!("{}", machine.code_bytes_report(eip));
 }
 
 fn print_guest_stack_if_requested(machine: &mut Machine) {
@@ -1339,7 +1288,7 @@ mod tests {
 
         let expected_bytes: String = expected.iter().map(|byte| format!(" {byte:02x}")).collect();
         assert_eq!(
-            guest_bytes_dump(&mut machine, 0x38),
+            machine.code_bytes_report(0x38),
             format!(
                 "bytes near 0x00000038 from 0x00000020 \
                  (cs=0x07c0 base=0x00007c00 linear=0x00007c20):{expected_bytes}"

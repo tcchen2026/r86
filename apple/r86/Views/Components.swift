@@ -152,6 +152,17 @@ struct PowerOverlay: View {
                 Text("\(machine.os) · \(machine.memoryText) · \(machine.diskText)")
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
+                if let failure = machine.failure {
+                    Text(failure)
+                        .font(.callout)
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 440)
+                        .textSelection(.enabled)
+                    if machine.log != nil {
+                        Button("Show Log") { library.showLog(machine.id) }
+                            .buttonStyle(.glass)
+                    }
+                }
             }
             .foregroundStyle(.white)
             .environment(\.colorScheme, .dark)

@@ -1,7 +1,7 @@
 r86 for the Mac (Apple silicon, macOS 26)
 
 SwiftUI app around the Rust r86 library. One process runs multiple VMs,
-each on its own r86 core thread (src/frontend/apple/runner.rs). The C API is
+each on its own r86 core thread (src/frontend/runner.rs). The C API is
 src/frontend/apple/mod.rs, declared in r86/Bridge/r86.h.
 
 Build (macOS 26, Xcode command line tools, rustup; no Xcode project):
@@ -56,3 +56,12 @@ Contracts:
 - Display: the core thread renders RGBA at most every 16.7 ms; the window
   copies new frames on its display link into a CALayer.
 - Sound: AVAudioEngine pulls 48 kHz stereo from r86 without blocking.
+- Tools (toolbar, also in the Machine menu), after the handheld's in-VM
+  menu: Install r86 Tools, and remote management, the web console
+  (ws_frontend::Remote) on the first free port of 127.0.0.1:8086-8095. Only
+  this Mac can connect; it ends when the VM turns off, and the console's
+  Power off turns the VM off. Listening needs the network.server entitlement.
+- Logs: only a fatal error writes one, $HOME/r86/logs/<VM folder>.log, with
+  the machine's state, the run's events and serial output kept in memory
+  until then (src/frontend/run_log.rs). The VM window shows the error and
+  Show Log.

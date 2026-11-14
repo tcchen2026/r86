@@ -50,7 +50,9 @@ char *r86_library_delete(const char *directory);
 void r86_string_free(char *s);
 
 // Running VMs. Each owns one core thread.
-R86Vm *r86_vm_start(const char *directory, const char *firmware, char **error);
+// A fatal error's report goes to logs/<VM folder>.log.
+R86Vm *r86_vm_start(const char *directory, const char *firmware, const char *logs,
+                    char **error);
 void r86_vm_free(R86Vm *vm);  // turn off now, flush disks
 // 0 pause, 1 resume, 2 reset, 3 power button, 4 Ctrl+Alt+Del, 5 release input
 void r86_vm_command(const R86Vm *vm, uint32_t command);
@@ -58,6 +60,9 @@ void r86_vm_key(const R86Vm *vm, uint16_t mac_key_code, bool down);
 void r86_vm_mouse(const R86Vm *vm, int32_t dx, int32_t dy, uint32_t buttons);
 void r86_vm_change_cd(const R86Vm *vm, const char *path);  // NULL ejects
 void r86_vm_set_volume(const R86Vm *vm, uint32_t percent);
+void r86_vm_set_remote(const R86Vm *vm, bool on);  // web console on 127.0.0.1
+char *r86_vm_remote_url(const R86Vm *vm);  // NULL while remote management is off
+char *r86_vm_log(const R86Vm *vm);  // the fatal error report, NULL without one
 void r86_vm_status(const R86Vm *vm, R86Status *status);
 char *r86_vm_take_message(const R86Vm *vm);  // NULL when none
 bool r86_vm_frame(const R86Vm *vm, uint64_t have_serial, uint8_t *pixels,

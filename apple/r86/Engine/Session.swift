@@ -29,7 +29,7 @@ final class Session {
             if let url = Bookmarks.access(path, in: machine.directory) { scoped.append(url) }
         }
         var error: UnsafeMutablePointer<CChar>?
-        guard let vm = r86_vm_start(machine.directory, R86.firmware, &error) else {
+        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path, &error) else {
             scoped.forEach { $0.stopAccessingSecurityScopedResource() }
             throw R86Error(message: R86.take(error) ?? "Cannot start \(machine.name)")
         }
@@ -107,6 +107,22 @@ final class Session {
 
     func setVolume(_ percent: Int) {
         r86_vm_set_volume(vm, UInt32(percent))
+    }
+
+    /// Remote management: the web console, for this Mac only, until the VM
+    /// turns off. The outcome arrives as a message.
+    func setRemote(_ on: Bool) {
+        r86_vm_set_remote(vm, on)
+    }
+
+    /// The web console's address while remote management is on.
+    func remoteURL() -> URL? {
+        R86.take(r86_vm_remote_url(vm)).flatMap { URL(string: $0) }
+    }
+
+    /// The report of the fatal error that ended the run, once written.
+    func log() -> URL? {
+        R86.take(r86_vm_log(vm)).map { URL(filePath: $0) }
     }
 
     /// Turn off now: no guest shutdown. Disks are flushed.

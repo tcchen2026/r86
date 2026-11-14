@@ -25,6 +25,11 @@ struct Machine: Identifiable, Equatable, Decodable {
     var instructionsPerSecond: UInt64 = 0
     var displayWidth = 0
     var displayHeight = 0
+    /// The web console's address while remote management is on.
+    var remoteURL: URL?
+    /// The fatal error that ended the last run, and its report.
+    var failure: String?
+    var log: URL?
 
     var id: String { directory }
     var isLive: Bool { status != .stopped }

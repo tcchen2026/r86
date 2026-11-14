@@ -1560,12 +1560,15 @@ pub struct Remote {
     slice_steps: u64,
     record: Option<Arc<fs::File>>,
     port: u16,
+    /// Bound to loopback: only this computer can connect.
+    local: bool,
     stop: Arc<AtomicBool>,
 }
 
 impl Remote {
-    /// Serves the console on `listener`, open to the local network like a
-    /// home BMC. `jobs` enables finite debugger jobs, which need a host loop
+    /// Serves the console on `listener`: open to the local network like a
+    /// home BMC, or to this computer only when bound to loopback (the Mac
+    /// and Windows apps). `jobs` enables finite debugger jobs, which need a host loop
     /// that steps the machine for them. With `save_dir`, uploaded discs are
     /// saved there instead of held in memory. `tools_iso` is the r86 tools
     /// disc media-tools inserts; it may be missing.
@@ -1588,6 +1591,9 @@ impl Remote {
                     .map_err(|e| format!("failed to open websocket record {path}: {e}"))
             })
             .transpose()?;
+        let local = listener
+            .local_addr()
+            .is_ok_and(|addr| addr.ip().is_loopback());
         let (rx, port, stop) = listen(listener)?;
         let mut service = Service::new();
         service.jobs = jobs;
@@ -1599,14 +1605,20 @@ impl Remote {
             slice_steps,
             record,
             port,
+            local,
             stop,
         })
     }
 
-    /// The address other devices on the network can open.
-    #[allow(dead_code)] // The handheld's embedding API; r86-run drives itself.
+    /// The address to open: 127.0.0.1 for a loopback console, else the one
+    /// other devices on the network reach.
+    #[allow(dead_code)] // The embedding API; r86-run drives itself.
     pub fn url(&self) -> String {
-        let host = lan_address().unwrap_or_else(|| "this-device".into());
+        let host = if self.local {
+            "127.0.0.1".into()
+        } else {
+            lan_address().unwrap_or_else(|| "this-device".into())
+        };
         format!("http://{host}:{}/", self.port)
     }
 

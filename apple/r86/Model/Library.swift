@@ -1,3 +1,4 @@
+import AppKit
 import Observation
 import SwiftUI
 
@@ -47,11 +48,15 @@ final class Library {
         let (list, problems) = R86.list()
         machines = list.map { m in
             var m = m
-            if let old = self[m.id], sessions[m.id] != nil {
+            guard let old = self[m.id] else { return m }
+            m.failure = old.failure
+            m.log = old.log
+            if sessions[m.id] != nil {
                 m.status = old.status
                 m.instructionsPerSecond = old.instructionsPerSecond
                 m.displayWidth = old.displayWidth
                 m.displayHeight = old.displayHeight
+                m.remoteURL = old.remoteURL
             }
             return m
         }
@@ -64,7 +69,11 @@ final class Library {
         guard let m = self[id], sessions[id] == nil else { return }
         do {
             sessions[id] = try Session(machine: m)
-            update(id) { $0.status = .running }
+            update(id) { m in
+                m.status = .running
+                m.failure = nil
+                m.log = nil
+            }
         } catch {
             show(error.localizedDescription, systemImage: "exclamationmark.triangle")
         }
@@ -126,6 +135,20 @@ final class Library {
     func insertTools(_ id: Machine.ID) {
         guard let iso = Self.toolsISO else { return }
         changeCD(id, iso)
+    }
+
+    /// Start or stop the web console; the next poll shows the outcome.
+    func setRemote(_ id: Machine.ID, _ on: Bool) {
+        sessions[id]?.setRemote(on)
+    }
+
+    func openConsole(_ id: Machine.ID) {
+        if let url = self[id]?.remoteURL { NSWorkspace.shared.open(url) }
+    }
+
+    /// Open the report of the error that ended the machine's last run.
+    func showLog(_ id: Machine.ID) {
+        if let log = self[id]?.log { NSWorkspace.shared.open(log) }
     }
 
     /// Turn every machine off now, flushing disks (used when quitting).
@@ -247,6 +270,7 @@ final class Library {
         update(id) { m in
             m.status = .stopped
             m.instructionsPerSecond = 0
+            m.remoteURL = nil
         }
         // The guest may have changed the CD or volume while running.
         reload()
@@ -256,19 +280,28 @@ final class Library {
         for (id, session) in sessions {
             // Status first: a stopping core thread posts its last messages with it.
             let status = session.status()
-            for message in session.takeMessages() {
+            let messages = session.takeMessages()
+            for message in messages {
                 show(message, systemImage: status.state == 3 ? "exclamationmark.triangle" : "info.circle")
             }
             switch status.state {
             case 2, 3:
+                let log = session.log()
                 finish(id, session)
-                if status.state == 2, let m = self[id] {
+                if status.state == 3 {
+                    update(id) { m in
+                        m.failure = messages.last
+                        m.log = log
+                    }
+                } else if let m = self[id] {
                     show("\(m.name) is off", systemImage: "power")
                 }
             default:
                 session.refreshThumbnail()
                 let size = session.image.map { ($0.width, $0.height) } ?? (0, 0)
+                let remote = session.remoteURL()
                 update(id) { m in
+                    m.remoteURL = remote
                     m.status = status.state == 1 ? .paused : .running
                     m.instructionsPerSecond = status.instructions_per_second
                     m.displayWidth = size.0

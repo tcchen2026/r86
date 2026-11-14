@@ -19,6 +19,8 @@ use crate::ws_frontend::Import;
 
 pub struct Ctx {
     pub library: PathBuf,
+    /// Where a VM's fatal error report goes (run_log.rs).
+    pub logs: PathBuf,
     pub share: PathBuf,
     /// Where the disk image chooser starts.
     pub vhd: PathBuf,
@@ -1651,6 +1653,7 @@ mod overlay_tests {
     fn optional_display_keeps_the_other_menu_actions() {
         let ctx = Ctx {
             library: PathBuf::new(),
+            logs: PathBuf::new(),
             share: PathBuf::new(),
             vhd: PathBuf::new(),
             iso: PathBuf::new(),

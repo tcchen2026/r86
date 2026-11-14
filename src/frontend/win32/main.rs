@@ -1,7 +1,8 @@
 //! r86 for Windows (amd64 and arm64): a library of VMs and one window per
 //! running VM, drawn with GDI. bios.bin, vgabios-stdvga.bin, dos.zip (the
 //! DOS kit) and r86_tools.iso sit beside the executable; VMs live in
-//! Documents\r86. The dialogs, icon and manifest are resources (r86-win.rc,
+//! Documents\r86, and a fatal error's report in Documents\r86\logs
+//! (run_log.rs). The dialogs, icon and manifest are resources (r86-win.rc,
 //! built by build.rs with MinGW windres).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
@@ -12,6 +13,9 @@ mod audio;
 #[path = "../catalog.rs"]
 #[allow(dead_code)]
 mod catalog;
+#[cfg(windows)]
+#[path = "../disk_files.rs"]
+mod disk_files;
 #[cfg(windows)]
 mod edit_vm;
 #[cfg(windows)]
@@ -25,6 +29,16 @@ mod keymap;
 #[allow(dead_code)]
 mod keys;
 #[cfg(windows)]
+#[path = "../media.rs"]
+mod media;
+#[cfg(windows)]
+#[path = "../protocol.rs"]
+#[allow(dead_code)]
+mod protocol;
+#[cfg(windows)]
+#[path = "../run_log.rs"]
+mod run_log;
+#[cfg(windows)]
 #[path = "../runner.rs"]
 mod runner;
 #[cfg(windows)]
@@ -37,6 +51,14 @@ mod vm_store;
 mod vm_window;
 #[cfg(windows)]
 mod wizard;
+#[cfg(windows)]
+#[path = "../ws.rs"]
+mod ws;
+// Remote management; r86-run's server loop and debugger jobs are unused.
+#[cfg(windows)]
+#[path = "../ws_frontend.rs"]
+#[allow(dead_code)]
+mod ws_frontend;
 
 #[cfg(windows)]
 fn main() {
@@ -284,6 +306,7 @@ mod library {
                 directory.clone(),
                 self.firmware.clone(),
                 self.tools_iso.clone(),
+                self.root.join("logs"),
             ) {
                 Ok(hwnd) => {
                     self.windows.push((directory, hwnd));

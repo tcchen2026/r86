@@ -16,6 +16,8 @@ mod media;
 #[allow(dead_code)] // Shared with r86-run's command line.
 #[path = "../protocol.rs"]
 mod protocol;
+#[path = "../run_log.rs"]
+mod run_log;
 #[path = "../vm_store.rs"]
 mod vm_store;
 #[path = "../ws.rs"]
@@ -52,7 +54,8 @@ const USAGE: &str = "usage: r86-handheld [--fb PATH] [--input PATH]... [--data D
            full screen through the system's libSDL2, else /dev/fb0)
 --input    evdev device, repeatable (default: every keyboard in /proc/bus/input/devices)
 --data     r86's folder (default: ~/r86): VMs/ holds the VMs; the disk and CD
-           choosers start in vhd/ and iso/; catalog downloads go to iso/
+           choosers start in vhd/ and iso/; catalog downloads go to iso/; a
+           VM's fatal error report goes to logs/<VM>.log
 --share    firmware and bundled images (default: beside the executable or ../share/r86)
 
 The handheld-sdl build shows a desktop window instead of --fb/--input and
@@ -179,6 +182,7 @@ fn run() -> Result<(), String> {
     let mut canvas = ui::Canvas::new(width, height);
     let ctx = Ctx {
         library,
+        logs: data.join("logs"),
         share,
         vhd,
         iso,

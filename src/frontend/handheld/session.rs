@@ -7,13 +7,16 @@
 //! Wi-Fi: screen, keyboard, mouse, power, virtual CD and, while the VM is off,
 //! its disk's files. While it is on, a powered-off VM stays in the session
 //! and the panel shows the address instead of returning to the library.
+//!
+//! A fatal error ends the session with a report in the run's log
+//! (run_log.rs); the run's events are kept for it in memory.
 use std::cell::RefCell;
 use std::fs::File;
 use std::net::TcpListener;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use r86::devices::{Ps2ButtonState, RenderMode};
+use r86::devices::{Ps2ButtonState, RenderMode, VgaModeInfo};
 use r86::machine::{GuestStepStatus, Machine};
 
 use super::device::{Device, KeyEvent, stop_requested};
@@ -24,6 +27,7 @@ use super::text80;
 use super::ui::{self, BLACK, Canvas, Font, Rect, TEXT};
 use crate::guest_os;
 use crate::keys::{InputKey, inject_input_key};
+use crate::run_log;
 use crate::vm_store::{self, Vm};
 use crate::ws_frontend::Remote;
 
@@ -120,21 +124,43 @@ struct Session<'a> {
     remote: Option<Remote>,
     /// What the panel last showed for a remote-held VM: (off, clients).
     remote_shown: Option<(bool, usize)>,
+    /// The last display mode shown, for the run's events.
+    display: Option<VgaModeInfo>,
     /// The on-screen keyboard; it keeps its selection while hidden.
     osk: Osk,
     osk_shown: bool,
 }
 
 /// Run `vm` until it powers off, the user turns it off, or a stop signal.
-/// With `remote`, the VM starts powered off under remote management.
+/// With `remote`, the VM starts powered off under remote management. An
+/// error names the report in the run's log.
 pub fn run(
-    mut vm: Vm,
+    vm: Vm,
     ctx: &Ctx,
     device: &mut dyn Device,
     canvas: &mut Canvas,
     remote: bool,
 ) -> Result<End, String> {
     let _lock = vm_store::lock_vm(&vm.directory)?;
+    run_log::start(&ctx.logs, &vm);
+    let end = run_locked(vm, ctx, device, canvas, remote).map_err(|error| {
+        // Reported already, unless the machine was never built.
+        match run_log::fatal(&error, None, None) {
+            Some(log) => format!("{error}\n\nDetails: {}", log.display()),
+            None => error,
+        }
+    });
+    run_log::end();
+    end
+}
+
+fn run_locked(
+    mut vm: Vm,
+    ctx: &Ctx,
+    device: &mut dyn Device,
+    canvas: &mut Canvas,
+    remote: bool,
+) -> Result<End, String> {
     // Remote management also serves the disk's files, so a moved or deleted
     // CD image leaves the drive empty for this session instead of failing.
     let missing_cd = remote && vm.iso.as_ref().is_some_and(|iso| !iso.exists());
@@ -191,6 +217,7 @@ pub fn run(
         blink_phase: 0,
         remote,
         remote_shown: None,
+        display: None,
         osk: Osk::new(),
         osk_shown: false,
     };
@@ -202,6 +229,14 @@ pub fn run(
     let result = session.run(device, canvas);
     let display_closed = device.set_hdmi(false, &session.vm.name);
     let flushed = session.machine.flush_disks();
+    let failed = [
+        result.as_ref().err(),
+        display_closed.as_ref().err(),
+        flushed.as_ref().err(),
+    ];
+    if let Some(error) = failed.into_iter().flatten().next() {
+        run_log::fatal(error, Some(&mut session.machine), None);
+    }
     let end = result?;
     display_closed?;
     flushed.map(|()| end)
@@ -254,6 +289,7 @@ impl Session<'_> {
             if self.machine.reset_count() != self.reset_count {
                 // A board reset drops device input; forget what we held.
                 self.reset_count = self.machine.reset_count();
+                self.event("reset by the guest or the web console");
                 self.forget_input();
             }
             if let Some(overlay) = &mut self.overlay {
@@ -299,7 +335,9 @@ impl Session<'_> {
                 Some(GuestStepStatus::PoweredOff) => return Ok(End::PoweredOff),
                 Some(GuestStepStatus::Stopped { message, eip }) => {
                     let at = eip.map_or(String::new(), |eip| format!(" at EIP {eip:#010x}"));
-                    return Err(format!("The VM stopped{at}: {message}"));
+                    let error = format!("The VM stopped{at}: {message}");
+                    run_log::fatal(&error, Some(&mut self.machine), eip);
+                    return Err(error);
                 }
                 _ => {}
             }
@@ -378,6 +416,11 @@ impl Session<'_> {
         self.redraw = true;
     }
 
+    /// Records an event of this run (run_log.rs), in memory.
+    fn event(&self, text: &str) {
+        run_log::event(self.machine.step_count(), text);
+    }
+
     /// Present the guest frame with an optional note: as its own scaled
     /// layer when the device has one, else drawn into the UI canvas.
     fn show_frame(
@@ -386,6 +429,16 @@ impl Session<'_> {
         canvas: &mut Canvas,
         note: Option<&str>,
     ) -> Result<(), String> {
+        let info = self.machine.vga().mode_info();
+        // Blanking flickers during mode sets; the modes themselves are events.
+        if info.mode != RenderMode::Blank && self.display != Some(info) {
+            self.display = Some(info);
+            let mode = format!(
+                "{:?} {}x{}x{}",
+                info.mode, info.width, info.height, info.bpp
+            );
+            self.event(&format!("display {mode}"));
+        }
         let layer = device.guest_layer() && self.render_rgba();
         if layer {
             self.native_text = false;
@@ -803,6 +856,7 @@ impl Session<'_> {
                 close = false;
             }
             Action::CtrlAltDel => {
+                self.event("Ctrl+Alt+Del");
                 for name in ["controlleft", "altleft", "delete"] {
                     crate::keys::inject_named_key(&mut self.machine, name, true)?;
                 }
@@ -822,6 +876,10 @@ impl Session<'_> {
                 };
                 match result {
                     Ok(()) => {
+                        let name = path.as_deref().and_then(std::path::Path::file_name);
+                        self.event(&name.map_or("CD ejected".into(), |name| {
+                            format!("CD inserted: {}", name.to_string_lossy())
+                        }));
                         self.vm.cdrom = true;
                         self.vm.iso = path;
                         // This session holds the VM lock.
@@ -836,18 +894,24 @@ impl Session<'_> {
                             "CD ejected"
                         });
                     }
-                    Err(err) => self.notify(&err),
+                    Err(err) => {
+                        self.event(&err);
+                        self.notify(&err);
+                    }
                 }
             }
             Action::PowerButton => {
+                self.event("power button");
                 self.machine.press_power_button();
                 self.notify("Power button pressed");
             }
             Action::Reset => {
+                self.event("reset from the menu");
                 match &mut self.remote {
                     Some(remote) => remote.reset(&mut self.machine)?,
                     None => self.machine.reboot()?,
                 }
+                self.reset_count = self.machine.reset_count();
                 self.forget_input();
             }
             // Under remote management the VM stays, off, for the browser.
@@ -858,15 +922,20 @@ impl Session<'_> {
             Action::Remote => {
                 if let Some(remote) = self.remote.take() {
                     remote.close(&mut self.machine);
+                    self.event("remote management stopped");
                     self.notify("Remote management stopped");
                 } else {
                     match start_remote(self.ctx) {
                         Ok(mut remote) => {
+                            self.event(&format!("remote management at {}", remote.url()));
                             remote.set_running(&self.machine, true);
                             self.remote = Some(remote);
                             close = false;
                         }
-                        Err(err) => self.notify(&err),
+                        Err(err) => {
+                            self.event(&err);
+                            self.notify(&err);
+                        }
                     }
                 }
             }

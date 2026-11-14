@@ -450,7 +450,7 @@ pub struct FetchCacheEntry {
     tag: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct FetchCache {
     // Translation-only cache for instruction bytes. Bytes are still read from
     // the bus so self-modifying code observes committed memory contents.
@@ -556,7 +556,7 @@ impl LinearTranslationCacheEntry {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct LinearTranslationCache {
     // Generation plus the current CPL's user bit. Keeping both in one word
     // lets the dominant read hit compare a prebuilt tag.
@@ -576,6 +576,26 @@ pub struct LinearTranslationCache {
     pub(crate) recheck_context: u64,
     #[cfg(feature = "jit")]
     pub(crate) walk_root: u64,
+}
+
+// CPU dumps (CpuShutdown, run logs, the web console's diagnostics) show the
+// caches' state, not their thousands of derived rows.
+impl core::fmt::Debug for FetchCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FetchCache")
+            .field("generation", &self.generation)
+            .field("valid_count", &self.valid_count)
+            .finish_non_exhaustive()
+    }
+}
+
+impl core::fmt::Debug for LinearTranslationCache {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("LinearTranslationCache")
+            .field("state", &self.state)
+            .field("ioram_active", &self.ioram_active)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FetchCacheEntry {
