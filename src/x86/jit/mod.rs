@@ -16,6 +16,8 @@
 //! AArch64 targets only; iOS/watchOS remain interpreter-only.
 //! [`arm32`] is a separate, smaller ARMv6K
 //! backend for the 3DS that shares decoding, flag liveness and code validity.
+//! `t32` (feature `jit-t32`) is the Thumb-2 backend for Cortex-M class cores;
+//! on 32-bit ARM targets it replaces `arm32`.
 //!
 //! Cpu remains the persistent state owner. An invocation exclusively borrows it
 //! and may keep live guest registers in ARM64 registers. Semantic helpers see
@@ -88,7 +90,7 @@
 //!
 
 pub mod a64;
-#[cfg(target_arch = "arm")]
+#[cfg(all(target_arch = "arm", not(feature = "jit-t32")))]
 pub mod arm32;
 mod cold;
 pub mod compile;
@@ -97,6 +99,8 @@ pub mod frame;
 pub mod links;
 pub mod memory;
 pub mod soft;
+#[cfg(feature = "jit-t32")]
+pub mod t32;
 pub mod validity;
 #[cfg(feature = "wasm-jit")]
 pub mod wasm;
@@ -107,5 +111,7 @@ pub mod code;
 #[cfg(a64_jit)]
 pub mod runtime;
 
-#[cfg(all(feature = "machine", target_arch = "arm"))]
+#[cfg(all(feature = "machine", target_arch = "arm", not(feature = "jit-t32")))]
 pub use arm32::runtime;
+#[cfg(all(feature = "machine", target_arch = "arm", feature = "jit-t32"))]
+pub use t32::runtime;
