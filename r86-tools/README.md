@@ -10,8 +10,9 @@ PYTHONPATH=tmp/iso-tools python3 script/build_tools_iso.py
 ```
 
 The build needs MinGW (`i686-w64-mingw32-gcc`) and writes
-`assets/r86_tools.iso` and the internal `assets/r86_tools_full.iso` (local
-extras, never published; see `assets/README.md`).
+`assets/r86_tools.iso`; where the local `assets/r86_tools_full.json` exists,
+also the internal `assets/r86_tools_full.iso` (never published; see
+`assets/README.md`). The Windows app workflow builds the public disc in CI.
 
 - `disc/` is copied to the disc as laid out. Add a new public tool as a
   directory here.

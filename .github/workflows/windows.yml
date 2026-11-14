@@ -1,0 +1,70 @@
+# The Windows app (src/frontend/win32/): r86-win.exe with SeaBIOS, the r86
+# tools disc and licenses, built on Linux by script/build_windows.sh and
+# uploaded as artifacts (r86-windows-x64, optionally r86-windows-arm64).
+# Run by hand: Actions > Windows app > Run workflow, picking the branch.
+name: Windows app
+
+on:
+  workflow_dispatch:
+    inputs:
+      arm64:
+        description: Also build for Windows on ARM (arm64)
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      LLVM_MINGW_VERSION: "20261104"
+      LLVM_MINGW_SHA256: 919380403de87dca3c581c2053230cd298af5e891286628ba0613b7fed370926
+    steps:
+      - uses: actions/checkout@v5
+
+      # i686 MinGW builds r86-tool.exe for the tools disc; x86_64 the app.
+      - name: Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-mingw-w64-i686 gcc-mingw-w64-x86-64 zip
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-gnu
+          rustup default stable
+          python3 -m pip install --target tmp/iso-tools pycdlib==1.22.0
+
+      - name: llvm-mingw for arm64
+        if: inputs.arm64
+        run: |
+          rustup target add aarch64-pc-windows-gnullvm
+          name=llvm-mingw-$LLVM_MINGW_VERSION-ucrt-ubuntu-22.04-x86_64
+          curl -sfL -o "$RUNNER_TEMP/$name.tar.xz" \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/$LLVM_MINGW_VERSION/$name.tar.xz"
+          echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/$name.tar.xz" | sha256sum -c -
+          tar -xJf "$RUNNER_TEMP/$name.tar.xz" -C "$RUNNER_TEMP"
+          echo "LLVM_MINGW=$RUNNER_TEMP/$name" >> "$GITHUB_ENV"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            tmp/target-windows
+          key: windows-${{ inputs.arm64 }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: |
+          PYTHONPATH=tmp/iso-tools python3 script/build_tools_iso.py
+          script/build_windows.sh x64 ${{ inputs.arm64 && 'arm64' || '' }}
+
+      # GitHub zips each artifact itself, so the folders are uploaded.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r86-windows-x64
+          path: tmp/windows/r86-windows-x64
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.arm64
+        with:
+          name: r86-windows-arm64
+          path: tmp/windows/r86-windows-arm64
+          if-no-files-found: error

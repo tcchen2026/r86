@@ -4,9 +4,10 @@
 Requires pycdlib and MinGW (i686-w64-mingw32-gcc). The public disc is
 r86-tools/disc/ plus R86TOOL/r86-tool.exe, compiled from r86-tools/r86-tool.c,
 and R86TOOL/LICENSE.TXT (the repository LICENSE); see r86-tools/README.md.
-assets/r86_tools_full.json adds local VBEMP and Super PI directories (see
-assets/README.md); r86_tools_full.iso must never be published. Both images
-are written to assets/. A missing source fails the build instead of silently
+assets/r86_tools_full.json, local and not in Git, adds VBEMP and Super PI
+directories for r86_tools_full.iso (see assets/README.md), which must never
+be published; without it only the public image is built. Images are written
+to assets/. A missing source fails the build instead of silently
 dropping a tool. PATCHES changes disc copies only; the sources stay original.
 """
 import hashlib
@@ -97,14 +98,17 @@ def main():
     public = tree(TOOLS / 'disc')
     public['R86TOOL/r86-tool.exe'] = r86_tool()
     public['R86TOOL/LICENSE.TXT'] = ROOT / 'LICENSE'
+    manifest = ASSETS / 'r86_tools_full.json'
     full = dict(public, **{'README.TXT': ASSETS / 'r86_tools_full.txt'})
-    for name, source in json.loads((ASSETS / 'r86_tools_full.json').read_text()).items():
+    internal = json.loads(manifest.read_text()) if manifest.exists() else {}
+    for name, source in internal.items():
         assert name and '/' not in name and name not in ('.', '..'), name
         if any(path.split('/')[0] == name for path in public):
             raise SystemExit(f'Internal root {name} must not replace a public tool')
         full.update(tree(ASSETS / source, name + '/'))
     build(public, 'r86_tools')
-    build(full, 'r86_tools_full')
+    if manifest.exists():
+        build(full, 'r86_tools_full')
 
 
 if __name__ == '__main__':

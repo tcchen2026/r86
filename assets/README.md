@@ -2,7 +2,8 @@
 
 Not in Git, except this file and the FreeDOS kit's manifest and pin. The
 public tools disc's sources are tracked in `r86-tools/` (see its README);
-`script/build_tools_iso.py` writes both images here:
+`script/build_tools_iso.py` writes the images here (the full one only
+where `r86_tools_full.json` exists):
 
 - `r86_tools.iso`: the public tools CD.
 - `r86_tools_full.iso`: internal only, the public contents plus the original
