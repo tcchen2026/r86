@@ -113,6 +113,14 @@ required-features = ["machine"]
 test = false
 bench = false
 
+# Bare-metal machine for a Cortex-M33 (QEMU MPS3 AN524); cortex-m/firmware/run.sh.
+[[bin]]
+name = "r86-cortex-m"
+path = "cortex-m/firmware/machine.rs"
+required-features = ["jit-t32"]
+test = false
+bench = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

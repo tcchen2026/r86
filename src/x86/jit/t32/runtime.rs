@@ -495,6 +495,7 @@ impl Engine {
         start: u64,
         budget: u64,
     ) -> Result<BatchResult, String> {
+        const COLD_BATCH: u64 = 16;
         bus.sync_ioram(cpu);
         let mut ran = 0;
         // EIP of the last instruction interpreted as cold code. Its sequential
@@ -510,11 +511,8 @@ impl Engine {
             let (limit, attention) = bus
                 .batch_attention_limit(start.wrapping_add(ran), budget - ran)
                 .unwrap_or((1, false));
-            let sequential = cold.is_some_and(|eip| cpu.eip.wrapping_sub(eip).wrapping_sub(1) < 15);
             cold = None;
-            if eligible && sequential {
-                cold = Some(cpu.eip);
-            } else if eligible {
+            if eligible {
                 self.sync(cpu, bus);
                 let native = match self.lookup(cpu, bus)? {
                     Lookup::Native(block) => self.invoke(cpu, bus, block, limit),
@@ -548,7 +546,14 @@ impl Engine {
                     self.stats.memory_exits += 1;
                 }
             }
-            let mut batch = if eligible || shadowed {
+            let mut batch = if cold.is_some() {
+                Interpreter::run_batch(
+                    cpu,
+                    bus,
+                    start.wrapping_add(ran),
+                    (budget - ran).min(COLD_BATCH),
+                )
+            } else if eligible || shadowed {
                 Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
             } else {
                 Interpreter::run_batch(cpu, bus, start.wrapping_add(ran), budget - ran)
