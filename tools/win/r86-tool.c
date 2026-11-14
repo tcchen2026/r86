@@ -4,6 +4,8 @@
  *   r86-tool mode W H [BITS]    switch the desktop to W x H at BITS (16 by
  *                               default) and keep it for the next boot
  *   r86-tool version            print tool and magic instruction versions
+ *   r86-tool autorun            the logon helper: absolute pointer plus a
+ *                               notification-area icon (settings, pointer, exit)
  *   r86-tool mouse              run the absolute pointer helper, hidden
  *   r86-tool mouse stop         stop the running pointer helper
  *   r86-tool mouse install      start this executable at the user's logon
@@ -11,8 +13,10 @@
  *   r86-tool install            copy the helper/docs to C:\R86 and start it
  *   r86-tool uninstall          stop it, remove its all-user Run entry/files
  *   r86-tool driver display [CDROOT]  install this OS's tools-CD VGA driver
- * No arguments: C:\R86\R86-TOOL.EXE runs the helper; any other copy (the
- * tools CD) opens the installer window. It is a GUI program, so neither
+ * No arguments: C:\R86\R86-TOOL.EXE opens the settings window, inside the
+ * running autorun helper when there is one, else as the helper with its icon;
+ * any other copy (the tools CD) opens the installer window, whose Install
+ * button reads Update once C:\R86 holds a copy. It is a GUI program, so none
  * shows a console. Commands print to a redirected output, the parent console
  * (AttachConsole, XP), or a new console that waits for Enter before closing.
  * cmd.exe does not wait for GUI programs: use `start /wait` for the exit code.
@@ -46,7 +50,7 @@ static int own_console;
 #define MAGIC_VERSION 0
 #define MAGIC_POINTER 2
 #define MAGIC_CAP_POINTER 2
-#define TOOL_VERSION 2
+#define TOOL_VERSION 3
 
 struct magic_regs { DWORD a, b, c, d, s, i; };
 
@@ -164,11 +168,11 @@ static int list_modes(void)
     }
 }
 
-static int set_mode(DWORD width, DWORD height, DWORD bits)
+/* Switches and saves the mode; returns 0 on success, with `text` for people. */
+static int change_mode(DWORD width, DWORD height, DWORD bits, const char **text)
 {
     DEVMODEA mode;
     LONG code;
-    const char *text;
 
     memset(&mode, 0, sizeof mode);
     mode.dmSize = sizeof mode;
@@ -178,14 +182,21 @@ static int set_mode(DWORD width, DWORD height, DWORD bits)
     mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
     code = ChangeDisplaySettingsA(&mode, CDS_UPDATEREGISTRY);
     switch (code) {
-    case DISP_CHANGE_SUCCESSFUL: text = "switched"; break;
-    case DISP_CHANGE_RESTART: text = "saved; restart Windows to use it"; break;
-    case DISP_CHANGE_BADMODE: text = "Windows does not offer this mode"; break;
-    case DISP_CHANGE_NOTUPDATED: text = "switched, but not saved in the registry"; break;
-    default: text = "failed"; break;
+    case DISP_CHANGE_SUCCESSFUL: *text = "switched"; break;
+    case DISP_CHANGE_RESTART: *text = "saved; restart Windows to use it"; break;
+    case DISP_CHANGE_BADMODE: *text = "Windows does not offer this mode"; break;
+    case DISP_CHANGE_NOTUPDATED: *text = "switched, but not saved in the registry"; break;
+    default: *text = "failed"; break;
     }
-    say("%lu x %lu, %lu bit: %s\r\n", width, height, bits, text);
     return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
+}
+
+static int set_mode(DWORD width, DWORD height, DWORD bits)
+{
+    const char *text;
+    int status = change_mode(width, height, bits, &text);
+    say("%lu x %lu, %lu bit: %s\r\n", width, height, bits, text);
+    return status;
 }
 
 static int version(void)
@@ -254,87 +265,19 @@ static void stop_mouse(void)
     }
 }
 
-static int mouse(void)
-{
-    struct magic_regs r;
-    DWORD buttons = 0, os_version, hint = 0;
-    HANDLE stop, mutex, pid_map;
-    DWORD *pid;
-    int wheel_supported;
+static DWORD buttons;               /* held guest buttons; the polling thread's */
+static volatile LONG pointer_on = 1; /* the icon menu's and settings' toggle */
+static int helper_running;          /* this process is the pointer helper */
 
-    FreeConsole();
-    if (!r86_present())
-        return 0;
-    r = magic_call(MAGIC_VERSION);
-    if (r.a != 1 || !(r.b & MAGIC_CAP_POINTER))
-        return 0;
-    os_version = GetVersion();
-    nt = !(os_version & 0x80000000);
-    wheel_supported = nt || LOBYTE(LOWORD(os_version)) > 4 ||
-        HIBYTE(LOWORD(os_version)) >= 10;
-    if (!prepare_desktop())
-        return 1;
-    mutex = CreateMutexA(NULL, TRUE, mutex_name);
-    if (!mutex)
-        return 1;
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        CloseHandle(mutex);
-        return 0;
-    }
-    stop = CreateEventA(NULL, TRUE, FALSE, stop_name);
-    if (!stop) {
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
-        return 1;
-    }
-    pid_map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(DWORD), pid_name);
-    pid = pid_map ? MapViewOfFile(pid_map, FILE_MAP_WRITE, 0, 0, sizeof(DWORD)) : NULL;
-    if (!pid) {
-        if (pid_map) CloseHandle(pid_map);
-        CloseHandle(stop);
-        ReleaseMutex(mutex);
-        CloseHandle(mutex);
-        return 1;
-    }
-    /* The installer opens this process before signalling stop, then waits for
-     * process exit so Windows has released the EXE before an update/delete. */
-    *pid = GetCurrentProcessId();
-    /* A timed event wait has Sleep's cadence and also permits a clean stop. */
-    while (WaitForSingleObject(stop, hint) == WAIT_TIMEOUT) {
-        DWORD changed, flags;
-        if (!input_desktop()) {
-            hint = 100;
-            continue; /* No poll: allow the host's PS/2 fallback lease to expire. */
-        }
-        r = magic_call(MAGIC_POINTER);
-        if (r.a == 0xffffffff)
-            break;
-        hint = r.s;
-        changed = buttons ^ r.c;
-        if (!r.a && !changed)
-            continue;
-        flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
-        if (changed & 1) flags |= (r.c & 1) ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
-        if (changed & 2) flags |= (r.c & 2) ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
-        if (changed & 4) flags |= (r.c & 4) ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
-        if (wheel_supported && r.d) flags |= MOUSEEVENTF_WHEEL;
-        mouse_event(flags, r.b & 0xffff, r.b >> 16,
-                    wheel_supported ? (DWORD)((LONG)r.d * WHEEL_DELTA) : 0, 0);
-        buttons = r.c;
-    }
-    if (buttons && input_desktop()) {
-        DWORD flags = 0;
-        if (buttons & 1) flags |= MOUSEEVENTF_LEFTUP;
-        if (buttons & 2) flags |= MOUSEEVENTF_RIGHTUP;
-        if (buttons & 4) flags |= MOUSEEVENTF_MIDDLEUP;
+static void release_buttons(void)
+{
+    DWORD flags = 0;
+    if (buttons & 1) flags |= MOUSEEVENTF_LEFTUP;
+    if (buttons & 2) flags |= MOUSEEVENTF_RIGHTUP;
+    if (buttons & 4) flags |= MOUSEEVENTF_MIDDLEUP;
+    if (flags && input_desktop())
         mouse_event(flags, 0, 0, 0, 0);
-    }
-    CloseHandle(stop);
-    UnmapViewOfFile(pid);
-    CloseHandle(pid_map);
-    ReleaseMutex(mutex);
-    CloseHandle(mutex);
-    return 0;
+    buttons = 0;
 }
 
 static int mouse_startup(int install)
@@ -374,6 +317,7 @@ static int mouse_startup(int install)
 /* Dialog-facing mechanics and result contract: r86-tool.h. */
 static const char install_dir[] = "C:\\R86";
 static const char install_exe[] = "C:\\R86\\R86-TOOL.EXE";
+static const char autorun_command[] = "\"C:\\R86\\R86-TOOL.EXE\" autorun";
 static const char run_key[] = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const char vga_id[] = "PCI\\VEN_1234&DEV_1111";
 static const char vbemp_message[] =
@@ -491,7 +435,8 @@ DWORD r86_start_helper(struct tool_result *r)
 {
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
-    char command[] = "\"C:\\R86\\R86-TOOL.EXE\"";
+    char command[sizeof autorun_command];
+    lstrcpyA(command, autorun_command);
     memset(&startup, 0, sizeof startup);
     startup.cb = sizeof startup;
     if (!CreateProcessA(install_exe, command, NULL, NULL, FALSE, DETACHED_PROCESS,
@@ -530,7 +475,7 @@ DWORD r86_install(struct tool_result *r)
                 return failure(r, "Set installed file attributes", GetLastError());
         }
     }
-    code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", "\"C:\\R86\\R86-TOOL.EXE\"");
+    code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", autorun_command);
     if (code) return failure(r, "Register all-user logon helper (administrator required on NT)", code);
     code = startup_entry(HKEY_CURRENT_USER, "r86 Mouse", NULL);
     if (code) return failure(r, "Remove old per-user helper entry", code);
@@ -827,13 +772,97 @@ DWORD r86_install_display(HWND parent, const char *directory, struct tool_result
     }
 }
 
-/* Installer window: R86-TOOL.EXE started from the tools CD. Plain controls
- * on a fixed window; the mechanics above do the work and supply the text. */
+/* Windows: plain controls on fixed windows; the mechanics above do the work
+ * and supply the text. A process shows one of them in `window`: the installer
+ * (the tools CD copy) or settings (the installed copy and its helper). */
 enum { ID_INTRO = 100, ID_HELPER, ID_DISPLAY, ID_VBEMP, ID_CHOOSE, ID_STATUS, ID_UNINSTALL, ID_REFRESH };
 
 static HWND window;
+static HICON icon;
 static char vbemp_dir[MAX_PATH];
 static int display_kind; /* 0: by hand, 1: VMDisp9x, 2: VBEMP */
+
+/* "86" on navy, drawn at run time: the build has no resource compiler. Navy
+ * and white are in the 16-colour palette Windows uses before a display driver. */
+static HICON r86_icon(void)
+{
+    HDC screen = GetDC(NULL), dc = CreateCompatibleDC(screen);
+    HBITMAP colour = CreateCompatibleBitmap(screen, 16, 16), mask = CreateBitmap(16, 16, 1, 1, NULL);
+    HBRUSH navy = CreateSolidBrush(RGB(0, 0, 128));
+    ICONINFO info = { TRUE, 0, 0, mask, colour };
+    RECT r = {0, 0, 16, 16};
+    HGDIOBJ old = SelectObject(dc, mask);
+    HICON made;
+
+    PatBlt(dc, 0, 0, 16, 16, BLACKNESS); /* an all-zero mask is opaque */
+    SelectObject(dc, colour);
+    FillRect(dc, &r, navy);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    DrawTextA(dc, "86", 2, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old);
+    made = CreateIconIndirect(&info);
+    DeleteObject(navy);
+    DeleteObject(colour);
+    DeleteObject(mask);
+    DeleteDC(dc);
+    ReleaseDC(NULL, screen);
+    return made;
+}
+
+static int window_class(const char *name, WNDPROC proc)
+{
+    WNDCLASSA c;
+
+    if (!icon)
+        icon = r86_icon();
+    memset(&c, 0, sizeof c);
+    c.lpfnWndProc = proc;
+    c.hInstance = GetModuleHandleA(NULL);
+    c.hIcon = icon;
+    c.hCursor = LoadCursorA(NULL, IDC_ARROW);
+    c.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    c.lpszClassName = name;
+    return RegisterClassA(&c) != 0;
+}
+
+/* Window rectangle for a client area, centred in the work area with its
+ * caption on screen: the handheld's 640x340 desktop must fit. */
+static void centred(DWORD style, int width, int height, RECT *r)
+{
+    RECT area;
+
+    SetRect(r, 0, 0, width, height);
+    AdjustWindowRect(r, style, FALSE);
+    SystemParametersInfoA(SPI_GETWORKAREA, 0, &area, 0);
+    r->right -= r->left;
+    r->bottom -= r->top;
+    r->left = area.left + (area.right - area.left - r->right) / 2;
+    r->top = area.top + (area.bottom - area.top - r->bottom) / 2;
+    if (r->left < area.left) r->left = area.left;
+    if (r->top < area.top) r->top = area.top;
+}
+
+static void dispatch(MSG *message)
+{
+    if (!window || !IsDialogMessageA(window, message)) {
+        TranslateMessage(message);
+        DispatchMessageA(message);
+    }
+}
+
+static const char *install_word(void)
+{
+    return regular_file(install_exe) ? "Update" : "Install";
+}
+
+/* Install becomes Update, and Uninstall is offered, once C:\R86 has a copy. */
+static void show_installed(void)
+{
+    SetDlgItemTextA(window, IDOK, install_word());
+    EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
+}
 
 static HWND control(DWORD ex, const char *cls, const char *text, DWORD style, int id,
                     int x, int y, int w, int h)
@@ -880,9 +909,9 @@ static void show_display(void)
         wsprintfA(text, "VBEMP: %s", found ? inf : "not found");
         SetDlgItemTextA(window, ID_VBEMP, text);
     }
-    SetDlgItemTextA(window, ID_STATUS, found ? "Choose what to install, then click Install. Windows "
-                                               "restarts once to start the display driver."
-                                             : r.message);
+    wsprintfA(text, "Choose what to install, then click %s. Windows restarts once to start "
+                    "the display driver.", install_word());
+    SetDlgItemTextA(window, ID_STATUS, found ? text : r.message);
 }
 
 static void choose_vbemp(void)
@@ -971,7 +1000,7 @@ static void run(int install)
     text[0] = 0;
     for (i = 0; i < 4; i++)
         EnableWindow(GetDlgItem(window, buttons[i]), FALSE);
-    SetDlgItemTextA(window, ID_STATUS, install ? "Installing..." : "Removing...");
+    SetDlgItemTextA(window, ID_STATUS, !install ? "Removing..." : regular_file(install_exe) ? "Updating..." : "Installing...");
     UpdateWindow(window);
     cursor = SetCursor(LoadCursorA(NULL, IDC_WAIT));
     if (!install) {
@@ -994,7 +1023,7 @@ static void run(int install)
     SetDlgItemTextA(window, ID_STATUS, text);
     for (i = 0; i < 4; i++)
         EnableWindow(GetDlgItem(window, buttons[i]), TRUE);
-    EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
+    show_installed();
     if (restart && MessageBoxA(window, "Restart Windows now to finish?", "r86 tools",
                                MB_YESNO | MB_ICONQUESTION) == IDYES)
         restart_windows();
@@ -1021,11 +1050,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
 
 static int installer(void)
 {
-    static const char helper[] = "r86 helper: mouse integration; installed in C:\\R86 and started at logon";
+    static const char helper[] = "r86 helper: mouse integration and a taskbar icon, started at logon";
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     DWORD os = GetVersion();
-    RECT rect = {0, 0, 440, 246}, area;
-    WNDCLASSA c;
+    RECT rect;
     MSG message;
     char text[96];
     int y;
@@ -1042,24 +1070,11 @@ static int installer(void)
         display_kind = LOBYTE(LOWORD(os)) == 5 && HIBYTE(LOWORD(os)) <= 1 ? 2 : 0;
     else
         display_kind = 1;
-    memset(&c, 0, sizeof c);
-    c.lpfnWndProc = window_proc;
-    c.hInstance = GetModuleHandleA(NULL);
-    c.hIcon = LoadIconA(NULL, IDI_APPLICATION);
-    c.hCursor = LoadCursorA(NULL, IDC_ARROW);
-    c.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
-    c.lpszClassName = "r86-tool";
-    if (!RegisterClassA(&c))
+    if (!window_class("r86-tool", window_proc))
         return 1;
-    /* Centred in the work area: the handheld's 640x340 desktop must fit. */
-    AdjustWindowRect(&rect, style, FALSE);
-    SystemParametersInfoA(SPI_GETWORKAREA, 0, &area, 0);
-    rect.right -= rect.left;
-    rect.bottom -= rect.top;
-    window = CreateWindowExA(0, "r86-tool", "r86 tools", style,
-                             area.left + (area.right - area.left - rect.right) / 2,
-                             area.top + (area.bottom - area.top - rect.bottom) / 2,
-                             rect.right, rect.bottom, NULL, NULL, c.hInstance, NULL);
+    centred(style, 440, 246, &rect);
+    window = CreateWindowExA(0, "r86-tool", "r86 tools", style, rect.left, rect.top,
+                             rect.right, rect.bottom, NULL, NULL, GetModuleHandleA(NULL), NULL);
     if (!window)
         return 1;
     wsprintfA(text, "Install the r86 tools for %s:", windows_name());
@@ -1080,9 +1095,10 @@ static int installer(void)
     control(0, "BUTTON", "Install", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 188, 214, 76, 24);
     control(0, "BUTTON", "Uninstall", BS_PUSHBUTTON | WS_TABSTOP, ID_UNINSTALL, 270, 214, 76, 24);
     control(0, "BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 352, 214, 76, 24);
-    SetDlgItemTextA(window, ID_STATUS, "Choose what to install, then click Install.");
+    wsprintfA(text, "Choose what to install, then click %s.", install_word());
+    SetDlgItemTextA(window, ID_STATUS, text);
     SendDlgItemMessageA(window, ID_HELPER, BM_SETCHECK, BST_CHECKED, 0);
-    EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
+    show_installed();
     show_display();
     if (!r86_present()) {
         SetDlgItemTextA(window, ID_STATUS, "This is not an r86 virtual machine. The r86 tools work only inside r86.");
@@ -1091,10 +1107,417 @@ static int installer(void)
     ShowWindow(window, SW_SHOWNORMAL);
     SetFocus(GetDlgItem(window, IsWindowEnabled(GetDlgItem(window, IDOK)) ? IDOK : IDCANCEL));
     while (GetMessageA(&message, NULL, 0, 0) > 0)
-        if (!IsDialogMessageA(window, &message)) {
-            TranslateMessage(&message);
-            DispatchMessageA(&message);
+        dispatch(&message);
+    return 0;
+}
+
+/* Settings window: the installed copy's window, in the helper process when
+ * there is one, so the pointer toggle acts on the running helper. */
+enum { ID_RESOLUTION = 200, ID_APPLY, ID_POINTER, ID_LOGON, ID_SETTINGS, ID_EXIT };
+#define WM_TRAY (WM_APP + 1)
+
+static const char settings_class[] = "r86-tool.settings";
+static const char tray_class[] = "r86-tool.tray";
+static int standalone; /* settings without a helper: closing it ends the process */
+static struct { DWORD width, height, bits; } modes[96];
+static HWND tray;
+static UINT taskbar_created;
+static BOOL (WINAPI *notify_icon)(DWORD, PNOTIFYICONDATAA);
+
+/* Every mode Windows offers, including those under 640x480 that the Display
+ * control panel hides; one entry per size and depth, whatever the refresh. */
+static void fill_modes(void)
+{
+    HWND list = GetDlgItem(window, ID_RESOLUTION);
+    HDC screen = GetDC(NULL);
+    DWORD width = (DWORD)GetDeviceCaps(screen, HORZRES), height = (DWORD)GetDeviceCaps(screen, VERTRES);
+    DWORD bits = (DWORD)(GetDeviceCaps(screen, BITSPIXEL) * GetDeviceCaps(screen, PLANES)), i;
+    DEVMODEA mode;
+    char text[48];
+    int count = 0, j, k;
+
+    ReleaseDC(NULL, screen);
+    SendMessageA(list, CB_RESETCONTENT, 0, 0);
+    for (i = 0; count < (int)(sizeof modes / sizeof modes[0]); i++) {
+        memset(&mode, 0, sizeof mode);
+        mode.dmSize = sizeof mode;
+        if (!EnumDisplaySettingsA(NULL, i, &mode))
+            break;
+        /* VBEMP, the 2000/XP driver, crashes winlogon in 256 colours. */
+        if (nt && mode.dmBitsPerPel == 8)
+            continue;
+        /* Sorted by width, height, then depth. */
+        for (j = 0; j < count && (modes[j].width != mode.dmPelsWidth ? modes[j].width < mode.dmPelsWidth
+                                  : modes[j].height != mode.dmPelsHeight ? modes[j].height < mode.dmPelsHeight
+                                  : modes[j].bits < mode.dmBitsPerPel); j++)
+            ;
+        if (j < count && modes[j].width == mode.dmPelsWidth && modes[j].height == mode.dmPelsHeight &&
+            modes[j].bits == mode.dmBitsPerPel)
+            continue;
+        for (k = count++; k > j; k--)
+            modes[k] = modes[k - 1];
+        modes[j].width = mode.dmPelsWidth;
+        modes[j].height = mode.dmPelsHeight;
+        modes[j].bits = mode.dmBitsPerPel;
+    }
+    for (j = 0; j < count; j++) {
+        if (modes[j].bits <= 8)
+            wsprintfA(text, "%lu x %lu, %lu colours", modes[j].width, modes[j].height, 1UL << modes[j].bits);
+        else
+            wsprintfA(text, "%lu x %lu, %lu-bit colour", modes[j].width, modes[j].height, modes[j].bits);
+        SendMessageA(list, CB_ADDSTRING, 0, (LPARAM)text);
+        if (modes[j].width == width && modes[j].height == height && modes[j].bits == bits)
+            SendMessageA(list, CB_SETCURSEL, (WPARAM)j, 0);
+    }
+}
+
+static void apply_mode(void)
+{
+    LRESULT i = SendDlgItemMessageA(window, ID_RESOLUTION, CB_GETCURSEL, 0, 0);
+    const char *result;
+    char text[96];
+
+    if (i < 0)
+        return;
+    change_mode(modes[i].width, modes[i].height, modes[i].bits, &result);
+    wsprintfA(text, "%lu x %lu, %lu-bit: %s.", modes[i].width, modes[i].height, modes[i].bits, result);
+    SetDlgItemTextA(window, ID_STATUS, text);
+}
+
+static int logon_entry(void)
+{
+    HKEY key;
+    int found = 0;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, run_key, 0, KEY_QUERY_VALUE, &key) == ERROR_SUCCESS) {
+        found = RegQueryValueExA(key, "r86 Tool", NULL, NULL, NULL, NULL) == ERROR_SUCCESS;
+        RegCloseKey(key);
+    }
+    return found;
+}
+
+static void set_logon(void)
+{
+    int on = checked(ID_LOGON);
+    DWORD code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", on ? autorun_command : NULL);
+    struct tool_result r;
+
+    if (code) {
+        failure(&r, on ? "Add the logon entry (administrator required on NT)" : "Remove the logon entry", code);
+        SendDlgItemMessageA(window, ID_LOGON, BM_SETCHECK, on ? BST_UNCHECKED : BST_CHECKED, 0);
+        SetDlgItemTextA(window, ID_STATUS, r.message);
+    } else
+        SetDlgItemTextA(window, ID_STATUS, on ? "r86 tools start at every user's logon."
+                                              : "r86 tools no longer start at logon.");
+}
+
+static void tray_icon(DWORD action)
+{
+    NOTIFYICONDATAA data;
+
+    if (!tray)
+        return;
+    memset(&data, 0, sizeof data);
+    /* The version 1 layout: Windows 95, 98 and NT 4 shells reject larger ones. */
+    data.cbSize = NOTIFYICONDATAA_V1_SIZE;
+    data.hWnd = tray;
+    data.uID = 1;
+    data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    data.uCallbackMessage = WM_TRAY;
+    data.hIcon = icon;
+    lstrcpyA(data.szTip, pointer_on ? "r86 tools: the mouse follows the host pointer"
+                                    : "r86 tools: absolute mouse off");
+    /* At logon the taskbar may not exist yet: retry until it does. */
+    if (!notify_icon(action, &data) && action == NIM_ADD)
+        SetTimer(tray, 1, 2000, NULL);
+}
+
+static void set_pointer(int on)
+{
+    pointer_on = on;
+    if (window)
+        SendDlgItemMessageA(window, ID_POINTER, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    tray_icon(NIM_MODIFY);
+}
+
+static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
+{
+    switch (message) {
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case ID_APPLY: apply_mode(); return 0;
+        case ID_POINTER: set_pointer(checked(ID_POINTER)); return 0;
+        case ID_LOGON: set_logon(); return 0;
+        case IDCANCEL: DestroyWindow(hwnd); return 0;
         }
+        break;
+    case WM_DISPLAYCHANGE: {
+        RECT client, r;
+        GetClientRect(hwnd, &client);
+        centred((DWORD)GetWindowLongA(hwnd, GWL_STYLE), client.right, client.bottom, &r);
+        SetWindowPos(hwnd, NULL, r.left, r.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        fill_modes();
+        return 0;
+    }
+    case WM_DESTROY:
+        window = NULL;
+        if (standalone)
+            PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, w, l);
+}
+
+static void open_settings(void)
+{
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r;
+    char text[64];
+
+    if (window) {
+        ShowWindow(window, SW_RESTORE);
+        SetForegroundWindow(window);
+        return;
+    }
+    centred(style, 380, 176, &r);
+    window = CreateWindowExA(0, settings_class, "r86 tools settings", style, r.left, r.top,
+                             r.right, r.bottom, NULL, NULL, GetModuleHandleA(NULL), NULL);
+    if (!window)
+        return;
+    control(0, "STATIC", "Screen:", SS_LEFT, ID_INTRO, 12, 14, 50, 16);
+    control(0, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_RESOLUTION, 64, 10, 222, 160);
+    control(0, "BUTTON", "Apply", BS_PUSHBUTTON | WS_TABSTOP, ID_APPLY, 292, 9, 76, 24);
+    control(0, "STATIC", "Includes the modes that the Display control panel hides.", SS_LEFT, ID_INTRO,
+            64, 38, 304, 16);
+    control(0, "BUTTON", helper_running ? "Mouse follows the host pointer (absolute mouse)"
+                                        : "Mouse follows the host pointer (the helper is not running)",
+            BS_AUTOCHECKBOX | WS_TABSTOP, ID_POINTER, 12, 62, 356, 18);
+    control(0, "BUTTON", "Start r86 tools at logon, with an icon in the taskbar",
+            BS_AUTOCHECKBOX | WS_TABSTOP, ID_LOGON, 12, 84, 356, 18);
+    control(0, "STATIC", "", SS_LEFT, ID_STATUS, 12, 110, 356, 30);
+    control(0, "BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 292, 144, 76, 24);
+    fill_modes();
+    SendDlgItemMessageA(window, ID_POINTER, BM_SETCHECK, helper_running && pointer_on ? BST_CHECKED : BST_UNCHECKED, 0);
+    EnableWindow(GetDlgItem(window, ID_POINTER), helper_running);
+    SendDlgItemMessageA(window, ID_LOGON, BM_SETCHECK, logon_entry() ? BST_CHECKED : BST_UNCHECKED, 0);
+    wsprintfA(text, "r86-tool %u on %s.", TOOL_VERSION, windows_name());
+    SetDlgItemTextA(window, ID_STATUS, text);
+    ShowWindow(window, SW_SHOWNORMAL);
+    SetForegroundWindow(window);
+    SetFocus(GetDlgItem(window, ID_RESOLUTION));
+}
+
+static void tray_menu(void)
+{
+    HMENU menu = CreatePopupMenu();
+    POINT at;
+
+    AppendMenuA(menu, MF_STRING, ID_SETTINGS, "&Settings...");
+    AppendMenuA(menu, MF_STRING | (pointer_on ? MF_CHECKED : MF_UNCHECKED), ID_POINTER,
+                "&Mouse follows the host pointer");
+    AppendMenuA(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(menu, MF_STRING, ID_EXIT, "E&xit");
+    SetMenuDefaultItem(menu, ID_SETTINGS, FALSE);
+    GetCursorPos(&at);
+    /* Foreground first, and a message after, so the menu closes on an outside click. */
+    SetForegroundWindow(tray);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON, at.x, at.y, 0, tray, NULL);
+    PostMessageA(tray, WM_NULL, 0, 0);
+    DestroyMenu(menu);
+}
+
+static LRESULT CALLBACK tray_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
+{
+    if (message == WM_TRAY) {
+        if (l == WM_LBUTTONUP)
+            open_settings();
+        else if (l == WM_RBUTTONUP)
+            tray_menu();
+        return 0;
+    }
+    if (taskbar_created && message == taskbar_created) { /* Explorer restarted */
+        tray_icon(NIM_ADD);
+        return 0;
+    }
+    switch (message) {
+    case WM_TIMER:
+        KillTimer(hwnd, w);
+        tray_icon(NIM_ADD);
+        return 0;
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case ID_SETTINGS: open_settings(); return 0;
+        case ID_POINTER: set_pointer(!pointer_on); return 0;
+        case ID_EXIT: PostQuitMessage(0); return 0;
+        }
+        break;
+    }
+    return DefWindowProcA(hwnd, message, w, l);
+}
+
+static void make_tray(void)
+{
+    HMODULE shell = LoadLibraryA("shell32.dll");
+
+    notify_icon = shell ? (void *)GetProcAddress(shell, "Shell_NotifyIconA") : NULL;
+    if (!notify_icon || !window_class(tray_class, tray_proc))
+        return;
+    taskbar_created = RegisterWindowMessageA("TaskbarCreated");
+    tray = CreateWindowExA(0, tray_class, "r86 tools", WS_POPUP, 0, 0, 0, 0, NULL, NULL,
+                           GetModuleHandleA(NULL), NULL);
+    tray_icon(NIM_ADD);
+}
+
+static int settings_only(void)
+{
+    MSG message;
+
+    standalone = 1;
+    if (!window_class(settings_class, settings_proc))
+        return 1;
+    open_settings();
+    while (window && GetMessageA(&message, NULL, 0, 0) > 0)
+        dispatch(&message);
+    return 0;
+}
+
+/* The installed copy started by hand: open settings in the autorun helper. */
+static int settings_in_helper(void)
+{
+    HWND helper = FindWindowA(tray_class, NULL);
+    BOOL (WINAPI *allow)(DWORD);
+
+    if (!helper)
+        return 0;
+    allow = (void *)GetProcAddress(GetModuleHandleA("user32.dll"), "AllowSetForegroundWindow");
+    if (allow)
+        allow(ASFW_ANY);
+    PostMessageA(helper, WM_COMMAND, ID_SETTINGS, 0);
+    return 1;
+}
+
+static HANDLE stop;
+static DWORD ui_thread; /* gets WM_QUIT when polling ends by itself */
+static int wheel_supported;
+
+/* Polls the host at its hinted interval on a thread of its own, so the icon
+ * menu, window drags and other modal loops keep receiving the pointer. */
+static DWORD WINAPI poll_pointer(LPVOID unused)
+{
+    struct magic_regs r;
+    DWORD hint = 0;
+
+    (void)unused;
+    /* A timed event wait has Sleep's cadence and also permits a clean stop. */
+    while (WaitForSingleObject(stop, hint) == WAIT_TIMEOUT) {
+        DWORD changed, flags;
+        hint = 100;
+        if (!pointer_on) {
+            release_buttons();
+            continue; /* No poll: the host's PS/2 fallback takes over. */
+        }
+        if (!input_desktop())
+            continue; /* No poll: allow the host's PS/2 fallback lease to expire. */
+        r = magic_call(MAGIC_POINTER);
+        if (r.a == 0xffffffff)
+            break;
+        hint = r.s;
+        changed = buttons ^ r.c;
+        if (!r.a && !changed)
+            continue;
+        flags = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE;
+        if (changed & 1) flags |= (r.c & 1) ? MOUSEEVENTF_LEFTDOWN : MOUSEEVENTF_LEFTUP;
+        if (changed & 2) flags |= (r.c & 2) ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_RIGHTUP;
+        if (changed & 4) flags |= (r.c & 4) ? MOUSEEVENTF_MIDDLEDOWN : MOUSEEVENTF_MIDDLEUP;
+        if (wheel_supported && r.d) flags |= MOUSEEVENTF_WHEEL;
+        mouse_event(flags, r.b & 0xffff, r.b >> 16,
+                    wheel_supported ? (DWORD)((LONG)r.d * WHEEL_DELTA) : 0, 0);
+        buttons = r.c;
+    }
+    release_buttons();
+    if (ui_thread)
+        PostThreadMessageA(ui_thread, WM_QUIT, 0, 0);
+    return 0;
+}
+
+/* The pointer helper: "mouse" runs it hidden; "autorun" adds the icon; the
+ * installed copy started by hand also opens settings. One per session. */
+static int helper(int with_icon, int show_settings)
+{
+    struct magic_regs r;
+    DWORD os_version = GetVersion();
+    HANDLE mutex, pid_map;
+    DWORD *pid;
+
+    FreeConsole();
+    if (!r86_present())
+        return show_settings ? settings_only() : 0;
+    r = magic_call(MAGIC_VERSION);
+    if (r.a != 1 || !(r.b & MAGIC_CAP_POINTER))
+        return show_settings ? settings_only() : 0;
+    wheel_supported = nt || LOBYTE(LOWORD(os_version)) > 4 ||
+        HIBYTE(LOWORD(os_version)) >= 10;
+    if (!prepare_desktop())
+        return show_settings ? settings_only() : 1;
+    mutex = CreateMutexA(NULL, TRUE, mutex_name);
+    if (!mutex)
+        return show_settings ? settings_only() : 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        CloseHandle(mutex);
+        return show_settings ? settings_only() : 0;
+    }
+    stop = CreateEventA(NULL, TRUE, FALSE, stop_name);
+    if (!stop) {
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
+    pid_map = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(DWORD), pid_name);
+    pid = pid_map ? MapViewOfFile(pid_map, FILE_MAP_WRITE, 0, 0, sizeof(DWORD)) : NULL;
+    if (!pid) {
+        if (pid_map) CloseHandle(pid_map);
+        CloseHandle(stop);
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return 1;
+    }
+    /* The installer opens this process before signalling stop, then waits for
+     * process exit so Windows has released the EXE before an update/delete. */
+    *pid = GetCurrentProcessId();
+    helper_running = 1;
+    if (!with_icon && !show_settings)
+        poll_pointer(NULL);
+    else {
+        HANDLE thread;
+        DWORD id;
+        MSG message;
+
+        ui_thread = GetCurrentThreadId();
+        window_class(settings_class, settings_proc);
+        if (with_icon)
+            make_tray();
+        if (show_settings)
+            open_settings();
+        thread = CreateThread(NULL, 0, poll_pointer, NULL, 0, &id);
+        if (thread) {
+            while (GetMessageA(&message, NULL, 0, 0) > 0)
+                dispatch(&message);
+            SetEvent(stop); /* Exit from the icon menu */
+            WaitForSingleObject(thread, INFINITE);
+            CloseHandle(thread);
+        }
+        if (window)
+            DestroyWindow(window);
+        if (tray) {
+            tray_icon(NIM_DELETE);
+            DestroyWindow(tray);
+        }
+    }
+    CloseHandle(stop);
+    UnmapViewOfFile(pid);
+    CloseHandle(pid_map);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
     return 0;
 }
 
@@ -1103,6 +1526,7 @@ static int usage(void)
     say("Usage: r86-tool modes\r\n"
         "       r86-tool mode WIDTH HEIGHT [BITS]   (BITS defaults to 16)\r\n"
         "       r86-tool version\r\n"
+        "       r86-tool autorun\r\n"
         "       r86-tool mouse [stop|install|remove]\r\n"
         "       r86-tool install\r\n"
         "       r86-tool uninstall\r\n"
@@ -1128,9 +1552,12 @@ void start(void)
         while (*s && *s != ' ' && *s != '\t')
             s++;
     }
+    nt = !(GetVersion() & 0x80000000);
     s = next_word(s, command, sizeof command);
     if (!*command)
-        status = installed_image() ? mouse() : installer();
+        status = !installed_image() ? installer() : settings_in_helper() ? 0 : helper(1, 1);
+    else if (!lstrcmpiA(command, "autorun"))
+        status = *spaces(s) ? usage() : helper(1, 0);
     else if (!lstrcmpiA(command, "install") || !lstrcmpiA(command, "uninstall")) {
         if (*spaces(s)) status = usage();
         else {
@@ -1153,7 +1580,7 @@ void start(void)
     else if (!lstrcmpiA(command, "mouse")) {
         next_word(s, command, sizeof command);
         if (!*command)
-            status = mouse();
+            status = helper(0, 0);
         else if (!lstrcmpiA(command, "install"))
             status = mouse_startup(1);
         else if (!lstrcmpiA(command, "remove"))
