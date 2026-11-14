@@ -264,6 +264,23 @@ fn cpu_shutdown_json(shutdown: &r86::machine::CpuShutdown) -> String {
     )
 }
 
+fn undefined_opcodes_json(machine: &Machine) -> String {
+    let records = machine.undefined_opcodes().map(|record| {
+        let bytes = record.bytes.iter().map(|byte| byte.map_or_else(
+            || "null".into(), |byte| byte.to_string(),
+        )).collect::<Vec<_>>().join(",");
+        format!(
+            "{{\"address\":{},\"eip\":{},\"first_step\":{},\"count\":{},\"cs\":{},\"cpl\":{},\"bytes\":[{}]}}",
+            record.address, record.eip, record.step, record.count, record.cs, record.cpl, bytes,
+        )
+    }).collect::<Vec<_>>().join(",");
+    format!(
+        "{{\"limit\":{},\"records\":[{}]}}",
+        r86::machine::UNDEFINED_OPCODE_LIMIT,
+        records
+    )
+}
+
 impl Service {
     fn new() -> Self {
         Self {
@@ -434,6 +451,11 @@ impl Service {
             self.failures.pop_front();
         }
     }
+    fn collect_undefined_opcodes(&mut self, machine: &mut Machine) {
+        while let Some(record) = machine.take_undefined_opcode() {
+            self.event_at(record.step, "undefined-opcode", &record.to_string());
+        }
+    }
     fn state(&self, machine: &Machine) -> String {
         format!(
             "{{\"type\":\"execution\",\"ok\":true,\"step\":{},\"running\":{},\"busy\":{},\"stop\":{},\"pending_text_bytes\":{}}}",
@@ -447,7 +469,7 @@ impl Service {
     fn snapshot(&self, machine: &Machine) -> String {
         let serial = machine.serial_output();
         format!(
-            "{{\"status\":{},\"execution\":{},\"cpu_dump\":\"{}\",\"vga_dump\":\"{}\",\"text\":\"{}\",\"serial_hex\":\"{}\",\"trace\":\"{}\",\"jit\":\"{}\",\"bus\":{},\"cpu_shutdown\":{}}}",
+            "{{\"status\":{},\"execution\":{},\"cpu_dump\":\"{}\",\"vga_dump\":\"{}\",\"text\":\"{}\",\"serial_hex\":\"{}\",\"trace\":\"{}\",\"jit\":\"{}\",\"bus\":{},\"undefined_opcodes\":{},\"cpu_shutdown\":{}}}",
             status_json(machine, true),
             self.state(machine),
             json_escape(&format!("{:#?}", machine.cpu())),
@@ -457,6 +479,7 @@ impl Service {
             json_escape(&machine.trace_report()),
             json_escape(&machine.jit_report()),
             bus_diagnostics_json(machine),
+            undefined_opcodes_json(machine),
             machine
                 .last_cpu_shutdown()
                 .map(cpu_shutdown_json)
@@ -1012,6 +1035,7 @@ impl Service {
     ) {
         self.check_remote(machine);
         self.collect_bus_warnings(machine);
+        self.collect_undefined_opcodes(machine);
         self.collect_cpu_shutdown(machine);
         match result {
             Ok(report) => {

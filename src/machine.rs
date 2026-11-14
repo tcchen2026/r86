@@ -8,9 +8,13 @@ pub use magic::{DisplayMode, DisplayResult};
 #[cfg(test)]
 mod sound_tests;
 #[cfg(test)]
+mod undefined_opcode_tests;
+#[cfg(test)]
 mod usb_tests;
 use bus_diagnostics::BusDiagnostics;
-pub use bus_diagnostics::{BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning};
+pub use bus_diagnostics::{
+    BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning, UNDEFINED_OPCODE_LIMIT, UndefinedOpcode,
+};
 use clock::{Clock, TICKS_PER_SECOND};
 
 use crate::acpi::Acpi;
@@ -505,6 +509,21 @@ impl Machine {
     /// The frontend drains this bounded queue into its shared log transcript.
     pub fn take_bus_warning(&mut self) -> Option<BusWarning> {
         self.bus.diagnostics.pending.pop_front()
+    }
+
+    /// First observations of absent CPU opcodes, with cumulative fault counts.
+    pub fn undefined_opcodes(&self) -> impl Iterator<Item = &UndefinedOpcode> {
+        self.bus.diagnostics.undefined_opcodes.values()
+    }
+
+    /// One notification per recorded address; repeats update only its count.
+    pub fn take_undefined_opcode(&mut self) -> Option<UndefinedOpcode> {
+        let address = self.bus.diagnostics.pending_undefined_opcodes.pop_front()?;
+        self.bus
+            .diagnostics
+            .undefined_opcodes
+            .get(&address)
+            .copied()
     }
 
     pub fn load_bios_rom(&mut self, bytes: &[u8]) -> Result<(), String> {
@@ -1676,6 +1695,9 @@ fn handle_non_running_step<P: PerfSink>(
         }
         Err(err) => {
             if let Some((vector, code, eip)) = err.exception(step_eip) {
+                if matches!(err, StepError::UndefinedOpcode { .. }) {
+                    bus_diagnostics::record_undefined_opcode(cpu, bus, eip, step);
+                }
                 let result = deliver_exception(cpu, bus, vector, code, eip);
                 finish_event_delivery(cpu, bus, result)?;
             } else {
@@ -1935,6 +1957,7 @@ fn error_eip(err: &StepError) -> Option<u32> {
         | StepError::UnsupportedOpcode2 { eip, .. }
         | StepError::UnsupportedModRm { eip, .. }
         | StepError::InvalidOpcode { eip }
+        | StepError::UndefinedOpcode { eip }
         | StepError::DivideError { eip }
         | StepError::DeviceNotAvailable { eip }
         | StepError::BoundRangeExceeded { eip }

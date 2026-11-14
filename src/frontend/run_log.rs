@@ -186,6 +186,13 @@ fn machine_report(text: &mut String, machine: &mut Machine, eip: Option<u32>) ->
             );
         }
     }
+    let mut opcodes = machine.undefined_opcodes().peekable();
+    if opcodes.peek().is_some() {
+        let _ = writeln!(text, "\nUndefined opcodes outside the CPU model:");
+        for opcode in opcodes {
+            let _ = writeln!(text, "  {opcode}");
+        }
+    }
     if let Some(shutdown) = machine.last_cpu_shutdown() {
         let _ = writeln!(
             text,

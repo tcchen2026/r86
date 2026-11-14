@@ -84,7 +84,7 @@ Verified in the tree on 2026-11-14:
 | F4 | Every execute page fault sets PFEC bit 4 (debt CPU-2) | `page_fault` `src/x86/mmu.rs:1949` |
 | F5 | FPU state: x87 as host `f64`, MMX in a separate array, an `mxcsr` field, no XMM registers; FXSAVE writes the x87 image only | `src/x86/cpu.rs:100-108`, `fxsave` `interp.rs:12520` |
 | F6 | x87 has no inexact flag; rounding control applies only to integer conversion | `fpu_round` `interp.rs:13446` |
-| F7 | MMX arms raise #UD on 66/F2/F3; `Prefix` is None/Rep/Repne; two-byte opcodes go through `execute_0f` | `reject_sse_prefixes` `interp.rs:8768`, 324, 2957 |
+| F7 | MMX arms raise #UD on 66/F2/F3; `Prefix` is None/Rep/Repne; two-byte opcodes go through `execute_0f`, whose fallback (opcodes outside the Pentium II, SSE included) raises `StepError::UndefinedOpcode`: guest #UD plus a capped record in the machine's diagnostics | `reject_sse_prefixes`, `execute_0f`, `src/machine/bus_diagnostics.rs` |
 | F8 | The shared JIT decoder compiles unprefixed MMX only and has a test that SSE prefixes are rejected | `src/x86/jit/decode.rs:128`, 1229 |
 | F9 | Unknown MSRs raise #GP; IA32_APIC_BASE is plain storage, reset to 0 (debt CPU-3) | `rdmsr`/`wrmsr` `interp.rs:4282-4392` |
 | F10 | FEC00000h and FEE00000h are declared MMIO regions with no device | `src/machine.rs:2092-2095` |

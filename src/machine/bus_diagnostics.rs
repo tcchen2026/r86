@@ -14,8 +14,47 @@
 //! absent frontend from accumulating log memory. Accesses without an instruction
 //! context use only the target-page limit.
 use alloc::collections::{BTreeMap, VecDeque};
+use core::fmt;
+
+use super::HostBus;
+use crate::x86::{Bus, Cpu, LinearAddr, SegmentReg};
 
 pub const BUS_PAGE_LOG_LIMIT: u64 = 1000;
+pub const UNDEFINED_OPCODE_LIMIT: usize = 1024;
+const PENDING_LIMIT: usize = 256;
+
+/// First #UD for an opcode outside the CPU model at this linear address.
+/// Bytes are a 15-byte window, including prefixes; uncached bytes are unknown.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UndefinedOpcode {
+    pub address: u32,
+    pub eip: u32,
+    pub step: u64,
+    pub count: u64,
+    pub cs: u16,
+    pub cpl: u8,
+    pub bytes: [Option<u8>; 15],
+}
+
+impl fmt::Display for UndefinedOpcode {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            out,
+            "#UD cs={:#06x} eip={:#010x} linear={:#010x} cpl={} first_step={} count={} bytes=",
+            self.cs, self.eip, self.address, self.cpl, self.step, self.count
+        )?;
+        for (i, byte) in self.bytes.iter().enumerate() {
+            if i != 0 {
+                out.write_str(" ")?;
+            }
+            match byte {
+                Some(byte) => write!(out, "{byte:02x}")?,
+                None => out.write_str("??")?,
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum BusSpace {
@@ -60,6 +99,8 @@ pub(super) struct BusDiagnostics {
     pub instructions: BTreeMap<u32, BusCounter>,
     pub pending: VecDeque<BusWarning>,
     pub instruction: Option<u32>,
+    pub undefined_opcodes: BTreeMap<u32, UndefinedOpcode>,
+    pub pending_undefined_opcodes: VecDeque<u32>,
 }
 impl BusDiagnostics {
     #[cold]
@@ -100,10 +141,53 @@ impl BusDiagnostics {
             instruction_count,
         };
         if emit {
-            if self.pending.len() == 256 {
+            if self.pending.len() == PENDING_LIMIT {
                 self.pending.pop_front();
             }
             self.pending.push_back(*last);
         }
     }
+}
+
+/// Called only for StepError::UndefinedOpcode. Reuse executable RAM's
+/// cached backing: diagnostics must not walk page tables, set A/D bits, or
+/// read MMIO. In particular, a window crossing an uncached page stays partial.
+#[cold]
+pub(super) fn record_undefined_opcode(cpu: &mut Cpu, bus: &mut HostBus, eip: u32, step: u64) {
+    let cs = cpu.seg(SegmentReg::Cs);
+    let address = cs.base.wrapping_add(eip);
+    if let Some(first) = bus.diagnostics.undefined_opcodes.get_mut(&address) {
+        first.count = first.count.saturating_add(1);
+        return;
+    }
+    if bus.diagnostics.undefined_opcodes.len() == UNDEFINED_OPCODE_LIMIT {
+        return;
+    }
+    let mut bytes = [None; 15];
+    for (offset, byte) in bytes.iter_mut().enumerate() {
+        if eip.wrapping_add(offset as u32) > cs.limit {
+            break;
+        }
+        let Some(hit) = cpu.fetch_cache_lookup(LinearAddr(address.wrapping_add(offset as u32)))
+        else {
+            break;
+        };
+        *byte = Some(bus.read_backing_token_u8(hit.backing));
+    }
+    bus.diagnostics.undefined_opcodes.insert(
+        address,
+        UndefinedOpcode {
+            address,
+            eip,
+            step,
+            count: 1,
+            cs: cs.selector,
+            cpl: cpu.cpl(),
+            bytes,
+        },
+    );
+    if bus.diagnostics.pending_undefined_opcodes.len() == PENDING_LIMIT {
+        bus.diagnostics.pending_undefined_opcodes.pop_front();
+    }
+    bus.diagnostics.pending_undefined_opcodes.push_back(address);
 }

@@ -132,6 +132,19 @@ logging stops. ``muted`` means that page has reached its own limit; a record
 may also be suppressed by the other page's limit. Guest resets preserve both.
 This policy does not suppress CPU exceptions or recover from device errors.
 
+Opcodes outside the CPU model raise guest #UD and produce one
+``logs.events`` entry of ``kind: "undefined-opcode"`` per linear instruction
+address (CS.base + starting EIP). ``diagnostics.current.undefined_opcodes``
+contains ``limit`` (1024 distinct addresses) and ``records``: ``address``,
+``eip``, ``first_step``, ``count``, ``cs``, ``cpl`` and ``bytes``. Repeats
+increment only the count; the first observation and counts survive guest
+resets. At most 256 first-observation notifications wait for collection.
+``bytes`` is a 15-byte window starting at the first prefix, with JSON null
+for bytes unavailable in the executable RAM cache. Capturing it does not
+walk page tables, change A/D bits or read devices. UD0/1/2, LOCK misuse and
+invalid operand forms are not recorded. These records stay in memory; a
+later fatal report includes them beside the unclaimed bus access records.
+
 ``diagnostics`` returns a read-only current snapshot and up to eight retained
 failure snapshots: complete CPU state, device status, stop/error cause, VGA text,
 VGA register state (``vga_dump``, excluding VRAM),

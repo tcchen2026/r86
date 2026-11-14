@@ -94,6 +94,10 @@ pub enum StepError {
     InvalidOpcode {
         eip: u32,
     },
+    /// An opcode absent from the CPU model: guest #UD with a diagnostic record.
+    UndefinedOpcode {
+        eip: u32,
+    },
     SoftwareInterrupt {
         vector: u8,
         return_eip: u32,
@@ -253,6 +257,7 @@ impl StepError {
             Self::DivideError { eip }
             | Self::BoundRangeExceeded { eip }
             | Self::InvalidOpcode { eip }
+            | Self::UndefinedOpcode { eip }
             | Self::DeviceNotAvailable { eip }
             | Self::GeneralProtection { eip, .. }
             | Self::InvalidTss { eip, .. }
@@ -274,7 +279,7 @@ impl StepError {
             Self::TaskSwitchTrap { eip } => (1, None, eip),
             Self::DivideError { eip } => (0, None, eip),
             Self::BoundRangeExceeded { eip } => (5, None, eip),
-            Self::InvalidOpcode { eip } => (6, None, eip),
+            Self::InvalidOpcode { eip } | Self::UndefinedOpcode { eip } => (6, None, eip),
             Self::DeviceNotAvailable { eip } => (7, None, eip),
             Self::InvalidTss { eip, code } => (10, Some(code), eip),
             Self::SegmentNotPresent { eip, code } => (11, Some(code), eip),
@@ -1881,10 +1886,8 @@ impl Interpreter {
                         let modrm = step_try!(fetch_u8(cpu, bus));
                         let op = (modrm >> 3) & 7;
                         if op != 0 {
-                            stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                eip: start_eip,
-                                opcode,
-                                modrm,
+                            stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                eip: start_eip
                             }));
                         }
                         if operand16 {
@@ -2537,10 +2540,8 @@ impl Interpreter {
                                 cpu.set_dec_flags8(lhs, result);
                             }
                             _ => {
-                                stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                    eip: start_eip,
-                                    opcode,
-                                    modrm,
+                                stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                    eip: start_eip
                                 }));
                             }
                         }
@@ -2577,10 +2578,8 @@ impl Interpreter {
                                 }
                                 3 => {
                                     let Rm32::Mem(addr) = dst else {
-                                        stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                            eip: start_eip,
-                                            opcode,
-                                            modrm,
+                                        stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                            eip: start_eip
                                         }));
                                     };
                                     let target =
@@ -2604,10 +2603,8 @@ impl Interpreter {
                                 }
                                 5 => {
                                     let Rm32::Mem(addr) = dst else {
-                                        stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                            eip: start_eip,
-                                            opcode,
-                                            modrm,
+                                        stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                            eip: start_eip
                                         }));
                                     };
                                     let target =
@@ -2629,10 +2626,8 @@ impl Interpreter {
                                     step_try!(push_u16(cpu, bus, value, start_eip));
                                 }
                                 _ => {
-                                    stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                        eip: start_eip,
-                                        opcode,
-                                        modrm,
+                                    stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                        eip: start_eip
                                     }));
                                 }
                             }
@@ -2660,10 +2655,8 @@ impl Interpreter {
                             }
                             3 => {
                                 let Rm32::Mem(addr) = dst else {
-                                    stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                        eip: start_eip,
-                                        opcode,
-                                        modrm,
+                                    stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                        eip: start_eip
                                     }));
                                 };
                                 let target = step_try!(read_mem_u32_at(cpu, bus, addr, start_eip));
@@ -2678,10 +2671,8 @@ impl Interpreter {
                             }
                             5 => {
                                 let Rm32::Mem(addr) = dst else {
-                                    stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                        eip: start_eip,
-                                        opcode,
-                                        modrm,
+                                    stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                        eip: start_eip
                                     }));
                                 };
                                 let target = step_try!(read_mem_u32_at(cpu, bus, addr, start_eip));
@@ -2695,10 +2686,8 @@ impl Interpreter {
                                 step_try!(push_u32(cpu, bus, value, start_eip));
                             }
                             _ => {
-                                stop!(BatchStepStop::Error(StepError::UnsupportedModRm {
-                                    eip: start_eip,
-                                    opcode,
-                                    modrm,
+                                stop!(BatchStepStop::Error(StepError::InvalidOpcode {
+                                    eip: start_eip
                                 }));
                             }
                         }
@@ -2760,6 +2749,14 @@ impl Interpreter {
                         }
                     }
                     _ => {
+                        if opcode == 0xf1 {
+                            // ICEBP/INT1 is the only remaining one-byte opcode.
+                            // Like an external event, it bypasses gate DPL/IOPL,
+                            // sets EXT on entry faults and does not synthesize RF.
+                            // It is synchronous even with IF=0; DR6 is unchanged.
+                            step_try!(deliver_external_interrupt(cpu, bus, 1, cpu.eip));
+                            stop!(BatchStepStop::Attention);
+                        }
                         stop!(BatchStepStop::Error(StepError::UnsupportedOpcode {
                             eip: start_eip,
                             opcode,
@@ -3064,8 +3061,6 @@ fn execute_0f<B: Bus>(
         0x33 => rdpmc(cpu, start_eip)?,
         0x34 => sysenter(cpu, start_eip)?,
         0x35 => sysexit(cpu, start_eip)?,
-        // The P6 model does not implement SSE2 MOVNTI or the SSSE3 maps.
-        0x38 | 0x3a | 0xc3 => return Err(StepError::InvalidOpcode { eip: start_eip }),
         0x60..=0x6b
         | 0x74..=0x76
         | 0xd1..=0xd3
@@ -3337,16 +3332,7 @@ fn execute_0f<B: Bus>(
                     lockable_rm32(lock_prefix, dst, start_eip)?;
                     cmpxchg8b(cpu, bus, dst, start_eip)?;
                 }
-                _ => {
-                    if lock_prefix {
-                        return Err(StepError::InvalidOpcode { eip: start_eip });
-                    }
-                    return Err(StepError::UnsupportedModRm {
-                        eip: start_eip,
-                        opcode,
-                        modrm,
-                    });
-                }
+                _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
             }
         }
         0xc8..=0xcf => {
@@ -3360,12 +3346,9 @@ fn execute_0f<B: Bus>(
             cpu.set_reg(reg, cpu.reg(reg).swap_bytes());
         }
         0xff => return Err(StepError::InvalidOpcode { eip: start_eip }),
-        _ => {
-            return Err(StepError::UnsupportedOpcode2 {
-                eip: start_eip,
-                opcode: opcode2,
-            });
-        }
+        // The remaining two-byte opcodes are absent on Pentium II. RSM also
+        // faults here: this machine never enters system management mode.
+        _ => return Err(StepError::UndefinedOpcode { eip: start_eip }),
     }
     Ok(())
 }
@@ -3419,11 +3402,7 @@ fn execute_fpu_d9<B: Bus>(
             6 => fpu_d9_group6(cpu, index, start_eip, opcode, modrm)?,
             7 => fpu_d9_group7(cpu, index, start_eip, opcode, modrm)?,
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
     } else {
@@ -3451,11 +3430,7 @@ fn execute_fpu_d9<B: Bus>(
             6 => fpu_store_environment(cpu, bus, dst, operand16)?,
             7 => write_rm16(cpu, bus, dst, cpu.fpu.control)?,
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
     }
@@ -3468,7 +3443,7 @@ fn execute_fpu_da<B: Bus>(
     bus: &mut B,
     address16: bool,
     start_eip: u32,
-    opcode: u8,
+    _opcode: u8,
 ) -> Result<StepOutcome, StepError> {
     fpu_escape_available(cpu, start_eip)?;
     let modrm = fetch_u8(cpu, bus)?;
@@ -3488,11 +3463,7 @@ fn execute_fpu_da<B: Bus>(
                 cpu.fpu.pop();
             }
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
     } else {
@@ -3510,7 +3481,7 @@ fn execute_fpu_db<B: Bus>(
     bus: &mut B,
     address16: bool,
     start_eip: u32,
-    opcode: u8,
+    _opcode: u8,
 ) -> Result<StepOutcome, StepError> {
     fpu_escape_available(cpu, start_eip)?;
     let modrm = fetch_u8(cpu, bus)?;
@@ -3536,11 +3507,7 @@ fn execute_fpu_db<B: Bus>(
             0xe0 | 0xe1 | 0xe4 => {}
             0xe8..=0xef | 0xf0..=0xf7 => fpu_comi(cpu, modrm & 7, false),
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
         return Ok(StepOutcome::Running);
@@ -3574,12 +3541,10 @@ fn execute_fpu_db<B: Bus>(
             write_fpu_m80(cpu, bus, dst, cpu.fpu.get(0))?;
             cpu.fpu.pop();
         }
+        // FISTTP requires SSE3.
+        1 => return Err(StepError::UndefinedOpcode { eip: start_eip }),
         _ => {
-            return Err(StepError::UnsupportedModRm {
-                eip: start_eip,
-                opcode,
-                modrm,
-            });
+            return Err(StepError::InvalidOpcode { eip: start_eip });
         }
     }
     Ok(StepOutcome::Running)
@@ -3648,13 +3613,16 @@ fn execute_fpu_dd<B: Bus>(
                 fpu_compare(cpu, cpu.fpu.get(0), cpu.fpu.get(index));
                 cpu.fpu.pop();
             }
-            _ => {
+            // FFREE and the legacy FXCH alias are valid P6 instructions
+            // still missing here; do not disguise those gaps as guest #UD.
+            0 | 1 => {
                 return Err(StepError::UnsupportedModRm {
                     eip: start_eip,
                     opcode,
                     modrm,
                 });
             }
+            _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
         }
         return Ok(StepOutcome::Running);
     }
@@ -3678,13 +3646,9 @@ fn execute_fpu_dd<B: Bus>(
         4 => fpu_restore_state(cpu, bus, dst, operand16)?,
         6 => fpu_save_state(cpu, bus, dst, operand16)?,
         7 => write_rm16(cpu, bus, dst, cpu.fpu.status_word())?,
-        _ => {
-            return Err(StepError::UnsupportedModRm {
-                eip: start_eip,
-                opcode,
-                modrm,
-            });
-        }
+        // FISTTP requires SSE3.
+        1 => return Err(StepError::UndefinedOpcode { eip: start_eip }),
+        _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
     }
     Ok(StepOutcome::Running)
 }
@@ -3720,13 +3684,15 @@ fn execute_fpu_de<B: Bus>(
             cpu.fpu.pop();
             cpu.fpu.pop();
         }
-        _ => {
+        // DE D0-D7 is a valid legacy FCOMP alias, not a reserved encoding.
+        2 => {
             return Err(StepError::UnsupportedModRm {
                 eip: start_eip,
                 opcode,
                 modrm,
             });
         }
+        _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
     }
     Ok(StepOutcome::Running)
 }
@@ -3737,7 +3703,7 @@ fn execute_fpu_df<B: Bus>(
     bus: &mut B,
     address16: bool,
     start_eip: u32,
-    opcode: u8,
+    _opcode: u8,
 ) -> Result<StepOutcome, StepError> {
     fpu_escape_available(cpu, start_eip)?;
     let modrm = fetch_u8(cpu, bus)?;
@@ -3752,11 +3718,7 @@ fn execute_fpu_df<B: Bus>(
             0xe0 => write_reg16(cpu, Reg32::Eax as u8, cpu.fpu.status_word()),
             0xe8..=0xef | 0xf0..=0xf7 => fpu_comi(cpu, modrm & 7, true),
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
     } else {
@@ -3800,12 +3762,10 @@ fn execute_fpu_df<B: Bus>(
                 write_fpu_i64(cpu, bus, dst, value)?;
                 cpu.fpu.pop();
             }
+            // FISTTP requires SSE3.
+            1 => return Err(StepError::UndefinedOpcode { eip: start_eip }),
             _ => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
+                return Err(StepError::InvalidOpcode { eip: start_eip });
             }
         }
     }
@@ -4986,11 +4946,11 @@ fn bit_test_imm<B: Bus>(
     op: u8,
     operand16: bool,
     eip: u32,
-    opcode: u8,
-    modrm: u8,
+    _opcode: u8,
+    _modrm: u8,
 ) -> Result<(), StepError> {
     if !(4..=7).contains(&op) {
-        return Err(StepError::UnsupportedModRm { eip, opcode, modrm });
+        return Err(StepError::InvalidOpcode { eip });
     }
     bit_test_modify(cpu, bus, dst, bit, op & 3, operand16, eip)
 }
@@ -9648,7 +9608,7 @@ fn fxsave_group<B: Bus>(
     modrm: u8,
     address16: bool,
     eip: u32,
-    opcode: u8,
+    _opcode: u8,
 ) -> Result<(), StepError> {
     let op = (modrm >> 3) & 7;
     match op {
@@ -9697,7 +9657,8 @@ fn fxsave_group<B: Bus>(
         _ if (modrm >> 6) == 3 => Err(StepError::InvalidOpcode { eip }),
         _ => {
             let _ = decode_rm32(cpu, bus, modrm, address16)?;
-            Err(StepError::UnsupportedModRm { eip, opcode, modrm })
+            // Memory /4-/6 require XSAVE support, absent on Pentium II.
+            Err(StepError::UndefinedOpcode { eip })
         }
     }
 }
@@ -12864,8 +12825,8 @@ fn fpu_d9_group4(
     cpu: &mut Cpu,
     index: u8,
     eip: u32,
-    opcode: u8,
-    modrm: u8,
+    _opcode: u8,
+    _modrm: u8,
 ) -> Result<(), StepError> {
     fpu_clear_c1(cpu);
     match index {
@@ -12876,7 +12837,7 @@ fn fpu_d9_group4(
         }
         4 => fpu_compare(cpu, cpu.fpu.get(0), 0.0),
         5 => fpu_fxam(cpu),
-        _ => return Err(StepError::UnsupportedModRm { eip, opcode, modrm }),
+        _ => return Err(StepError::InvalidOpcode { eip }),
     }
     Ok(())
 }
@@ -12885,8 +12846,8 @@ fn fpu_load_constant(
     cpu: &mut Cpu,
     index: u8,
     eip: u32,
-    opcode: u8,
-    modrm: u8,
+    _opcode: u8,
+    _modrm: u8,
 ) -> Result<(), StepError> {
     let value = match index {
         0 => 1.0,
@@ -12896,7 +12857,7 @@ fn fpu_load_constant(
         4 => core::f64::consts::LOG10_2,
         5 => core::f64::consts::LN_2,
         6 => 0.0,
-        _ => return Err(StepError::UnsupportedModRm { eip, opcode, modrm }),
+        _ => return Err(StepError::InvalidOpcode { eip }),
     };
     fpu_clear_c1(cpu);
     cpu.fpu.push(value);
@@ -21676,7 +21637,7 @@ mod tests {
     }
 
     #[test]
-    fn fxsave_group_memory_xsave_subops_remain_unsupported() {
+    fn fxsave_group_memory_xsave_subops_raise_ud() {
         let mut ram = Ram::new();
         ram.data[..7].copy_from_slice(&fxsave_moffs(4, 0x300));
 
@@ -21684,11 +21645,7 @@ mod tests {
 
         assert_eq!(
             Interpreter::step(&mut cpu, &mut ram),
-            Err(StepError::UnsupportedModRm {
-                eip: 0,
-                opcode: 0xae,
-                modrm: 0x25,
-            })
+            Err(StepError::UndefinedOpcode { eip: 0 })
         );
     }
 
