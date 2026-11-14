@@ -908,7 +908,7 @@ impl Picker {
     fn memory(ctx: &Ctx, current: u32, os: &OsPreset) -> Self {
         let values: Vec<u64> = guest_os::MEMORY_CHOICES
             .iter()
-            .filter(|mib| **mib <= ctx.memory_limit.min(512))
+            .filter(|mib| **mib <= ctx.memory_limit.min(256))
             .map(|mib| u64::from(*mib))
             .collect();
         let items = values

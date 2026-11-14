@@ -36,7 +36,7 @@ pub const PRESETS: &[OsPreset] = &[
 ];
 
 /// Memory sizes the new-VM wizards and settings offer, in MiB, up to
-/// vm_store's 3 GiB limit. The handheld offers those up to 512 MiB that fit
+/// vm_store's 3 GiB limit. The handheld offers those up to 256 MiB that fit
 /// its RAM.
 pub const MEMORY_CHOICES: &[u32] = &[
     16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
