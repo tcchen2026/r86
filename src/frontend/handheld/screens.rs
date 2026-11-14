@@ -588,8 +588,7 @@ impl Wizard {
     /// Windows 3.1/9x CDs install from FreeDOS planted on the new disk, so
     /// their setup runs from DOS on first boot; other CDs get a blank disk.
     fn windows_setup(&self) -> Option<&'static str> {
-        let dos_setup = matches!(self.os.id, "win31" | "win95" | "win98" | "winme");
-        (self.source == Source::Iso && dos_setup).then_some(self.os.id)
+        guest_os::dos_setup(self.os).filter(|_| self.source == Source::Iso)
     }
 
     /// Whether this VM gets a new disk whose size the user picks.
@@ -907,9 +906,10 @@ impl Picker {
     }
 
     fn memory(ctx: &Ctx, current: u32, os: &OsPreset) -> Self {
-        let values: Vec<u64> = [16, 32, 64, 96, 128, 192, 256, 384, 512]
-            .into_iter()
-            .filter(|mib| *mib <= ctx.memory_limit as u64)
+        let values: Vec<u64> = guest_os::MEMORY_CHOICES
+            .iter()
+            .filter(|mib| **mib <= ctx.memory_limit.min(512))
+            .map(|mib| u64::from(*mib))
             .collect();
         let items = values
             .iter()
@@ -931,12 +931,7 @@ impl Picker {
     }
 
     fn disk(current: u64, os: &OsPreset) -> Self {
-        // DOS, Windows 3.1 and the first Windows 95 use FAT16 (at most 2 GB).
-        let values = if matches!(os.id, "dos" | "win31" | "win95") {
-            vec![256, 512, 1024, 2047]
-        } else {
-            vec![512, 1024, 2048, 4096, 8192, 16384]
-        };
+        let values = guest_os::disk_choices(os).to_vec();
         let items = values
             .iter()
             .map(|mib| {

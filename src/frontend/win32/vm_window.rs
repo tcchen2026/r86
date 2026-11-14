@@ -30,7 +30,7 @@ use windows::core::{HSTRING, w};
 use super::audio::Audio;
 use super::keys::{self, InputKey};
 use super::runner::{Command, Running, State, lock};
-use super::ui::{instance, message_box, open_file, resource};
+use super::ui::{draw_text, instance, message_box, open_file, resource};
 use super::vm_store::Vm;
 use super::{keymap, library_changed};
 
@@ -660,7 +660,8 @@ impl VmWindow {
             ),
             (None, true) => ("Starting".to_string(), String::new()),
         };
-        let icon = self.scale(64);
+        // The icon's sharp pixel-art sizes.
+        let icon = if self.scale(80) >= 160 { 160 } else { 80 };
         let cx = (screen.left + screen.right) / 2;
         let top = (screen.top + screen.bottom) / 2 - icon;
         // SAFETY: a shared icon (never destroyed) drawn into the paint DC.
@@ -1189,16 +1190,6 @@ fn raw_mouse(target: HWND, flags: RAWINPUTDEVICE_FLAGS) {
     };
     // SAFETY: one plain device record.
     let _ = unsafe { RegisterRawInputDevices(&[mouse], size_of::<RAWINPUTDEVICE>() as u32) };
-}
-
-fn draw_text(dc: HDC, text: &str, rect: &mut RECT, format: DRAW_TEXT_FORMAT) {
-    // Wine's DrawTextW never returns for an empty string.
-    if text.is_empty() {
-        return;
-    }
-    let mut text: Vec<u16> = text.encode_utf16().collect();
-    // SAFETY: the text and rectangle live across the call.
-    unsafe { DrawTextW(dc, &mut text, rect, format) };
 }
 
 /// The guest frame's displayed size: standard VGA modes at 4:3, like a

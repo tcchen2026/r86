@@ -1,5 +1,6 @@
-# The Windows app (src/frontend/win32/): r86-win.exe with SeaBIOS, the r86
-# tools disc and licenses, built on Linux by script/build_windows.sh and
+# The Windows app (src/frontend/win32/): r86-win.exe with SeaBIOS, the DOS
+# kit (the release assets/freedos-kit.sha256 pins), the r86 tools disc and
+# licenses, built on Linux by script/build_windows.sh and
 # uploaded as artifacts (r86-windows-x64, optionally r86-windows-arm64).
 # Run by hand: Actions > Windows app > Run workflow, picking the branch.
 name: Windows app
@@ -41,6 +42,14 @@ jobs:
           echo "$LLVM_MINGW_SHA256  $RUNNER_TEMP/$name.tar.xz" | sha256sum -c -
           tar -xJf "$RUNNER_TEMP/$name.tar.xz" -C "$RUNNER_TEMP"
           echo "LLVM_MINGW=$RUNNER_TEMP/$name" >> "$GITHUB_ENV"
+
+      - name: DOS kit
+        run: |
+          read -r sha256 name < assets/freedos-kit.sha256
+          mkdir -p tmp/freedos/share
+          curl -sfL -o tmp/freedos/share/dos.zip \
+            "https://github.com/${{ github.repository }}/releases/download/freedos-kit-${sha256:0:8}/$name"
+          echo "$sha256  tmp/freedos/share/dos.zip" | sha256sum -c -
 
       - uses: actions/cache@v4
         with:

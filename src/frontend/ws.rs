@@ -72,6 +72,7 @@ impl WebSocket {
                     "text/html; charset=utf-8",
                     include_bytes!("../../web/ws_ui.html"),
                 ),
+                "/r86.png" => ("200 OK", "image/png", include_bytes!("../../web/r86.png")),
                 "/favicon.ico" => ("204 No Content", "image/x-icon", b""),
                 _ => ("404 Not Found", "text/plain", b"Not found\n"),
             };

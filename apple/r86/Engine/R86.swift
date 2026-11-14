@@ -15,7 +15,8 @@ enum R86 {
         return url
     }()
 
-    /// bios.bin and vgabios-stdvga.bin ship in the app's resources.
+    /// bios.bin, vgabios-stdvga.bin and the DOS kit dos.zip ship in the
+    /// app's resources.
     static var firmware: String { Bundle.main.resourcePath ?? "" }
 
     /// Take ownership of a string returned by the library.
@@ -48,9 +49,20 @@ enum R86 {
         return (try? JSONDecoder().decode([Preset].self, from: Data(json.utf8))) ?? []
     }()
 
+    /// Memory sizes the wizard and settings offer, in MiB.
+    static let memoryChoices: [Int] = {
+        let json = take(r86_memory_choices()) ?? "[]"
+        return (try? JSONDecoder().decode([Int].self, from: Data(json.utf8))) ?? []
+    }()
+
     /// The preset an ISO image looks like, if any.
     static func detect(iso path: String) -> String? {
         take(r86_detect_iso(path)).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    /// The preset a disk image looks like, if any.
+    static func detect(disk path: String) -> String? {
+        take(r86_detect_disk(path)).flatMap { $0.isEmpty ? nil : $0 }
     }
 
     static func suggestedName(_ base: String) -> String {
@@ -62,7 +74,29 @@ enum R86 {
         try withOptionalCString(iso) { iso in
             try check(r86_library_create(library.path, name, os, UInt32(memoryMiB), UInt64(diskMiB), iso))
         }
-        return library.appending(path: name, directoryHint: .isDirectory).path
+        return directory(name)
+    }
+
+    /// Create a machine whose new disk holds FreeDOS from the bundled DOS
+    /// kit, set up for `setup` ("freedos", or a preset's dosSetup to run
+    /// Windows setup from `iso`). Blocks for seconds; call it off the main thread.
+    static func createDOS(name: String, os: String, memoryMiB: Int, diskMiB: Int,
+                          iso: String?, setup: String) throws -> String {
+        try withOptionalCString(iso) { iso in
+            try check(r86_library_create_dos(library.path, name, os, UInt32(memoryMiB),
+                                             UInt64(diskMiB), iso, firmware, setup))
+        }
+        return directory(name)
+    }
+
+    /// Create a machine around an existing disk image, used in place.
+    static func createExisting(name: String, os: String, memoryMiB: Int, disk: String) throws -> String {
+        try check(r86_library_create_existing(library.path, name, os, UInt32(memoryMiB), disk))
+        return directory(name)
+    }
+
+    private static func directory(_ name: String) -> String {
+        library.appending(path: name, directoryHint: .isDirectory).path
     }
 
     static func set(_ directory: String, _ key: String, _ value: String) throws {
@@ -94,8 +128,8 @@ func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) throws
     return try s.withCString { try body($0) }
 }
 
-/// Files the user picked outside the container (CD images), remembered as
-/// security-scoped bookmarks in the VM folder's bookmarks.plist.
+/// Files the user picked outside the container (CD and disk images),
+/// remembered as security-scoped bookmarks in the VM folder's bookmarks.plist.
 enum Bookmarks {
     private static func file(_ directory: String) -> URL {
         URL(filePath: directory).appending(path: "bookmarks.plist")

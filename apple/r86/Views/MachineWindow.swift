@@ -104,3 +104,7 @@ struct MachineWindow: View {
 enum CDImage {
     static let types: [UTType] = [UTType(filenameExtension: "iso") ?? .diskImage, .diskImage]
 }
+
+enum DiskImage {
+    static let types: [UTType] = ["vhd", "img", "raw"].compactMap { UTType(filenameExtension: $0) } + [.diskImage]
+}

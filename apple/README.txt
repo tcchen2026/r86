@@ -17,7 +17,12 @@ Contracts:
   sandboxed, so this is inside its container. CD images outside it are
   remembered as security-scoped bookmarks in each VM's bookmarks.plist.
 - Firmware: bios.bin and vgabios-stdvga.bin from firmware/seabios, in the
-  app's resources.
+  app's resources, with the DOS kit dos.zip (tmp/freedos/share; CI fetches
+  the pinned release) and licenses/. r86.icns is from script/build_icons.py.
+- New Machine follows the handheld's wizard: a CD image, FreeDOS from the
+  kit (r86_library_create_dos) or an existing disk (bookmarked like CDs),
+  then OS, memory (to 3 GiB), disk size and name. Windows 3.1/9x/ME CDs
+  install from FreeDOS planted on the new disk.
 - Apple silicon macOS builds include the A64 JIT, using MAP_JIT and only the
   allow-jit Hardened Runtime exception. iOS/watchOS remain interpreter-only.
   Native JIT/ABI tests and a deterministic ROM boot have passed on macOS CI;

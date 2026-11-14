@@ -35,6 +35,30 @@ pub const PRESETS: &[OsPreset] = &[
     preset("Other", "other", 128, 2048),
 ];
 
+/// Memory sizes the new-VM wizards and settings offer, in MiB, up to
+/// vm_store's 3 GiB limit. The handheld offers those up to 512 MiB that fit
+/// its RAM.
+pub const MEMORY_CHOICES: &[u32] = &[
+    16, 32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
+];
+
+/// Disk sizes the new-VM wizards offer for `os`, in MiB. DOS, Windows 3.1 and
+/// the first Windows 95 use FAT16 (at most 2 GB).
+pub fn disk_choices(os: &OsPreset) -> &'static [u64] {
+    if matches!(os.id, "dos" | "win31" | "win95") {
+        &[256, 512, 1024, 2047]
+    } else {
+        &[512, 1024, 2048, 4096, 8192, 16384]
+    }
+}
+
+/// The DOS kit profile (src/frontend/dos_disk.rs) that installs `os` from
+/// its CD: Windows 3.1/9x/ME setup runs from FreeDOS planted on the new
+/// disk. Other systems install onto a blank disk.
+pub fn dos_setup(os: &OsPreset) -> Option<&'static str> {
+    matches!(os.id, "win31" | "win95" | "win98" | "winme").then_some(os.id)
+}
+
 /// Saved VMs store the preset name; unknown names use "Other".
 pub fn by_name(name: &str) -> &'static OsPreset {
     PRESETS

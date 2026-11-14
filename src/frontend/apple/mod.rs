@@ -130,21 +130,31 @@ pub unsafe extern "C" fn r86_library_list(root: *const c_char) -> *mut c_char {
     out(format!("[{}]", items.join(",")))
 }
 
-/// OS presets as a JSON array of {name, memoryMiB, diskMiB}.
+/// OS presets as a JSON array of {name, memoryMiB, diskMiB, diskChoices,
+/// dosSetup}; dosSetup is the r86_library_create_dos setup that installs
+/// the OS from its CD, or null.
 #[unsafe(no_mangle)]
 pub extern "C" fn r86_presets() -> *mut c_char {
     let items: Vec<String> = guest_os::PRESETS
         .iter()
         .map(|p| {
             format!(
-                "{{\"name\":{},\"memoryMiB\":{},\"diskMiB\":{}}}",
+                "{{\"name\":{},\"memoryMiB\":{},\"diskMiB\":{},\"diskChoices\":{:?},\"dosSetup\":{}}}",
                 json(p.name),
                 p.memory_mib,
-                p.disk_mib
+                p.disk_mib,
+                guest_os::disk_choices(p),
+                guest_os::dos_setup(p).map_or("null".into(), json)
             )
         })
         .collect();
     out(format!("[{}]", items.join(",")))
+}
+
+/// The memory sizes (MiB) the new-VM wizard and settings offer, as JSON.
+#[unsafe(no_mangle)]
+pub extern "C" fn r86_memory_choices() -> *mut c_char {
+    out(format!("{:?}", guest_os::MEMORY_CHOICES))
 }
 
 /// The preset name an ISO image looks like, or "" if unknown.
@@ -156,6 +166,21 @@ pub unsafe extern "C" fn r86_detect_iso(path: *const c_char) -> *mut c_char {
     // SAFETY: forwarded caller contract.
     let path = PathBuf::from(unsafe { text(path) }.unwrap_or_default());
     let name = guest_os::detect_iso(&path)
+        .ok()
+        .flatten()
+        .map_or("", |p| p.name);
+    out(name.into())
+}
+
+/// The preset name a disk image looks like, or "" if unknown.
+///
+/// # Safety
+/// `path` is a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_detect_disk(path: *const c_char) -> *mut c_char {
+    // SAFETY: forwarded caller contract.
+    let path = PathBuf::from(unsafe { text(path) }.unwrap_or_default());
+    let name = guest_os::detect_disk(&path)
         .ok()
         .flatten()
         .map_or("", |p| p.name);
@@ -179,7 +204,34 @@ pub unsafe extern "C" fn r86_library_suggest_name(
     ))
 }
 
-/// Create `root/name` with a new dynamic VHD and an optional CD image.
+/// A new VM definition as the new-VM wizard leaves it (cpu-engine auto).
+///
+/// # Safety
+/// `root`, `name` and `os` are valid C strings.
+unsafe fn new_vm(
+    root: *const c_char,
+    name: *const c_char,
+    os: *const c_char,
+    memory_mib: u32,
+    disk_mib: u64,
+) -> Vm {
+    // SAFETY: forwarded caller contract.
+    let (root, name, os) = unsafe { (text(root), text(name), text(os)) };
+    let preset = guest_os::by_name(&os.unwrap_or_default());
+    let mut vm = Vm::new(
+        Path::new(&root.unwrap_or_default()),
+        name.unwrap_or_default(),
+        preset,
+    );
+    vm.engine = "auto".into();
+    vm.memory = memory_mib;
+    vm.disk_mib = disk_mib;
+    vm
+}
+
+/// Create `root/name` with a new dynamic VHD and an optional CD image. It
+/// boots from the disk first, as on the handheld: a blank disk falls through
+/// to the CD.
 ///
 /// # Safety
 /// `root`, `name` and `os` are valid C strings; `iso` is NULL or one.
@@ -193,21 +245,64 @@ pub unsafe extern "C" fn r86_library_create(
     iso: *const c_char,
 ) -> *mut c_char {
     // SAFETY: forwarded caller contract.
-    let (root, name, os, iso) = unsafe { (text(root), text(name), text(os), text(iso)) };
-    let preset = guest_os::by_name(&os.unwrap_or_default());
-    let mut vm = Vm::new(
-        Path::new(&root.unwrap_or_default()),
-        name.unwrap_or_default(),
-        preset,
-    );
-    vm.engine = "auto".into();
-    vm.memory = memory_mib;
-    vm.disk_mib = disk_mib;
-    vm.iso = iso.filter(|p| !p.is_empty()).map(PathBuf::from);
-    if vm.iso.is_some() {
-        vm.boot_order = "cdrom".into();
-    }
+    let mut vm = unsafe { new_vm(root, name, os, memory_mib, disk_mib) };
+    // SAFETY: forwarded caller contract.
+    vm.iso = unsafe { text(iso) }
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from);
     result(vm.create_blank())
+}
+
+/// Create `root/name` like r86_library_create, its new disk holding FreeDOS
+/// from the DOS kit `share/dos.zip`, set up for `setup`: "freedos", or
+/// "win31" | "win95" | "win98" | "winme" to run Windows setup from the CD on
+/// first boot. Blocks while it copies the kit; call it off the main thread.
+///
+/// # Safety
+/// `root`, `name`, `os`, `share` and `setup` are valid C strings; `iso` is
+/// NULL or one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_library_create_dos(
+    root: *const c_char,
+    name: *const c_char,
+    os: *const c_char,
+    memory_mib: u32,
+    disk_mib: u64,
+    iso: *const c_char,
+    share: *const c_char,
+    setup: *const c_char,
+) -> *mut c_char {
+    // SAFETY: forwarded caller contract.
+    let mut vm = unsafe { new_vm(root, name, os, memory_mib, disk_mib) };
+    // SAFETY: forwarded caller contract.
+    let (iso, share, setup) = unsafe { (text(iso), text(share), text(setup)) };
+    vm.iso = iso.filter(|p| !p.is_empty()).map(PathBuf::from);
+    let (share, setup) = (share.unwrap_or_default(), setup.unwrap_or_default());
+    result(vm.create_with(|vm| {
+        r86::dos_disk::create(&vm.disk, vm.disk_mib, &setup, Path::new(&share), |_, _| {})
+    }))
+}
+
+/// Create `root/name` around the existing disk image `disk`, used in place.
+///
+/// # Safety
+/// `root`, `name`, `os` and `disk` are valid C strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_library_create_existing(
+    root: *const c_char,
+    name: *const c_char,
+    os: *const c_char,
+    memory_mib: u32,
+    disk: *const c_char,
+) -> *mut c_char {
+    // SAFETY: forwarded caller contract.
+    let mut vm = unsafe { new_vm(root, name, os, memory_mib, 0) };
+    // SAFETY: forwarded caller contract.
+    vm.disk = PathBuf::from(unsafe { text(disk) }.unwrap_or_default());
+    vm.disk_mib = std::fs::metadata(&vm.disk)
+        .map_or(0, |m| m.len() >> 20)
+        .max(1);
+    result(vm.create_existing())
 }
 
 /// Change one setting of a stopped VM. Keys and values as in vm.toml:

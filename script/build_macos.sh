@@ -36,7 +36,14 @@ swiftc -O -whole-module-optimization -parse-as-library -swift-version 5 \
     -o "$app/Contents/MacOS/r86" "$@"
 
 cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" \
-    "$app/Contents/Resources/"
+    "$apple/r86/r86.icns" "$app/Contents/Resources/"
+# FreeDOS for New Machine, and the DOS that runs Windows 3.1/9x setup: the
+# DOS kit from script/build_freedos_image.py (or the pinned release), with
+# its sources, licenses and provenance inside.
+cp "$root/tmp/freedos/share/dos.zip" "$app/Contents/Resources/"
+"$root/ports/licenses.sh" "$app/Contents/Resources/licenses"
+mkdir -p "$app/Contents/Resources/licenses/freedos"
+cp "$root/assets/freedos.json" "$app/Contents/Resources/licenses/freedos/"
 # Machine › Install r86 Tools… inserts the public tools CD. It is a local
 # asset (assets/README.md); builds without it disable that item.
 if [ -f "$root/assets/r86_tools.iso" ]; then
@@ -53,6 +60,8 @@ cat >"$app/Contents/Info.plist" <<PLIST
 	<key>CFBundleDisplayName</key>
 	<string>r86</string>
 	<key>CFBundleExecutable</key>
+	<string>r86</string>
+	<key>CFBundleIconFile</key>
 	<string>r86</string>
 	<key>CFBundleIdentifier</key>
 	<string>io.github.tcchen2026.r86</string>

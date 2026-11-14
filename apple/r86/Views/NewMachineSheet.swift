@@ -1,7 +1,11 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-/// Three steps: System, Hardware, Summary.
+/// New Machine, step by step as the handheld's wizard (handheld/screens.rs):
+/// how to start (a CD image, FreeDOS from the bundled DOS kit, or an
+/// existing disk), which OS, memory, disk size, then the name and Create and
+/// Start. Windows 3.1/9x/ME CDs get FreeDOS planted so their setup runs from
+/// DOS. The handheld's downloads are not offered.
 struct NewMachineSheet: View {
     @Environment(Library.self) private var library
     @Environment(\.dismiss) private var dismiss
@@ -9,131 +13,237 @@ struct NewMachineSheet: View {
     /// Called after the machine is created: (new machine, start it now).
     var onCreated: (Machine.ID, Bool) -> Void
 
-    @State private var step = 0
-    @State private var preset = R86.presets.first(where: { $0.name == "Windows 98" }) ?? R86.presets[0]
-    @State private var iso: URL?
-    @State private var name = ""
-    @State private var memoryMiB = 64
-    @State private var diskMiB = 512
-    @State private var network = true
-    @State private var startAfter = true
-    @State private var importing = false
+    private enum Source { case cd, freeDOS, disk }
+    private enum Step { case source, os, memory, disk, summary }
 
-    private let titles = ["System", "Hardware", "Summary"]
-    private var isLast: Bool { step == titles.count - 1 }
+    @State private var step = Step.source
+    @State private var source = Source.cd
+    @State private var media: URL?
+    @State private var detected: String?
+    @State private var preset = R86.presets.first(where: { $0.name == "Other" }) ?? R86.presets[0]
+    @State private var memoryMiB = 128
+    @State private var diskMiB = 2048
+    @State private var name = ""
+    /// The name last suggested; replaced while the user has not edited it.
+    @State private var suggested = ""
+    @State private var network = true
+    @State private var importing = false
+    @State private var creating = false
+
+    private var steps: [Step] {
+        switch source {
+        case .cd: [.source, .os, .memory, .disk, .summary]
+        case .freeDOS: [.source, .summary]
+        case .disk: [.source, .os, .memory, .summary]
+        }
+    }
+
+    private var index: Int { steps.firstIndex(of: step) ?? 0 }
+
+    private static func title(_ step: Step) -> String {
+        switch step {
+        case .source: "How to start?"
+        case .os: "Which OS is it?"
+        case .memory: "Memory"
+        case .disk: "Disk size (grows as used)"
+        case .summary: "Ready"
+        }
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    StepHeader(index: step, titles: titles)
+                    StepHeader(index: index, titles: steps.map(Self.title))
                 }
                 switch step {
-                case 0: systemStep
-                case 1: hardwareStep
-                default: summaryStep
+                case .source: sourceStep
+                case .os: osStep
+                case .memory: memoryStep
+                case .disk: diskStep
+                case .summary: summaryStep
                 }
             }
             .formStyle(.grouped)
             .navigationTitle("New Machine")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    if step == 0 {
+                    if index == 0 {
                         Button("Cancel") { dismiss() }
                     } else {
-                        Button("Back") { withAnimation { step -= 1 } }
+                        Button("Back") { withAnimation { step = steps[index - 1] } }
+                            .disabled(creating)
                     }
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button(isLast ? "Create" : "Continue") { advance() }
-                        .disabled(isLast && name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if step == .summary {
+                        Button("Create and Start") { create() }
+                            .disabled(creating || name.trimmingCharacters(in: .whitespaces).isEmpty)
+                    } else {
+                        Button("Continue") { advance() }
+                    }
                 }
             }
-            .fileImporter(isPresented: $importing, allowedContentTypes: CDImage.types) { result in
+            .fileImporter(isPresented: $importing,
+                          allowedContentTypes: source == .cd ? CDImage.types : DiskImage.types) { result in
                 if case .success(let url) = result { choose(url) }
             }
-            .onAppear { apply(preset) }
         }
         .frame(width: 520, height: 560)
     }
 
-    private func apply(_ p: Preset) {
+    private func use(_ p: Preset) {
+        preset = p
         memoryMiB = p.memoryMiB
         diskMiB = p.diskMiB
-        name = R86.suggestedName(p.name)
     }
 
-    /// Use a picked CD image and the system it looks like.
-    private func choose(_ url: URL) {
-        iso = url
-        let accessing = url.startAccessingSecurityScopedResource()
-        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
-        if let detected = R86.detect(iso: url.path),
-           let match = R86.presets.first(where: { $0.name == detected }) {
-            preset = match
-            apply(match)
+    private func suggest(_ base: String) {
+        if name.isEmpty || name == suggested {
+            suggested = R86.suggestedName(base)
+            name = suggested
         }
     }
 
     private func advance() {
-        guard isLast else {
-            withAnimation { step += 1 }
-            return
+        switch step {
+        case .source:
+            media = nil
+            detected = nil
+            if source == .freeDOS {
+                // As the handheld's catalog entry (src/frontend/catalog.rs).
+                use(R86.presets.first(where: { $0.name == "DOS" }) ?? preset)
+                memoryMiB = 32
+                diskMiB = 512
+                suggest("FreeDOS")
+                withAnimation { step = .summary }
+            } else {
+                importing = true
+            }
+        case .os:
+            use(preset)
+            withAnimation { step = .memory }
+        case .memory:
+            suggest(preset.name)
+            withAnimation { step = source == .cd ? .disk : .summary }
+        case .disk:
+            withAnimation { step = .summary }
+        case .summary:
+            create()
         }
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        guard let id = library.create(name: trimmed, preset: preset, memoryMiB: memoryMiB,
-                                      diskMiB: diskMiB, network: network, iso: iso) else { return }
-        dismiss()
-        onCreated(id, startAfter)
+    }
+
+    /// Use a picked CD or disk image and the system it looks like.
+    private func choose(_ url: URL) {
+        media = url
+        let accessing = url.startAccessingSecurityScopedResource()
+        defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+        detected = source == .cd ? R86.detect(iso: url.path) : R86.detect(disk: url.path)
+        use(R86.presets.first(where: { $0.name == (detected ?? "Other") }) ?? preset)
+        withAnimation { step = .os }
+    }
+
+    private func create() {
+        let plan: Library.NewMachine.Source
+        switch source {
+        case .cd:
+            guard let media else { return }
+            plan = .cd(media)
+        case .freeDOS:
+            plan = .freeDOS
+        case .disk:
+            guard let media else { return }
+            plan = .disk(media)
+        }
+        let machine = Library.NewMachine(source: plan, name: name.trimmingCharacters(in: .whitespaces),
+                                         preset: preset, memoryMiB: memoryMiB, diskMiB: diskMiB,
+                                         network: network)
+        creating = true
+        Task {
+            let id = await library.create(machine)
+            creating = false
+            guard let id else { return }
+            dismiss()
+            onCreated(id, true)
+        }
     }
 
     // MARK: Steps
 
-    @ViewBuilder
-    private var systemStep: some View {
-        Section("Operating system") {
-            Picker("Operating system", selection: $preset) {
-                ForEach(R86.presets) { p in
-                    Text(p.name).tag(p)
-                }
-            }
-            .pickerStyle(.inline)
-            .labelsHidden()
-            .onChange(of: preset) { _, p in apply(p) }
-        }
-        Section {
-            LabeledContent("CD image") {
-                HStack(spacing: 8) {
-                    Text(iso?.lastPathComponent ?? "None")
-                        .font(.callout.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .foregroundStyle(.secondary)
-                    if iso != nil {
-                        Button("Remove") { iso = nil }
-                    }
-                    Button("Choose…") { importing = true }
-                }
-            }
-        } header: {
-            Text("Install from")
-        } footer: {
-            Text("Bring your own installation CD. A machine with a CD image starts from it.")
+    /// A choice with its detail on the right, as the handheld's lists.
+    private func choice(_ title: String, _ detail: String) -> some View {
+        LabeledContent(title) {
+            Text(detail).foregroundStyle(.secondary)
         }
     }
 
     @ViewBuilder
-    private var hardwareStep: some View {
+    private var sourceStep: some View {
         Section {
-            MemoryRow(memoryMiB: $memoryMiB)
-            DiskRow(diskMiB: $diskMiB)
-        } header: {
-            Text("Resources")
+            Picker("How to start?", selection: $source) {
+                choice("Install from a CD image", ".iso").tag(Source.cd)
+                choice("Install FreeDOS", "included").tag(Source.freeDOS)
+                choice("Use an existing disk", ".vhd .img").tag(Source.disk)
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
         } footer: {
-            Text("The disk is a dynamic VHD: it grows as the guest writes.")
+            Text("Bring your own installation CD, or start with FreeDOS, which comes with r86.")
         }
-        Section("Network") {
-            Toggle("User-mode network (NAT)", isOn: $network)
+    }
+
+    @ViewBuilder
+    private var osStep: some View {
+        Section {
+            Picker("Operating system", selection: $preset) {
+                ForEach(R86.presets) { p in
+                    choice(p.name, p.name == detected ? "detected" : "").tag(p)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } footer: {
+            Text(detected == nil
+                 ? "r86 did not recognise the image; choose the closest."
+                 : "r86 recognised the image. Its choice sets the memory and disk size.")
+        }
+    }
+
+    @ViewBuilder
+    private var memoryStep: some View {
+        Section {
+            Picker("Memory", selection: $memoryMiB) {
+                ForEach(R86.memoryChoices, id: \.self) { mib in
+                    choice(Format.size(mib: mib), mib == preset.memoryMiB ? "recommended" : "").tag(mib)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        }
+    }
+
+    @ViewBuilder
+    private var diskStep: some View {
+        Section {
+            Picker("Disk size", selection: $diskMiB) {
+                ForEach(preset.diskChoices, id: \.self) { mib in
+                    choice(Format.size(mib: mib), mib == preset.diskMiB ? "recommended" : "").tag(mib)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } footer: {
+            Text("The disk file starts small and grows as the guest writes, up to this size.")
+        }
+    }
+
+    private var hint: String {
+        switch source {
+        case .cd where preset.dosSetup != nil:
+            "Setup runs from DOS: r86 puts FreeDOS on the new disk, and it starts Windows Setup from the CD."
+        case .cd: "The VM starts from the CD to install."
+        case .freeDOS: "FreeDOS is installed on the new disk."
+        case .disk: "The disk image is used where it is, not copied."
         }
     }
 
@@ -143,14 +253,24 @@ struct NewMachineSheet: View {
             TextField("Name", text: $name)
         }
         Section {
-            LabeledContent("System", value: preset.name)
-            LabeledContent("CD image", value: iso?.lastPathComponent ?? "None")
+            LabeledContent("OS", value: preset.name)
             LabeledContent("Memory", value: Format.size(mib: memoryMiB))
-            LabeledContent("Disk", value: Format.size(mib: diskMiB))
-            LabeledContent("Network", value: network ? "User (NAT)" : "None")
+            if source != .disk {
+                LabeledContent("Disk size", value: Format.size(mib: diskMiB))
+            }
+            switch source {
+            case .cd: LabeledContent("CD", value: media?.lastPathComponent ?? "")
+            case .freeDOS: LabeledContent("FreeDOS", value: "included")
+            case .disk: LabeledContent("Disk", value: media?.lastPathComponent ?? "")
+            }
+            Toggle("User-mode network (NAT)", isOn: $network)
+        } footer: {
+            Text(hint)
         }
-        Section {
-            Toggle("Start after creating", isOn: $startAfter)
+        if creating {
+            Section {
+                ProgressView(source == .freeDOS || preset.dosSetup != nil ? "Installing FreeDOS…" : "Creating…")
+            }
         }
     }
 }

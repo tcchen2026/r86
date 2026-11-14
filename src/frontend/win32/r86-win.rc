@@ -1,6 +1,7 @@
-// r86-win.exe's resources: icon, manifest, the library and New VM dialogs
-// and version (build.rs compiles them with windres; R86_FILEVERSION and
-// R86_VERSION come from there). Control IDs match main.rs.
+// r86-win.exe's resources: icon, manifest, the library, New VM and Edit VM
+// dialogs and version (build.rs compiles them with windres; R86_FILEVERSION and
+// R86_VERSION come from there). Control IDs match main.rs, wizard.rs and
+// edit_vm.rs.
 #include <windows.h>
 
 1 ICON "r86.ico"
@@ -16,31 +17,52 @@ BEGIN
     LISTBOX 10, 7, 18, 196, 165, LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
     PUSHBUTTON "&New...", 11, 210, 18, 113, 15
     DEFPUSHBUTTON "&Start", IDOK, 210, 36, 113, 15
-    PUSHBUTTON "&Delete...", 12, 210, 54, 113, 15
-    PUSHBUTTON "Show &files", 13, 210, 72, 113, 15
-    LTEXT "", 14, 210, 96, 113, 87
+    PUSHBUTTON "&Edit this VM...", 15, 210, 54, 113, 15
+    PUSHBUTTON "&Delete...", 12, 210, 72, 113, 15
+    PUSHBUTTON "Show &files", 13, 210, 90, 113, 15
+    LTEXT "", 14, 210, 114, 113, 69
 END
 
-// New virtual machine
-101 DIALOGEX 0, 0, 260, 126
+// New virtual machine: one step at a time, as the handheld's wizard. The
+// list (drawn by wizard.rs: choice, then its detail on the right) serves the
+// choice steps; the name and summary the last one.
+101 DIALOGEX 0, 0, 280, 196
 STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "New virtual machine"
 FONT 9, "Segoe UI", 400, 0, 1
 BEGIN
-    LTEXT "&Name", -1, 7, 9, 70, 9
-    EDITTEXT 20, 80, 7, 173, 13, ES_AUTOHSCROLL
-    LTEXT "&Operating system", -1, 7, 27, 70, 9
-    COMBOBOX 21, 80, 25, 173, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT "&CD image", -1, 7, 45, 70, 9
-    EDITTEXT 22, 80, 43, 119, 13, ES_AUTOHSCROLL
-    PUSHBUTTON "&Browse...", 23, 203, 42, 50, 15
-    LTEXT "&Memory (MB)", -1, 7, 63, 70, 9
-    EDITTEXT 24, 80, 61, 45, 13, ES_NUMBER
-    LTEXT "&Disk (MB)", -1, 140, 63, 50, 9
-    EDITTEXT 25, 195, 61, 58, 13, ES_NUMBER
-    LTEXT "Memory and disk follow the operating system. With a CD image, the VM starts from it to install.", -1, 7, 81, 246, 18
-    DEFPUSHBUTTON "Create", IDOK, 147, 105, 50, 15
-    PUSHBUTTON "Cancel", IDCANCEL, 203, 105, 50, 15
+    LTEXT "", 30, 7, 7, 220, 10
+    RTEXT "", 31, 230, 7, 43, 10
+    LISTBOX 32, 7, 20, 266, 124, LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    LTEXT "&Name", 33, 7, 23, 40, 9
+    EDITTEXT 20, 50, 21, 223, 13, ES_AUTOHSCROLL
+    LTEXT "", 34, 50, 42, 223, 100
+    LTEXT "", 35, 7, 148, 266, 20
+    PUSHBUTTON "< &Back", 36, 99, 175, 50, 15
+    DEFPUSHBUTTON "&Next >", IDOK, 153, 175, 66, 15
+    PUSHBUTTON "Cancel", IDCANCEL, 223, 175, 50, 15
+END
+
+// Edit this VM: the handheld's settings that the Windows app uses
+102 DIALOGEX 0, 0, 260, 138
+STYLE DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Edit VM"
+FONT 9, "Segoe UI", 400, 0, 1
+BEGIN
+    LTEXT "&OS type", -1, 7, 9, 60, 9
+    COMBOBOX 40, 70, 7, 183, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "&Memory", -1, 7, 27, 60, 9
+    COMBOBOX 41, 70, 25, 100, 160, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "&CD", -1, 7, 45, 60, 9
+    EDITTEXT 42, 70, 43, 81, 13, ES_AUTOHSCROLL | ES_READONLY
+    PUSHBUTTON "&Choose...", 43, 155, 42, 50, 15
+    PUSHBUTTON "E&ject", 44, 209, 42, 44, 15
+    LTEXT "&Boot", -1, 7, 63, 60, 9
+    COMBOBOX 45, 70, 61, 100, 60, CBS_DROPDOWNLIST | WS_TABSTOP
+    AUTOCHECKBOX "&Network", 46, 70, 79, 183, 10
+    LTEXT "", 47, 7, 95, 246, 18
+    DEFPUSHBUTTON "OK", IDOK, 147, 117, 50, 15
+    PUSHBUTTON "Cancel", IDCANCEL, 203, 117, 50, 15
 END
 
 VS_VERSION_INFO VERSIONINFO

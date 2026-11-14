@@ -24,11 +24,23 @@ typedef struct {
 
 // Library: VMs are folders holding vm.toml under `root`.
 char *r86_library_list(const char *root);  // JSON array; engine: auto|jit|interpreter
-char *r86_presets(void);                   // JSON array
+char *r86_presets(void);                   // JSON array; diskChoices, dosSetup per preset
+char *r86_memory_choices(void);            // JSON array of MiB
 char *r86_detect_iso(const char *path);    // preset name or ""
+char *r86_detect_disk(const char *path);   // preset name or ""
 char *r86_library_suggest_name(const char *root, const char *base);
+// New VMs boot from the disk first; a blank disk falls through to the CD.
 char *r86_library_create(const char *root, const char *name, const char *os,
                          uint32_t memory_mib, uint64_t disk_mib, const char *iso);
+// The new disk holds FreeDOS from share/dos.zip set up for `setup`: "freedos",
+// or "win31" | "win95" | "win98" | "winme" to run Windows setup from `iso` on
+// first boot. Blocks for seconds; call it off the main thread.
+char *r86_library_create_dos(const char *root, const char *name, const char *os,
+                             uint32_t memory_mib, uint64_t disk_mib, const char *iso,
+                             const char *share, const char *setup);
+// Around an existing disk image, used in place.
+char *r86_library_create_existing(const char *root, const char *name, const char *os,
+                                  uint32_t memory_mib, const char *disk);
 // cpu-engine: auto|jit|interpreter (legacy interp accepted). Changes a stopped VM.
 // auto selects JIT for Windows/ReactOS presets when this build supports it;
 // other presets use the interpreter. Builds without the JIT ignore jit.

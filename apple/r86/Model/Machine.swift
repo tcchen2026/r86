@@ -62,6 +62,10 @@ struct Preset: Decodable, Identifiable, Hashable {
     let name: String
     let memoryMiB: Int
     let diskMiB: Int
+    /// Disk sizes the wizard offers for this OS, in MiB.
+    let diskChoices: [Int]
+    /// The DOS kit setup that installs it from its CD (Windows 3.1/9x/ME).
+    let dosSetup: String?
     var id: String { name }
 }
 

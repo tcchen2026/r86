@@ -1,13 +1,19 @@
 //! r86 for Windows (amd64 and arm64): a library of VMs and one window per
-//! running VM, drawn with GDI. bios.bin, vgabios-stdvga.bin and
-//! r86_tools.iso sit beside the executable; VMs live in Documents\r86.
-//! The dialogs, icon and manifest are resources (r86-win.rc, built by
-//! build.rs with MinGW windres).
+//! running VM, drawn with GDI. bios.bin, vgabios-stdvga.bin, dos.zip (the
+//! DOS kit) and r86_tools.iso sit beside the executable; VMs live in
+//! Documents\r86. The dialogs, icon and manifest are resources (r86-win.rc,
+//! built by build.rs with MinGW windres).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 #[cfg(windows)]
 mod audio;
+#[cfg(windows)]
+#[path = "../catalog.rs"]
+#[allow(dead_code)]
+mod catalog;
+#[cfg(windows)]
+mod edit_vm;
 #[cfg(windows)]
 #[path = "../guest_os.rs"]
 #[allow(dead_code)]
@@ -29,6 +35,8 @@ mod ui;
 mod vm_store;
 #[cfg(windows)]
 mod vm_window;
+#[cfg(windows)]
+mod wizard;
 
 #[cfg(windows)]
 fn main() {
@@ -50,38 +58,30 @@ mod library {
     use std::path::{Path, PathBuf};
 
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-    use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
     use windows::Win32::UI::Shell::{CSIDL_PERSONAL, SHGetFolderPathW, ShellExecuteW};
     use windows::Win32::UI::WindowsAndMessaging::*;
     use windows::core::{HSTRING, PCWSTR, w};
 
-    use super::guest_os::{self, PRESETS};
-    use super::ui::{instance, message_box, open_file, resource, set_text, text_of};
+    use super::ui::{instance, item, message_box, resource, set_icons, set_text, size_text, with};
     use super::vm_store::{self, Vm};
     use super::vm_window::{self, WM_APP_DESTROY};
+    use super::{edit_vm, wizard};
 
     // Dialog and control IDs, as in r86-win.rc.
     const IDD_LIBRARY: u16 = 100;
-    const IDD_NEW_VM: u16 = 101;
     const ID_LIST: i32 = 10;
     const ID_NEW: i32 = 11;
     const ID_DELETE: i32 = 12;
     const ID_FILES: i32 = 13;
     const ID_DETAILS: i32 = 14;
-    const ID_NAME: i32 = 20;
-    const ID_OS: i32 = 21;
-    const ID_CD: i32 = 22;
-    const ID_BROWSE: i32 = 23;
-    const ID_MEMORY: i32 = 24;
-    const ID_DISK: i32 = 25;
-    const ID_OK: i32 = IDOK.0; // the library's Start, the New VM window's Create
+    const ID_EDIT: i32 = 15;
+    const ID_START: i32 = IDOK.0;
     const ID_CANCEL: i32 = IDCANCEL.0;
     const WM_APP_REFRESH: u32 = WM_APP + 2;
 
     thread_local! {
         static LIBRARY_HWND: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
         static LIBRARY: RefCell<Option<Library>> = const { RefCell::new(None) };
-        static NEW_VM: RefCell<Option<NewVm>> = const { RefCell::new(None) };
     }
 
     /// Asks the library to reread the VMs and window states.
@@ -117,19 +117,6 @@ mod library {
             }
         }
         LIBRARY.with(|library| library.borrow_mut().take());
-    }
-
-    /// Runs `handle` on a dialog's state. Messages that arrive while a
-    /// handler runs (under a message box or the modal New VM window) are
-    /// left to the dialog manager.
-    fn with<T>(
-        cell: &'static std::thread::LocalKey<RefCell<Option<T>>>,
-        handle: impl FnOnce(&mut T) -> bool,
-    ) -> isize {
-        cell.with(|cell| match cell.try_borrow_mut() {
-            Ok(mut state) => state.as_mut().is_some_and(handle) as isize,
-            Err(_) => 0,
-        })
     }
 
     struct Library {
@@ -177,10 +164,11 @@ mod library {
                 WM_COMMAND => {
                     let (id, code) = ((w.0 & 0xffff) as i32, (w.0 >> 16) as u32);
                     match id {
-                        ID_OK => self.start(),
+                        ID_START => self.start(),
                         ID_LIST if code == LBN_DBLCLK => self.start(),
                         ID_LIST if code == LBN_SELCHANGE => self.show_details(),
                         ID_NEW => self.new_vm(),
+                        ID_EDIT => self.edit(),
                         ID_DELETE => self.delete(),
                         ID_FILES => self.show_files(),
                         ID_CANCEL => {} // Esc does not quit
@@ -201,8 +189,7 @@ mod library {
         }
 
         fn item(&self, id: i32) -> HWND {
-            // SAFETY: a control of this dialog.
-            unsafe { GetDlgItem(Some(self.hwnd), id) }.unwrap_or_default()
+            item(self.hwnd, id)
         }
 
         /// Rereads the library, keeping the selection (or selecting `select`).
@@ -275,9 +262,9 @@ mod library {
                         "Off"
                     };
                     format!(
-                        "{state}\n\n{}\n{} MB memory\n{} disk\nCD: {cd}",
+                        "{state}\n\n{}\n{} memory\n{} disk\nCD: {cd}",
                         vm.os,
-                        vm.memory,
+                        size_text(u64::from(vm.memory)),
                         size_text(vm.disk_mib)
                     )
                 }
@@ -348,36 +335,31 @@ mod library {
             };
         }
 
-        /// The modal New VM window; a created VM is selected and, with a CD
-        /// image to install from, started.
+        /// The New VM wizard; the VM it creates is selected and started.
         fn new_vm(&mut self) {
-            NEW_VM.with(|cell| {
-                *cell.borrow_mut() = Some(NewVm {
-                    hwnd: HWND::default(),
-                    root: self.root.clone(),
-                    suggested: String::new(),
-                })
-            });
-            // SAFETY: a modal dialog from this module's resources.
-            let created = unsafe {
-                DialogBoxParamW(
-                    Some(instance()),
-                    resource(IDD_NEW_VM),
-                    Some(self.hwnd),
-                    Some(new_vm_proc),
-                    LPARAM(0),
-                )
-            };
-            let vm = NEW_VM
-                .with(|cell| cell.borrow_mut().take())
-                .and(CREATED.with(|c| c.borrow_mut().take()));
-            if created != 1 {
+            if let Some(vm) = wizard::run(self.hwnd, &self.root, &self.firmware) {
+                self.refresh(Some(vm.directory));
+                self.start();
+            }
+        }
+
+        /// Edit this VM: its settings, while it is off.
+        fn edit(&mut self) {
+            let Some(vm) = self.selected() else { return };
+            if self.window_of(&vm.directory).is_some() {
+                let text = format!("{} is running. Turn it off to edit it.", vm.name);
+                message_box(self.hwnd, &text, MB_OK | MB_ICONINFORMATION);
                 return;
             }
-            if let Some(vm) = vm {
-                self.refresh(Some(vm.directory.clone()));
-                if vm.iso.is_some() {
-                    self.start();
+            // Reread, in case another r86 changed it.
+            match Vm::load(vm.directory.clone()) {
+                Ok(vm) => {
+                    if edit_vm::run(self.hwnd, vm) {
+                        self.refresh(None);
+                    }
+                }
+                Err(err) => {
+                    message_box(self.hwnd, &err, MB_OK | MB_ICONERROR);
                 }
             }
         }
@@ -415,179 +397,6 @@ mod library {
         }
     }
 
-    thread_local! {
-        /// The VM the New VM window made, for Library::new_vm.
-        static CREATED: RefCell<Option<Vm>> = const { RefCell::new(None) };
-    }
-
-    struct NewVm {
-        hwnd: HWND,
-        root: PathBuf,
-        /// The name the app last suggested; replaced while unedited.
-        suggested: String,
-    }
-
-    unsafe extern "system" fn new_vm_proc(hwnd: HWND, msg: u32, w: WPARAM, _l: LPARAM) -> isize {
-        if msg == WM_INITDIALOG {
-            set_icons(hwnd);
-            return with(&NEW_VM, |dialog| {
-                dialog.hwnd = hwnd;
-                let os = dialog.item(ID_OS);
-                for preset in PRESETS {
-                    let name = HSTRING::from(preset.name);
-                    // SAFETY: the item text lives across the call.
-                    unsafe {
-                        SendMessageW(os, CB_ADDSTRING, None, Some(LPARAM(name.as_ptr() as isize)))
-                    };
-                }
-                dialog.choose_preset(0);
-                true
-            });
-        }
-        with(&NEW_VM, |dialog| dialog.handle(msg, w))
-    }
-
-    impl NewVm {
-        fn item(&self, id: i32) -> HWND {
-            // SAFETY: a control of this dialog.
-            unsafe { GetDlgItem(Some(self.hwnd), id) }.unwrap_or_default()
-        }
-
-        fn handle(&mut self, msg: u32, w: WPARAM) -> bool {
-            if msg != WM_COMMAND {
-                return false;
-            }
-            let (id, code) = ((w.0 & 0xffff) as i32, (w.0 >> 16) as u32);
-            match id {
-                ID_OK => self.create(),
-                // SAFETY: closes this modal dialog.
-                ID_CANCEL => unsafe {
-                    let _ = EndDialog(self.hwnd, 0);
-                },
-                ID_BROWSE => self.browse(),
-                ID_OS if code == CBN_SELCHANGE => {
-                    // SAFETY: combo box query.
-                    let index =
-                        unsafe { SendMessageW(self.item(ID_OS), CB_GETCURSEL, None, None) }.0;
-                    self.choose_preset(index.max(0) as usize);
-                }
-                _ => return false,
-            }
-            true
-        }
-
-        /// Selects a preset: its memory and disk, and a matching name while
-        /// the user has not typed one.
-        fn choose_preset(&mut self, index: usize) {
-            let index = index.min(PRESETS.len() - 1);
-            let preset = &PRESETS[index];
-            set_text(self.item(ID_MEMORY), &preset.memory_mib.to_string());
-            set_text(self.item(ID_DISK), &preset.disk_mib.to_string());
-            // SAFETY: combo box selection.
-            unsafe { SendMessageW(self.item(ID_OS), CB_SETCURSEL, Some(WPARAM(index)), None) };
-            let name = text_of(self.item(ID_NAME));
-            if name.is_empty() || name == self.suggested {
-                self.suggested = vm_store::suggested_name(&self.root, preset.name);
-                set_text(self.item(ID_NAME), &self.suggested);
-            }
-        }
-
-        fn browse(&mut self) {
-            let filter = [("CD images (*.iso)", "*.iso"), ("All files", "*.*")];
-            let Some(path) = open_file(self.hwnd, "Choose a CD image", &filter) else {
-                return;
-            };
-            set_text(self.item(ID_CD), &path);
-            if let Ok(Some(preset)) = guest_os::detect_iso(path.as_ref())
-                && let Some(index) = PRESETS.iter().position(|p| p.name == preset.name)
-            {
-                self.choose_preset(index);
-            }
-        }
-
-        fn create(&mut self) {
-            let name = text_of(self.item(ID_NAME)).trim().to_string();
-            let memory = text_of(self.item(ID_MEMORY))
-                .parse::<u32>()
-                .ok()
-                .filter(|m| (4..=3584).contains(m));
-            let disk = text_of(self.item(ID_DISK))
-                .parse::<u64>()
-                .ok()
-                .filter(|d| (16..=131_072).contains(d));
-            let cd = text_of(self.item(ID_CD)).trim().to_string();
-            let (focus, problem) = if name.is_empty()
-                || name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|'])
-            {
-                (ID_NAME, "Give the VM a name without \\ / : * ? \" < > |.")
-            } else if memory.is_none() {
-                (ID_MEMORY, "Memory must be 4 to 3584 MB.")
-            } else if disk.is_none() {
-                (ID_DISK, "The disk must be 16 MB to 128 GB.")
-            } else {
-                (0, "")
-            };
-            if focus != 0 {
-                message_box(self.hwnd, problem, MB_OK | MB_ICONWARNING);
-                // SAFETY: focus a control of this dialog.
-                let _ = unsafe { SetFocus(Some(self.item(focus))) };
-                return;
-            }
-            // SAFETY: combo box query.
-            let index = unsafe { SendMessageW(self.item(ID_OS), CB_GETCURSEL, None, None) }
-                .0
-                .max(0) as usize;
-            let preset = &PRESETS[index.min(PRESETS.len() - 1)];
-            let mut vm = Vm::new(&self.root, name, preset);
-            vm.engine = "auto".into();
-            vm.memory = memory.unwrap_or(preset.memory_mib);
-            vm.disk_mib = disk.unwrap_or(preset.disk_mib);
-            if !cd.is_empty() {
-                vm.iso = Some(cd.into());
-                vm.boot_order = "cdrom".into();
-            }
-            let created = std::fs::create_dir_all(&self.root)
-                .map_err(|err| format!("Cannot create {}: {err}", self.root.display()))
-                .and_then(|()| vm.create_blank());
-            match created {
-                Ok(()) => {
-                    CREATED.with(|c| *c.borrow_mut() = Some(vm));
-                    // SAFETY: closes this modal dialog.
-                    let _ = unsafe { EndDialog(self.hwnd, 1) };
-                }
-                Err(err) => {
-                    message_box(self.hwnd, &err, MB_OK | MB_ICONERROR);
-                }
-            }
-        }
-    }
-
-    /// The r86 icon in a dialog's title bar and the taskbar (shared icons,
-    /// never destroyed).
-    fn set_icons(hwnd: HWND) {
-        // SAFETY: shared icon handles from this module's resources.
-        unsafe {
-            for (kind, metric) in [(ICON_BIG, SM_CXICON), (ICON_SMALL, SM_CXSMICON)] {
-                let size = GetSystemMetrics(metric);
-                if let Ok(icon) = LoadImageW(
-                    Some(instance()),
-                    resource(1),
-                    IMAGE_ICON,
-                    size,
-                    size,
-                    LR_SHARED,
-                ) {
-                    SendMessageW(
-                        hwnd,
-                        WM_SETICON,
-                        Some(WPARAM(kind as usize)),
-                        Some(LPARAM(icon.0 as isize)),
-                    );
-                }
-            }
-        }
-    }
-
     fn is_window(hwnd: HWND) -> bool {
         // SAFETY: IsWindow accepts any handle.
         !hwnd.0.is_null() && unsafe { IsWindow(Some(hwnd)) }.as_bool()
@@ -597,14 +406,6 @@ mod library {
         directory
             .file_name()
             .map_or("the VM".into(), |n| n.to_string_lossy().into_owned())
-    }
-
-    fn size_text(mib: u64) -> String {
-        if mib >= 1024 && mib.is_multiple_of(1024) {
-            format!("{} GB", mib / 1024)
-        } else {
-            format!("{mib} MB")
-        }
     }
 
     /// The user's Documents folder, or the profile.

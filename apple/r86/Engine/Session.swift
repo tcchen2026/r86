@@ -19,14 +19,14 @@ final class Session {
     @ObservationIgnored private var serial: UInt64 = 0
     @ObservationIgnored private var pixels = Data()
     @ObservationIgnored private var audio: AudioOutput?
-    /// Security-scoped files (CD images) open while the VM runs.
+    /// Security-scoped files (CD and disk images) open while the VM runs.
     @ObservationIgnored private var scoped: [URL] = []
     private let directory: String
 
     init(machine: Machine) throws {
         var scoped: [URL] = []
-        if let iso = machine.iso, let url = Bookmarks.access(iso, in: machine.directory) {
-            scoped.append(url)
+        for path in [machine.iso, machine.disk].compactMap({ $0 }) {
+            if let url = Bookmarks.access(path, in: machine.directory) { scoped.append(url) }
         }
         var error: UnsafeMutablePointer<CChar>?
         guard let vm = r86_vm_start(machine.directory, R86.firmware, &error) else {

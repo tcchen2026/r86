@@ -71,6 +71,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The DOS kit release that assets/freedos-kit.sha256 pins.
+      - name: DOS kit
+        run: |
+          read -r sha256 name < assets/freedos-kit.sha256
+          mkdir -p tmp/freedos/share
+          curl -sfL -o tmp/freedos/share/dos.zip \
+            "https://github.com/${{ github.repository }}/releases/download/freedos-kit-${sha256:0:8}/$name"
+          echo "$sha256  tmp/freedos/share/dos.zip" | shasum -a 256 -c -
+
       - name: Tools
         run: |
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin

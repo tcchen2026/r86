@@ -135,17 +135,61 @@ final class Library {
 
     // MARK: Library edits
 
-    /// Create a machine with an empty disk; returns its id.
-    func create(name: String, preset: Preset, memoryMiB: Int, diskMiB: Int, network: Bool, iso: URL?) -> Machine.ID? {
-        let accessing = iso?.startAccessingSecurityScopedResource() ?? false
-        defer { if accessing { iso?.stopAccessingSecurityScopedResource() } }
+    /// What the New Machine wizard creates.
+    struct NewMachine {
+        enum Source {
+            case cd(URL)
+            case freeDOS
+            case disk(URL)
+        }
+
+        var source: Source
+        var name: String
+        var preset: Preset
+        var memoryMiB: Int
+        var diskMiB: Int
+        var network: Bool
+
+        /// FreeDOS from the DOS kit: FreeDOS itself, or the DOS that runs
+        /// Windows 3.1/9x/ME setup from its CD.
+        var dosSetup: String? {
+            switch source {
+            case .cd: preset.dosSetup
+            case .freeDOS: "freedos"
+            case .disk: nil
+            }
+        }
+    }
+
+    /// Create a machine; planting FreeDOS runs off the main thread. Returns its id.
+    func create(_ plan: NewMachine) async -> Machine.ID? {
+        let picked: URL?
+        switch plan.source {
+        case .cd(let url), .disk(let url): picked = url
+        case .freeDOS: picked = nil
+        }
+        let accessing = picked?.startAccessingSecurityScopedResource() ?? false
+        defer { if accessing { picked?.stopAccessingSecurityScopedResource() } }
         do {
-            let directory = try R86.create(name: name, os: preset.name, memoryMiB: memoryMiB,
-                                           diskMiB: diskMiB, iso: iso?.path)
-            if let iso { Bookmarks.remember(iso, in: directory) }
-            if !network { try R86.set(directory, "network", "false") }
+            let directory: String
+            if let setup = plan.dosSetup {
+                let (name, os, memory, disk, iso) = (plan.name, plan.preset.name, plan.memoryMiB,
+                                                     plan.diskMiB, picked?.path)
+                directory = try await Task.detached {
+                    try R86.createDOS(name: name, os: os, memoryMiB: memory, diskMiB: disk,
+                                      iso: iso, setup: setup)
+                }.value
+            } else if case .disk(let disk) = plan.source {
+                directory = try R86.createExisting(name: plan.name, os: plan.preset.name,
+                                                   memoryMiB: plan.memoryMiB, disk: disk.path)
+            } else {
+                directory = try R86.create(name: plan.name, os: plan.preset.name, memoryMiB: plan.memoryMiB,
+                                           diskMiB: plan.diskMiB, iso: picked?.path)
+            }
+            if let picked { Bookmarks.remember(picked, in: directory) }
+            if !plan.network { try R86.set(directory, "network", "false") }
             reload()
-            show("Created \(name)", systemImage: "checkmark")
+            show("Created \(plan.name)", systemImage: "checkmark")
             return directory
         } catch {
             show(error.localizedDescription, systemImage: "exclamationmark.triangle")

@@ -100,28 +100,14 @@ struct SpeedOverlay: View {
 
 // MARK: - Settings rows
 
-/// Memory doubling from 16 MiB to 2 GiB, the range r86 accepts.
+/// Memory from the wizard's choices (16 MiB to 3 GiB), plus the current size.
 struct MemoryRow: View {
     @Binding var memoryMiB: Int
 
     var body: some View {
-        Stepper(onIncrement: { memoryMiB = min(memoryMiB * 2, 2048) },
-                onDecrement: { memoryMiB = max(memoryMiB / 2, 16) }) {
-            LabeledContent("Memory") {
-                Text(Format.size(mib: memoryMiB)).monospacedDigit()
-            }
-        }
-    }
-}
-
-struct DiskRow: View {
-    @Binding var diskMiB: Int
-
-    var body: some View {
-        Stepper(onIncrement: { diskMiB = min(diskMiB * 2, 131_072) },
-                onDecrement: { diskMiB = max(diskMiB / 2, 64) }) {
-            LabeledContent("Disk") {
-                Text(Format.size(mib: diskMiB)).monospacedDigit()
+        Picker("Memory", selection: $memoryMiB) {
+            ForEach(Set(R86.memoryChoices + [memoryMiB]).sorted(), id: \.self) { mib in
+                Text(Format.size(mib: mib)).tag(mib)
             }
         }
     }

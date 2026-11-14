@@ -157,8 +157,9 @@ impl Vm {
 
     pub fn validate(&self) -> Result<(), String> {
         validate_name(&self.name)?;
-        if !(16..=2048).contains(&self.memory) {
-            return Err("Memory must be between 16 and 2048 MiB.".into());
+        // Guest RAM ends below the VGA framebuffer at 3.5 GiB.
+        if !(16..=3072).contains(&self.memory) {
+            return Err("Memory must be between 16 MiB and 3 GiB.".into());
         }
         if !(1..=131072).contains(&self.disk_mib) {
             return Err("Disk capacity must be between 1 MiB and 128 GiB.".into());

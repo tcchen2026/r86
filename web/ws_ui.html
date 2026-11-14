@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>r86</title>
+<link rel="icon" href="r86.png">
 <style>
   :root {
     color-scheme: dark;
@@ -98,6 +99,7 @@
 
   #off { position: absolute; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 14px; }
+  #off img { image-rendering: pixelated; }
   #off h2 { font-size: 20px; font-weight: normal; margin: 0; color: var(--muted); }
   #off .buttons { display: flex; gap: 8px; }
   #off button { padding: 8px 16px; }
@@ -244,11 +246,7 @@
     <div id="stage">
       <div id="wrap"><canvas id="screen" width="720" height="400" tabindex="0"></canvas></div>
       <div id="off" hidden>
-        <svg width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="r86">
-          <rect width="96" height="96" rx="18" fill="#000080"/>
-          <text x="48" y="60" fill="#fff" text-anchor="middle"
-            style="font: bold 34px system-ui, sans-serif">r86</text>
-        </svg>
+        <img src="r86.png" width="160" height="160" alt="r86">
         <h2>Powered off</h2>
         <div class="buttons">
           <button id="off-poweron">Power on</button>
