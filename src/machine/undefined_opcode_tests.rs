@@ -122,18 +122,19 @@ fn pentium2_undefined_opcodes_deliver_idt_and_keep_bounded_diagnostics() {
         assert_eq!(m.undefined_opcodes().count(), 0, "{code:02x?}");
     }
 
-    // Valid P6 gaps (including undefined-result BSWAP r16) still stop.
-    for code in [
-        &[0x66, 0x0f, 0xc8][..],
-        &[0xdd, 0xc0],
-        &[0xdd, 0xc8],
-        &[0xde, 0xd0],
-    ] {
+    // FFREE and the P6 FXCH and FCOMP aliases execute; only BSWAP r16, an
+    // undefined result, still stops.
+    for code in [&[0xdd, 0xc0][..], &[0xdd, 0xc8], &[0xde, 0xd0]] {
         let mut m = user_machine();
         m.bus.ram[0x1200..0x1200 + code.len()].copy_from_slice(code);
-        assert!(m.run_steps(1).unwrap().stop.is_some(), "{code:02x?}");
+        assert!(m.run_steps(1).unwrap().stop.is_none(), "{code:02x?}");
+        assert_eq!(m.cpu.eip, 0x202, "{code:02x?}");
         assert_eq!(m.undefined_opcodes().count(), 0);
     }
+    let mut m = user_machine();
+    m.bus.ram[0x1200..0x1203].copy_from_slice(&[0x66, 0x0f, 0xc8]);
+    assert!(m.run_steps(1).unwrap().stop.is_some());
+    assert_eq!(m.undefined_opcodes().count(), 0);
 
     let mut m = user_machine();
     let original = m.cpu.clone();

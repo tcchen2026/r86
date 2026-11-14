@@ -2387,7 +2387,7 @@ impl Interpreter {
                     0xdd => {
                         {
                             step_try!(batch_step_result(execute_fpu_dd(
-                                cpu, bus, operand16, address16, start_eip, opcode,
+                                cpu, bus, operand16, address16, start_eip,
                             )));
                             break 'instruction;
                         };
@@ -2395,7 +2395,7 @@ impl Interpreter {
                     0xde => {
                         {
                             step_try!(batch_step_result(execute_fpu_de(
-                                cpu, bus, address16, start_eip, opcode,
+                                cpu, bus, address16, start_eip,
                             )));
                             break 'instruction;
                         };
@@ -3589,7 +3589,6 @@ fn execute_fpu_dd<B: Bus>(
     operand16: bool,
     address16: bool,
     start_eip: u32,
-    opcode: u8,
 ) -> Result<StepOutcome, StepError> {
     fpu_escape_available(cpu, start_eip)?;
     let modrm = fetch_u8(cpu, bus)?;
@@ -3613,15 +3612,12 @@ fn execute_fpu_dd<B: Bus>(
                 fpu_compare(cpu, cpu.fpu.get(0), cpu.fpu.get(index));
                 cpu.fpu.pop();
             }
-            // FFREE and the legacy FXCH alias are valid P6 instructions
-            // still missing here; do not disguise those gaps as guest #UD.
-            0 | 1 => {
-                return Err(StepError::UnsupportedModRm {
-                    eip: start_eip,
-                    opcode,
-                    modrm,
-                });
-            }
+            // FFREE ST(i) only tags the register empty. This model keeps no
+            // tags (fpu_tag_word reports every register valid), so there is
+            // nothing to change; C0-C3 are undefined.
+            0 => {}
+            // The P6 alias of FXCH ST(i) (D9 C8+i).
+            1 => fpu_fxch(cpu, index),
             _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
         }
         return Ok(StepOutcome::Running);
@@ -3659,7 +3655,6 @@ fn execute_fpu_de<B: Bus>(
     bus: &mut B,
     address16: bool,
     start_eip: u32,
-    opcode: u8,
 ) -> Result<StepOutcome, StepError> {
     fpu_escape_available(cpu, start_eip)?;
     let modrm = fetch_u8(cpu, bus)?;
@@ -3684,14 +3679,8 @@ fn execute_fpu_de<B: Bus>(
             cpu.fpu.pop();
             cpu.fpu.pop();
         }
-        // DE D0-D7 is a valid legacy FCOMP alias, not a reserved encoding.
-        2 => {
-            return Err(StepError::UnsupportedModRm {
-                eip: start_eip,
-                opcode,
-                modrm,
-            });
-        }
+        // The P6 alias of FCOMP ST(i) (D8 D8+i).
+        2 => fpu_arith(cpu, 3, 0, cpu.fpu.get(0), cpu.fpu.get(index)),
         _ => return Err(StepError::InvalidOpcode { eip: start_eip }),
     }
     Ok(StepOutcome::Running)
@@ -20907,10 +20896,10 @@ mod tests {
     }
 
     #[test]
-    fn fpu_escape_nm_precedes_unsupported_register_subop() {
+    fn fpu_escape_nm_precedes_reserved_register_subop() {
         let mut ram = Ram::new();
         ram.data[..2].copy_from_slice(&[
-            0xdd, 0xc0, // unsupported register form in this interpreter
+            0xdd, 0xf0, // reserved register form: #UD once the FPU is available
         ]);
 
         let mut cpu = flat_cpu();
@@ -20923,11 +20912,7 @@ mod tests {
         cpu.eip = 0;
         assert_eq!(
             Interpreter::step(&mut cpu, &mut ram),
-            Err(StepError::UnsupportedModRm {
-                eip: 0,
-                opcode: 0xdd,
-                modrm: 0xc0,
-            })
+            Err(StepError::InvalidOpcode { eip: 0 })
         );
     }
 
