@@ -12,11 +12,12 @@ cp "$root/src/devices/usb/qemu-license.txt" "$licenses/qemu-usb/LICENSE"
 cp "$root/vendor/fatfs/LICENSE.txt" "$root/vendor/fatfs/provenance.txt" "$licenses/fatfs/"
 cp "$root/vendor/seabios/COPYING" "$root/vendor/seabios/COPYING.LESSER" \
     "$root/firmware/seabios/bios.config" "$root/firmware/seabios/vga.config" \
-    "$root/firmware/seabios/acpi-features.patch" "$root/firmware/seabios/handheld-modes.patch" \
     "$licenses/seabios/"
 cat >"$licenses/seabios/SOURCE" <<'TXT'
-bios.bin and the vgabios-*.bin ROMs are SeaBIOS 1.17.0 (LGPL-3.0), upstream
-commit b52ca86e094d19b58e2304417787e96b940e39c6
-(https://www.seabios.org/), built with the configs and patches in this
-directory by r86's script/build_seabios.py.
+bios.bin and vgabios-stdvga.bin are SeaBIOS 1.17.0 (LGPL-3.0), upstream
+commit b52ca86e094d19b58e2304417787e96b940e39c6 (https://www.seabios.org/),
+with r86's changes, built with the configs in this directory by r86's
+script/build_seabios.py. The corresponding source is vendor/seabios in r86's
+repository (https://github.com/tcchen2026/r86); vendor/README.md lists the
+changes.
 TXT

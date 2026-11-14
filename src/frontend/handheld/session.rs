@@ -31,9 +31,9 @@ use crate::ws_frontend::Remote;
 const SLICE_STEPS: u64 = 200_000;
 const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 const TOAST: Duration = Duration::from_secs(4);
-/// The standard VGA BIOS plus 640x340 (twice the CardputerZero panel) and
-/// 300x200 RGB565 VBE modes; see firmware/seabios/handheld-modes.patch.
-const HANDHELD_VGA_BIOS: &str = "vgabios-handheld.bin";
+/// The one VGA BIOS; its VBE mode 1A0h, 640x340, is twice the
+/// CardputerZero panel (vendor/seabios/vgasrc/svgamodes.c).
+const HANDHELD_VGA_BIOS: &str = "vgabios-stdvga.bin";
 /// The guest tools disc, installed beside the firmware by ports/share.sh.
 const TOOLS_ISO: &str = "r86_tools.iso";
 /// Remote management listens on the first free port.

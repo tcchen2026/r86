@@ -445,6 +445,15 @@ impl Machine {
     pub fn set_boot_order(&mut self, order: BootOrder) {
         self.bus.boot_order = order;
     }
+    /// SeaBIOS shows the r86 logo, "Press ESC for boot menu" and a bar for
+    /// 3 s before booting (vendor/seabios/src/bootsplash.c r86_splash). Off by
+    /// default, so tests and benchmarks boot without the wait; the Windows
+    /// and Mac apps (runner.rs) and r86-run's web console and SDL2 turn it on.
+    pub fn enable_boot_splash(&mut self) {
+        self.bus
+            .fw_cfg
+            .enable_boot_splash(include_bytes!("../firmware/seabios/r86-splash.bin"));
+    }
     pub fn powered_off(&self) -> bool {
         self.bus.acpi.powered_off
     }

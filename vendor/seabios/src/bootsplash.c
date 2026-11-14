@@ -15,6 +15,7 @@
 #include "std/vbe.h" // struct vbe_info
 #include "string.h" // memset
 #include "util.h" // enable_bootsplash
+#include "x86.h" // outb
 
 
 /****************************************************************
@@ -252,4 +253,82 @@ disable_bootsplash(void)
         return;
     BootsplashActive = 0;
     enable_vga_console();
+}
+
+
+/****************************************************************
+ * r86 splash
+ ****************************************************************/
+
+#define R86_SCALE 3
+#define R86_DAC 0xf0 // the logo's colours replace the palette's last entries
+
+// Fill a rectangle of the VGA mode 13h screen.
+static void
+r86_fill(int x, int y, int w, int h, u8 colour)
+{
+    u8 *row = (u8 *)0xa0000 + y * 320 + x;
+    for (; h > 0; h--, row += 320)
+        memset(row, colour, w);
+}
+
+// Wait up to `msec` for a key like get_keystroke(), showing r86's logo, the
+// boot menu hint and a bar stepping 10-30-70-100% in VGA mode 13h, then
+// return to text mode. r86 supplies the logo as etc/r86-splash: u16 width,
+// u16 height, u8 colour count, 8-bit RGB per colour, then one colour per
+// pixel (0 background, 1 also fills the bar). Without it the wait is plain.
+int
+r86_splash(int msec)
+{
+    static const u8 steps[] = { 10, 30, 70, 100 };
+    int size, key = -1;
+    u8 *file = romfile_loadfile("etc/r86-splash", &size);
+    int width = 0, height = 0, colours = 0;
+    if (file && size >= 5) {
+        width = file[0] | file[1] << 8;
+        height = file[2] | file[3] << 8;
+        colours = file[4];
+    }
+    if (colours < 2 || colours > 16 || width * R86_SCALE > 320
+        || height * R86_SCALE > 120 || 5 + colours * 3 + width * height > size) {
+        free(file);
+        return get_keystroke(msec);
+    }
+    u8 *rgb = file + 5, *pixels = rgb + colours * 3;
+
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.ax = 0x0013;
+    call16_int10(&br);
+    int i, x, y;
+    outb(R86_DAC, 0x3c8);
+    for (i = 0; i < colours * 3; i++)
+        outb(rgb[i] >> 2, 0x3c9);
+    int left = (320 - width * R86_SCALE) / 2;
+    for (y = 0; y < height; y++)
+        for (x = 0; x < width; x++) {
+            u8 c = pixels[y * width + x];
+            if (c)
+                r86_fill(left + x * R86_SCALE, 24 + y * R86_SCALE
+                         , R86_SCALE, R86_SCALE, R86_DAC + c);
+        }
+    free(file);
+
+    // The VGA BIOS font in colour 7 (light grey), row 17, column 8.
+    memset(&br, 0, sizeof(br));
+    br.ah = 0x02;
+    br.dx = (17 << 8) | 8;
+    call16_int10(&br);
+    printf("Press ESC for boot menu");
+    r86_fill(59, 159, 202, 10, 8);
+    r86_fill(60, 160, 200, 8, 0);
+    for (i = 0; i < ARRAY_SIZE(steps) && key < 0; i++) {
+        r86_fill(60, 160, 200 * steps[i] / 100, 8, R86_DAC + 1);
+        key = get_keystroke(msec / ARRAY_SIZE(steps));
+    }
+
+    memset(&br, 0, sizeof(br));
+    br.ax = 0x0003;
+    call16_int10(&br);
+    return key;
 }

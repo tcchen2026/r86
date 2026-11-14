@@ -146,15 +146,27 @@ impl FwCfgDevice {
     /// Supplying it through fw_cfg avoids inventing a second PCI ROM aperture.
     /// See vendor/seabios/src/optionroms.c: init_pcirom / vgarom_setup.
     pub fn set_vga_rom(&mut self, bytes: &[u8]) {
-        const NAME: &str = "pci1234,1111.rom";
+        self.set_file("pci1234,1111.rom", bytes.to_vec());
+    }
+
+    /// SeaBIOS's boot menu wait shows `logo` with "Press ESC for boot menu"
+    /// and a stepped bar for 3 s (vendor/seabios/src/bootsplash.c r86_splash).
+    pub fn enable_boot_splash(&mut self, logo: &[u8]) {
+        // SeaBIOS reads 0 here as "no boot menu" and skips the wait.
+        self.add_entry(FW_CFG_BOOT_MENU, 1u16.to_le_bytes().to_vec());
+        self.set_file("etc/r86-splash", logo.to_vec());
+        self.set_file("etc/boot-menu-wait", 3000u32.to_le_bytes().to_vec());
+    }
+
+    fn set_file(&mut self, name: &str, data: Vec<u8>) {
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .find(|e| e.name.as_deref() == Some(NAME))
+            .find(|e| e.name.as_deref() == Some(name))
         {
-            entry.data = bytes.to_vec();
+            entry.data = data;
         } else {
-            self.add_file(NAME, bytes.to_vec());
+            self.add_file(name, data);
         }
         self.rebuild_file_dir();
     }

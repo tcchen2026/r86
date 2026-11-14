@@ -246,7 +246,7 @@ taskset -c 2 valgrind --tool=callgrind --dump-instr=yes \
   --hdd <floppy.img> --hdd-frozen --boot-order disk --no-cdrom --steps 70000000
 # Windows 2000 window: same, with
 #   --hdd tmp/usb/win2000-clean.vhd --hdd-frozen
-#   --vga-bios firmware/seabios/vgabios-handheld.bin --steps <fixed N>
+#   --vga-bios firmware/seabios/vgabios-stdvga.bin --steps <fixed N>
 ```
 
 ## 6. The decision tree

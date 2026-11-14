@@ -100,5 +100,8 @@ struct generic_svga_mode svga_modes[] VAR16 = {
     { 0x19c, { MM_DIRECT, 4096, 2160, 32, 8, 16, SEG_GRAPH } },
     { 0x19d, { MM_DIRECT, 5120, 2160, 16, 8, 16, SEG_GRAPH } },
     { 0x19e, { MM_DIRECT, 5120, 2160, 32, 8, 16, SEG_GRAPH } },
+
+    /* r86: 640x340 is twice the M5Stack CardputerZero's 320x170 LCD */
+    { 0x1a0, { MM_DIRECT, 640,  340,  16, 8, 16, SEG_GRAPH } },
 };
 unsigned int svga_mcount VAR16 = ARRAY_SIZE(svga_modes);

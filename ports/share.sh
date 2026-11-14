@@ -6,7 +6,7 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 app=$1
 install -D -m 0644 "$root/firmware/seabios/bios.bin" "$app/bios.bin"
-install -m 0644 "$root/firmware/seabios/vgabios-handheld.bin" "$app/"
+install -m 0644 "$root/firmware/seabios/vgabios-stdvga.bin" "$app/"
 # One archive keeps guest files, boot templates, corresponding sources and
 # provenance together.
 install -m 0644 "$root/tmp/freedos/share/dos.zip" "$app/"

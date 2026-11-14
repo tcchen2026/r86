@@ -95,18 +95,18 @@ fn seabios_vbe_800x600_planar_and_rgb565() {
 
 #[test]
 #[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
-fn handheld_vga_bios_offers_the_cardputer_320x170_mode() {
-    // Only the handheld ROM lists mode 1A0h; the guest queries, sets and
-    // draws it through the BIOS, so the mode reaches drivers such as VBEMP.
+fn vga_bios_offers_the_cardputer_640x340_mode() {
+    // Mode 1A0h is twice the CardputerZero panel; the guest queries, sets
+    // and draws it through the BIOS, so the mode reaches drivers such as VBEMP.
     let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
     let mut disk = vec![0; 8 << 20];
-    disk[..512].copy_from_slice(include_bytes!("bootsectors/firmware_vbe_handheld.bin"));
+    disk[..512].copy_from_slice(include_bytes!("bootsectors/firmware_vbe_640x340.bin"));
     m.attach_disk(Disk::memory(disk, false));
     m.load_bios_rom(include_bytes!("../firmware/seabios/bios.bin"))
         .unwrap();
     m.load_option_rom(
         0xc0000,
-        include_bytes!("../firmware/seabios/vgabios-handheld.bin"),
+        include_bytes!("../firmware/seabios/vgabios-stdvga.bin"),
     )
     .unwrap();
     m.reset_bios();
@@ -118,16 +118,16 @@ fn handheld_vga_bios_offers_the_cardputer_320x170_mode() {
     );
     assert!(log.contains("R86_VBE_OK"), "{log}");
     let info = m.vga().mode_info();
-    assert_eq!((info.width, info.height, info.bpp), (320, 170, 16));
-    let mut pixels = vec![0; 320 * 170 * 4];
+    assert_eq!((info.width, info.height, info.bpp), (640, 340, 16));
+    let mut pixels = vec![0; 640 * 340 * 4];
     m.vga().render_rgba(&mut pixels).unwrap();
     for (x, y, color) in [
         (0, 0, [255, 0, 0, 255]),
-        (319, 0, [0, 255, 0, 255]),
-        (0, 169, [0, 0, 255, 255]),
-        (319, 169, [255; 4]),
+        (639, 0, [0, 255, 0, 255]),
+        (0, 339, [0, 0, 255, 255]),
+        (639, 339, [255; 4]),
     ] {
-        let pos = (y * 320 + x) * 4;
+        let pos = (y * 640 + x) * 4;
         assert_eq!(&pixels[pos..pos + 4], &color, "at {x},{y}");
     }
 }

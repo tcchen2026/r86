@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build the vendored SeaBIOS ROMs without modifying the source tree.
+"""Build the vendored SeaBIOS ROMs (vendor/seabios, with r86's changes) in a
+temporary copy, leaving the source tree free of build output.
 
-Requires GNU make, GCC with x86 -m32/-m16 support, binutils, patch and Python 3.
+Requires GNU make, GCC with x86 -m32/-m16 support, binutils and Python 3.
 The default output is firmware/seabios; --output-dir allows a comparison build.
 """
 
@@ -34,26 +35,13 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="seabios-build-", dir=ROOT / "tmp") as work:
         source = Path(work) / "seabios"
         shutil.copytree(ROOT / "vendor/seabios", source)
-        subprocess.run(
-            ["patch", "-p1", "--batch"], cwd=source,
-            input=(ROOT / "firmware/seabios/acpi-features.patch").read_bytes(),
-            check=True,
-        )
         # SeaBIOS's release version mechanism suppresses host/time suffixes.
         (source / ".version").write_text(VERSION + "\n", encoding="ascii")
-        # The handheld VGA BIOS adds VBE modes sized for the CardputerZero's
-        # LCD; it is built last so the patch never reaches the standard ROMs.
-        for config, target, filename, patch in (
-            ("bios", "bios.bin", "bios.bin", None),
-            ("vga", "vgabios.bin", "vgabios-stdvga.bin", None),
-            ("vga", "vgabios.bin", "vgabios-handheld.bin", "handheld-modes.patch"),
+        # vendor/seabios carries r86's changes (vendor/README.md).
+        for config, target, filename in (
+            ("bios", "bios.bin", "bios.bin"),
+            ("vga", "vgabios.bin", "vgabios-stdvga.bin"),
         ):
-            if patch:
-                subprocess.run(
-                    ["patch", "-p1", "--batch"], cwd=source,
-                    input=(ROOT / "firmware/seabios" / patch).read_bytes(),
-                    check=True,
-                )
             name = Path(filename).stem
             build = source / f"out-{name}"
             build.mkdir()
@@ -62,7 +50,7 @@ def main() -> None:
             command = [
                 "make", "-C", str(source), f"-j{args.jobs}",
                 f"OUT=out-{name}/", f"KCONFIG_CONFIG={config_path}",
-                "PYTHON=python3", f"EXTRAVERSION=-r86-{3 if config == 'bios' else 1}",
+                "PYTHON=python3", f"EXTRAVERSION=-r86-{4 if config == 'bios' else 2}",
             ]
             subprocess.run(command + ["olddefconfig"], check=True)
             subprocess.run(command + [f"out-{name}/{target}"], check=True)

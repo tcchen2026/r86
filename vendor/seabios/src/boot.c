@@ -720,7 +720,7 @@ interactive_bootmenu(void)
         free(bootmsg);
 
         enable_bootsplash();
-        scan_code = get_keystroke(menutime);
+        scan_code = r86_splash(menutime);
         disable_bootsplash();
         if (scan_code != menukey)
             return;

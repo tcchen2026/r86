@@ -119,6 +119,7 @@ impl Running {
                     set_core_qos()?;
                     let mut machine =
                         launch_config(&vm, no_jit).machine(&firmware, "vgabios-stdvga.bin")?;
+                    machine.enable_boot_splash();
                     let network = if vm.network {
                         machine.attach_network();
                         Some(UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)

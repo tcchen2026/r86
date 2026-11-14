@@ -308,7 +308,7 @@ qemu_platform_setup(void)
         RsdpAddr = find_acpi_rsdp();
 
         if (RsdpAddr) {
-            acpi_dsdt_parse();
+            find_acpi_features();
             virtio_mmio_setup_acpi();
             return;
         }
