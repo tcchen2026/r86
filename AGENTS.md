@@ -213,11 +213,13 @@ guide; old archived thresholds do not apply.
 `script/ws_cli.py` is the WebSocket protocol reference. Keep the singular
 `script/` path and update its module docstring when the protocol changes.
 
-Keep guest utilities and drivers together on `assets/r86_tools.iso`. Add future
-tools to `assets/r86_tools.json` and rebuild with `script/build_tools_iso.py`;
-retain existing tools instead of creating a separate ISO for each addition.
-Preserve original executables, documentation and licenses, and keep guest
-binaries/generated media outside Git with provenance and checksums recorded.
+Keep guest utilities and drivers together on the r86 tools disc. Its public
+sources are tracked in `r86-tools/` (see its README): add future public tools
+under `r86-tools/disc/` and rebuild with `script/build_tools_iso.py`, which
+writes `assets/r86_tools.iso`; retain existing tools instead of creating a
+separate ISO for each addition. Preserve original executables, documentation
+and licenses, with provenance and checksums recorded. Generated images and
+the full disc's private extras stay outside Git.
 
 ## Local artifacts
 

@@ -1,0 +1,2 @@
+# Disc files are copied byte for byte (CRLF text, vmdisp9x.sha256).
+disc/** -text

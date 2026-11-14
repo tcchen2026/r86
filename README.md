@@ -40,7 +40,9 @@ cargo run --release --features sdl2-frontend --bin r86-run -- \
 
 r86 is licensed under the [Apache License 2.0](LICENSE). The bundled SeaBIOS
 ([source](vendor/seabios), [firmware](firmware/seabios)) is LGPLv3, and
-[the tiny386 patch](patches/tiny386-reactos-compat.patch) is BSD-3-Clause.
+[the tiny386 patch](patches/tiny386-reactos-compat.patch) is BSD-3-Clause. The
+r86 tools disc's Windows 95/98/Me display driver,
+[VMDisp9x](r86-tools/disc/VMDISP9X), is MIT; see [r86-tools](r86-tools).
 
 ## Credits
 
@@ -49,8 +51,9 @@ r86 is licensed under the [Apache License 2.0](LICENSE). The bundled SeaBIOS
 which remains its performance baseline. [v86](https://github.com/copy/v86)
 (BSD-2-Clause) is used as a reference for operating-system compatibility.
 [SeaBIOS](https://www.seabios.org/) (LGPLv3) is bundled as the PC BIOS and VGA
-BIOS; its source is in [vendor/seabios](vendor/seabios). We thank their
-authors.
+BIOS; its source is in [vendor/seabios](vendor/seabios).
+[VMDisp9x](https://github.com/JHRobotics/vmdisp9x) (MIT) is the Windows
+95/98/Me display driver on the r86 tools disc. We thank their authors.
 
 **How x86 behavior was checked.** r86 follows Intel's published architecture
 manuals. Where details are ambiguous or undocumented, such as fault ordering,

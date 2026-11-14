@@ -1,37 +1,75 @@
 #!/usr/bin/env python3
 """Build the public tools ISO and the internal full ISO in one run.
 
-Requires pycdlib. See assets/README.md for preparing the local source files.
-Missing sources fail the build instead of silently dropping an existing tool.
-The public manifest contains redistributable tools. r86_tools_full.json adds
-local VBEMP and Super PI assets; r86_tools_full.iso must never be published.
+Requires pycdlib and MinGW (i686-w64-mingw32-gcc). The public disc is
+r86-tools/disc/ plus R86TOOL/r86-tool.exe, compiled from r86-tools/r86-tool.c,
+and R86TOOL/LICENSE.TXT (the repository LICENSE); see r86-tools/README.md.
+assets/r86_tools_full.json adds local VBEMP and Super PI directories (see
+assets/README.md); r86_tools_full.iso must never be published. Both images
+are written to assets/. A missing source fails the build instead of silently
+dropping a tool. PATCHES changes disc copies only; the sources stay original.
 """
 import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
+import tempfile
 
 import pycdlib
+
+ROOT = Path(__file__).resolve().parents[1]
+TOOLS = ROOT / 'r86-tools'
+ASSETS = ROOT / 'assets'
 
 # Windows opens the installer window when the disc is inserted (Joliet names).
 AUTORUN = b'[autorun]\r\nopen=R86TOOL\\R86-TOOL.EXE\r\nlabel=r86 tools\r\n'
 
+# Plain C without the C runtime; runs on Windows 95 and NT 4 and later.
+CC = ['i686-w64-mingw32-gcc', '-Os', '-s', '-nostdlib', '-ffreestanding',
+      '-fno-asynchronous-unwind-tables', '-Wall', '-Wextra', '-e', '_start',
+      '-Wl,--subsystem,windows:4.0', '-Wl,--major-os-version,4',
+      '-Wl,--minor-os-version,0', '-Wl,--no-insert-timestamp']
+LIBS = ['-lkernel32', '-luser32', '-lgdi32', '-ladvapi32']
 
-def build(assets, roots, image_name):
-    directories = set()
-    files = {'README.TXT': assets / (image_name + '.txt')}
-    for name, source in roots.items():
-        assert name and '/' not in name and name not in ('.', '..'), name
-        source = assets / source
-        if not source.is_dir():
-            raise SystemExit(f'Missing tool directory: {source}')
-        directories.add(name)
-        for path in sorted(source.rglob('*')):
-            destination = name + '/' + path.relative_to(source).as_posix()
-            if path.is_dir():
-                directories.add(destination)
-            elif path.is_file():
-                files[destination] = path
+# Disc path -> [(offset, original, replacement)]. VMDisp9x 1.2025.0.119's
+# qemumini.drv refuses modes under 640x480 (modes.c FixModeInfo:
+# cmp es:[bx],640 / cmp es:[bx+2],480); r86 lowers that to 320x170, half the
+# handheld panel. The driver has no other minimum.
+PATCHES = {
+    'VMDISP9X/qemumini.drv': [
+        (0x2a31, (640).to_bytes(2, 'little'), (320).to_bytes(2, 'little')),
+        (0x2a39, (480).to_bytes(2, 'little'), (170).to_bytes(2, 'little')),
+    ],
+}
+
+
+def tree(source, prefix=''):
+    """Disc path -> file for every file under `source`."""
+    if not source.is_dir():
+        raise SystemExit(f'Missing tool directory: {source}')
+    return {prefix + path.relative_to(source).as_posix(): path
+            for path in sorted(source.rglob('*')) if path.is_file()}
+
+
+def r86_tool():
+    with tempfile.TemporaryDirectory() as scratch:
+        exe = Path(scratch) / 'r86-tool.exe'
+        subprocess.run(CC + ['-o', str(exe), str(TOOLS / 'r86-tool.c')] + LIBS, check=True)
+        return exe.read_bytes()
+
+
+def build(files, image_name):
+    """Writes assets/IMAGE_NAME.iso; `files` maps disc paths to a Path or bytes."""
+    for destination, patches in PATCHES.items():
+        data = files[destination].read_bytes()
+        for offset, original, replacement in patches:
+            if data[offset:offset + len(original)] != original:
+                raise SystemExit(f'{files[destination]}: unexpected bytes at {offset:#x}')
+            data = data[:offset] + replacement + data[offset + len(original):]
+        files[destination] = data
+    directories = {'/'.join(path.split('/')[:i])
+                   for path in files for i in range(1, path.count('/') + 1)}
 
     iso = pycdlib.PyCdlib()
     iso.new(interchange_level=3, joliet=3, vol_ident=image_name.upper())
@@ -41,10 +79,11 @@ def build(assets, roots, image_name):
     iso.add_fp(io.BytesIO(AUTORUN), len(AUTORUN), iso_path='/AUTORUN.INF;1',
                joliet_path='/autorun.inf')
     for destination, source in sorted(files.items()):
+        data = source if isinstance(source, bytes) else source.read_bytes()
         # ISO 9660 excludes hyphens; Joliet retains names such as r86-tool.exe.
-        iso.add_file(str(source), iso_path='/' + destination.upper().replace('-', '_') + ';1',
-                     joliet_path='/' + destination)
-    output = assets / (image_name + '.iso')
+        iso.add_fp(io.BytesIO(data), len(data), iso_path='/' + destination.upper().replace('-', '_') + ';1',
+                   joliet_path='/' + destination)
+    output = ASSETS / (image_name + '.iso')
     temporary = output.with_suffix('.iso.part')
     iso.write(str(temporary))
     iso.close()
@@ -55,13 +94,17 @@ def build(assets, roots, image_name):
 
 
 def main():
-    assets = Path(__file__).resolve().parents[1] / 'assets'
-    public = json.loads((assets / 'r86_tools.json').read_text())
-    internal = json.loads((assets / 'r86_tools_full.json').read_text())
-    if public.keys() & internal.keys():
-        raise SystemExit('Internal roots must not replace public tools')
-    build(assets, public, 'r86_tools')
-    build(assets, public | internal, 'r86_tools_full')
+    public = tree(TOOLS / 'disc')
+    public['R86TOOL/r86-tool.exe'] = r86_tool()
+    public['R86TOOL/LICENSE.TXT'] = ROOT / 'LICENSE'
+    full = dict(public, **{'README.TXT': ASSETS / 'r86_tools_full.txt'})
+    for name, source in json.loads((ASSETS / 'r86_tools_full.json').read_text()).items():
+        assert name and '/' not in name and name not in ('.', '..'), name
+        if any(path.split('/')[0] == name for path in public):
+            raise SystemExit(f'Internal root {name} must not replace a public tool')
+        full.update(tree(ASSETS / source, name + '/'))
+    build(public, 'r86_tools')
+    build(full, 'r86_tools_full')
 
 
 if __name__ == '__main__':

@@ -37,13 +37,12 @@ __pycache__/
 
 # Keep Cargo.lock, firmware ROMs, and bootsector fixtures tracked.
 
-# Local-only inputs: reference checkouts and boot media, guest tool sources,
+# Local-only inputs: reference checkouts and boot media, local guest tool extras,
 # and private development notes.
 /refs/
 /assets/*
 !/assets/freedos.json
 !/assets/freedos-kit.sha256
-!/assets/r86_tools.json
 /private_docs/
 /private/
 
@@ -53,3 +52,4 @@ __pycache__/
 !/README.md
 !/KNOWN_ISSUES.md
 !/assets/README.md
+!/r86-tools/README.md

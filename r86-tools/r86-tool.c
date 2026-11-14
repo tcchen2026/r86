@@ -26,13 +26,8 @@
  * do not.
  *
  * Plain C with no C runtime, importing Win32 calls present
- * since Windows 95 and NT 4. Build with MinGW:
- *
- *   i686-w64-mingw32-gcc -Os -s -nostdlib -ffreestanding \
- *       -fno-asynchronous-unwind-tables -Wall -Wextra -o r86-tool.exe \
- *       tools/win/r86-tool.c -e _start -Wl,--subsystem,windows:4.0 \
- *       -Wl,--major-os-version,4 -Wl,--minor-os-version,0 -lkernel32 -luser32 \
- *       -lgdi32 -ladvapi32
+ * since Windows 95 and NT 4. script/build_tools_iso.py compiles it with
+ * MinGW (CC and LIBS there) for the r86 tools disc.
  */
 #include <windows.h>
 #define USE_SP_DRVINFO_DATA_V1 1
@@ -203,35 +198,49 @@ static int set_mode(DWORD width, DWORD height, DWORD bits)
     return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
 }
 
-/* r86's display card: widths are multiples of 8 up to 1920, heights up to 1600. */
+/* Sizes VMDisp9x can add: the r86 tools CD's copy accepts 320x170 and up
+ * (stock VMDisp9x: 640x480); r86's display card takes widths in multiples
+ * of 8 up to 1920 and heights up to 1600. */
 static int valid_size(DWORD width, DWORD height)
 {
-    return width >= 8 && width <= 1920 && !(width & 7) && height >= 8 && height <= 1600;
+    return width >= 320 && width <= 1920 && !(width & 7) && height >= 170 && height <= 1600;
 }
 
 /* Windows 9x offers a display driver's modes from its class key, where
- * VMDisp9x's INF lists them (MODES\BITS\WIDTH,HEIGHT). Adds a mode to every
- * VMDisp9x QEMU adapter key. Returns 1 if added (Windows offers it after a
- * restart), 0 if already listed, -1 without a VMDisp9x adapter. */
+ * VMDisp9x's INF lists them (MODES\BITS\WIDTH,HEIGHT). */
+static const char display_class[] = "System\\CurrentControlSet\\Services\\Class\\Display";
+
+/* Whether display class key `name` is a VMDisp9x QEMU adapter. */
+static int qemu_adapter(HKEY root, const char *name)
+{
+    char path[64], drv[32];
+    DWORD size = sizeof drv;
+    HKEY key;
+    int ours;
+
+    wsprintfA(path, "%s\\DEFAULT", name);
+    if (RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return 0;
+    ours = RegQueryValueExA(key, "drv", NULL, NULL, (BYTE *)drv, &size) == ERROR_SUCCESS &&
+           !lstrcmpiA(drv, "qemumini.drv");
+    RegCloseKey(key);
+    return ours;
+}
+
+/* Adds a mode to every VMDisp9x QEMU adapter key. Returns 1 if added (Windows
+ * offers it after a restart), 0 if already listed, -1 without a VMDisp9x
+ * adapter. */
 static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
 {
-    static const char display[] = "System\\CurrentControlSet\\Services\\Class\\Display";
-    char name[32], path[96], drv[32];
+    char name[32], path[96];
     HKEY root, key;
-    DWORD i, size, made;
-    int ours, found = 0, added = 0;
+    DWORD i, made;
+    int found = 0, added = 0;
 
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, display, 0, KEY_READ | KEY_CREATE_SUB_KEY, &root) != ERROR_SUCCESS)
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, display_class, 0, KEY_READ | KEY_CREATE_SUB_KEY, &root) != ERROR_SUCCESS)
         return -1;
     for (i = 0; RegEnumKeyA(root, i, name, sizeof name) == ERROR_SUCCESS; i++) {
-        wsprintfA(path, "%s\\DEFAULT", name);
-        if (RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
-            continue;
-        size = sizeof drv;
-        ours = RegQueryValueExA(key, "drv", NULL, NULL, (BYTE *)drv, &size) == ERROR_SUCCESS &&
-               !lstrcmpiA(drv, "qemumini.drv");
-        RegCloseKey(key);
-        if (!ours)
+        if (!qemu_adapter(root, name))
             continue;
         found = 1;
         wsprintfA(path, "%s\\MODES\\%lu\\%lu,%lu", name, bits, width, height);
@@ -242,6 +251,51 @@ static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
     }
     RegCloseKey(root);
     return found ? added : -1;
+}
+
+/* Reinstalling VMDisp9x deletes its mode list (the INF's DelReg), including
+ * added sizes: the installer saves the list first and adds it back after. */
+static struct { DWORD width, height, bits; } saved_modes[256];
+static int saved_count;
+
+static void save_9x_modes(void)
+{
+    char name[32], path[64], bits[8], size[16];
+    HKEY root, modes, depth;
+    DWORD i, j, k, b, w, h;
+    const char *p;
+
+    saved_count = 0;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, display_class, 0, KEY_READ, &root) != ERROR_SUCCESS)
+        return;
+    for (i = 0; RegEnumKeyA(root, i, name, sizeof name) == ERROR_SUCCESS; i++) {
+        wsprintfA(path, "%s\\MODES", name);
+        if (!qemu_adapter(root, name) || RegOpenKeyExA(root, path, 0, KEY_READ, &modes) != ERROR_SUCCESS)
+            continue;
+        for (j = 0; RegEnumKeyA(modes, j, bits, sizeof bits) == ERROR_SUCCESS; j++) {
+            if (!number(bits, &b) || RegOpenKeyExA(modes, bits, 0, KEY_READ, &depth) != ERROR_SUCCESS)
+                continue;
+            for (k = 0; saved_count < 256 && RegEnumKeyA(depth, k, size, sizeof size) == ERROR_SUCCESS; k++) {
+                p = number(size, &w);
+                if (p && *p == ',' && number(p + 1, &h)) {
+                    saved_modes[saved_count].width = w;
+                    saved_modes[saved_count].height = h;
+                    saved_modes[saved_count++].bits = b;
+                }
+            }
+            RegCloseKey(depth);
+        }
+        RegCloseKey(modes);
+    }
+    RegCloseKey(root);
+}
+
+static void restore_9x_modes(void)
+{
+    int i;
+
+    for (i = 0; i < saved_count; i++)
+        add_9x_mode(saved_modes[i].width, saved_modes[i].height, saved_modes[i].bits);
 }
 
 /* Adds a mode to the display driver's list: 1 added (Windows offers it after
@@ -778,7 +832,12 @@ DWORD r86_install_display(HWND parent, const char *directory, struct tool_result
         return result(r, ERROR_NOT_SUPPORTED, "Automatic display installation supports Windows 95/98/Me and 32-bit Windows 2000/XP");
     code = display_source(directory, is_nt, inf, r);
     if (code) return code;
-    if (!is_nt) return display_9x(parent, inf, r);
+    if (!is_nt) {
+        save_9x_modes();
+        code = display_9x(parent, inf, r);
+        if (code == ERROR_SUCCESS_REBOOT_REQUIRED) restore_9x_modes();
+        return code;
+    }
     else {
         BOOL (WINAPI *update)(HWND, LPCSTR, LPCSTR, DWORD, PBOOL);
         HMODULE library, setup = load_setup(r);
@@ -1326,11 +1385,13 @@ static void add_custom(void)
     LRESULT i = SendDlgItemMessageA(custom, ID_BITS, CB_GETCURSEL, 0, 0);
     DWORD bits = custom_bits[i < 0 ? 1 : i];
     int added = has_width && has_height ? add_mode(width, height, bits) : -2;
-    char text[256];
+    const char *small = width < 640 || height < 480 ? " Sizes under 640 x 480 need the display "
+        "driver from a current r86 tools CD: Install r86 tools, Update with the display driver ticked." : "";
+    char text[400];
 
     if (added == -2) {
-        MessageBoxA(custom, "The width must be a multiple of 8 from 8 to 1920, and the height "
-                    "from 8 to 1600.", title, MB_OK | MB_ICONEXCLAMATION);
+        MessageBoxA(custom, "The width must be a multiple of 8 from 320 to 1920, and the height "
+                    "from 170 to 1600.", title, MB_OK | MB_ICONEXCLAMATION);
         return;
     }
     if (added == -1) {
@@ -1341,12 +1402,12 @@ static void add_custom(void)
     }
     if (!added) {
         wsprintfA(text, "%lu x %lu, %lu-bit colour is already in the display driver's list. "
-                  "If Settings does not offer it yet, restart Windows.", width, height, bits);
+                  "If Settings does not offer it yet, restart Windows.%s", width, height, bits, small);
         MessageBoxA(custom, text, title, MB_OK | MB_ICONINFORMATION);
         return;
     }
     wsprintfA(text, "%lu x %lu, %lu-bit colour was added to the display driver's list. "
-              "Windows offers it after a restart.\r\n\r\nRestart Windows now?", width, height, bits);
+              "Windows offers it after a restart.%s\r\n\r\nRestart Windows now?", width, height, bits, small);
     if (MessageBoxA(custom, text, title, MB_YESNO | MB_ICONINFORMATION) == IDYES)
         restart_windows();
     DestroyWindow(custom);
