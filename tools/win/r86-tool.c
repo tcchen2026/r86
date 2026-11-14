@@ -49,7 +49,10 @@ static int own_console;
 #define MAGIC_CPUID 0x40000000
 #define MAGIC_VERSION 0
 #define MAGIC_POINTER 2
+#define MAGIC_REQUEST 3
+#define MAGIC_REPORT 4
 #define MAGIC_CAP_POINTER 2
+#define MAGIC_CAP_REQUESTS 4
 #define TOOL_VERSION 3
 
 struct magic_regs { DWORD a, b, c, d, s, i; };
@@ -69,9 +72,9 @@ static int r86_present(void)
     return a == MAGIC_CPUID && b == 0x72363872 && c == 0x38723638 && d == 0x36387236;
 }
 
-static struct magic_regs magic_call(DWORD command)
+static struct magic_regs magic_call(DWORD command, DWORD b, DWORD s, DWORD i)
 {
-    struct magic_regs r = { MAGIC_VALUE, 0, command, MAGIC_PORT, 0, 0 };
+    struct magic_regs r = { MAGIC_VALUE, b, command, MAGIC_PORT, s, i };
     __asm__ volatile("inl %%dx,%%eax"
                      : "+a"(r.a), "+b"(r.b), "+c"(r.c), "+d"(r.d), "+S"(r.s), "+D"(r.i));
     return r;
@@ -168,8 +171,8 @@ static int list_modes(void)
     }
 }
 
-/* Switches and saves the mode; returns 0 on success, with `text` for people. */
-static int change_mode(DWORD width, DWORD height, DWORD bits, const char **text)
+/* Switches and saves the mode; returns the DISP_CHANGE code, with `text`. */
+static LONG change_mode(DWORD width, DWORD height, DWORD bits, const char **text)
 {
     DEVMODEA mode;
     LONG code;
@@ -188,15 +191,59 @@ static int change_mode(DWORD width, DWORD height, DWORD bits, const char **text)
     case DISP_CHANGE_NOTUPDATED: *text = "switched, but not saved in the registry"; break;
     default: *text = "failed"; break;
     }
-    return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
+    return code;
 }
 
 static int set_mode(DWORD width, DWORD height, DWORD bits)
 {
     const char *text;
-    int status = change_mode(width, height, bits, &text);
+    LONG code = change_mode(width, height, bits, &text);
     say("%lu x %lu, %lu bit: %s\r\n", width, height, bits, text);
-    return status;
+    return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
+}
+
+/* Windows 9x offers a display driver's modes from its class key, where
+ * VMDisp9x's INF lists them (MODES\BITS\WIDTH,HEIGHT). Adds a mode to every
+ * VMDisp9x QEMU adapter key; returns 1 if one was missing. */
+static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
+{
+    static const char display[] = "System\\CurrentControlSet\\Services\\Class\\Display";
+    char name[32], path[96], drv[32];
+    HKEY root, key;
+    DWORD i, size, made;
+    int ours, added = 0;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, display, 0, KEY_READ | KEY_CREATE_SUB_KEY, &root) != ERROR_SUCCESS)
+        return 0;
+    for (i = 0; RegEnumKeyA(root, i, name, sizeof name) == ERROR_SUCCESS; i++) {
+        wsprintfA(path, "%s\\DEFAULT", name);
+        if (RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+            continue;
+        size = sizeof drv;
+        ours = RegQueryValueExA(key, "drv", NULL, NULL, (BYTE *)drv, &size) == ERROR_SUCCESS &&
+               !lstrcmpiA(drv, "qemumini.drv");
+        RegCloseKey(key);
+        if (!ours)
+            continue;
+        wsprintfA(path, "%s\\MODES\\%lu\\%lu,%lu", name, bits, width, height);
+        if (RegCreateKeyExA(root, path, 0, NULL, 0, KEY_WRITE, NULL, &key, &made) == ERROR_SUCCESS) {
+            added |= made == REG_CREATED_NEW_KEY;
+            RegCloseKey(key);
+        }
+    }
+    RegCloseKey(root);
+    return added;
+}
+
+/* The handheld panel's 320x170 and twice it, which VMDisp9x's INF lacks. */
+static void add_panel_modes(void)
+{
+    static const DWORD sizes[][2] = {{320, 170}, {640, 340}}, depths[] = {8, 16, 32};
+    unsigned i, j;
+
+    for (i = 0; i < 2; i++)
+        for (j = 0; j < 3; j++)
+            add_9x_mode(sizes[i][0], sizes[i][1], depths[j]);
 }
 
 static int version(void)
@@ -207,7 +254,7 @@ static int version(void)
         say("r86 magic instruction is not available\r\n");
         return 1;
     }
-    r = magic_call(MAGIC_VERSION);
+    r = magic_call(MAGIC_VERSION, 0, 0, 0);
     say("r86 magic instruction protocol %lu, capabilities %08lx\r\n", r.a, r.b);
     return r.a == 1 ? 0 : 1;
 }
@@ -711,6 +758,7 @@ static DWORD display_9x(HWND parent, const char *inf, struct tool_result *r)
     if (!p_SetupDiSetSelectedDriverA(devices, &device, &driver) ||
         !p_SetupDiInstallDevice(devices, &device)) { code = GetLastError(); goto done; }
     code = ERROR_SUCCESS_REBOOT_REQUIRED;
+    add_panel_modes();
 done:
     if (devices != INVALID_HANDLE_VALUE) p_SetupDiDestroyDeviceInfoList(devices);
     FreeLibrary(setup);
@@ -1119,26 +1167,21 @@ enum { ID_RESOLUTION = 200, ID_APPLY, ID_POINTER, ID_LOGON, ID_SETTINGS, ID_EXIT
 static const char settings_class[] = "r86-tool.settings";
 static const char tray_class[] = "r86-tool.tray";
 static int standalone; /* settings without a helper: closing it ends the process */
-static struct { DWORD width, height, bits; } modes[96];
+struct mode { DWORD width, height, bits; };
+static struct mode modes[96];
 static HWND tray;
 static UINT taskbar_created;
 static BOOL (WINAPI *notify_icon)(DWORD, PNOTIFYICONDATAA);
 
 /* Every mode Windows offers, including those under 640x480 that the Display
  * control panel hides; one entry per size and depth, whatever the refresh. */
-static void fill_modes(void)
+static int collect_modes(struct mode *list, int limit)
 {
-    HWND list = GetDlgItem(window, ID_RESOLUTION);
-    HDC screen = GetDC(NULL);
-    DWORD width = (DWORD)GetDeviceCaps(screen, HORZRES), height = (DWORD)GetDeviceCaps(screen, VERTRES);
-    DWORD bits = (DWORD)(GetDeviceCaps(screen, BITSPIXEL) * GetDeviceCaps(screen, PLANES)), i;
     DEVMODEA mode;
-    char text[48];
+    DWORD i;
     int count = 0, j, k;
 
-    ReleaseDC(NULL, screen);
-    SendMessageA(list, CB_RESETCONTENT, 0, 0);
-    for (i = 0; count < (int)(sizeof modes / sizeof modes[0]); i++) {
+    for (i = 0; count < limit; i++) {
         memset(&mode, 0, sizeof mode);
         mode.dmSize = sizeof mode;
         if (!EnumDisplaySettingsA(NULL, i, &mode))
@@ -1147,19 +1190,33 @@ static void fill_modes(void)
         if (nt && mode.dmBitsPerPel == 8)
             continue;
         /* Sorted by width, height, then depth. */
-        for (j = 0; j < count && (modes[j].width != mode.dmPelsWidth ? modes[j].width < mode.dmPelsWidth
-                                  : modes[j].height != mode.dmPelsHeight ? modes[j].height < mode.dmPelsHeight
-                                  : modes[j].bits < mode.dmBitsPerPel); j++)
+        for (j = 0; j < count && (list[j].width != mode.dmPelsWidth ? list[j].width < mode.dmPelsWidth
+                                  : list[j].height != mode.dmPelsHeight ? list[j].height < mode.dmPelsHeight
+                                  : list[j].bits < mode.dmBitsPerPel); j++)
             ;
-        if (j < count && modes[j].width == mode.dmPelsWidth && modes[j].height == mode.dmPelsHeight &&
-            modes[j].bits == mode.dmBitsPerPel)
+        if (j < count && list[j].width == mode.dmPelsWidth && list[j].height == mode.dmPelsHeight &&
+            list[j].bits == mode.dmBitsPerPel)
             continue;
         for (k = count++; k > j; k--)
-            modes[k] = modes[k - 1];
-        modes[j].width = mode.dmPelsWidth;
-        modes[j].height = mode.dmPelsHeight;
-        modes[j].bits = mode.dmBitsPerPel;
+            list[k] = list[k - 1];
+        list[j].width = mode.dmPelsWidth;
+        list[j].height = mode.dmPelsHeight;
+        list[j].bits = mode.dmBitsPerPel;
     }
+    return count;
+}
+
+static void fill_modes(void)
+{
+    HWND list = GetDlgItem(window, ID_RESOLUTION);
+    HDC screen = GetDC(NULL);
+    DWORD width = (DWORD)GetDeviceCaps(screen, HORZRES), height = (DWORD)GetDeviceCaps(screen, VERTRES);
+    DWORD bits = (DWORD)(GetDeviceCaps(screen, BITSPIXEL) * GetDeviceCaps(screen, PLANES));
+    char text[48];
+    int count = collect_modes(modes, sizeof modes / sizeof modes[0]), j;
+
+    ReleaseDC(NULL, screen);
+    SendMessageA(list, CB_RESETCONTENT, 0, 0);
     for (j = 0; j < count; j++) {
         if (modes[j].bits <= 8)
             wsprintfA(text, "%lu x %lu, %lu colours", modes[j].width, modes[j].height, 1UL << modes[j].bits);
@@ -1399,28 +1456,82 @@ static int settings_in_helper(void)
 static HANDLE stop;
 static DWORD ui_thread; /* gets WM_QUIT when polling ends by itself */
 static int wheel_supported;
+static int takes_requests; /* the host offers requests and reports */
+
+/* Tells the host which modes Windows offers (report kinds 1 and 2). */
+static void report_modes(void)
+{
+    struct mode list[96];
+    int i, count = collect_modes(list, 96);
+
+    magic_call(MAGIC_REPORT, 1, 0, 0);
+    for (i = 0; i < count; i++)
+        magic_call(MAGIC_REPORT, 2, list[i].width | list[i].height << 16, list[i].bits);
+}
+
+/* A host display request. On 9x a size VMDisp9x does not list is added to
+ * its list first; Windows may only offer it after a restart. */
+static void display_request(DWORD width, DWORD height, DWORD bits)
+{
+    const char *text;
+    LONG code = change_mode(width, height, bits, &text);
+    int added = 0;
+    DWORD result;
+
+    if (code == DISP_CHANGE_BADMODE && !nt && add_9x_mode(width, height, bits)) {
+        added = 1;
+        code = change_mode(width, height, bits, &text);
+    }
+    result = code == DISP_CHANGE_SUCCESSFUL ? 0 : code == DISP_CHANGE_RESTART ? 1
+           : code != DISP_CHANGE_BADMODE ? 3 : added ? 4 : 2;
+    magic_call(MAGIC_REPORT, 3, width | height << 16, bits | result << 16);
+    report_modes();
+}
+
+static void take_requests(void)
+{
+    struct magic_regs r;
+
+    for (;;) {
+        r = magic_call(MAGIC_REQUEST, 0, 0, 0);
+        if (!r.a || r.a == 0xffffffff)
+            return;
+        if (r.a == 1)
+            display_request(r.b, r.c, r.d);
+        /* Other kinds are newer than this tool: skipped. */
+    }
+}
 
 /* Polls the host at its hinted interval on a thread of its own, so the icon
- * menu, window drags and other modal loops keep receiving the pointer. */
+ * menu, window drags and other modal loops keep receiving the pointer. With
+ * the pointer off it still takes host requests, without renewing the
+ * pointer lease. */
 static DWORD WINAPI poll_pointer(LPVOID unused)
 {
     struct magic_regs r;
     DWORD hint = 0;
 
     (void)unused;
+    if (takes_requests)
+        report_modes();
     /* A timed event wait has Sleep's cadence and also permits a clean stop. */
     while (WaitForSingleObject(stop, hint) == WAIT_TIMEOUT) {
         DWORD changed, flags;
         hint = 100;
         if (!pointer_on) {
             release_buttons();
-            continue; /* No poll: the host's PS/2 fallback takes over. */
+            if (takes_requests)
+                take_requests();
+            hint = 500;
+            continue; /* No pointer poll: the host's PS/2 fallback takes over. */
         }
         if (!input_desktop())
             continue; /* No poll: allow the host's PS/2 fallback lease to expire. */
-        r = magic_call(MAGIC_POINTER);
+        r = magic_call(MAGIC_POINTER, 0, 0, 0);
         if (r.a == 0xffffffff)
             break;
+        if (takes_requests && r.i)
+            take_requests();
         hint = r.s;
         changed = buttons ^ r.c;
         if (!r.a && !changed)
@@ -1452,9 +1563,10 @@ static int helper(int with_icon, int show_settings)
     FreeConsole();
     if (!r86_present())
         return show_settings ? settings_only() : 0;
-    r = magic_call(MAGIC_VERSION);
+    r = magic_call(MAGIC_VERSION, 0, 0, 0);
     if (r.a != 1 || !(r.b & MAGIC_CAP_POINTER))
         return show_settings ? settings_only() : 0;
+    takes_requests = (r.b & MAGIC_CAP_REQUESTS) != 0;
     wheel_supported = nt || LOBYTE(LOWORD(os_version)) > 4 ||
         HIBYTE(LOWORD(os_version)) >= 10;
     if (!prepare_desktop())
@@ -1485,6 +1597,8 @@ static int helper(int with_icon, int show_settings)
      * process exit so Windows has released the EXE before an update/delete. */
     *pid = GetCurrentProcessId();
     helper_running = 1;
+    if (!nt)
+        add_panel_modes();
     if (!with_icon && !show_settings)
         poll_pointer(NULL);
     else {

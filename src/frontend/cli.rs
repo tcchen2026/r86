@@ -792,6 +792,11 @@ impl ReplaySchedule {
                 let (x, y, buttons, wheel) = parse_pointer(line)?;
                 machine.inject_pointer(x, y, buttons, wheel)?;
             }
+            "display-mode" => {
+                let (width, height, bits) = parse_display_mode(line)?
+                    .ok_or_else(|| "display-mode event missing width".to_string())?;
+                machine.request_display_mode(width, height, bits)?;
+            }
             "mouse-move" => {
                 let dx = clamp_i64_to_i16(json_i64(line, "dx")?.unwrap_or(0));
                 let dy = clamp_i64_to_i16(json_i64(line, "dy")?.unwrap_or(0));

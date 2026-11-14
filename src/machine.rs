@@ -4,6 +4,7 @@
 mod bus_diagnostics;
 mod clock;
 mod magic;
+pub use magic::{DisplayMode, DisplayResult};
 #[cfg(test)]
 mod sound_tests;
 #[cfg(test)]
@@ -860,6 +861,41 @@ impl Machine {
             .magic
             .pointer
             .active(self.bus.clock.ticks(self.step))
+    }
+
+    /// A guest tool that takes host requests polled within two seconds.
+    pub fn guest_tools_active(&self) -> bool {
+        self.bus.magic.tools_active(self.bus.clock.ticks(self.step))
+    }
+
+    /// Asks the guest tool to switch the display mode; its answer arrives as
+    /// guest_display_result().
+    pub fn request_display_mode(
+        &mut self,
+        width: u16,
+        height: u16,
+        bits: u8,
+    ) -> Result<(), String> {
+        if !self.guest_tools_active() {
+            return Err("display mode: the r86 tools helper is not running in the guest".into());
+        }
+        self.bus
+            .magic
+            .request(magic::Request::DisplayMode {
+                width,
+                height,
+                bits,
+            })
+            .map_err(String::from)
+    }
+
+    /// Display modes the guest tool reported as offered by the guest OS.
+    pub fn guest_display_modes(&self) -> &[DisplayMode] {
+        &self.bus.magic.display_modes
+    }
+
+    pub fn guest_display_result(&self) -> Option<DisplayResult> {
+        self.bus.magic.display_result
     }
 
     /// Host wait after HLT, bounded so UI input remains responsive. Never used

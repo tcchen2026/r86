@@ -117,6 +117,12 @@
   dialog h2 { font-size: 16px; margin: 0 0 10px; }
   dialog ul { padding-left: 18px; margin: 0 0 14px; }
   dialog li { margin: 5px 0; }
+  dialog select, dialog input { background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 4px 6px; font: inherit; }
+  #display-form { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center;
+    margin: 0 0 16px; }
+  #display-form input { width: 6em; }
+  dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; }
 
   /* Import mode: the device's New VM wizard waits for one image. */
   body.import nav, body.import main, body.import #statusbar .vm { display: none; }
@@ -189,6 +195,8 @@
       <div class="items" role="menu">
         <button data-view="fit" role="menuitemradio" aria-checked="true">Fit to window</button>
         <button data-view="1x" role="menuitemradio">Actual size</button>
+        <hr>
+        <button id="display-open" disabled title="Needs the r86 tools helper running in Windows">Guest resolution…</button>
         <hr>
         <button id="fullscreen" role="menuitemcheckbox">Full screen</button>
       </div>
@@ -285,8 +293,28 @@
     <li>Drop an ISO, files or folders on the page to insert them as a CD. While the VM is
       off, dropped files are copied to its hard disk.</li>
     <li>Keyboard has the key combinations a browser keeps for itself, such as Ctrl+Alt+Del.</li>
+    <li>View → Guest resolution asks the r86 tools helper to switch Windows' display mode,
+      including sizes the Display control panel hides.</li>
   </ul>
   <form method="dialog"><button>Close</button></form>
+</dialog>
+<dialog id="display">
+  <h2>Guest resolution</h2>
+  <p class="muted">The r86 tools helper in Windows switches to the mode you choose. On Windows
+    95/98/Me a size the display driver does not list yet is added first; Windows then offers it
+    after a restart.</p>
+  <form id="display-form" method="dialog">
+    <label for="display-list">Mode</label>
+    <select id="display-list"></select>
+    <label for="display-w">Size</label>
+    <span><input id="display-w" type="number" min="1" max="4096"> ×
+      <input id="display-h" type="number" min="1" max="4096">
+      <select id="display-bits" aria-label="Colour depth">
+        <option value="8">256 colours</option><option value="16" selected>16-bit</option>
+        <option value="24">24-bit</option><option value="32">32-bit</option>
+      </select></span>
+  </form>
+  <div class="buttons"><button id="display-apply">Apply</button><button id="display-close">Close</button></div>
 </dialog>
 <script>
 "use strict";
@@ -487,6 +515,7 @@ async function pollStatus() {
   running = json.execution.running;
   showPower(json.powered_off);
   showMouse(json);
+  showDisplay(json);
   showMedia((await request({ cmd: "media" })).json);
   const mode = `${json.vga.mode} ${json.vga.width}x${json.vga.height}`;
   const run = json.powered_off ? "powered off" : json.execution.busy ? "busy" : running ? "running" : "paused";
@@ -552,7 +581,7 @@ function setUi(on) {
   }
   for (const item of document.querySelectorAll("[data-mode]")) item.disabled = !on;
   $("diag").disabled = !on;
-  if (!on) showMedia(null);
+  if (!on) { showMedia(null); $("display-open").disabled = true; }
 }
 
 async function command(msg) {
@@ -585,6 +614,55 @@ $("release").onclick = () => { held.clear(); command({ cmd: "release-input" }); 
 $("type-open").onclick = () => { $("typebar").hidden = false; $("text").focus(); };
 $("type-close").onclick = () => { $("typebar").hidden = true; canvas.focus(); };
 $("help-open").onclick = () => $("help").showModal();
+
+// --- Guest resolution: a display-mode request to the r86 tools helper, which
+// answers later; status carries the answer (display_result, new id).
+const displayText = {
+  switched: "switched", restart: "saved; restart Windows to use it",
+  unavailable: "Windows does not offer this mode", failed: "failed",
+  added: "added to the display driver's modes; restart Windows, then choose it again",
+};
+let displayResult = null;
+function showDisplay(json) {
+  $("display-open").disabled = !json.guest_tools;
+  const r = json.display_result;
+  if (r && displayResult !== null && r.id !== displayResult) {
+    note(`Guest resolution ${r.width} × ${r.height}, ${r.bits}-bit: ${displayText[r.result] ?? r.result}`,
+      r.result === "failed" || r.result === "unavailable");
+  }
+  displayResult = r ? r.id : 0;
+}
+function pickDisplay(w, h, bits) {
+  $("display-w").value = w;
+  $("display-h").value = h;
+  $("display-bits").value = String(bits);
+}
+$("display-open").onclick = async () => {
+  const json = await command({ cmd: "display-mode" });
+  if (!json) return;
+  const list = $("display-list"), current = `${canvas.width},${canvas.height}`;
+  list.replaceChildren();
+  for (const [w, h, bits] of json.modes) {
+    const colours = bits <= 8 ? `${2 ** bits} colours` : `${bits}-bit`;
+    list.add(new Option(`${w} × ${h}, ${colours}`, `${w},${h},${bits}`));
+  }
+  const match = [...list.options].find(o => o.value.startsWith(current + ",16"))
+    ?? [...list.options].find(o => o.value.startsWith(current + ","));
+  if (match) match.selected = true;
+  list.disabled = !list.options.length;
+  if (list.value) pickDisplay(...list.value.split(",").map(Number));
+  else pickDisplay(canvas.width, canvas.height, 16);
+  $("display").showModal();
+};
+$("display-list").onchange = e => pickDisplay(...e.target.value.split(",").map(Number));
+$("display-close").onclick = () => $("display").close();
+$("display-apply").onclick = async () => {
+  const [width, height, bits] = ["display-w", "display-h", "display-bits"].map(id => Number($(id).value));
+  if (await command({ cmd: "display-mode", width, height, bits })) {
+    note(`Asked Windows for ${width} × ${height}, ${bits}-bit`);
+    $("display").close();
+  }
+};
 $("shot").onclick = () => canvas.toBlob(blob => {
   download(blob, `r86-${lastStep ?? 0}.png`);
 });

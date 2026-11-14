@@ -184,6 +184,7 @@ Commands implemented by the current harness:
     {"cmd":"mouse-move", "dx": DX, "dy": DY}
     {"cmd":"mouse-button", "button": "left|right|middle", "down": BOOL}
     {"cmd":"mouse-mode", "mode": optional "auto|relative"}
+    {"cmd":"display-mode", "width": optional W, "height": H, "bits": optional 16}
     {"cmd":"usb-tablet", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"pointer", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"text-snapshot"}
@@ -358,6 +359,19 @@ read relative motion). Its reply and ``status`` carry ``mouse_mode`` and
 cursor's position across the guest screen instead of capturing the mouse, and
 ``mouse-move``/``mouse-button`` otherwise. The mode guides clients; the server
 accepts both inputs in either mode.
+
+``display-mode`` asks the guest tool (r86-tool 3 and later) to switch the guest
+OS's display mode; without ``width`` it only reports. Width and height are
+1..4096, bits 4/8/15/16/24/32. The request travels as a magic instruction host
+request; it fails while no such tool polls. The reply carries ``guest_tools``
+(the tool takes requests), ``modes`` (``[[width,height,bits],...]``, what the
+guest OS offers, as the tool reported) and ``display_result``. ``status``
+carries ``guest_tools`` and ``display_result``: null, or ``{"id","width",
+"height","bits","result"}`` with result ``switched``, ``restart`` (saved for
+the next Windows restart), ``unavailable``, ``failed`` or ``added`` (Windows
+9x with VMDisp9x: the size was added to the driver's mode list; restart
+Windows and request it again); a new ``id`` marks a new answer. Accepted
+requests are recorded and replayable.
 
 ``usb-tablet`` requires the opt-in ``--usb-tablet`` / TOML ``usb-tablet = true``.
 X and Y are absolute coordinates 0..32767 (left/top to right/bottom); normalize
@@ -666,6 +680,11 @@ def build_parser():
     mode = mouse_sub.add_parser("mode")
     mode.add_argument("mode", nargs="?", choices=["auto", "relative"])
 
+    display = sub.add_parser("display", help="report the guest display modes, or request WIDTH HEIGHT [BITS]")
+    display.add_argument("width", type=int, nargs="?")
+    display.add_argument("height", type=int, nargs="?")
+    display.add_argument("bits", type=int, nargs="?", default=16)
+
     sub.add_parser("text-snapshot")
     sub.add_parser("hash-frame")
 
@@ -738,6 +757,9 @@ def command_object(args):
         if args.mouse_command == "mode":
             return {"cmd": "mouse-mode", **({"mode": args.mode} if args.mode else {})}
         return {"cmd": "mouse-button", "button": args.button, "down": args.state == "down"}
+    if args.command == "display":
+        size = {"width": args.width, "height": args.height, "bits": args.bits} if args.width else {}
+        return {"cmd": "display-mode", **size}
     if args.command == "text-snapshot":
         return {"cmd": "text-snapshot"}
     if args.command == "hash-frame":

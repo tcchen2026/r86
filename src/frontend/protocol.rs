@@ -443,6 +443,22 @@ pub fn json_escape(value: &str) -> String {
     out
 }
 
+/// `display-mode` with width, height and optional bits (16): None without width.
+pub fn parse_display_mode(line: &str) -> Result<Option<(u16, u16, u8)>, String> {
+    let Some(width) = json_i64(line, "width")? else {
+        return Ok(None);
+    };
+    let height = json_i64(line, "height")?.ok_or("display-mode needs height with width")?;
+    let bits = json_i64(line, "bits")?.unwrap_or(16);
+    if !(1..=4096).contains(&width) || !(1..=4096).contains(&height) {
+        return Err("display-mode width and height must be 1..4096".into());
+    }
+    if ![4, 8, 15, 16, 24, 32].contains(&bits) {
+        return Err("display-mode bits must be 4, 8, 15, 16, 24 or 32".into());
+    }
+    Ok(Some((width as u16, height as u16, bits as u8)))
+}
+
 pub fn parse_pointer(line: &str) -> Result<(u16, u16, u8, i16), String> {
     let integer = |key: &str, default: Option<i64>| -> Result<i64, String> {
         match json_value(line, key)? {

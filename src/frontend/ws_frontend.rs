@@ -57,7 +57,7 @@ impl WsSession {
 
     fn hello(&self, machine: &Machine) -> String {
         let response = format!(
-            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"usb-tablet\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
             machine.step_count(),
             self.slice_steps
         );
@@ -624,6 +624,35 @@ impl Service {
         };
         format!("\"mouse_mode\":\"{mode}\",\"mouse_absolute\":{absolute}")
     }
+
+    /// The guest tool's display state: whether it takes requests, the last
+    /// display-mode result, and with `modes` the modes the guest offers.
+    fn display_json(machine: &Machine, modes: bool) -> String {
+        let result = machine
+            .guest_display_result()
+            .map_or("null".to_string(), |r| {
+                let text = ["switched", "restart", "unavailable", "failed", "added"]
+                    .get(usize::from(r.result))
+                    .unwrap_or(&"failed");
+                format!(
+                    "{{\"id\":{},\"width\":{},\"height\":{},\"bits\":{},\"result\":\"{text}\"}}",
+                    r.id, r.mode.0, r.mode.1, r.mode.2
+                )
+            });
+        let mut json = format!(
+            "\"guest_tools\":{},\"display_result\":{result}",
+            machine.guest_tools_active()
+        );
+        if modes {
+            let list: Vec<String> = machine
+                .guest_display_modes()
+                .iter()
+                .map(|(w, h, bits)| format!("[{w},{h},{bits}]"))
+                .collect();
+            json.push_str(&format!(",\"modes\":[{}]", list.join(",")));
+        }
+        json
+    }
     fn cancel_job(&mut self, machine: &Machine, reason: &str) {
         if let Some(job) = self.job.take() {
             self.reply(
@@ -808,9 +837,24 @@ impl Service {
                 let mut json = status_json(machine, true);
                 json.pop();
                 format!(
-                    "{json},{},\"execution\":{}}}",
+                    "{json},{},{},\"execution\":{}}}",
                     self.mouse_json(machine),
+                    Self::display_json(machine, false),
                     self.state(machine)
+                )
+            }
+            "display-mode" => {
+                if let Some((width, height, bits)) = parse_display_mode(message)? {
+                    machine.request_display_mode(width, height, bits)?;
+                    self.clients.get_mut(&id).unwrap().session.record_line(&format!(
+                        "{{\"step\":{},\"cmd\":\"display-mode\",\"width\":{width},\"height\":{height},\"bits\":{bits}}}",
+                        machine.step_count()
+                    ))?;
+                }
+                format!(
+                    "{{\"type\":\"display-mode\",\"ok\":true,\"step\":{},{}}}",
+                    machine.step_count(),
+                    Self::display_json(machine, true)
                 )
             }
             "diagnostics" => {
