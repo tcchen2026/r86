@@ -42,6 +42,7 @@
 
 static HANDLE out;
 static int own_console;
+static int nt; /* Windows NT, 2000 or XP */
 
 /* Constants mirror src/machine/magic.rs, the protocol authority. */
 #define MAGIC_PORT 0x5286
@@ -202,19 +203,26 @@ static int set_mode(DWORD width, DWORD height, DWORD bits)
     return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
 }
 
+/* r86's display card: widths are multiples of 8 up to 1920, heights up to 1600. */
+static int valid_size(DWORD width, DWORD height)
+{
+    return width >= 8 && width <= 1920 && !(width & 7) && height >= 8 && height <= 1600;
+}
+
 /* Windows 9x offers a display driver's modes from its class key, where
  * VMDisp9x's INF lists them (MODES\BITS\WIDTH,HEIGHT). Adds a mode to every
- * VMDisp9x QEMU adapter key; returns 1 if one was missing. */
+ * VMDisp9x QEMU adapter key. Returns 1 if added (Windows offers it after a
+ * restart), 0 if already listed, -1 without a VMDisp9x adapter. */
 static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
 {
     static const char display[] = "System\\CurrentControlSet\\Services\\Class\\Display";
     char name[32], path[96], drv[32];
     HKEY root, key;
     DWORD i, size, made;
-    int ours, added = 0;
+    int ours, found = 0, added = 0;
 
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, display, 0, KEY_READ | KEY_CREATE_SUB_KEY, &root) != ERROR_SUCCESS)
-        return 0;
+        return -1;
     for (i = 0; RegEnumKeyA(root, i, name, sizeof name) == ERROR_SUCCESS; i++) {
         wsprintfA(path, "%s\\DEFAULT", name);
         if (RegOpenKeyExA(root, path, 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
@@ -225,6 +233,7 @@ static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
         RegCloseKey(key);
         if (!ours)
             continue;
+        found = 1;
         wsprintfA(path, "%s\\MODES\\%lu\\%lu,%lu", name, bits, width, height);
         if (RegCreateKeyExA(root, path, 0, NULL, 0, KEY_WRITE, NULL, &key, &made) == ERROR_SUCCESS) {
             added |= made == REG_CREATED_NEW_KEY;
@@ -232,18 +241,14 @@ static int add_9x_mode(DWORD width, DWORD height, DWORD bits)
         }
     }
     RegCloseKey(root);
-    return added;
+    return found ? added : -1;
 }
 
-/* The handheld panel's 320x170 and twice it, which VMDisp9x's INF lacks. */
-static void add_panel_modes(void)
+/* Adds a mode to the display driver's list: 1 added (Windows offers it after
+ * a restart), 0 already listed, -1 the list is fixed, -2 an invalid size. */
+static int add_mode(DWORD width, DWORD height, DWORD bits)
 {
-    static const DWORD sizes[][2] = {{320, 170}, {640, 340}}, depths[] = {8, 16, 32};
-    unsigned i, j;
-
-    for (i = 0; i < 2; i++)
-        for (j = 0; j < 3; j++)
-            add_9x_mode(sizes[i][0], sizes[i][1], depths[j]);
+    return !valid_size(width, height) ? -2 : nt ? -1 : add_9x_mode(width, height, bits);
 }
 
 static int version(void)
@@ -264,7 +269,6 @@ static HDESK (WINAPI *open_input_desktop)(DWORD, BOOL, ACCESS_MASK);
 static BOOL (WINAPI *close_desktop)(HDESK);
 static BOOL (WINAPI *object_info)(HANDLE, int, PVOID, DWORD, LPDWORD);
 static char own_desktop[256];
-static int nt;
 
 static int prepare_desktop(void)
 {
@@ -758,7 +762,6 @@ static DWORD display_9x(HWND parent, const char *inf, struct tool_result *r)
     if (!p_SetupDiSetSelectedDriverA(devices, &device, &driver) ||
         !p_SetupDiInstallDevice(devices, &device)) { code = GetLastError(); goto done; }
     code = ERROR_SUCCESS_REBOOT_REQUIRED;
-    add_panel_modes();
 done:
     if (devices != INVALID_HANDLE_VALUE) p_SetupDiDestroyDeviceInfoList(devices);
     FreeLibrary(setup);
@@ -892,8 +895,12 @@ static void centred(DWORD style, int width, int height, RECT *r)
     if (r->top < area.top) r->top = area.top;
 }
 
+static HWND custom; /* Add custom resolution, owned by settings */
+
 static void dispatch(MSG *message)
 {
+    if (custom && IsDialogMessageA(custom, message))
+        return;
     if (!window || !IsDialogMessageA(window, message)) {
         TranslateMessage(message);
         DispatchMessageA(message);
@@ -912,13 +919,19 @@ static void show_installed(void)
     EnableWindow(GetDlgItem(window, ID_UNINSTALL), regular_file(install_exe));
 }
 
+static HWND child(HWND parent, DWORD ex, const char *cls, const char *text, DWORD style, int id,
+                  int x, int y, int w, int h)
+{
+    HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
+                             parent, (HMENU)(UINT_PTR)id, GetModuleHandleA(NULL), NULL);
+    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
+    return c;
+}
+
 static HWND control(DWORD ex, const char *cls, const char *text, DWORD style, int id,
                     int x, int y, int w, int h)
 {
-    HWND c = CreateWindowExA(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
-                             window, (HMENU)(UINT_PTR)id, GetModuleHandleA(NULL), NULL);
-    SendMessageA(c, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), FALSE);
-    return c;
+    return child(window, ex, cls, text, style, id, x, y, w, h);
 }
 
 static const char *windows_name(void)
@@ -1161,11 +1174,13 @@ static int installer(void)
 
 /* Settings window: the installed copy's window, in the helper process when
  * there is one, so the pointer toggle acts on the running helper. */
-enum { ID_RESOLUTION = 200, ID_APPLY, ID_POINTER, ID_LOGON, ID_SETTINGS, ID_EXIT };
+enum { ID_RESOLUTION = 200, ID_APPLY, ID_POINTER, ID_LOGON, ID_SETTINGS, ID_EXIT, ID_CUSTOM,
+       ID_WIDTH, ID_HEIGHT, ID_BITS };
 #define WM_TRAY (WM_APP + 1)
 
 static const char settings_class[] = "r86-tool.settings";
 static const char tray_class[] = "r86-tool.tray";
+static const char custom_class[] = "r86-tool.custom";
 static int standalone; /* settings without a helper: closing it ends the process */
 struct mode { DWORD width, height, bits; };
 static struct mode modes[96];
@@ -1297,6 +1312,100 @@ static void set_pointer(int on)
     tray_icon(NIM_MODIFY);
 }
 
+/* Add custom resolution (Windows 9x): adds a size to VMDisp9x's mode list;
+ * Windows offers it after a restart. VBEMP on 2000/XP offers only the VGA
+ * BIOS's modes, so Settings has no such button there. */
+static const DWORD custom_bits[] = {8, 16, 32};
+
+static void add_custom(void)
+{
+    static const char title[] = "Add custom resolution";
+    BOOL has_width, has_height;
+    DWORD width = GetDlgItemInt(custom, ID_WIDTH, &has_width, FALSE);
+    DWORD height = GetDlgItemInt(custom, ID_HEIGHT, &has_height, FALSE);
+    LRESULT i = SendDlgItemMessageA(custom, ID_BITS, CB_GETCURSEL, 0, 0);
+    DWORD bits = custom_bits[i < 0 ? 1 : i];
+    int added = has_width && has_height ? add_mode(width, height, bits) : -2;
+    char text[256];
+
+    if (added == -2) {
+        MessageBoxA(custom, "The width must be a multiple of 8 from 8 to 1920, and the height "
+                    "from 8 to 1600.", title, MB_OK | MB_ICONEXCLAMATION);
+        return;
+    }
+    if (added == -1) {
+        MessageBoxA(custom, "Windows does not use the VMDisp9x display driver, so its mode list "
+                    "cannot change. Install the display driver from the r86 tools CD first.",
+                    title, MB_OK | MB_ICONEXCLAMATION);
+        return;
+    }
+    if (!added) {
+        wsprintfA(text, "%lu x %lu, %lu-bit colour is already in the display driver's list. "
+                  "If Settings does not offer it yet, restart Windows.", width, height, bits);
+        MessageBoxA(custom, text, title, MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    wsprintfA(text, "%lu x %lu, %lu-bit colour was added to the display driver's list. "
+              "Windows offers it after a restart.\r\n\r\nRestart Windows now?", width, height, bits);
+    if (MessageBoxA(custom, text, title, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+        restart_windows();
+    DestroyWindow(custom);
+}
+
+static LRESULT CALLBACK custom_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
+{
+    switch (message) {
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDOK: add_custom(); return 0;
+        case IDCANCEL: DestroyWindow(hwnd); return 0;
+        }
+        break;
+    case WM_DESTROY:
+        custom = NULL;
+        if (window) {
+            EnableWindow(window, TRUE);
+            SetForegroundWindow(window);
+        }
+        return 0;
+    }
+    return DefWindowProcA(hwnd, message, w, l);
+}
+
+static void open_custom(void)
+{
+    static const char *const depths[] = {"256 colours", "16-bit colour", "32-bit colour"};
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT r;
+    unsigned i;
+
+    if (custom) {
+        SetForegroundWindow(custom);
+        return;
+    }
+    centred(style, 264, 108, &r);
+    custom = CreateWindowExA(WS_EX_DLGMODALFRAME, custom_class, "Add custom resolution", style,
+                             r.left, r.top, r.right, r.bottom, window, NULL, GetModuleHandleA(NULL), NULL);
+    if (!custom)
+        return;
+    child(custom, 0, "STATIC", "Size:", SS_LEFT, ID_INTRO, 12, 14, 44, 16);
+    child(custom, WS_EX_CLIENTEDGE, "EDIT", "640", ES_NUMBER | WS_TABSTOP, ID_WIDTH, 60, 10, 56, 22);
+    child(custom, 0, "STATIC", "x", SS_CENTER, ID_INTRO, 118, 14, 16, 16);
+    child(custom, WS_EX_CLIENTEDGE, "EDIT", "340", ES_NUMBER | WS_TABSTOP, ID_HEIGHT, 136, 10, 56, 22);
+    child(custom, 0, "STATIC", "Colour:", SS_LEFT, ID_INTRO, 12, 44, 44, 16);
+    child(custom, 0, "COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, ID_BITS, 60, 40, 132, 120);
+    for (i = 0; i < 3; i++)
+        SendDlgItemMessageA(custom, ID_BITS, CB_ADDSTRING, 0, (LPARAM)depths[i]);
+    SendDlgItemMessageA(custom, ID_BITS, CB_SETCURSEL, 1, 0);
+    child(custom, 0, "BUTTON", "Add", BS_DEFPUSHBUTTON | WS_TABSTOP, IDOK, 96, 76, 76, 24);
+    child(custom, 0, "BUTTON", "Cancel", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 178, 76, 76, 24);
+    EnableWindow(window, FALSE);
+    ShowWindow(custom, SW_SHOWNORMAL);
+    SetForegroundWindow(custom);
+    SetFocus(GetDlgItem(custom, ID_WIDTH));
+    SendDlgItemMessageA(custom, ID_WIDTH, EM_SETSEL, 0, -1);
+}
+
 static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM w, LPARAM l)
 {
     switch (message) {
@@ -1305,6 +1414,7 @@ static LRESULT CALLBACK settings_proc(HWND hwnd, UINT message, WPARAM w, LPARAM 
         case ID_APPLY: apply_mode(); return 0;
         case ID_POINTER: set_pointer(checked(ID_POINTER)); return 0;
         case ID_LOGON: set_logon(); return 0;
+        case ID_CUSTOM: open_custom(); return 0;
         case IDCANCEL: DestroyWindow(hwnd); return 0;
         }
         break;
@@ -1352,6 +1462,8 @@ static void open_settings(void)
     control(0, "BUTTON", "Start r86 tools at logon, with an icon in the taskbar",
             BS_AUTOCHECKBOX | WS_TABSTOP, ID_LOGON, 12, 84, 356, 18);
     control(0, "STATIC", "", SS_LEFT, ID_STATUS, 12, 110, 356, 30);
+    if (!nt)
+        control(0, "BUTTON", "Add custom resolution...", BS_PUSHBUTTON | WS_TABSTOP, ID_CUSTOM, 12, 144, 150, 24);
     control(0, "BUTTON", "Close", BS_PUSHBUTTON | WS_TABSTOP, IDCANCEL, 292, 144, 76, 24);
     fill_modes();
     SendDlgItemMessageA(window, ID_POINTER, BM_SETCHECK, helper_running && pointer_on ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -1430,7 +1542,7 @@ static int settings_only(void)
     MSG message;
 
     standalone = 1;
-    if (!window_class(settings_class, settings_proc))
+    if (!window_class(settings_class, settings_proc) || !window_class(custom_class, custom_proc))
         return 1;
     open_settings();
     while (window && GetMessageA(&message, NULL, 0, 0) > 0)
@@ -1469,23 +1581,23 @@ static void report_modes(void)
         magic_call(MAGIC_REPORT, 2, list[i].width | list[i].height << 16, list[i].bits);
 }
 
-/* A host display request. On 9x a size VMDisp9x does not list is added to
- * its list first; Windows may only offer it after a restart. */
-static void display_request(DWORD width, DWORD height, DWORD bits)
+/* Host display requests (kinds 1 and 2), answered with report kind 3. */
+static void display_request(DWORD kind, DWORD width, DWORD height, DWORD bits)
 {
     const char *text;
-    LONG code = change_mode(width, height, bits, &text);
-    int added = 0;
+    LONG code;
+    int added;
     DWORD result;
 
-    if (code == DISP_CHANGE_BADMODE && !nt && add_9x_mode(width, height, bits)) {
-        added = 1;
+    if (kind == 1) {
         code = change_mode(width, height, bits, &text);
+        result = code == DISP_CHANGE_SUCCESSFUL ? 0 : code == DISP_CHANGE_RESTART ? 1
+               : code == DISP_CHANGE_BADMODE ? 2 : 3;
+    } else {
+        added = add_mode(width, height, bits);
+        result = added == 1 ? 4 : added == 0 ? 5 : added == -1 ? 6 : 3;
     }
-    result = code == DISP_CHANGE_SUCCESSFUL ? 0 : code == DISP_CHANGE_RESTART ? 1
-           : code != DISP_CHANGE_BADMODE ? 3 : added ? 4 : 2;
     magic_call(MAGIC_REPORT, 3, width | height << 16, bits | result << 16);
-    report_modes();
 }
 
 static void take_requests(void)
@@ -1496,8 +1608,8 @@ static void take_requests(void)
         r = magic_call(MAGIC_REQUEST, 0, 0, 0);
         if (!r.a || r.a == 0xffffffff)
             return;
-        if (r.a == 1)
-            display_request(r.b, r.c, r.d);
+        if (r.a == 1 || r.a == 2)
+            display_request(r.a, r.b, r.c, r.d);
         /* Other kinds are newer than this tool: skipped. */
     }
 }
@@ -1597,8 +1709,6 @@ static int helper(int with_icon, int show_settings)
      * process exit so Windows has released the EXE before an update/delete. */
     *pid = GetCurrentProcessId();
     helper_running = 1;
-    if (!nt)
-        add_panel_modes();
     if (!with_icon && !show_settings)
         poll_pointer(NULL);
     else {
@@ -1608,6 +1718,7 @@ static int helper(int with_icon, int show_settings)
 
         ui_thread = GetCurrentThreadId();
         window_class(settings_class, settings_proc);
+        window_class(custom_class, custom_proc);
         if (with_icon)
             make_tray();
         if (show_settings)

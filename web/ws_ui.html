@@ -119,10 +119,12 @@
   dialog li { margin: 5px 0; }
   dialog select, dialog input { background: var(--bg); color: var(--text); border: 1px solid var(--line);
     border-radius: 6px; padding: 4px 6px; font: inherit; }
-  #display-form { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center;
-    margin: 0 0 16px; }
-  #display-form input { width: 6em; }
+  #display-form, #display-add-form { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px;
+    align-items: center; margin: 0 0 16px; }
+  #display-add-form input { width: 6em; }
   dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; }
+  dialog .buttons .left { margin-right: auto; }
+  #msgbox p { margin: 0 0 16px; white-space: pre-line; }
 
   /* Import mode: the device's New VM wizard waits for one image. */
   body.import nav, body.import main, body.import #statusbar .vm { display: none; }
@@ -294,27 +296,44 @@
       off, dropped files are copied to its hard disk.</li>
     <li>Keyboard has the key combinations a browser keeps for itself, such as Ctrl+Alt+Del.</li>
     <li>View → Guest resolution asks the r86 tools helper to switch Windows' display mode,
-      including sizes the Display control panel hides.</li>
+      including sizes the Display control panel hides. On Windows 95/98/Me, Add custom
+      resolution adds a size; Windows offers it after a restart.</li>
   </ul>
   <form method="dialog"><button>Close</button></form>
 </dialog>
 <dialog id="display">
   <h2>Guest resolution</h2>
-  <p class="muted">The r86 tools helper in Windows switches to the mode you choose. On Windows
-    95/98/Me a size the display driver does not list yet is added first; Windows then offers it
-    after a restart.</p>
+  <p class="muted">The r86 tools helper in Windows switches to the mode you choose, including
+    modes the Display control panel hides.</p>
   <form id="display-form" method="dialog">
     <label for="display-list">Mode</label>
     <select id="display-list"></select>
-    <label for="display-w">Size</label>
-    <span><input id="display-w" type="number" min="1" max="4096"> ×
-      <input id="display-h" type="number" min="1" max="4096">
-      <select id="display-bits" aria-label="Colour depth">
-        <option value="8">256 colours</option><option value="16" selected>16-bit</option>
-        <option value="24">24-bit</option><option value="32">32-bit</option>
-      </select></span>
   </form>
-  <div class="buttons"><button id="display-apply">Apply</button><button id="display-close">Close</button></div>
+  <div class="buttons">
+    <button id="display-add-open" class="left" title="Windows 95/98/Me with the VMDisp9x display driver">Add custom resolution…</button>
+    <button id="display-apply">Apply</button><button id="display-close">Close</button>
+  </div>
+</dialog>
+<dialog id="display-add">
+  <h2>Add custom resolution</h2>
+  <p class="muted">Adds a size to the Windows 95/98/Me display driver's list (VMDisp9x);
+    Windows offers it after a restart. Windows 2000/XP offer only the VGA BIOS's modes.</p>
+  <form id="display-add-form" method="dialog">
+    <label for="display-w">Size</label>
+    <span><input id="display-w" type="number" min="8" max="1920" step="8" value="640"> ×
+      <input id="display-h" type="number" min="8" max="1600" value="340"></span>
+    <label for="display-bits">Colour</label>
+    <select id="display-bits">
+      <option value="8">256 colours</option><option value="16" selected>16-bit</option>
+      <option value="32">32-bit</option>
+    </select>
+  </form>
+  <div class="buttons"><button id="display-add-apply">Add</button><button id="display-add-close">Cancel</button></div>
+</dialog>
+<dialog id="msgbox">
+  <h2 id="msgbox-title"></h2>
+  <p id="msgbox-text"></p>
+  <div class="buttons"><button id="msgbox-ok">OK</button></div>
 </dialog>
 <script>
 "use strict";
@@ -620,22 +639,35 @@ $("help-open").onclick = () => $("help").showModal();
 const displayText = {
   switched: "switched", restart: "saved; restart Windows to use it",
   unavailable: "Windows does not offer this mode", failed: "failed",
-  added: "added to the display driver's modes; restart Windows, then choose it again",
 };
-let displayResult = null;
+const addText = {
+  added: "was added to the display driver's list. Windows offers it after a restart.",
+  listed: "is already in the display driver's list. If Windows does not offer it yet, restart Windows.",
+  fixed: "cannot be added: this Windows has no VMDisp9x display driver. Windows 2000/XP offer only "
+    + "the VGA BIOS's modes; on Windows 95/98/Me, install the display driver first.",
+  failed: "could not be added.",
+};
+let displayResult = null, adding = false;
+function msgbox(title, text) {
+  $("msgbox-title").textContent = title;
+  $("msgbox-text").textContent = text;
+  $("msgbox").showModal();
+}
+$("msgbox-ok").onclick = () => $("msgbox").close();
 function showDisplay(json) {
   $("display-open").disabled = !json.guest_tools;
   const r = json.display_result;
   if (r && displayResult !== null && r.id !== displayResult) {
-    note(`Guest resolution ${r.width} × ${r.height}, ${r.bits}-bit: ${displayText[r.result] ?? r.result}`,
-      r.result === "failed" || r.result === "unavailable");
+    const mode = `${r.width} × ${r.height}, ${r.bits <= 8 ? "256 colours" : r.bits + "-bit"}`;
+    if (adding && r.result in addText) {
+      adding = false;
+      msgbox("Add custom resolution", `${mode} ${addText[r.result]}`);
+    } else {
+      note(`Guest resolution ${mode}: ${displayText[r.result] ?? r.result}`,
+        r.result === "failed" || r.result === "unavailable");
+    }
   }
   displayResult = r ? r.id : 0;
-}
-function pickDisplay(w, h, bits) {
-  $("display-w").value = w;
-  $("display-h").value = h;
-  $("display-bits").value = String(bits);
 }
 $("display-open").onclick = async () => {
   const json = await command({ cmd: "display-mode" });
@@ -649,18 +681,29 @@ $("display-open").onclick = async () => {
   const match = [...list.options].find(o => o.value.startsWith(current + ",16"))
     ?? [...list.options].find(o => o.value.startsWith(current + ","));
   if (match) match.selected = true;
-  list.disabled = !list.options.length;
-  if (list.value) pickDisplay(...list.value.split(",").map(Number));
-  else pickDisplay(canvas.width, canvas.height, 16);
+  list.disabled = $("display-apply").disabled = !list.options.length;
   $("display").showModal();
 };
-$("display-list").onchange = e => pickDisplay(...e.target.value.split(",").map(Number));
 $("display-close").onclick = () => $("display").close();
 $("display-apply").onclick = async () => {
-  const [width, height, bits] = ["display-w", "display-h", "display-bits"].map(id => Number($(id).value));
+  const [width, height, bits] = $("display-list").value.split(",").map(Number);
   if (await command({ cmd: "display-mode", width, height, bits })) {
     note(`Asked Windows for ${width} × ${height}, ${bits}-bit`);
     $("display").close();
+  }
+};
+$("display-add-open").onclick = () => $("display-add").showModal();
+$("display-add-close").onclick = () => $("display-add").close();
+// r86's display card: widths are multiples of 8 up to 1920, heights up to 1600.
+$("display-add-apply").onclick = async () => {
+  const [width, height, bits] = ["display-w", "display-h", "display-bits"].map(id => Number($(id).value));
+  if (!(width >= 8 && width <= 1920 && width % 8 === 0 && height >= 8 && height <= 1600)) {
+    msgbox("Add custom resolution", "The width must be a multiple of 8 from 8 to 1920, and the height from 8 to 1600.");
+    return;
+  }
+  if (await command({ cmd: "display-mode", add: true, width, height, bits })) {
+    adding = true;
+    $("display-add").close();
   }
 };
 $("shot").onclick = () => canvas.toBlob(blob => {

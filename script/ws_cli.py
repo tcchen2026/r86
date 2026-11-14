@@ -184,7 +184,8 @@ Commands implemented by the current harness:
     {"cmd":"mouse-move", "dx": DX, "dy": DY}
     {"cmd":"mouse-button", "button": "left|right|middle", "down": BOOL}
     {"cmd":"mouse-mode", "mode": optional "auto|relative"}
-    {"cmd":"display-mode", "width": optional W, "height": H, "bits": optional 16}
+    {"cmd":"display-mode", "width": optional W, "height": H, "bits": optional 16,
+     "add": optional false}
     {"cmd":"usb-tablet", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"pointer", "x": X, "y": Y, "buttons": optional MASK, "wheel": optional N}
     {"cmd":"text-snapshot"}
@@ -361,17 +362,19 @@ cursor's position across the guest screen instead of capturing the mouse, and
 accepts both inputs in either mode.
 
 ``display-mode`` asks the guest tool (r86-tool 3 and later) to switch the guest
-OS's display mode; without ``width`` it only reports. Width and height are
+OS's display mode, or with ``"add": true`` to add the mode to the guest
+driver's list; without ``width`` it only reports. Width and height are
 1..4096, bits 4/8/15/16/24/32. The request travels as a magic instruction host
 request; it fails while no such tool polls. The reply carries ``guest_tools``
 (the tool takes requests), ``modes`` (``[[width,height,bits],...]``, what the
 guest OS offers, as the tool reported) and ``display_result``. ``status``
 carries ``guest_tools`` and ``display_result``: null, or ``{"id","width",
-"height","bits","result"}`` with result ``switched``, ``restart`` (saved for
-the next Windows restart), ``unavailable``, ``failed`` or ``added`` (Windows
-9x with VMDisp9x: the size was added to the driver's mode list; restart
-Windows and request it again); a new ``id`` marks a new answer. Accepted
-requests are recorded and replayable.
+"height","bits","result"}``; a new ``id`` marks a new answer. Switching
+results: ``switched``, ``restart`` (saved for the next Windows restart),
+``unavailable``, ``failed``. Adding results: ``added`` (Windows 9x with
+VMDisp9x; Windows offers it after a restart), ``listed`` (already in the
+list) and ``fixed`` (the driver's list cannot change: Windows 2000/XP VBEMP,
+or no VMDisp9x). Accepted requests are recorded and replayable.
 
 ``usb-tablet`` requires the opt-in ``--usb-tablet`` / TOML ``usb-tablet = true``.
 X and Y are absolute coordinates 0..32767 (left/top to right/bottom); normalize
@@ -684,6 +687,7 @@ def build_parser():
     display.add_argument("width", type=int, nargs="?")
     display.add_argument("height", type=int, nargs="?")
     display.add_argument("bits", type=int, nargs="?", default=16)
+    display.add_argument("--add", action="store_true", help="add the mode to the guest driver's list")
 
     sub.add_parser("text-snapshot")
     sub.add_parser("hash-frame")
@@ -759,7 +763,7 @@ def command_object(args):
         return {"cmd": "mouse-button", "button": args.button, "down": args.state == "down"}
     if args.command == "display":
         size = {"width": args.width, "height": args.height, "bits": args.bits} if args.width else {}
-        return {"cmd": "display-mode", **size}
+        return {"cmd": "display-mode", **size, **({"add": True} if args.add else {})}
     if args.command == "text-snapshot":
         return {"cmd": "text-snapshot"}
     if args.command == "hash-frame":

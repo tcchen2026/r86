@@ -24,18 +24,20 @@
 //!   remain, 10 while a button is held or within one second of movement/a
 //!   held button, otherwise 100.
 //! - 3, request: takes the oldest host request: EAX=kind (0: none), EBX,
-//!   ECX and EDX its arguments. Kind 1, display mode: EBX=width, ECX=height,
-//!   EDX=bits per pixel. A newer request replaces a queued one of its kind,
-//!   and up to 16 kinds queue. A tool polls
+//!   ECX and EDX its arguments. Kind 1, display mode: switch to EBX=width,
+//!   ECX=height, EDX=bits per pixel. Kind 2, add display mode: add that mode
+//!   to the guest driver's list. A newer request replaces a queued one of its
+//!   kind, and up to 16 kinds queue. A tool polls
 //!   this when the pointer poll reports requests, and every 500 ms or so
 //!   while it does not poll the pointer.
 //! - 4, report: EBX=kind, ESI and EDI its arguments; EAX=0, or FFFFFFFFh for
 //!   an unknown kind. Kind 1 starts the display mode list, discarding the
 //!   old one. Kind 2 adds a mode to it (up to 128): ESI=width | height << 16,
 //!   EDI=bits per pixel. Kind 3 is a display request's result: ESI=width |
-//!   height << 16, EDI=bits | result << 16; result 0 switched, 1 saved for
-//!   the next Windows restart, 2 not offered by Windows, 3 failed, 4 added to
-//!   the driver's mode list (Windows 9x): restart Windows and request again.
+//!   height << 16, EDI=bits | result << 16. Switching: 0 switched, 1 saved
+//!   for the next Windows restart, 2 not offered by Windows, 3 failed.
+//!   Adding: 4 added (Windows offers it after a restart), 5 already listed,
+//!   6 the driver's list is fixed (Windows 2000/XP VBEMP, or no VMDisp9x).
 //!
 //! Commands 2, 3 and 4 renew a two-second tool lease in guest time.
 //! Machine::guest_tools_active() also needs a command 3 or 4 since reset, so
@@ -161,6 +163,7 @@ impl Pointer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     DisplayMode { width: u16, height: u16, bits: u8 },
+    AddDisplayMode { width: u16, height: u16, bits: u8 },
 }
 
 /// A display mode as the guest tool reports it: width, height, bits.
@@ -232,6 +235,11 @@ impl State {
                         height,
                         bits,
                     }) => (1, width.into(), height.into(), bits.into()),
+                    Some(Request::AddDisplayMode {
+                        width,
+                        height,
+                        bits,
+                    }) => (2, width.into(), height.into(), bits.into()),
                 };
                 cpu.set_reg(Reg32::Eax, kind);
                 cpu.set_reg(Reg32::Ebx, b);
@@ -464,8 +472,15 @@ mod tests {
         })
         .unwrap();
         s.request(mode).unwrap(); // replaces the queued display request
-        assert_eq!(call(&mut s, 2, 0, 0, 0, 2)[4], 1);
+        s.request(Request::AddDisplayMode {
+            width: 320,
+            height: 170,
+            bits: 32,
+        })
+        .unwrap();
+        assert_eq!(call(&mut s, 2, 0, 0, 0, 2)[4], 2);
         assert_eq!(call(&mut s, 3, 0, 0, 0, 2)[..4], [1, 640, 340, 16]);
+        assert_eq!(call(&mut s, 3, 0, 0, 0, 2)[..4], [2, 320, 170, 32]);
         assert_eq!(call(&mut s, 3, 0, 0, 0, 2)[0], 0);
         assert_eq!(call(&mut s, 2, 0, 0, 0, 2)[4], 0);
 

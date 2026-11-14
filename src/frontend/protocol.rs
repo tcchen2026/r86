@@ -443,7 +443,8 @@ pub fn json_escape(value: &str) -> String {
     out
 }
 
-/// `display-mode` with width, height and optional bits (16): None without width.
+/// `display-mode` with width, height and optional bits (16): None without
+/// width. `add` is read separately.
 pub fn parse_display_mode(line: &str) -> Result<Option<(u16, u16, u8)>, String> {
     let Some(width) = json_i64(line, "width")? else {
         return Ok(None);

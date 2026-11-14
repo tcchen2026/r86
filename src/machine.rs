@@ -868,25 +868,32 @@ impl Machine {
         self.bus.magic.tools_active(self.bus.clock.ticks(self.step))
     }
 
-    /// Asks the guest tool to switch the display mode; its answer arrives as
+    /// Asks the guest tool to switch to a display mode, or with `add` to add
+    /// it to the guest driver's list; the answer arrives as
     /// guest_display_result().
     pub fn request_display_mode(
         &mut self,
         width: u16,
         height: u16,
         bits: u8,
+        add: bool,
     ) -> Result<(), String> {
         if !self.guest_tools_active() {
             return Err("display mode: the r86 tools helper is not running in the guest".into());
         }
-        self.bus
-            .magic
-            .request(magic::Request::DisplayMode {
+        let request = match add {
+            false => magic::Request::DisplayMode {
                 width,
                 height,
                 bits,
-            })
-            .map_err(String::from)
+            },
+            true => magic::Request::AddDisplayMode {
+                width,
+                height,
+                bits,
+            },
+        };
+        self.bus.magic.request(request).map_err(String::from)
     }
 
     /// Display modes the guest tool reported as offered by the guest OS.

@@ -631,9 +631,17 @@ impl Service {
         let result = machine
             .guest_display_result()
             .map_or("null".to_string(), |r| {
-                let text = ["switched", "restart", "unavailable", "failed", "added"]
-                    .get(usize::from(r.result))
-                    .unwrap_or(&"failed");
+                let text = [
+                    "switched",
+                    "restart",
+                    "unavailable",
+                    "failed",
+                    "added",
+                    "listed",
+                    "fixed",
+                ]
+                .get(usize::from(r.result))
+                .unwrap_or(&"failed");
                 format!(
                     "{{\"id\":{},\"width\":{},\"height\":{},\"bits\":{},\"result\":\"{text}\"}}",
                     r.id, r.mode.0, r.mode.1, r.mode.2
@@ -845,9 +853,10 @@ impl Service {
             }
             "display-mode" => {
                 if let Some((width, height, bits)) = parse_display_mode(message)? {
-                    machine.request_display_mode(width, height, bits)?;
+                    let add = json_bool(message, "add")?.unwrap_or(false);
+                    machine.request_display_mode(width, height, bits, add)?;
                     self.clients.get_mut(&id).unwrap().session.record_line(&format!(
-                        "{{\"step\":{},\"cmd\":\"display-mode\",\"width\":{width},\"height\":{height},\"bits\":{bits}}}",
+                        "{{\"step\":{},\"cmd\":\"display-mode\",\"width\":{width},\"height\":{height},\"bits\":{bits},\"add\":{add}}}",
                         machine.step_count()
                     ))?;
                 }
