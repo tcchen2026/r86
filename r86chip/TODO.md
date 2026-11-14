@@ -41,10 +41,10 @@ the 1,000,000-step run.
 
 Second million: interpreter 1.163 clocks per word, 90.2 clocks per x86
 instruction; translator 5.08 words and 7.9 clocks per x86 instruction (7.0
-with `GenerateSystem 2 12 11`). The task-3 firmware (`046cd834`, committed)
-also equals the ISS at 1M to 4M steps: 7.4 clocks per x86 instruction in
-1M-2M, 6.0 in 2M-3M, 30.2 in 3M-4M (11.78 words; 346,719 line fills, 243,927
-of them data lines in the firmware region below `0x02000000`). Mapping: 9,463 logic LUTs, 17 LUT levels.
+with `GenerateSystem 2 12 11`). The task-4 firmware (`e546c0c3`, commit
+`00ca1c4`) equals the ISS at 1M to 4M steps: 5.5 clocks per x86 instruction
+in 1M-2M, 4.3 in 2M-3M, 24.5 in 3M-4M (section B has the table and what the
+cost is). Mapping: 9,463 logic LUTs, 17 LUT levels.
 The RAM hashes and word counts must not change unless firmware changes; the
 clock counts are what RTL work is allowed to change.
 
@@ -224,58 +224,63 @@ rules given with them.
 
 ### B. Intern: translator runtime
 
-**Current Intern task (task 4, ISS only), given 2026-11-11.** Evidence it
-starts from: the task-3 firmware on the RTL (two banks, 64 KiB + 64 KiB
-caches, 24-clock RAM), equal to the ISS at every endpoint.
+**Task 4 is reviewed (2026-11-14).** Its firmware (`e546c0c3`, commit
+`00ca1c4`) equals the ISS on the RTL at 1M, 2M, 3M and 4M steps (two banks,
+64 KiB + 64 KiB caches, 24-clock RAM; images and results in
+`tmp/review/chip/t4-*`, `g2-t4-*.json`).
 
-| Interval | Words per x86 | Clocks per x86 | Line fills | Firmware region / heap / guest |
-| --- | ---: | ---: | ---: | --- |
-| 1M-2M | 4.66 | 7.36 | 39,464 | 29,231 / 7,312 / 2,921 |
-| 2M-3M | 4.03 | 5.95 | 24,315 | 16,075 / 5,450 / 2,790 |
-| 3M-4M | 11.78 | 30.17 | 346,719 | 243,927 / 99,201 / 3,591 |
+| Interval | Words per x86 | Clocks per x86 (task 3) | Line fills | In generated code | Leaves | Firmware words per leave |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1M-2M | 3.77 | 5.46 (7.36) | 29,177 | | | |
+| 2M-3M | 3.34 | 4.32 (5.95) | 15,206 | | | |
+| 3M-4M | 12.27 | 24.49 (30.17) | 221,412 | 1.91 words per x86 | 2,791 | 3,716 |
+| 4M-10M (ISS estimate only) | 35.21 | 49.8 | 1,244,104 | 2.48 words per x86 | 123,565 | 1,592 |
 
-"Firmware region" is native addresses below `0x02000000` (image, .bss,
-static tables). A cold line costs about 45 clocks. A 256 KiB instruction
-cache barely helps 3M-4M (27.4 clocks), so the fills are data lines: the
-runtime walks tables that do not fit a 64 KiB data cache.
+The ISS cache estimate is within 3% of the RTL (5.61 and 23.78). The last
+three columns are from the Intern's profiles
+(`tmp/r86chip/batch4/final-*/report.json`). They show what the cost is now:
+generated code runs at 2 to 2.5 words per x86 instruction, and 85% (3M-4M)
+to 93% (4M-10M) of all words are firmware executed around a leave of
+generated code. Interpreting one instruction costs about 120 words; a leave
+costs 1,600 to 3,700. Line fills follow from that code, they are not the cause.
 
-1. Give the ISS a cache estimate, statistics only: two-way, 32-byte lines,
-   64 KiB instruction and 64 KiB data, counting line fills for fetches and
-   for data accesses in the three regions. It must not change execution,
-   retired counts or any existing output field; add fields to the run
-   report. "Estimated clocks" = 1.15 * native words + 45 * line fills. Check
-   it against the table above (within about 15%). A hook in `sim/rv32.rs`
-   must be a counter call only.
-2. Remove the remaining linear scans from the runtime: service site lookup,
-   unlink and restoration scans, anything that visits more than a few
-   entries per event.
-3. Make every hot lookup touch at most two data cache lines: compact key
-   arrays separate from payloads, packed entries. Report each table's size
-   in bytes and lines touched per lookup.
-4. Measure 1M-2M, 3M-4M and 4M-10M: words and estimated clocks per x86
-   instruction, line fills by region and side, and the tables of handoff 3.
-   Target: 3M-4M at or below 15 estimated clocks per x86 instruction.
+**Next Intern task (task 5): the cost of a leave. Not yet given; the Intern
+is on other work (user, 2026-11-14).** ISS only, no ISA or RTL change.
 
-No opcode coverage in this task. No change to word semantics or any RTL
-file.
+1. Cut the fixed work of leave, interpret, re-enter. Largest items, words in
+   4M-10M: `run_batch` itself 36.0M (291 per leave), `execute` 15.9M,
+   `sync_segments` 14.7M (six descriptors recomputed per entry; use a change
+   counter), `lookup` 13.8M, `sync_mapping` 6.1M, `unsupported_backing` 5.4M
+   (statistics on the hot path; move behind a feature), PIT
+   `Counter::advance` 2.6M (attention limit per iteration). Target: at most
+   300 firmware words per leave on top of the interpreted instruction.
+2. Leaves by cause in 4M-10M: 86,997 lookup misses, 25,659 unsupported
+   instruction, 6,916 service, 3,993 tick. Unsupported forms above the
+   coverage rule (1 per 1,000 x86): the `0F 01` group 69,300 (INVLPG, judging by
+   `invalidate_translation_page` in the profile; needs the runtime, so make
+   it one cheap leave), MOVSD `A5` 16,381, IN `E4` 16,345 (stays in the
+   interpreter), RDTSC 8,184, IMUL `6B` 8,095. Translate `A5`, `6B`, RDTSC.
+3. Report the table above again plus leaves by cause and firmware words per
+   leave. Target: 4M-10M at or below 20 estimated clocks per x86.
 
-Handoff 3 showed that native words no longer predict cost: line fills do.
-Judge the runtime by clocks on the RTL (or the ISS cache estimate task 4
-adds: 1.15 clocks per word plus 45 per line fill).
+Open design risk from task 4, to settle before any Windows interval:
+`sync_mapping` retires the whole code generation whenever the mapping
+identity changes, and that identity includes CPL and the mapping epoch (CR3
+write). Task 3 only unlinked. TinyCore 0-10M runs no user code, so the
+measurements cannot see it; a guest with ring transitions would recompile
+after every one. Keep generations per identity, or key entries by it.
 
-When the Intern's handoff for the current task appears in section 7:
+Not reviewed line by line: `jit/compile.rs` and most of the `runtime.rs`
+diff. Read: `jit/cache.rs`, the entry, lookup, group and leave paths of
+`runtime.rs`, and the three ISS hooks in `sim/rv32.rs` (counter calls only).
 
-1. Check its evidence (endpoint comparisons pass; cost table present; the
-   ISS cache estimate changes no existing output). Run its firmware on the
-   RTL for 1M to 4M steps and compare line fills with its estimate.
-2. Decide:
-   - **3M-4M above 15 clocks per x86 instruction on the RTL:** the runtime
-     is still the cost. Next task: the table or function with the most line
-     fills in its report, nothing else.
-   - **At or below 15:** next task is cross-page links (direct links to
-     blocks on another guest code page, invalidated with that page), then
-     the cost table for 4M-10M and for a Windows 2000 boot interval on the
-     ISS.
+Rules for later handoffs:
+
+1. Check the evidence (endpoint comparisons pass; cost table present), run
+   the firmware on the RTL for 1M to 4M steps, compare with its estimate.
+2. Judge by firmware words per leave and leaves per 1,000 x86 instructions
+   first, line fills second. Cross-page links come after 4M-10M is at or
+   below 20 clocks per x86 instruction.
 3. Opcode coverage rule: add a translation for an x86 form when its
    interpreter handoffs exceed 1 per 1,000 x86 instructions in any measured
    interval. Below that, leave it to the interpreter.
