@@ -121,7 +121,11 @@ impl FpuState {
     }
 
     pub fn init(&mut self) {
-        *self = Self::new();
+        // FNINIT/FNSAVE reset x87/MMX state, not MXCSR.
+        *self = Self {
+            mxcsr: self.mxcsr,
+            ..Self::new()
+        };
     }
 
     pub fn clear_exceptions(&mut self) {
@@ -387,6 +391,8 @@ pub struct Cpu {
     #[cfg(feature = "jit")]
     jit_invalidated_range: Option<(u32, u32)>,
     pub cache_stats: CpuCacheStats,
+    /// Cold XMM0-7 state, little-endian halves: [bits 63:0, bits 127:64].
+    pub xmm: [[u64; 2]; 8],
     #[cfg(feature = "r86chip")]
     pub chip_counts: crate::chipinterp::Counts,
 }
@@ -1252,6 +1258,7 @@ impl Cpu {
             #[cfg(feature = "jit")]
             jit_invalidated_range: None,
             cache_stats: CpuCacheStats::new(),
+            xmm: [[0; 2]; 8],
             #[cfg(feature = "r86chip")]
             chip_counts: crate::chipinterp::Counts::ZERO,
         }
@@ -1305,7 +1312,8 @@ impl Cpu {
         self.msr_sysenter_esp = 0;
         self.msr_sysenter_eip = 0;
         self.set_tsc(0);
-        self.fpu.init();
+        self.fpu = FpuState::new();
+        self.xmm = [[0; 2]; 8];
         self.segment_override = None;
         self.segments = [real_seg; 6];
         self.flat_segment_read_mask = 0;
@@ -1371,7 +1379,8 @@ impl Cpu {
         self.msr_sysenter_esp = 0;
         self.msr_sysenter_eip = 0;
         self.set_tsc(0);
-        self.fpu.init();
+        self.fpu = FpuState::new();
+        self.xmm = [[0; 2]; 8];
         self.segment_override = None;
         self.set_seg_cache(SegmentReg::Cs, SegmentCache::flat(0x10, 0xc09a));
         for seg in [

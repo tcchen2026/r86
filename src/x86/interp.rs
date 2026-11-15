@@ -8738,6 +8738,33 @@ fn mmx_available(cpu: &Cpu, eip: u32) -> Result<(), StepError> {
     Ok(())
 }
 
+pub(super) fn sse_available(cpu: &Cpu, eip: u32) -> Result<(), StepError> {
+    if cpu.cr0 & CR0_EM != 0 || cpu.cr4 & CR4_OSFXSR == 0 {
+        return Err(StepError::InvalidOpcode { eip });
+    }
+    if cpu.cr0 & CR0_TS != 0 {
+        return Err(StepError::DeviceNotAvailable { eip });
+    }
+    Ok(())
+}
+
+// S3 arithmetic will call this before committing a destination. PE is not
+// raised by policy; see SSE-1 in design/IMPLEMENTATION_DEBT.md. The unchanged
+// CR4 mask cannot enable OSXMMEXCPT, so an unmasked SIMD exception is #UD.
+#[allow(dead_code)]
+pub(super) fn sse_check_exceptions(cpu: &mut Cpu, flags: u32, eip: u32) -> Result<(), StepError> {
+    let mut raised = flags & 0x1f;
+    let unmasked = raised & !(cpu.fpu.mxcsr >> 7);
+    if unmasked & 0x07 != 0 {
+        raised &= 0x07; // A pre-computation exception suppresses post-computation flags.
+    }
+    cpu.fpu.mxcsr |= raised;
+    if unmasked != 0 {
+        return Err(StepError::InvalidOpcode { eip });
+    }
+    Ok(())
+}
+
 fn mmx_emms(cpu: &mut Cpu, eip: u32) -> Result<(), StepError> {
     mmx_available(cpu, eip)?;
     cpu.fpu.emms();
@@ -9620,6 +9647,10 @@ fn fxsave_group<B: Bus>(
             fxrstor(cpu, bus, addr, eip)
         }
         2 => {
+            if modrm >> 6 == 3 {
+                return Err(StepError::InvalidOpcode { eip });
+            }
+            sse_available(cpu, eip)?;
             let rm = decode_rm32(cpu, bus, modrm, address16)?;
             let Rm32::Mem(addr) = rm else {
                 return Err(StepError::InvalidOpcode { eip });
@@ -9627,6 +9658,10 @@ fn fxsave_group<B: Bus>(
             ldmxcsr(cpu, bus, addr, eip)
         }
         3 => {
+            if modrm >> 6 == 3 {
+                return Err(StepError::InvalidOpcode { eip });
+            }
+            sse_available(cpu, eip)?;
             let rm = decode_rm32(cpu, bus, modrm, address16)?;
             let Rm32::Mem(addr) = rm else {
                 return Err(StepError::InvalidOpcode { eip });
@@ -12189,12 +12224,11 @@ const FPU_ENV32_LEN: usize = 28;
 const FPU_REG_IMAGE_LEN: usize = 10;
 const FPU_SAVE_IMAGE_MAX: usize = FPU_ENV32_LEN + FPU_REG_IMAGE_LEN * 8;
 const FPU_STATUS_TOP_MASK: u16 = 0x3800;
-// The advertised P6 model has FXSR, but not SSE. Only the x87/MMX prefix
-// belongs to this CPU; MXCSR is reserved and XMM/software bytes are untouched.
-// v86 misc_instr.rs fxsave, an SSE CPU, also stores MXCSR and XMM registers.
+// CPUID remains P6, but SSE execution and context state are supported.
+// OSFXSR selects the XMM/MXCSR image; bytes 288..512 remain untouched.
 const FXSAVE_X87_IMAGE_LEN: usize = 160;
+const FXSAVE_XMM_IMAGE_LEN: usize = 288;
 const FXSAVE_X87_REG_BASE: usize = 32;
-#[cfg(test)]
 const FXSAVE_XMM_REG_BASE: usize = 160;
 const FXSAVE_MXCSR_MASK: u32 = 0x0000_ffbf;
 
@@ -12468,7 +12502,7 @@ fn fpu_save_state<B: Bus>(
 }
 
 fn fxsave<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Result<(), StepError> {
-    let mut image = [0u8; FXSAVE_X87_IMAGE_LEN];
+    let mut image = [0u8; FXSAVE_XMM_IMAGE_LEN];
     image_write_u16(&mut image, 0, cpu.fpu.control);
     image_write_u16(&mut image, 2, cpu.fpu.status_word());
     image[4] = fxsave_tag_byte(cpu);
@@ -12484,12 +12518,32 @@ fn fxsave<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Result
         index += 1;
     }
 
-    write_mem_image_at(cpu, bus, addr, &image, FXSAVE_X87_IMAGE_LEN, eip)
+    let len = if cpu.cr4 & CR4_OSFXSR != 0 {
+        image_write_u32(&mut image, 24, cpu.fpu.mxcsr);
+        image_write_u32(&mut image, 28, FXSAVE_MXCSR_MASK);
+        for (index, xmm) in cpu.xmm.iter().enumerate() {
+            let offset = FXSAVE_XMM_REG_BASE + index * 16;
+            image_write_u64(&mut image, offset, xmm[0]);
+            image_write_u64(&mut image, offset + 8, xmm[1]);
+        }
+        FXSAVE_XMM_IMAGE_LEN
+    } else {
+        FXSAVE_X87_IMAGE_LEN
+    };
+    write_mem_image_at(cpu, bus, addr, &image, len, eip)
 }
 
 fn fxrstor<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Result<(), StepError> {
-    let image: [u8; FXSAVE_X87_IMAGE_LEN] =
-        read_mem_bytes_at(cpu, bus, addr, FXSAVE_X87_IMAGE_LEN, eip)?;
+    let osfxsr = cpu.cr4 & CR4_OSFXSR != 0;
+    let len = if osfxsr {
+        FXSAVE_XMM_IMAGE_LEN
+    } else {
+        FXSAVE_X87_IMAGE_LEN
+    };
+    let image: [u8; FXSAVE_XMM_IMAGE_LEN] = read_mem_bytes_at(cpu, bus, addr, len, eip)?;
+    // Retro OSes may leave junk in this formerly reserved field. LDMXCSR
+    // remains strict; FXRSTOR masks it for compatibility (debt SSE-1).
+    let mxcsr = image_read_u32(&image, 24) & FXSAVE_MXCSR_MASK;
 
     let env = FpuEnvImage {
         control: image_read_u16(&image, 0),
@@ -12507,6 +12561,16 @@ fn fxrstor<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Resul
         index += 1;
     }
     cpu.fpu.mmx_active = restored_mmx;
+    if osfxsr {
+        cpu.fpu.mxcsr = mxcsr;
+        for (index, xmm) in cpu.xmm.iter_mut().enumerate() {
+            let offset = FXSAVE_XMM_REG_BASE + index * 16;
+            *xmm = [
+                image_read_u64(&image, offset),
+                image_read_u64(&image, offset + 8),
+            ];
+        }
+    }
     Ok(())
 }
 
@@ -21318,7 +21382,7 @@ mod tests {
     }
 
     #[test]
-    fn fxsave_writes_p6_state_without_touching_xmm_or_software_bytes() {
+    fn fxsave_without_osfxsr_preserves_xmm_and_software_bytes() {
         let mut ram = Ram::new();
         write_fxsave_instr(&mut ram, 0, 0x300);
         ram.data[7] = 0xf4;
@@ -21358,7 +21422,7 @@ mod tests {
     }
 
     #[test]
-    fn fxrstor_restores_p6_control_status_and_register_image() {
+    fn fxrstor_without_osfxsr_restores_only_x87_state() {
         let mut ram = Ram::new();
         write_fxsave_instr(&mut ram, 1, 0x300);
         ram.data[7] = 0xf4;
@@ -21389,29 +21453,36 @@ mod tests {
     }
 
     #[test]
-    fn fxrstor_ignores_reserved_mxcsr_even_with_osfxsr_set_without_sse() {
-        let mut ram = Ram::new();
-        write_fxsave_instr(&mut ram, 1, 0x300);
-        image_write_u16(&mut ram.data, 0x300, 0x027f);
-        image_write_u16(&mut ram.data, 0x302, 0x3800);
-        image_write_u32(&mut ram.data, 0x318, FXSAVE_MXCSR_MASK | 0x0001_0000);
-        f64_to_fpu_m80(1.0, &mut ram.data, 0x300 + FXSAVE_X87_REG_BASE);
-
-        let mut cpu = flat_cpu();
-        cpu.fpu.control = 0x037f;
-        cpu.fpu.status = 0x0001;
-        cpu.fpu.top = 2;
-        cpu.fpu.mxcsr = 0x0000_1f80;
-        cpu.fpu.set(0, 42.0);
-
-        cpu.cr4 |= CR4_OSFXSR;
-        step_running(&mut cpu, &mut ram);
-
-        assert_eq!(cpu.fpu.control, 0x027f);
-        assert_eq!(cpu.fpu.status, 0);
-        assert_eq!(cpu.fpu.top, 7);
-        assert_eq!(cpu.fpu.mxcsr, 0x0000_1f80);
-        assert_close(cpu.fpu.get(0), 1.0, 0.0);
+    fn fxrstor_masks_reserved_mxcsr_only_with_osfxsr() {
+        for osfxsr in [0, CR4_OSFXSR] {
+            for reserved in [0x40, 0xffff_0000] {
+                let mut ram = Ram::new();
+                write_fxsave_instr(&mut ram, 1, 0x300);
+                image_write_u16(&mut ram.data, 0x300, 0x027f);
+                image_write_u16(&mut ram.data, 0x302, 0x3800);
+                image_write_u32(&mut ram.data, 0x318, 0x1f80 | reserved);
+                f64_to_fpu_m80(1.0, &mut ram.data, 0x300 + FXSAVE_X87_REG_BASE);
+                let mut cpu = flat_cpu();
+                cpu.cr4 |= osfxsr;
+                cpu.fpu.status = 1;
+                cpu.fpu.top = 2;
+                cpu.fpu.mxcsr = 0x5f80;
+                cpu.xmm = [[0x1122_3344, 0x5566_7788]; 8];
+                cpu.fpu.set(0, 42.0);
+                step_running(&mut cpu, &mut ram);
+                assert_eq!(cpu.fpu.control, 0x027f);
+                assert_eq!(cpu.fpu.status, 0);
+                assert_eq!(cpu.fpu.top, 7);
+                assert_close(cpu.fpu.get(0), 1.0, 0.0);
+                if osfxsr != 0 {
+                    assert_eq!(cpu.fpu.mxcsr, 0x1f80);
+                    assert_eq!(cpu.xmm, [[0; 2]; 8]);
+                } else {
+                    assert_eq!(cpu.fpu.mxcsr, 0x5f80);
+                    assert_eq!(cpu.xmm, [[0x1122_3344, 0x5566_7788]; 8]);
+                }
+            }
+        }
     }
 
     #[test]
@@ -21424,6 +21495,7 @@ mod tests {
         ram.write_u32(0x300, 0x0000_7fa0);
 
         let mut cpu = flat_cpu();
+        cpu.cr4 |= CR4_OSFXSR;
 
         step_running(&mut cpu, &mut ram);
         assert_eq!(cpu.fpu.mxcsr, 0x0000_7fa0);
@@ -21441,6 +21513,7 @@ mod tests {
         ram.write_u32(0x300, 0x0000_1fc0);
 
         let mut cpu = flat_cpu();
+        cpu.cr4 |= CR4_OSFXSR;
         cpu.fpu.mxcsr = 0x0000_5f80;
 
         step_gp(&mut cpu, &mut ram, 0);
@@ -21456,6 +21529,7 @@ mod tests {
         ]);
 
         let mut cpu = flat_cpu();
+        cpu.cr4 |= CR4_OSFXSR;
         cpu.fpu.mxcsr = FXSAVE_MXCSR_MASK | 0x0001_0040;
 
         step_running(&mut cpu, &mut ram);
@@ -21504,7 +21578,7 @@ mod tests {
     }
 
     #[test]
-    fn p6_fxsave_and_fxrstor_do_not_access_an_unmapped_sse_tail() {
+    fn fxsave_and_fxrstor_access_xmm_tail_only_with_osfxsr() {
         for op in [0, 1] {
             for osfxsr in [0, CR4_OSFXSR] {
                 let mut ram = Ram::new();
@@ -21520,6 +21594,19 @@ mod tests {
                 enable_test_paging(&mut cpu);
                 map_test_page(&mut ram, 0, 0, TEST_PTE_PRESENT | TEST_PTE_WRITE);
 
+                let before = ram.data;
+                if osfxsr != 0 {
+                    let err = Interpreter::step(&mut cpu, &mut ram).unwrap_err();
+                    assert_eq!(err.page_fault().unwrap().linear, LinearAddr(0x1000));
+                    assert_eq!(
+                        err.page_fault().unwrap().code,
+                        if op == 0 { mmu::PFEC_WRITE } else { 0 }
+                    );
+                    assert_eq!(&ram.data[0xf60..0x1000], &before[0xf60..0x1000]);
+                    assert_eq!(cpu.fpu.control, 0x037f);
+                    assert_close(cpu.fpu.get(0), 2.5, 0.0);
+                    continue;
+                }
                 step_running(&mut cpu, &mut ram);
 
                 assert_eq!(cpu.fpu.mxcsr, 0x1f80);
@@ -21619,6 +21706,122 @@ mod tests {
         step_running(&mut cpu, &mut ram);
         assert_eq!(cpu.reg(Reg32::Eax), 0x1111_2222);
         step_ud(&mut cpu, &mut ram, 9);
+    }
+
+    #[test]
+    fn sse_state_fxsave_layout_and_fxrstor_preserve_all_xmm_bits() {
+        let mut ram = Ram::new();
+        ram.data[..7].copy_from_slice(&fxsave_moffs(0, 0x300));
+        ram.data[7..14].copy_from_slice(&fxsave_moffs(1, 0x300));
+        ram.data[0x300..0x500].fill(0xa5);
+        let mut cpu = flat_cpu();
+        cpu.cr4 |= CR4_OSFXSR;
+        cpu.fpu.mxcsr = 0x5f81;
+        for (i, xmm) in cpu.xmm.iter_mut().enumerate() {
+            *xmm = [
+                0x7ff0_1234_5678_0000 | i as u64,
+                0x8000_0000_0000_0080 | i as u64,
+            ];
+        }
+        let expected = cpu.xmm;
+        step_running(&mut cpu, &mut ram);
+        assert_eq!(ram.read_u32(0x318), 0x5f81);
+        assert_eq!(ram.read_u32(0x31c), 0xffbf);
+        for (i, xmm) in expected.iter().enumerate() {
+            assert_eq!(ram.read_u64(0x3a0 + i * 16), xmm[0]);
+            assert_eq!(ram.read_u64(0x3a8 + i * 16), xmm[1]);
+        }
+        assert!(ram.data[0x420..0x500].iter().all(|b| *b == 0xa5));
+        cpu.xmm = [[0; 2]; 8];
+        cpu.fpu.mxcsr = 0;
+        step_running(&mut cpu, &mut ram);
+        assert_eq!(cpu.xmm, expected);
+        assert_eq!(cpu.fpu.mxcsr, 0x5f81);
+    }
+
+    #[test]
+    fn sse_state_survives_x87_init_and_save_but_not_cpu_reset() {
+        let mut ram = Ram::new();
+        ram.data[..8].copy_from_slice(&[0xdb, 0xe3, 0xdd, 0x35, 0, 3, 0, 0]);
+        let mut cpu = flat_cpu();
+        cpu.xmm = [[u64::MAX, 0x0123_4567_89ab_cdef]; 8];
+        cpu.fpu.mxcsr = 0x7f80;
+        for _ in 0..2 {
+            step_running(&mut cpu, &mut ram);
+            assert_eq!(cpu.xmm, [[u64::MAX, 0x0123_4567_89ab_cdef]; 8]);
+            assert_eq!(cpu.fpu.mxcsr, 0x7f80);
+        }
+        cpu.reset_bios();
+        assert_eq!(cpu.xmm, [[0; 2]; 8]);
+        assert_eq!(cpu.fpu.mxcsr, 0x1f80);
+    }
+
+    #[test]
+    fn sse_state_mxcsr_availability_and_operand_forms() {
+        for op in [2, 3] {
+            for cr0 in [0, CR0_EM, CR0_TS, CR0_EM | CR0_TS] {
+                for osfxsr in [0, CR4_OSFXSR] {
+                    let mut ram = Ram::new();
+                    ram.data[..7].copy_from_slice(&fxsave_moffs(op, 0x300));
+                    ram.write_u32(0x300, 0x1f80);
+                    let mut cpu = flat_cpu();
+                    cpu.cr0 |= cr0;
+                    cpu.cr4 |= osfxsr;
+                    if cr0 & CR0_EM != 0 || osfxsr == 0 {
+                        step_ud(&mut cpu, &mut ram, 0);
+                    } else if cr0 & CR0_TS != 0 {
+                        step_nm(&mut cpu, &mut ram, 0);
+                    } else {
+                        step_running(&mut cpu, &mut ram);
+                    }
+                    assert_eq!(cpu.fpu.mxcsr, 0x1f80);
+                    cpu.eip = 0;
+                    ram.data[2] = 0xc0 | (op << 3);
+                    step_ud(&mut cpu, &mut ram, 0); // A register operand is always invalid.
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sse_state_fences_and_clflush_ignore_em_ts_and_osfxsr() {
+        for osfxsr in [0, CR4_OSFXSR] {
+            let mut ram = Ram::new();
+            ram.data[..16].copy_from_slice(&[
+                0x0f, 0xae, 0xe8, 0x0f, 0xae, 0xf0, 0x0f, 0xae, 0xf8, 0x0f, 0xae, 0x3d, 0, 3, 0, 0,
+            ]);
+            ram.data[0x300] = 0xa5;
+            let mut cpu = flat_cpu();
+            cpu.cr0 |= CR0_EM | CR0_TS;
+            cpu.cr4 |= osfxsr;
+            for _ in 0..4 {
+                step_running(&mut cpu, &mut ram);
+            }
+            assert_eq!(ram.data[0x300], 0xa5);
+        }
+    }
+
+    #[test]
+    fn sse_state_exception_policy_keeps_five_flags_suppresses_pe_and_uses_ud() {
+        for flag in [1, 2, 4, 8, 16] {
+            let mut cpu = flat_cpu();
+            assert_eq!(sse_check_exceptions(&mut cpu, flag, 0x24), Ok(()));
+            assert_eq!(cpu.fpu.mxcsr, 0x1f80 | flag);
+            cpu.fpu.mxcsr = 0;
+            let err = sse_check_exceptions(&mut cpu, flag, 0x24).unwrap_err();
+            assert_eq!(err, StepError::InvalidOpcode { eip: 0x24 });
+            assert_eq!(err.exception(0x24), Some((6, None, 0x24)));
+            assert_eq!(cpu.fpu.mxcsr, flag);
+        }
+        let mut cpu = flat_cpu();
+        cpu.fpu.mxcsr = 0;
+        assert_eq!(sse_check_exceptions(&mut cpu, 0x20, 0x24), Ok(()));
+        assert_eq!(cpu.fpu.mxcsr, 0);
+        assert!(sse_check_exceptions(&mut cpu, 0x19, 0x24).is_err());
+        assert_eq!(cpu.fpu.mxcsr, 1); // Unmasked IE suppresses OE/UE.
+        cpu.fpu.mxcsr = 0x20; // A previously loaded PE stays sticky, without a fault.
+        assert_eq!(sse_check_exceptions(&mut cpu, 0, 0x24), Ok(()));
+        assert_eq!(cpu.fpu.mxcsr, 0x20);
     }
 
     #[test]
