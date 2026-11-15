@@ -48,6 +48,8 @@ cp "$root/assets/freedos.json" "$app/Contents/Resources/licenses/freedos/"
 # asset (assets/README.md); builds without it disable that item.
 if [ -f "$root/assets/r86_tools.iso" ]; then
     cp "$root/assets/r86_tools.iso" "$app/Contents/Resources/"
+else
+    echo "assets/r86_tools.iso is missing: the app lacks Install r86 Tools" >&2
 fi
 printf 'APPL????' >"$app/Contents/PkgInfo"
 cat >"$app/Contents/Info.plist" <<PLIST

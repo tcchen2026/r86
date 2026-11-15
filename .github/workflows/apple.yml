@@ -80,14 +80,18 @@ jobs:
             "https://github.com/${{ github.repository }}/releases/download/freedos-kit-${sha256:0:8}/$name"
           echo "$sha256  tmp/freedos/share/dos.zip" | shasum -a 256 -c -
 
+      # i686 MinGW builds r86-tool.exe for the tools disc (Install r86 Tools…).
       - name: Tools
         run: |
           rustup toolchain install stable --profile minimal --target aarch64-apple-darwin
+          brew install mingw-w64
+          python3 -m pip install --target tmp/iso-tools pycdlib==1.22.0
           swiftc --version
           rustc -V
 
       - name: Build
         run: |
+          PYTHONPATH=tmp/iso-tools python3 script/build_tools_iso.py
           script/build_macos.sh
           codesign -d --entitlements - apple/build/r86.app
 
