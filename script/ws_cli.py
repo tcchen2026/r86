@@ -356,7 +356,9 @@ Mouse motion uses screen coordinates: positive dx moves right and positive dy
 moves down. The emulator-side PS/2 core converts that to PS/2 packet sign
 conventions. Each session latches its own mouse buttons; motion carries the union of all
 clients' buttons until their matching button-up or disconnect. Symbolic keys
-include left/right modifiers, arrows, navigation keys, F1-F12 and the keypad.
+include left/right modifiers, arrows, navigation keys, F1-F12, the keypad,
+``printscreen``, ``pause``, ``intlbackslash`` and ``menu`` (``contextmenu``).
+Pause sends its complete sequence on keydown; its keyup sends no bytes.
 
 ``pointer`` injects absolute input for the magic instruction guest tool. X/Y
 are 0..65535, buttons are 0..7 (left/right/middle), and wheel is -32768..32767.

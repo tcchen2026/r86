@@ -70,6 +70,7 @@ pub fn parse_ps2_key(name: &str) -> Result<Ps2Key, String> {
 pub enum InputKey {
     Basic(Ps2Key),
     Set2(bool, u8),
+    Pause,
 }
 pub fn parse_named_key(name: &str) -> Result<InputKey, String> {
     if let Ok(key) = parse_ps2_key(name) {
@@ -85,6 +86,10 @@ pub fn parse_named_key(name: &str) -> Result<InputKey, String> {
         "capslock" => (false, 0x58),
         "numlock" => (false, 0x77),
         "scrolllock" => (false, 0x7e),
+        "printscreen" => (true, 0x7c),
+        "pause" => return Ok(InputKey::Pause),
+        "intlbackslash" => (false, 0x61),
+        "menu" | "contextmenu" => (true, 0x2f),
         "f1" => (false, 0x05),
         "f2" => (false, 0x06),
         "f3" => (false, 0x04),
@@ -134,6 +139,13 @@ pub fn inject_input_key(machine: &mut Machine, key: InputKey, down: bool) {
             return;
         }
         InputKey::Set2(extended, code) => (extended, code),
+        InputKey::Pause => {
+            // Pause sends its full make/break sequence on press, nothing on release.
+            if down {
+                machine.inject_scancode_set2(&[0xe1, 0x14, 0x77, 0xe1, 0xf0, 0x14, 0xf0, 0x77]);
+            }
+            return;
+        }
     };
     let mut bytes = Vec::with_capacity(3);
     if extended {

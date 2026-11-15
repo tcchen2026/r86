@@ -1027,6 +1027,7 @@ fn translate_set2_byte(byte: u8) -> Option<u8> {
         0x5a => Some(0x1c),
         0x5b => Some(0x1b),
         0x5d => Some(0x2b),
+        0x61 => Some(0x56), // ISO key between left Shift and Z.
         0x66 => Some(0x0e),
         0x69 => Some(0x4f),
         0x6b => Some(0x4b),

@@ -1,7 +1,7 @@
-//! C API for the r86 Mac app (apple/). The authoritative declarations are in
+//! C API for the r86 Apple apps (apple/). The authoritative declarations are in
 //! apple/r86/Bridge/r86.h; keep both in step.
 //!
-//! - Library calls take the library root ($HOME/r86/VMs) or a VM directory
+//! - Library calls take the app's library root or a VM directory
 //!   and return NULL on success or an error string. Lists are JSON.
 //! - A running VM is an opaque `R86Vm` owning one core thread. Any thread may
 //!   call the r86_vm_* functions; the audio callback only reads audio.
@@ -457,6 +457,19 @@ pub unsafe extern "C" fn r86_vm_command(vm: *const R86Vm, command: u32) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r86_vm_key(vm: *const R86Vm, mac_key_code: u16, down: bool) {
     if let Some(key) = keymap::mac_key(mac_key_code) {
+        // SAFETY: caller contract.
+        unsafe { &*vm }.0.send(Command::Key(key, down));
+    }
+}
+
+/// A USB HID keyboard page 7 usage (UIKeyboardHIDUsage) pressed or released.
+/// Unknown usages are ignored.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_hid_key(vm: *const R86Vm, usage: u16, down: bool) {
+    if let Some(key) = keymap::hid_key(usage) {
         // SAFETY: caller contract.
         unsafe { &*vm }.0.send(Command::Key(key, down));
     }

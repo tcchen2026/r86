@@ -1,4 +1,4 @@
-// C API of the r86 library for the Mac app. Implemented in
+// C API of the r86 library for the Apple apps. Implemented in
 // src/frontend/apple/mod.rs (Rust, feature `apple`); keep both in step.
 //
 // Library calls return NULL on success or an error string. Every returned
@@ -59,6 +59,8 @@ void r86_vm_free(R86Vm *vm);  // turn off now, flush disks
 // 0 pause, 1 resume, 2 reset, 3 power button, 4 Ctrl+Alt+Del, 5 release input
 void r86_vm_command(const R86Vm *vm, uint32_t command);
 void r86_vm_key(const R86Vm *vm, uint16_t mac_key_code, bool down);
+// USB HID keyboard page 7 usage (UIKeyboardHIDUsage); unknown usages ignored.
+void r86_vm_hid_key(const R86Vm *vm, uint16_t usage, bool down);
 void r86_vm_mouse(const R86Vm *vm, int32_t dx, int32_t dy, uint32_t buttons);
 // Absolute 0..65535 across the screen, for the guest's r86 tools helper while
 // r86_vm_pointer_active; wheel steps, positive scrolls down.
