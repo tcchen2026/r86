@@ -233,7 +233,8 @@ that differs from a pin is usually the newer, unpublished candidate.
 
 - Local runs, the handheld simulator and device packages built here use the
   ROMs in Git and the newest kit and tools ISO built from the current tree.
-  Publishing a kit or changing its pin needs the user's OK.
+  Publishing a kit or the tools disc, or changing a pin, needs the user's
+  OK.
 - Call a generated artifact outdated only with evidence: it differs from the
   ROMs in Git or from a fresh build of the current tree
   (`python3 script/build_freedos_image.py --share-dir tmp/<scratch>` rebuilds

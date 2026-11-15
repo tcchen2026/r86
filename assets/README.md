@@ -1,11 +1,15 @@
 # Local assets
 
-Not in Git, except this file and the FreeDOS kit's manifest and pin. The
-public tools disc's sources are tracked in `r86-tools/` (see its README);
-`script/build_tools_iso.py` writes the images here (the full one only
-where `r86_tools_full.json` exists):
+Not in Git, except this file, the FreeDOS kit's manifest and pin, and the
+tools disc's pin. The public tools disc's sources are tracked in
+`r86-tools/` (see its README); `script/build_tools_iso.py` writes the
+images here (the full one only where `r86_tools_full.json` exists):
 
-- `r86_tools.iso`: the public tools CD.
+- `r86_tools.iso`: the public tools CD. `tools-disc.sha256` pins the copy
+  published as a GitHub Release asset (tag `tools-disc-<first 8 hex>`), which
+  the Mac workflow bundles; update the pin when uploading a new disc. The
+  build is not byte-reproducible (the ISO records build times), so a local
+  build always differs from the pin.
 - `r86_tools_full.iso`: internal only, the public contents plus the original
   VBEMP and user-supplied Super PI packages listed in `r86_tools_full.json`,
   with `r86_tools_full.txt` as its README.TXT. **Never publish or distribute

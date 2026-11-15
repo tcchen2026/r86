@@ -43,6 +43,7 @@ __pycache__/
 /assets/*
 !/assets/freedos.json
 !/assets/freedos-kit.sha256
+!/assets/tools-disc.sha256
 /private_docs/
 /private/
 
