@@ -7,6 +7,8 @@ CRT: 80x80 cells of 6x6 units, one <rect> per run. Requires Pillow. Writes:
   web/r86.png                  80x80, scaled up pixelated by the page
   src/frontend/win32/r86.ico   16-256 px, with 80 and 160 px sharp
   apple/r86/r86.icns           16-1024 px, artwork in the 824 px icon grid
+  apple/ios/Assets.xcassets/AppIcon.appiconset/r86.png
+                               1024 px, opaque; iOS masks the corners
   firmware/seabios/r86-splash.bin
                                the BIOS splash: "r86" and its flame without
                                the monitor, in r86_splash's format
@@ -41,6 +43,17 @@ def framed(image, canvas, art):
     scaled = image.resize((art, art), Image.NEAREST)
     out.paste(scaled, ((canvas - art) // 2,) * 2)
     return out
+
+
+def ios_icon(image):
+    """The artwork on an opaque dark slate gradient, 1024 px square."""
+    top, bottom = (0x3a, 0x3f, 0x4b), (0x16, 0x18, 0x1d)
+    out = Image.new('RGBA', (1024, 1024))
+    for y in range(1024):
+        t = y / 1023
+        out.paste((*(round(a + (b - a) * t) for a, b in zip(top, bottom)), 255), (0, y, 1024, y + 1))
+    out.alpha_composite(framed(image, 1024, 800))
+    return out.convert('RGB')
 
 
 def pixels(image):
@@ -80,6 +93,7 @@ def main():
         ROOT / 'src/frontend/win32/r86.ico', append_images=small + sharp,
         sizes=[(n, n) for n in (16, 24, 32, 48, 64, 80, 160, 256)])
     framed(image, 1024, 800).save(ROOT / 'apple/r86/r86.icns')
+    ios_icon(image).save(ROOT / 'apple/ios/Assets.xcassets/AppIcon.appiconset/r86.png', optimize=True)
     (ROOT / 'firmware/seabios/r86-splash.bin').write_bytes(splash(image))
 
 

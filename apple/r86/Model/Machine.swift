@@ -27,6 +27,8 @@ struct Machine: Identifiable, Equatable, Decodable {
     var displayHeight = 0
     /// The web console's address while remote management is on.
     var remoteURL: URL?
+    /// The guest's r86 tools helper takes absolute pointer positions.
+    var pointerActive = false
     /// The fatal error that ended the last run, and its report.
     var failure: String?
     var log: URL?

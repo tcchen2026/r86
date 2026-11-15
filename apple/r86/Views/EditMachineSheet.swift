@@ -95,7 +95,9 @@ struct EditMachineSheet: View {
                 }
             }
         }
+        #if os(macOS)
         .frame(width: 520, height: 560)
+        #endif
     }
 
     private func save() {

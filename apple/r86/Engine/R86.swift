@@ -1,4 +1,7 @@
 import Foundation
+#if os(iOS)
+import UIKit
+#endif
 
 struct R86Error: LocalizedError {
     let message: String
@@ -8,20 +11,39 @@ struct R86Error: LocalizedError {
 /// Library calls of the r86 C API (Bridge/r86.h).
 enum R86 {
     /// $HOME/r86/VMs, the same layout as the handheld. Inside the sandbox
-    /// $HOME is the app's container.
+    /// $HOME is the app's container. On iOS, Documents/VMs, which the Files
+    /// app shows.
     static let library: URL = {
-        let url = URL.homeDirectory.appending(path: "r86/VMs", directoryHint: .isDirectory)
+        let url = home.appending(path: "VMs", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
+
+    #if os(iOS)
+    private static let home = URL.documentsDirectory
+    #else
+    private static let home = URL.homeDirectory.appending(path: "r86", directoryHint: .isDirectory)
+    #endif
 
     /// bios.bin, vgabios-stdvga.bin and the DOS kit dos.zip ship in the
     /// app's resources.
     static var firmware: String { Bundle.main.resourcePath ?? "" }
 
-    /// $HOME/r86/logs: a VM's fatal error report, <VM folder>.log, written
-    /// only when its run fails.
-    static let logs = URL.homeDirectory.appending(path: "r86/logs", directoryHint: .isDirectory)
+    /// $HOME/r86/logs (iOS: Documents/logs): a VM's fatal error report,
+    /// <VM folder>.log, written only when its run fails.
+    static let logs = home.appending(path: "logs", directoryHint: .isDirectory)
+
+    /// The guest mode a fresh r86 tools install sets, at 16 bpp (magic
+    /// command 5): on iPhone 936x666, half the iPhone Duo's laptop half
+    /// (VBE 1A1h); on iPad and the Mac 1024x768.
+    @MainActor
+    static var recommendedMode: (width: UInt16, height: UInt16) {
+        #if os(iOS)
+        UIDevice.current.userInterfaceIdiom == .phone ? (936, 666) : (1024, 768)
+        #else
+        (1024, 768)
+        #endif
+    }
 
     /// Take ownership of a string returned by the library.
     static func take(_ s: UnsafeMutablePointer<CChar>?) -> String? {
@@ -135,6 +157,15 @@ func withOptionalCString<R>(_ s: String?, _ body: (UnsafePointer<CChar>?) throws
 /// Files the user picked outside the container (CD and disk images),
 /// remembered as security-scoped bookmarks in the VM folder's bookmarks.plist.
 enum Bookmarks {
+    // iOS bookmarks of picked files carry their scope without the option.
+    #if os(macOS)
+    private static let creation: URL.BookmarkCreationOptions = .withSecurityScope
+    private static let resolution: URL.BookmarkResolutionOptions = .withSecurityScope
+    #else
+    private static let creation: URL.BookmarkCreationOptions = []
+    private static let resolution: URL.BookmarkResolutionOptions = []
+    #endif
+
     private static func file(_ directory: String) -> URL {
         URL(filePath: directory).appending(path: "bookmarks.plist")
     }
@@ -146,7 +177,7 @@ enum Bookmarks {
 
     /// Remember a URL from a file panel. The caller holds its access.
     static func remember(_ url: URL, in directory: String) {
-        guard let bookmark = try? url.bookmarkData(options: .withSecurityScope,
+        guard let bookmark = try? url.bookmarkData(options: creation,
                                                     includingResourceValuesForKeys: nil,
                                                     relativeTo: nil) else { return }
         var all = load(directory)
@@ -160,7 +191,7 @@ enum Bookmarks {
     static func access(_ path: String, in directory: String) -> URL? {
         guard let bookmark = load(directory)[path] else { return nil }
         var stale = false
-        guard let url = try? URL(resolvingBookmarkData: bookmark, options: .withSecurityScope,
+        guard let url = try? URL(resolvingBookmarkData: bookmark, options: resolution,
                                  relativeTo: nil, bookmarkDataIsStale: &stale),
               url.startAccessingSecurityScopedResource() else { return nil }
         if stale { remember(url, in: directory) }

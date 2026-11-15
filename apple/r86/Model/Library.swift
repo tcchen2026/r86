@@ -1,4 +1,6 @@
+#if os(macOS)
 import AppKit
+#endif
 import Observation
 import SwiftUI
 
@@ -20,6 +22,8 @@ final class Library {
     private(set) var problems: [String] = []
     private(set) var sessions: [Machine.ID: Session] = [:]
     var toast: Toast?
+    /// iOS: a fatal error report to preview (Quick Look).
+    var logToShow: URL?
 
     /// Menu requests for the Library window.
     var requestNewMachine = false
@@ -57,6 +61,7 @@ final class Library {
                 m.displayWidth = old.displayWidth
                 m.displayHeight = old.displayHeight
                 m.remoteURL = old.remoteURL
+                m.pointerActive = old.pointerActive
             }
             return m
         }
@@ -142,13 +147,20 @@ final class Library {
         sessions[id]?.setRemote(on)
     }
 
+    #if os(macOS)
     func openConsole(_ id: Machine.ID) {
         if let url = self[id]?.remoteURL { NSWorkspace.shared.open(url) }
     }
+    #endif
 
     /// Open the report of the error that ended the machine's last run.
     func showLog(_ id: Machine.ID) {
-        if let log = self[id]?.log { NSWorkspace.shared.open(log) }
+        guard let log = self[id]?.log else { return }
+        #if os(macOS)
+        NSWorkspace.shared.open(log)
+        #else
+        logToShow = log
+        #endif
     }
 
     /// Turn every machine off now, flushing disks (used when quitting).
@@ -271,6 +283,7 @@ final class Library {
             m.status = .stopped
             m.instructionsPerSecond = 0
             m.remoteURL = nil
+            m.pointerActive = false
         }
         // The guest may have changed the CD or volume while running.
         reload()
@@ -300,8 +313,10 @@ final class Library {
                 session.refreshThumbnail()
                 let size = session.image.map { ($0.width, $0.height) } ?? (0, 0)
                 let remote = session.remoteURL()
+                let pointer = session.pointerActive
                 update(id) { m in
                     m.remoteURL = remote
+                    m.pointerActive = pointer
                     m.status = status.state == 1 ? .paused : .running
                     m.instructionsPerSecond = status.instructions_per_second
                     m.displayWidth = size.0

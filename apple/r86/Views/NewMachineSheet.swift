@@ -89,7 +89,9 @@ struct NewMachineSheet: View {
                 if case .success(let url) = result { choose(url) }
             }
         }
+        #if os(macOS)
         .frame(width: 520, height: 560)
+        #endif
     }
 
     private func use(_ p: Preset) {

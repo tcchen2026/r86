@@ -1,0 +1,54 @@
+# The r86 iOS app for the simulator on Apple silicon: a compile check, and an
+# app to install with `xcrun simctl install booted r86.app`. Unsigned; device
+# builds need a signing identity and profile (script/build_ios.sh device).
+name: iOS app
+
+on:
+  workflow_dispatch:
+
+jobs:
+  simulator:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      # The newest Xcode on the runner: the iPhone Duo APIs need the iOS 27.1
+      # SDK; older SDKs build without the laptop posture.
+      - name: Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | sort -V | tail -n1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          echo "iOS simulator SDK $(xcrun --sdk iphonesimulator --show-sdk-version)"
+
+      # The DOS kit release that assets/freedos-kit.sha256 pins.
+      - name: DOS kit
+        run: |
+          read -r sha256 name < assets/freedos-kit.sha256
+          mkdir -p tmp/freedos/share
+          curl -sfL -o tmp/freedos/share/dos.zip \
+            "https://github.com/${{ github.repository }}/releases/download/freedos-kit-${sha256:0:8}/$name"
+          echo "$sha256  tmp/freedos/share/dos.zip" | shasum -a 256 -c -
+
+      # The tools disc release that assets/tools-disc.sha256 pins.
+      - name: Tools disc
+        run: |
+          read -r sha256 name < assets/tools-disc.sha256
+          curl -sfL -o "assets/$name" \
+            "https://github.com/${{ github.repository }}/releases/download/tools-disc-${sha256:0:8}/$name"
+          echo "$sha256  assets/$name" | shasum -a 256 -c -
+
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-apple-ios-sim
+          rustc -V
+
+      - name: Build
+        run: |
+          script/build_ios.sh simulator
+          cd apple/build/ios-simulator && zip -qry r86-ios-simulator.zip r86.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: r86-ios-simulator
+          path: apple/build/ios-simulator/r86-ios-simulator.zip

@@ -1,4 +1,4 @@
-r86 for the Mac (Apple silicon, macOS 26)
+r86 for the Mac (Apple silicon, macOS 26), iPhone and iPad (iOS 26)
 
 SwiftUI app around the Rust r86 library. One process runs multiple VMs,
 each on its own r86 core thread (src/frontend/runner.rs). The C API is
@@ -65,3 +65,41 @@ Contracts:
   the machine's state, the run's events and serial output kept in memory
   until then (src/frontend/run_log.rs). The VM window shows the error and
   Show Log.
+
+iPhone and iPad (ios/, iOS 26, interpreter only)
+
+The iOS app shares Engine/, Model/ and the New/Edit Machine sheets with the
+Mac; its own UI is in ios/ (SwiftUI layout, UIKit for the screen, keys and
+trackpad). One machine runs at a time.
+
+Build (Apple silicon Mac, Xcode, rustup target aarch64-apple-ios-sim or
+aarch64-apple-ios):
+  script/build_ios.sh [simulator|device]   apple/build/ios-<kind>/r86.app
+Device builds are signed with R86_IOS_IDENTITY and R86_IOS_PROFILE (set
+R86_IOS_BUNDLE_ID to match) and packed as r86.ipa. The manual workflow
+.github/workflows/ios.yml uploads a simulator build.
+
+Contracts:
+- Data: Documents/VMs and Documents/logs, shown in the Files app. Picked CD
+  and disk images are bookmarked as on the Mac.
+- Layout follows the window (RootView): an iPhone Duo folded like a laptop
+  shows the guest above the fold and a deck below it; wide windows show the
+  guest full screen under a floating bar; tall ones show the guest, a key
+  row, a trackpad and the controls. The fold is the active horizontal
+  division region of GeometryProxy.reservedRegions (iOS 27.1 SDK; the build
+  defines R86_DUO only with that SDK).
+- Deck: a 15-unit keyboard with an F-row; Fn gives Ins, PrtSc, Home, End,
+  PgUp, PgDn and Ctrl+Alt+Del. Tap ▦ for a full trackpad, hold it for a
+  trackpad while held.
+- Recommended guest mode for a fresh r86 tools install (magic command 5):
+  936x666 on iPhone (VBE 1A1h, half the Duo laptop half's 1878x1335 pixels),
+  1024x768 on iPad.
+- Keys are USB HID usages (UIKeyboardHIDUsage) for the hardware keyboard,
+  the deck and the key row. On-screen modifiers latch for one key; a double
+  tap locks them. Held keys repeat after 0.45 s at 30 per second. The key row
+  rides on the system keyboard.
+- Pointer: with the guest's r86 tools helper, touches, an iPad pointer and
+  the wheel are absolute; without it, the trackpad sends relative PS/2.
+- Background pauses the running machine; returning resumes it. If iOS ends
+  the app meanwhile, the machine is off. No remote management: the web
+  console listens on 127.0.0.1, and iOS suspends r86 while Safari shows it.

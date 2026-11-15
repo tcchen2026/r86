@@ -29,7 +29,9 @@ final class Session {
             if let url = Bookmarks.access(path, in: machine.directory) { scoped.append(url) }
         }
         var error: UnsafeMutablePointer<CChar>?
-        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path, 1024, 768, &error) else {
+        let mode = R86.recommendedMode
+        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path,
+                                    mode.width, mode.height, &error) else {
             scoped.forEach { $0.stopAccessingSecurityScopedResource() }
             throw R86Error(message: R86.take(error) ?? "Cannot start \(machine.name)")
         }
@@ -90,6 +92,14 @@ final class Session {
     func key(_ code: UInt16, down: Bool) {
         r86_vm_key(vm, code, down)
     }
+
+    #if os(iOS)
+    /// A USB HID keyboard usage (page 7, as UIKeyboardHIDUsage) pressed or
+    /// released: the hardware keyboard and the on-screen keys.
+    func hidKey(_ usage: UInt16, down: Bool) {
+        r86_vm_hid_key(vm, usage, down)
+    }
+    #endif
 
     func mouse(dx: Int32, dy: Int32, buttons: UInt32) {
         r86_vm_mouse(vm, dx, dy, buttons)
@@ -177,6 +187,11 @@ final class AudioOutput {
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
         do {
+            #if os(iOS)
+            // Mixes with other apps' sound and follows the silent switch.
+            try AVAudioSession.sharedInstance().setCategory(.ambient)
+            try AVAudioSession.sharedInstance().setActive(true)
+            #endif
             try engine.start()
         } catch {
             return nil
