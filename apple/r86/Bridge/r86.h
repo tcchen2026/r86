@@ -41,6 +41,15 @@ char *r86_library_create_dos(const char *root, const char *name, const char *os,
 // Around an existing disk image, used in place.
 char *r86_library_create_existing(const char *root, const char *name, const char *os,
                                   uint32_t memory_mib, const char *disk);
+// Transfer a stopped VM. disk_out must not exist; the caller owns its parent
+// directory during the copy. *config is portable vm.toml (relative disk name,
+// no ISO or firmware paths). Import moves disk into a fresh folder under root
+// and returns that folder in *directory; failures keep the incoming disk.
+// Both block: call off the main thread. NULL or error string; output is NULL
+// on failure. Free all returned strings with r86_string_free.
+char *r86_library_export(const char *directory, const char *disk_out, char **config);
+char *r86_library_import(const char *root, const char *config, const char *disk,
+                         char **directory);
 // cpu-engine: auto|jit|interpreter (legacy interp accepted). Changes a stopped VM.
 // auto selects JIT for Windows/ReactOS presets when this build supports it;
 // other presets use the interpreter. Builds without the JIT ignore jit.

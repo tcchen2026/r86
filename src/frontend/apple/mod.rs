@@ -321,6 +321,63 @@ pub unsafe extern "C" fn r86_library_create_existing(
     result(vm.create_existing())
 }
 
+/// Copy a stopped VM's disk to a fresh path and return its portable vm.toml
+/// in `*config`. ISO and firmware paths are omitted. The caller owns the
+/// destination directory during the copy. Blocks; call off the main thread.
+///
+/// # Safety
+/// `directory` and `disk_out` are valid C strings; `config` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_library_export(
+    directory: *const c_char,
+    disk_out: *const c_char,
+    config: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: forwarded caller contract.
+    let (directory, disk_out) = unsafe {
+        *config = std::ptr::null_mut();
+        (text(directory), text(disk_out))
+    };
+    result((|| {
+        let directory = directory.ok_or("Missing VM directory")?;
+        let disk_out = disk_out.ok_or("Missing disk destination")?;
+        let portable = Vm::export(Path::new(&directory), Path::new(&disk_out))?;
+        // SAFETY: the caller provides a writable output pointer.
+        unsafe { *config = out(portable) };
+        Ok(())
+    })())
+}
+
+/// Move a received disk into a fresh VM folder under `root`, using its
+/// portable vm.toml. Return the new folder in `*directory`. Blocks; call
+/// off the main thread. On failure the incoming disk is kept.
+///
+/// # Safety
+/// `root`, `config` and `disk` are valid C strings; `directory` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_library_import(
+    root: *const c_char,
+    config: *const c_char,
+    disk: *const c_char,
+    directory: *mut *mut c_char,
+) -> *mut c_char {
+    // SAFETY: forwarded caller contract.
+    let (root, config, disk) = unsafe {
+        *directory = std::ptr::null_mut();
+        (text(root), text(config), text(disk))
+    };
+    result((|| {
+        let root = root.ok_or("Missing VM library")?;
+        let config = config.ok_or("Missing VM configuration")?;
+        let disk = disk.ok_or("Missing transferred disk")?;
+        let vm = Vm::import(Path::new(&root), &config, Path::new(&disk))?;
+        // SAFETY: the caller provides a writable output pointer. All path
+        // components came from the UTF-8 root and validated configuration.
+        unsafe { *directory = out(vm.directory.to_string_lossy().into_owned()) };
+        Ok(())
+    })())
+}
+
 /// Change one setting of a stopped VM. Keys and values as in vm.toml:
 /// os, memory-mib, boot-order, iso ("" ejects), cdrom, scale, volume,
 /// network, notes, cpu-engine (auto | jit | interpreter; legacy interp accepted).
@@ -675,6 +732,148 @@ pub unsafe extern "C" fn r86_vm_audio_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_transfer_round_trips_without_overwriting_or_accepting_bad_config() {
+        use std::fs;
+
+        let root = std::env::temp_dir().join(format!("r86-apple-transfer-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let destination = root.join("received");
+        fs::create_dir(&destination).unwrap();
+        let mut vm = Vm::new(&root.join("source"), "VM".into(), guest_os::by_name("DOS"));
+        vm.disk_mib = 1;
+        vm.iso = Some(root.join("setup.iso"));
+        vm.bios = Some(root.join("custom-bios.bin"));
+        vm.vga_bios = Some(root.join("custom-vga.bin"));
+        vm.network = false;
+        vm.volume = 35;
+        vm.notes = "Transferred VM".into();
+        vm.create_blank().unwrap();
+        let bytes = fs::read(&vm.disk).unwrap();
+        let original = fs::read(vm.directory.join(vm_store::CONFIG)).unwrap();
+        let outgoing = root.join("copy.vhd");
+        let directory_c = CString::new(vm.directory.to_str().unwrap()).unwrap();
+        let outgoing_c = CString::new(outgoing.to_str().unwrap()).unwrap();
+        let destination_c = CString::new(destination.to_str().unwrap()).unwrap();
+        // SAFETY: the inputs are live C strings, output pointers are writable,
+        // and each successful output/error is reclaimed exactly once.
+        unsafe {
+            let mut config = std::ptr::null_mut();
+            let lock = vm_store::lock_vm(&vm.directory).unwrap();
+            let error = r86_library_export(directory_c.as_ptr(), outgoing_c.as_ptr(), &mut config);
+            assert!(!error.is_null());
+            assert!(
+                CString::from_raw(error)
+                    .to_str()
+                    .unwrap()
+                    .contains("already running")
+            );
+            assert!(config.is_null());
+            assert!(!outgoing.exists());
+            drop(lock);
+
+            assert!(
+                r86_library_export(directory_c.as_ptr(), outgoing_c.as_ptr(), &mut config)
+                    .is_null()
+            );
+            let config = CString::from_raw(config);
+            let portable: toml::Table = config.to_str().unwrap().parse().unwrap();
+            assert_eq!(portable["disk"].as_str(), Some("copy.vhd"));
+            for key in ["iso", "bios", "vga-bios"] {
+                assert!(!portable.contains_key(key));
+            }
+            assert_eq!(fs::read(&outgoing).unwrap(), bytes);
+            let mut duplicate = std::ptr::null_mut();
+            let error =
+                r86_library_export(directory_c.as_ptr(), outgoing_c.as_ptr(), &mut duplicate);
+            assert!(!error.is_null());
+            r86_string_free(error);
+            assert!(duplicate.is_null());
+            assert_eq!(fs::read(&outgoing).unwrap(), bytes);
+
+            for name in ["VM", "VM 2"] {
+                if !outgoing.exists() {
+                    fs::copy(&vm.disk, &outgoing).unwrap();
+                }
+                let mut directory = std::ptr::null_mut();
+                assert!(
+                    r86_library_import(
+                        destination_c.as_ptr(),
+                        config.as_ptr(),
+                        outgoing_c.as_ptr(),
+                        &mut directory
+                    )
+                    .is_null()
+                );
+                let directory = CString::from_raw(directory);
+                let directory = PathBuf::from(directory.to_str().unwrap());
+                assert_eq!(directory, destination.join(name));
+                assert!(!outgoing.exists());
+                let received = Vm::load(directory.clone()).unwrap();
+                assert_eq!(received.name, name);
+                assert_eq!(received.disk, directory.join("copy.vhd"));
+                assert_eq!(fs::read(&received.disk).unwrap(), bytes);
+                assert!(
+                    received.iso.is_none()
+                        && received.bios.is_none()
+                        && received.vga_bios.is_none()
+                );
+                assert_eq!(received.memory, vm.memory);
+                assert_eq!(received.engine, vm.engine);
+                assert_eq!(received.notes, vm.notes);
+                assert!(!received.network);
+                assert_eq!(received.volume, 35);
+                let stored: toml::Table = fs::read_to_string(directory.join(vm_store::CONFIG))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(stored["disk"], portable["disk"]);
+            }
+
+            fs::copy(&vm.disk, &outgoing).unwrap();
+            let entries = || {
+                let mut names: Vec<_> = fs::read_dir(&destination)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                names.sort();
+                names
+            };
+            let before = entries();
+            for (key, value) in [
+                ("disk", toml::Value::String("../escape.vhd".into())),
+                ("disk", toml::Value::String("sub\\disk.vhd".into())),
+                ("disk", toml::Value::String("VM.TOML".into())),
+                ("disk", toml::Value::String("runtime.lock".into())),
+                ("version", toml::Value::Integer(2)),
+                ("memory-mib", toml::Value::Integer(0)),
+            ] {
+                let mut bad = portable.clone();
+                bad.insert(key.into(), value);
+                let bad = CString::new(toml::to_string_pretty(&bad).unwrap()).unwrap();
+                let mut directory = std::ptr::null_mut();
+                let error = r86_library_import(
+                    destination_c.as_ptr(),
+                    bad.as_ptr(),
+                    outgoing_c.as_ptr(),
+                    &mut directory,
+                );
+                assert!(!error.is_null());
+                r86_string_free(error);
+                assert!(directory.is_null());
+                assert_eq!(entries(), before);
+                assert_eq!(fs::read(&outgoing).unwrap(), bytes);
+            }
+        }
+        assert_eq!(fs::read(&vm.disk).unwrap(), bytes);
+        assert_eq!(
+            fs::read(vm.directory.join(vm_store::CONFIG)).unwrap(),
+            original
+        );
+        assert!(!destination.join("escape.vhd").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn engine_choices_round_trip_through_the_c_api() {

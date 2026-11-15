@@ -76,18 +76,32 @@ pub fn list(root: &Path) -> Vec<Result<Vm, String>> {
     vms
 }
 
-pub fn validate_name(name: &str) -> Result<(), String> {
-    if name.trim() != name
-        || name.is_empty()
-        || name.len() > 120
-        || matches!(name, "." | "..")
-        || name.chars().any(|c| {
+fn plain_name(name: &str) -> bool {
+    name.trim() == name
+        && !name.is_empty()
+        && !matches!(name, "." | "..")
+        && !name.chars().any(|c| {
             c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         })
-    {
+}
+
+pub fn validate_name(name: &str) -> Result<(), String> {
+    if !plain_name(name) || name.len() > 120 {
         return Err("Use a name of 1–120 characters, without path separators or special filename characters.".into());
     }
     Ok(())
+}
+
+fn transfer_disk_name(path: &Path) -> Result<&str, String> {
+    let name = path.to_str().ok_or("Disk name must use valid UTF-8")?;
+    if !plain_name(name)
+        || [CONFIG, "vm.toml.new", "runtime.lock"]
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    {
+        return Err("The transferred disk must have a plain file name, distinct from the VM configuration and lock.".into());
+    }
+    Ok(name)
 }
 
 pub fn name_exists(root: &Path, name: &str) -> bool {
@@ -190,6 +204,10 @@ impl Vm {
 
     pub fn load(directory: PathBuf) -> Result<Self, String> {
         let text = fs::read_to_string(directory.join(CONFIG)).map_err(|err| err.to_string())?;
+        Self::from_toml(directory, &text)
+    }
+
+    fn from_toml(directory: PathBuf, text: &str) -> Result<Self, String> {
         let table: Table = text
             .parse()
             .map_err(|err| format!("Invalid VM configuration: {err}"))?;
@@ -277,7 +295,7 @@ impl Vm {
         self.write_config()
     }
 
-    fn write_config(&self) -> Result<(), String> {
+    fn to_toml(&self) -> Result<String, String> {
         let mut table = Table::new();
         for (key, value) in [
             ("name", &self.name),
@@ -314,14 +332,15 @@ impl Vm {
                 );
             }
         }
+        toml::to_string_pretty(&table).map_err(|err| err.to_string())
+    }
+
+    fn write_config(&self) -> Result<(), String> {
+        let config = self.to_toml()?;
         let temp = self.directory.join("vm.toml.new");
         let result = (|| -> std::io::Result<()> {
             let mut file = File::create(&temp)?;
-            file.write_all(
-                toml::to_string_pretty(&table)
-                    .map_err(std::io::Error::other)?
-                    .as_bytes(),
-            )?;
+            file.write_all(config.as_bytes())?;
             file.sync_all()?;
             fs::rename(&temp, self.directory.join(CONFIG))?;
             // Makes the rename durable. Windows cannot open a directory as a
@@ -334,6 +353,74 @@ impl Vm {
             let _ = fs::remove_file(temp);
         }
         result.map_err(|err| format!("Cannot save virtual machine: {err}"))
+    }
+
+    /// Copy a stopped VM's disk to a fresh path, returning a portable config.
+    /// The caller owns the destination directory during the copy.
+    pub fn export(directory: &Path, disk_out: &Path) -> Result<String, String> {
+        let _lock = lock_vm(directory)?;
+        let mut vm = Self::load(directory.to_path_buf())?;
+        let _disk = Disk::open(&vm.disk, false)
+            .map_err(|err| format!("Cannot open disk for transfer: {err}"))?;
+        let source = vm.disk.clone();
+        vm.disk = PathBuf::from(transfer_disk_name(Path::new(
+            disk_out
+                .file_name()
+                .ok_or("Missing destination disk name")?,
+        ))?);
+        vm.directory = PathBuf::new();
+        vm.iso = None;
+        vm.bios = None;
+        vm.vga_bios = None;
+        let config = vm.to_toml()?;
+        match fs::symlink_metadata(disk_out) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(format!("Cannot access transfer destination: {err}")),
+            Ok(_) => return Err("The transfer destination already exists.".into()),
+        }
+        if let Err(err) = fs::copy(&source, disk_out) {
+            let _ = fs::remove_file(disk_out);
+            return Err(format!("Cannot copy disk for transfer: {err}"));
+        }
+        Ok(config)
+    }
+
+    /// Adopt a transferred disk into a fresh VM directory. Validate the config
+    /// before creating anything; a failed import keeps the incoming disk.
+    pub fn import(root: &Path, config: &str, disk: &Path) -> Result<Self, String> {
+        let mut vm = Self::from_toml(PathBuf::new(), config)?;
+        let disk_name = transfer_disk_name(&vm.disk)?.to_owned();
+        if !fs::symlink_metadata(disk)
+            .map_err(|err| format!("Cannot inspect transferred disk: {err}"))?
+            .is_file()
+        {
+            return Err("The transferred disk must be a regular file.".into());
+        }
+        let _disk = Disk::open(disk, false)
+            .map_err(|err| format!("Cannot open transferred disk: {err}"))?;
+        vm.name = suggested_name(root, &vm.name);
+        vm.directory = root.join(&vm.name);
+        vm.disk = vm.directory.join(disk_name);
+        vm.iso = None;
+        vm.bios = None;
+        vm.vga_bios = None;
+        vm.create_directory()?;
+        let result = (|| {
+            let _lock = lock_vm(&vm.directory)?;
+            // Finish config writes before consuming the only incoming disk.
+            vm.write_config()?;
+            fs::rename(disk, &vm.disk)
+                .or_else(|_| {
+                    fs::copy(disk, &vm.disk)?;
+                    fs::remove_file(disk)
+                })
+                .map_err(|err| format!("Cannot move transferred disk: {err}"))
+        })();
+        if let Err(err) = result {
+            let _ = fs::remove_dir_all(&vm.directory);
+            return Err(err);
+        }
+        Ok(vm)
     }
 
     /// Create the VM with a new empty dynamic VHD of `disk_mib`.
@@ -359,6 +446,15 @@ impl Vm {
         &self,
         make_disk: impl FnOnce(&Vm) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.create_directory()?;
+        let result = make_disk(self).and_then(|()| self.save());
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+        result
+    }
+
+    fn create_directory(&self) -> Result<(), String> {
         self.validate()?;
         let root = self.directory.parent().ok_or("Invalid VM directory")?;
         fs::create_dir_all(root).map_err(|err| format!("Cannot create VM library: {err}"))?;
@@ -366,13 +462,7 @@ impl Vm {
             return Err("That virtual machine name is already in use. Choose another name.".into());
         }
         // Atomic reservation catches another manager creating the same name.
-        fs::create_dir(&self.directory)
-            .map_err(|err| format!("Cannot create VM directory: {err}"))?;
-        let result = make_disk(self).and_then(|()| self.save());
-        if result.is_err() {
-            let _ = fs::remove_dir_all(&self.directory);
-        }
-        result
+        fs::create_dir(&self.directory).map_err(|err| format!("Cannot create VM directory: {err}"))
     }
 
     /// Remove the VM directory, including a disk stored inside it. A disk
