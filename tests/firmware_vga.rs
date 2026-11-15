@@ -134,6 +134,53 @@ fn vga_bios_offers_the_cardputer_640x340_mode() {
 
 #[test]
 #[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
+fn vga_bios_offers_the_duo_936x666_modes() {
+    // The guest enumerates each mode, queries its geometry/depth/pitch, sets
+    // it and draws through A000. The bottom corners span two banks.
+    for (mode, bpp) in [(0x1a1u16, 16u8), (0x1a2, 32)] {
+        let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
+        let mut disk = vec![0; 8 << 20];
+        disk[..512].copy_from_slice(include_bytes!("bootsectors/firmware_vbe_936x666.bin"));
+        disk[0x1f0..0x1f2].copy_from_slice(&mode.to_le_bytes());
+        disk[0x1f2] = bpp;
+        m.attach_disk(Disk::memory(disk, false));
+        m.load_bios_rom(include_bytes!("../firmware/seabios/bios.bin"))
+            .unwrap();
+        m.load_option_rom(
+            0xc0000,
+            include_bytes!("../firmware/seabios/vgabios-stdvga.bin"),
+        )
+        .unwrap();
+        m.reset_bios();
+        let report = m.run_steps(100_000_000).unwrap();
+        let log = String::from_utf8_lossy(m.serial_output());
+        assert!(
+            matches!(report.stop, Some(GuestStepStatus::PoweredOff)),
+            "mode={mode:x} {report:?}\n{log}"
+        );
+        assert!(log.contains("R86_VBE_OK"), "mode={mode:x}\n{log}");
+        assert!(!log.contains("R86_VBE_ERROR"), "mode={mode:x}\n{log}");
+        let info = m.vga().mode_info();
+        assert_eq!(
+            (info.width, info.height, info.bpp),
+            (936, 666, u16::from(bpp))
+        );
+        let mut pixels = vec![0; 936 * 666 * 4];
+        m.vga().render_rgba(&mut pixels).unwrap();
+        for (x, y, color) in [
+            (0, 0, [255, 0, 0, 255]),
+            (935, 0, [0, 255, 0, 255]),
+            (0, 665, [0, 0, 255, 255]),
+            (935, 665, [255; 4]),
+        ] {
+            let pos = (y * 936 + x) * 4;
+            assert_eq!(&pixels[pos..pos + 4], &color, "mode={mode:x} at {x},{y}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
 fn seabios_vbe_eight_bit_dac_matches_its_advertised_capability() {
     let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
     let mut disk = vec![0; 8 << 20];

@@ -16,7 +16,9 @@ changes. These are all of them; keep this list current:
   Without the file the wait is unchanged. r86 supplies it through
   `Machine::enable_boot_splash`.
 - `vgasrc/svgamodes.c`: VBE mode 1A0h, 640x340x16, twice the M5Stack
-  CardputerZero's 320x170 LCD.
+  CardputerZero's 320x170 LCD; modes 1A1h/1A2h, 936x666 at 16/32 bpp,
+  half the iPhone Duo's 1878x1335 upper half in laptop posture, with width
+  rounded down to a multiple of eight pixels.
 
 The upstream repository is <https://github.com/coreboot/seabios.git>.
 The export includes all tracked files, including the original copyright
