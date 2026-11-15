@@ -1,4 +1,4 @@
-r86 for the Mac (Apple silicon, macOS 26), iPhone and iPad (iOS 26)
+r86 for the Mac (Apple silicon, macOS 26), iPhone and iPad (iOS 26), Apple Watch (watchOS 26)
 
 SwiftUI app around the Rust r86 library. One process runs multiple VMs,
 each on its own r86 core thread (src/frontend/runner.rs). The C API is
@@ -111,3 +111,35 @@ Contracts:
   address and code. Turning it on also shows the Local Network alert (a
   Bonjour browse for _r86._tcp): accepting connections needs no permission
   (TN3179), but guests on the user-mode network reaching LAN devices do.
+- Apple Watch: Machines › swipe, or More › Copy to Apple Watch, copies a
+  turned-off machine to the Watch; the Machines list's Apple Watch section
+  copies the Watch's machines back (watch/WatchLink.swift).
+
+Apple Watch (watch/, watchOS 26 arm64: Series 9 and later, interpreter only)
+
+Embedded in the iOS app as r86.app/Watch/r86.app and built with it
+(script/build_ios.sh; Rust targets aarch64-apple-watchos and -sim). It shares
+Engine/, Model/ and ios/Input/HID.swift; its UI is in watch/. One machine
+runs at a time; there is no sound and no machine creation.
+
+Contracts:
+- Transfer (WatchLink, WatchConnectivity): one file transfer per machine, a
+  clone of its disk image with its portable vm.toml in the metadata
+  (r86_library_export: relative disk; no CD, BIOS or VGA BIOS paths). The
+  receiver adopts it into a new folder (r86_library_import); nothing is
+  overwritten. Running machines are not copied. The Watch publishes its
+  machines' names in the application context; the iPhone asks for one by
+  name, as a message or as user info delivered when r86 next runs on the
+  Watch. The system continues transfers while the apps are suspended.
+- Data: Documents/VMs and Documents/logs in the Watch app's container.
+- Screen: the guest fitted to the display, 20 frames a second; 320x200,
+  640x400 and 720x400 at 4:3. Recommended mode for a fresh r86 tools
+  install: 640x480.
+- Pointer: with r86 tools, absolute: tap clicks, a second tap within 0.5 s
+  and 12 points double-clicks, drag drags, a long press right-clicks.
+  Without them the screen is a trackpad (relative PS/2). The Digital Crown
+  scrolls with r86 tools and presses Up/Down without them.
+- Keys: ⋯ opens typing (system keyboard, Scribble or dictation; US layout),
+  Return, Esc, Tab, Delete, Ctrl+Alt+Del and power.
+- Background (the watch face) pauses the running machine; returning
+  resumes it.

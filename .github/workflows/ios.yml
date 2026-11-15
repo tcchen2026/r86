@@ -1,6 +1,8 @@
 # The r86 iOS app for the simulator on Apple silicon: a compile check, and an
-# app to install with `xcrun simctl install booted r86.app`. Unsigned; device
-# builds need a signing identity and profile (script/build_ios.sh device).
+# app to install with `xcrun simctl install booted r86.app`. It embeds the
+# Watch app (r86.app/Watch/r86.app); rust-src lets apple/build-rust.sh build
+# std for the tier 3 watchOS targets. Unsigned; device builds need a signing
+# identity and profiles (script/build_ios.sh device).
 name: iOS app
 
 on:
@@ -40,7 +42,7 @@ jobs:
 
       - name: Rust
         run: |
-          rustup toolchain install stable --profile minimal --target aarch64-apple-ios-sim
+          rustup toolchain install stable --profile minimal --component rust-src --target aarch64-apple-ios-sim
           rustc -V
 
       - name: Build

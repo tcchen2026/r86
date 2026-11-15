@@ -3,12 +3,16 @@
 # with Xcode's command line tools and rustup; no Xcode project.
 #   script/build_ios.sh [simulator|device]    (default: simulator)
 # Output: apple/build/ios-<kind>/r86.app; a signed device build adds r86.ipa.
+# The Watch app (watchOS 26, arm64: Series 9 and later) is embedded as
+# r86.app/Watch/r86.app.
 #
 # A simulator build is ad-hoc signed. A device build is signed when
 # R86_IOS_IDENTITY (a codesigning identity) and R86_IOS_PROFILE (its
 # .mobileprovision) are set; R86_IOS_BUNDLE_ID must match the profile
-# (default io.github.tcchen2026.r86). The iPhone Duo's laptop posture needs
-# the iOS 27.1 SDK; older SDKs build without it.
+# (default io.github.tcchen2026.r86). The Watch app needs its own profile,
+# R86_WATCH_PROFILE, for <bundle id>.watchkitapp; a device build without it
+# leaves the Watch app out. The iPhone Duo's laptop posture needs the iOS
+# 27.1 SDK; older SDKs build without it.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 apple="$root/apple"
@@ -22,12 +26,20 @@ case $kind in
         target=aarch64-apple-ios-sim
         triple=arm64-apple-ios26.0-simulator
         platform=iPhoneSimulator
+        watch_sdk=watchsimulator
+        watch_target=aarch64-apple-watchos-sim
+        watch_triple=arm64-apple-watchos26.0-simulator
+        watch_platform=WatchSimulator
         ;;
     device)
         sdk=iphoneos
         target=aarch64-apple-ios
         triple=arm64-apple-ios26.0
         platform=iPhoneOS
+        watch_sdk=watchos
+        watch_target=aarch64-apple-watchos
+        watch_triple=arm64-apple-watchos26.0
+        watch_platform=WatchOS
         ;;
     *)
         echo "usage: $0 [simulator|device]" >&2
@@ -58,10 +70,11 @@ echo "iOS SDK $sdk_version${duo:+ (iPhone Duo laptop posture)}"
 rm -rf "$app"
 mkdir -p "$app"
 
-# The engine, model and wizard sheets are shared with the Mac app.
+# The engine, model and wizard sheets are shared with the Mac app; the
+# iPhone-Watch link with the Watch app.
 cd "$apple"
 set --
-for source in $(find r86/Engine r86/Model ios -name '*.swift' | sort) \
+for source in $(find r86/Engine r86/Model ios -name '*.swift' | sort) watch/WatchLink.swift \
     r86/Views/Components.swift r86/Views/NewMachineSheet.swift r86/Views/EditMachineSheet.swift; do
     set -- "$@" "$source"
 done
@@ -172,9 +185,90 @@ PLIST
 /usr/libexec/PlistBuddy -c "Merge $out/assets.plist" "$app/Info.plist" >/dev/null
 plutil -lint "$app/Info.plist" >/dev/null
 
+# The Watch app: the engine, model, HID table and WatchLink, with the
+# firmware; machines come from the iPhone.
+if [ "$kind" = simulator ] || [ -n "${R86_WATCH_PROFILE:-}" ]; then
+    watch="$app/Watch/r86.app"
+    "$apple/build-rust.sh" "$watch_target"
+    mkdir -p "$watch"
+    set --
+    for source in $(find r86/Engine r86/Model watch -name '*.swift' | sort) ios/Input/HID.swift; do
+        set -- "$@" "$source"
+    done
+    xcrun --sdk "$watch_sdk" swiftc -O -whole-module-optimization -parse-as-library -swift-version 5 \
+        -target "$watch_triple" -module-name r86 \
+        -import-objc-header r86/Bridge/r86-Bridging-Header.h \
+        -L "build/rust/$watch_target" -lr86 -liconv -framework CoreFoundation \
+        -o "$watch/r86" "$@"
+    xcrun --sdk "$watch_sdk" actool ios/Assets.xcassets --compile "$watch" --platform "$watch_sdk" \
+        --minimum-deployment-target 26.0 --target-device watch \
+        --app-icon AppIcon --output-partial-info-plist "$out/watch-assets.plist" >/dev/null
+    cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" "$watch/"
+    "$root/ports/licenses.sh" "$watch/licenses"
+    cat >"$watch/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>r86</string>
+	<key>CFBundleExecutable</key>
+	<string>r86</string>
+	<key>CFBundleIdentifier</key>
+	<string>$bundle_id.watchkitapp</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>r86</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$version</string>
+	<key>CFBundleSupportedPlatforms</key>
+	<array>
+		<string>$watch_platform</string>
+	</array>
+	<key>CFBundleVersion</key>
+	<string>$build</string>
+	<key>DTPlatformName</key>
+	<string>$watch_sdk</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>MinimumOSVersion</key>
+	<string>26.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Apache-2.0; see the bundled licenses</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>4</integer>
+	</array>
+	<key>WKApplication</key>
+	<true/>
+	<key>WKCompanionAppBundleIdentifier</key>
+	<string>$bundle_id</string>
+</dict>
+</plist>
+PLIST
+    /usr/libexec/PlistBuddy -c "Merge $out/watch-assets.plist" "$watch/Info.plist" >/dev/null
+    plutil -lint "$watch/Info.plist" >/dev/null
+else
+    echo "build_ios.sh: R86_WATCH_PROFILE is not set; the device build has no Watch app" >&2
+fi
+
 if [ "$kind" = simulator ]; then
+    codesign --force --sign - --timestamp=none "$app/Watch/r86.app"
     codesign --force --sign - --timestamp=none "$app"
 elif [ -n "${R86_IOS_IDENTITY:-}" ] && [ -n "${R86_IOS_PROFILE:-}" ]; then
+    if [ -d "$app/Watch/r86.app" ]; then
+        watch="$app/Watch/r86.app"
+        cp "$R86_WATCH_PROFILE" "$watch/embedded.mobileprovision"
+        security cms -D -i "$R86_WATCH_PROFILE" >"$out/watch-profile.plist"
+        /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$out/watch-profile.plist" >"$out/watch-entitlements.plist"
+        codesign --force --sign "$R86_IOS_IDENTITY" --entitlements "$out/watch-entitlements.plist" \
+            --timestamp=none "$watch"
+    fi
     cp "$R86_IOS_PROFILE" "$app/embedded.mobileprovision"
     security cms -D -i "$R86_IOS_PROFILE" >"$out/profile.plist"
     /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$out/profile.plist" >"$out/entitlements.plist"

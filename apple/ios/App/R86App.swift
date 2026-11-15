@@ -9,6 +9,10 @@ struct R86App: App {
     @State private var prefs = Preferences.shared
     @State private var stage = Stage.shared
 
+    init() {
+        WatchLink.shared.activate()
+    }
+
     var body: some Scene {
         WindowGroup {
             RootView()

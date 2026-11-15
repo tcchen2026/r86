@@ -38,7 +38,10 @@ final class Session {
         self.vm = vm
         self.directory = machine.directory
         self.scoped = scoped
+        // The Watch plays no sound: its two cores stay with the guest and the screen.
+        #if !os(watchOS)
         self.audio = AudioOutput(vm: vm)
+        #endif
     }
 
     func send(_ command: Command) {
@@ -93,7 +96,7 @@ final class Session {
         r86_vm_key(vm, code, down)
     }
 
-    #if os(iOS)
+    #if !os(macOS)
     /// A USB HID keyboard usage (page 7, as UIKeyboardHIDUsage) pressed or
     /// released: the hardware keyboard and the on-screen keys.
     func hidKey(_ usage: UInt16, down: Bool) {

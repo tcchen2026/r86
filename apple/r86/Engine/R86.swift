@@ -11,18 +11,18 @@ struct R86Error: LocalizedError {
 /// Library calls of the r86 C API (Bridge/r86.h).
 enum R86 {
     /// $HOME/r86/VMs, the same layout as the handheld. Inside the sandbox
-    /// $HOME is the app's container. On iOS, Documents/VMs, which the Files
-    /// app shows.
+    /// $HOME is the app's container. On iOS and watchOS, Documents/VMs; the
+    /// Files app shows the iPhone's.
     static let library: URL = {
         let url = home.appending(path: "VMs", directoryHint: .isDirectory)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
 
-    #if os(iOS)
-    private static let home = URL.documentsDirectory
-    #else
+    #if os(macOS)
     private static let home = URL.homeDirectory.appending(path: "r86", directoryHint: .isDirectory)
+    #else
+    private static let home = URL.documentsDirectory
     #endif
 
     /// bios.bin, vgabios-stdvga.bin and the DOS kit dos.zip ship in the
@@ -35,11 +35,13 @@ enum R86 {
 
     /// The guest mode a fresh r86 tools install sets, at 16 bpp (magic
     /// command 5): on iPhone 936x666, half the iPhone Duo's laptop half
-    /// (VBE 1A1h); on iPad and the Mac 1024x768.
+    /// (VBE 1A1h); on the Watch 640x480; on iPad and the Mac 1024x768.
     @MainActor
     static var recommendedMode: (width: UInt16, height: UInt16) {
         #if os(iOS)
         UIDevice.current.userInterfaceIdiom == .phone ? (936, 666) : (1024, 768)
+        #elseif os(watchOS)
+        (640, 480)
         #else
         (1024, 768)
         #endif
@@ -131,6 +133,22 @@ enum R86 {
 
     static func delete(_ directory: String) throws {
         try check(r86_library_delete(directory))
+    }
+
+    /// Copy a stopped machine for the other device (iPhone or Watch): its
+    /// disk image to `disk` (an APFS clone), and its portable vm.toml.
+    static func export(_ directory: String, disk: String) throws -> String {
+        var config: UnsafeMutablePointer<CChar>?
+        try check(r86_library_export(directory, disk, &config))
+        return take(config) ?? ""
+    }
+
+    /// Adopt a machine from the other device into a new folder named after
+    /// it; `disk` is moved in. Returns the folder.
+    static func adopt(config: String, disk: String) throws -> String {
+        var directory: UnsafeMutablePointer<CChar>?
+        try check(r86_library_import(library.path, config, disk, &directory))
+        return take(directory) ?? ""
     }
 
     private enum Entry: Decodable {

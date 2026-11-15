@@ -146,6 +146,10 @@ struct MoreMenu: View {
             }
             Button("Edit \(machine.name)…", systemImage: "slider.horizontal.3") { stage.present(.edit(machine.id)) }
                 .disabled(machine.isLive)
+            if WatchLink.shared.available {
+                Button("Copy to Apple Watch", systemImage: "applewatch") { WatchLink.shared.send(machine) }
+                    .disabled(machine.isLive)
+            }
             Button("Machines…", systemImage: "list.bullet") { stage.showPicker = true }
             Button("New Machine…", systemImage: "plus") { stage.present(.newMachine) }
             Divider()
@@ -246,6 +250,9 @@ struct MachinePicker: View {
                         ForEach(library.problems, id: \.self) { Text($0).font(.footnote) }
                     }
                 }
+                if link.available {
+                    watchSection
+                }
             }
             .navigationTitle("Machines")
             .navigationBarTitleDisplayMode(.inline)
@@ -257,6 +264,34 @@ struct MachinePicker: View {
         }
         .frame(minWidth: 340, idealWidth: 400, minHeight: 360, idealHeight: 470)
         .presentationDetents([.medium, .large])
+    }
+
+    private var link: WatchLink { .shared }
+
+    /// Copies on their way, and the Watch's machines to copy back.
+    private var watchSection: some View {
+        Section {
+            ForEach(link.sending) { item in
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Copying \(item.name) to Apple Watch")
+                        .font(.footnote)
+                    ProgressView(item.progress)
+                }
+            }
+            ForEach(link.watchMachines, id: \.self) { name in
+                HStack {
+                    Label(name, systemImage: "applewatch")
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Button("Copy to iPhone") { link.request(name) }
+                        .buttonStyle(.borderless)
+                }
+            }
+        } header: {
+            Text("Apple Watch")
+        } footer: {
+            Text("Copies of turned-off machines go between iPhone and Apple Watch under new names; nothing is replaced. Swipe a machine to copy it to the Watch.")
+        }
     }
 
     private func row(_ m: Machine) -> some View {
@@ -301,5 +336,11 @@ struct MachinePicker: View {
             .accessibilityLabel("Edit \(m.name)")
         }
         .listRowBackground(isCurrent ? Color.accentColor.opacity(0.14) : nil)
+        .swipeActions {
+            if link.available && !m.isLive {
+                Button("Copy to Apple Watch", systemImage: "applewatch") { link.send(m) }
+                    .tint(.blue)
+            }
+        }
     }
 }
