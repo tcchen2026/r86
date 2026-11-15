@@ -168,6 +168,12 @@ fn run_locked(
         vm.iso = None;
     }
     let mut machine = vm.machine(&ctx.share, HANDHELD_VGA_BIOS)?;
+    // Only the CardputerZero panel uses the small mode; TrimUI uses desktop.
+    machine.set_recommended_display_mode(Some(if device.size() == (320, 170) {
+        r86::machine::RECOMMENDED_CARDPUTER_MODE
+    } else {
+        r86::machine::RECOMMENDED_DESKTOP_MODE
+    }));
     let network = if vm.network {
         machine.attach_network();
         Some(r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)

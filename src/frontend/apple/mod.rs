@@ -384,7 +384,7 @@ pub unsafe extern "C" fn r86_string_free(s: *mut c_char) {
 
 /// Start the VM in `directory` with ROMs from `firmware`; a fatal error's
 /// report goes to `logs` (run_log.rs). On failure returns NULL and stores an
-/// error string in `*error`.
+/// error string in `*error`. The recommendation is 16 bpp; (0, 0) means none.
 ///
 /// # Safety
 /// `directory`, `firmware` and `logs` are valid C strings; `error` is
@@ -394,13 +394,22 @@ pub unsafe extern "C" fn r86_vm_start(
     directory: *const c_char,
     firmware: *const c_char,
     logs: *const c_char,
+    recommended_width: u16,
+    recommended_height: u16,
     error: *mut *mut c_char,
 ) -> *mut R86Vm {
     // SAFETY: forwarded caller contract.
     let (directory, firmware, logs) = unsafe { (text(directory), text(firmware), text(logs)) };
     let path = |s: Option<String>| PathBuf::from(s.unwrap_or_default());
-    let started =
-        Vm::load(path(directory)).and_then(|vm| Running::start(vm, path(firmware), path(logs)));
+    let recommended_mode = match (recommended_width, recommended_height) {
+        (0, 0) => Ok(None),
+        (0, _) | (_, 0) => Err("Recommended width and height must both be set or both zero".into()),
+        (width, height) => Ok(Some((width, height, 16))),
+    };
+    let started = recommended_mode.and_then(|mode| {
+        Vm::load(path(directory))
+            .and_then(|vm| Running::start(vm, path(firmware), path(logs), mode))
+    });
     match started {
         Ok(running) => Box::into_raw(Box::new(R86Vm(running))),
         Err(err) => {

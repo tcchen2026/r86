@@ -256,6 +256,7 @@ fn run_machine_output(
     machine.set_jit_enabled(args.jit)?;
     if args.realtime_clock {
         machine.use_realtime_clock()?;
+        machine.set_recommended_display_mode(Some(r86::machine::RECOMMENDED_DESKTOP_MODE));
     }
     if args.usb_tablet {
         machine.attach_usb_tablet();

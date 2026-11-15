@@ -51,7 +51,9 @@ void r86_string_free(char *s);
 
 // Running VMs. Each owns one core thread.
 // A fatal error's report goes to logs/<VM folder>.log.
+// Recommended resolution for a fresh tools install, at 16 bpp. Use 0,0 for none.
 R86Vm *r86_vm_start(const char *directory, const char *firmware, const char *logs,
+                    uint16_t recommended_width, uint16_t recommended_height,
                     char **error);
 void r86_vm_free(R86Vm *vm);  // turn off now, flush disks
 // 0 pause, 1 resume, 2 reset, 3 power button, 4 Ctrl+Alt+Del, 5 release input

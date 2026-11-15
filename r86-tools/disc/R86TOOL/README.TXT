@@ -26,9 +26,23 @@ program: output goes to a redirected file, the console it was started from
 (XP), or a new console that waits for Enter. cmd.exe does not wait for it; use
 start /wait for the result. On NT, installation/removal requires an
 administrator. Result 0 means success; 3010 means restart Windows. No command
-reboots for you. Uninstall from the installed copy can defer EXE deletion to
-the next boot; uninstall from the CD removes it immediately. Unrelated C:\R86
-files remain.
+restarts Windows without your Yes. After a successful Install or Update,
+including the install and driver display commands, it asks:
+"r86 tools installed. Restart now?" Yes restarts Windows; No closes.
+Failed installs keep the window open with the error. Uninstall from the
+installed copy can defer EXE deletion to the next boot; uninstall from the
+CD removes it immediately. Unrelated C:\R86 files remain.
+
+A fresh install (no earlier C:\R86\R86-TOOL.EXE) asks the host for this
+device's recommended resolution, always in 16-bit colour. If Windows can
+switch now, the installer switches and saves it. If the display driver was
+just installed, or VMDisp9x needs the size added, a one-time step at your
+next logon asks "Switch to <W>x<H>, recommended for this device?" Yes switches;
+No leaves your resolution alone. If Windows still does not offer the mode,
+that step silently finishes. A driver-only install copies the utility to
+C:\R86 for this choice without enabling the logon helper. Updates preserve
+your resolution and cancel any older pending choice. Hosts with no
+recommendation skip this step.
 
 Windows 95/98/Me: attach the r86 tools CD for VMDisp9x. Windows 95 also needs
 the Microsoft SetupAPI redistributable; it is not bundled here.

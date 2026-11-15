@@ -22,6 +22,21 @@ the Mac workflow bundles the release pinned by `assets/tools-disc.sha256`.
   `R86TOOL/LICENSE.TXT` is the repository `LICENSE`.
 - `vmdisp9x.sha256`: hashes of the original VMDisp9x files.
 
+The installer offers the host's recommended 16-bit resolution only on a
+fresh install. A mode available now is applied and saved; a newly installed
+driver or a mode added to VMDisp9x gets one Yes/No choice at the installing
+user's next logon, through HKCU RunOnce. An unavailable mode is then skipped
+silently. A driver-only install copies the utility for that choice without
+starting the helper. Updates preserve the user's resolution and cancel an
+older pending choice. See [the guest README](disc/R86TOOL/README.TXT).
+
+Every successful Install/Update, including the command-line install and
+driver display commands, asks "r86 tools installed. Restart now?" Yes
+restarts Windows; No closes. Failures retain their error report. Host
+recommendations use command 5 and capability bit 3 of
+[the magic protocol](../src/machine/magic.rs); a Machine has none until its
+frontend supplies one.
+
 ## VMDisp9x
 
 MIT 2D display driver for Windows 95/98/Me, copyright (c) 2022 JHRobotics;

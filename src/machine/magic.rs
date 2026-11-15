@@ -10,7 +10,8 @@
 //!
 //! Commands:
 //! - 0, version: EAX=protocol version (1), EBX=capabilities (bit 0: time,
-//!   bit 1: pointer, bit 2: host requests and guest reports).
+//!   bit 1: pointer, bit 2: host requests and guest reports, bit 3: recommended
+//!   display mode).
 //! - 1, time: EDX:EAX=unsigned UTC seconds since 1970-01-01, EBX=signed
 //!   seconds east of UTC. The host epoch and offset are captured once when
 //!   realtime mode starts; elapsed time uses the already sampled machine
@@ -38,6 +39,9 @@
 //!   for the next Windows restart, 2 not offered by Windows, 3 failed.
 //!   Adding: 4 added (Windows offers it after a restart), 5 already listed,
 //!   6 the driver's list is fixed (Windows 2000/XP VBEMP, or no VMDisp9x).
+//! - 5, recommended display mode: EAX=1, EBX=width, ECX=height, EDX=bits
+//!   per pixel; EAX=0 and the other outputs zero when the host has none.
+//!   Frontends set it before boot; the default is none. Reset preserves it.
 //!
 //! Commands 2, 3 and 4 renew a two-second tool lease in guest time.
 //! Machine::guest_tools_active() also needs a command 3 or 4 since reset, so
@@ -166,8 +170,12 @@ pub enum Request {
     AddDisplayMode { width: u16, height: u16, bits: u8 },
 }
 
-/// A display mode as the guest tool reports it: width, height, bits.
+/// A guest display mode: width, height, bits.
 pub type DisplayMode = (u16, u16, u8);
+
+/// Frontend recommendations for a fresh tools installation, all at 16 bpp.
+pub const RECOMMENDED_DESKTOP_MODE: DisplayMode = (1024, 768, 16);
+pub const RECOMMENDED_CARDPUTER_MODE: DisplayMode = (640, 340, 16);
 
 /// The guest tool's answer to a display request (report kind 3); `id`
 /// counts results so a frontend can tell a new one from the last.
@@ -186,6 +194,7 @@ pub(super) struct State {
     requests: VecDeque<Request>,
     pub display_modes: Vec<DisplayMode>,
     pub display_result: Option<DisplayResult>,
+    pub recommended_display_mode: Option<DisplayMode>,
     last_tool_call: Option<u64>,
     takes_requests: bool,
 }
@@ -199,6 +208,7 @@ impl Default for State {
             requests: VecDeque::new(),
             display_modes: Vec::new(),
             display_result: None,
+            recommended_display_mode: None,
             last_tool_call: None,
             takes_requests: false,
         }
@@ -215,7 +225,7 @@ impl State {
         match command {
             0 => {
                 cpu.set_reg(Reg32::Eax, 1);
-                cpu.set_reg(Reg32::Ebx, 7);
+                cpu.set_reg(Reg32::Ebx, 15);
             }
             1 => {
                 let seconds = self.utc_seconds.saturating_add(ticks / TICKS_PER_SECOND);
@@ -253,6 +263,16 @@ impl State {
                     cpu.reg(Reg32::Edi),
                 );
                 cpu.set_reg(Reg32::Eax, if known { 0 } else { u32::MAX });
+            }
+            5 => {
+                let (width, height, bits) = self.recommended_display_mode.unwrap_or_default();
+                cpu.set_reg(
+                    Reg32::Eax,
+                    u32::from(self.recommended_display_mode.is_some()),
+                );
+                cpu.set_reg(Reg32::Ebx, width.into());
+                cpu.set_reg(Reg32::Ecx, height.into());
+                cpu.set_reg(Reg32::Edx, bits.into());
             }
             _ => cpu.set_reg(Reg32::Eax, u32::MAX),
         }
@@ -419,7 +439,7 @@ mod tests {
         m.cpu.set_reg(Reg32::Ecx, 0);
         Interpreter::step(&mut m.cpu, &mut m.bus).unwrap();
         assert_eq!(m.cpu.reg(Reg32::Eax), 1);
-        assert_eq!(m.cpu.reg(Reg32::Ebx), 7);
+        assert_eq!(m.cpu.reg(Reg32::Ebx), 15);
 
         m.bus.magic.utc_seconds = 0x1_ffff_fffe;
         m.bus.magic.utc_offset = -8 * 3600;
@@ -448,6 +468,45 @@ mod tests {
         }
         state.call(&mut cpu, now);
         [Reg32::Eax, Reg32::Ebx, Reg32::Ecx, Reg32::Edx, Reg32::Edi].map(|reg| cpu.reg(reg))
+    }
+
+    #[test]
+    fn magic_recommended_display_is_optional_and_survives_reset() {
+        let mut m = Machine::new(0x10000);
+        assert_eq!(
+            call(&mut m.bus.magic, 5, 99, 123, 456, 0),
+            [0, 0, 0, 0, 456]
+        );
+        for mode in [RECOMMENDED_DESKTOP_MODE, RECOMMENDED_CARDPUTER_MODE] {
+            m.set_recommended_display_mode(Some(mode));
+            m.bus.reset(0);
+            m.cpu.enter_protected_flat(0, 0);
+            m.bus.ram[0] = 0xed;
+            for (reg, value) in [
+                (Reg32::Eax, 0x2136_3872),
+                (Reg32::Edx, 0x5286),
+                (Reg32::Ecx, 5),
+                (Reg32::Esi, 123),
+                (Reg32::Edi, 456),
+            ] {
+                m.cpu.set_reg(reg, value);
+            }
+            let flags = m.cpu.eflags;
+            Interpreter::step(&mut m.cpu, &mut m.bus).unwrap();
+            assert_eq!(m.cpu.reg(Reg32::Eax), 1);
+            assert_eq!(m.cpu.reg(Reg32::Ebx), u32::from(mode.0));
+            assert_eq!(m.cpu.reg(Reg32::Ecx), u32::from(mode.1));
+            assert_eq!(m.cpu.reg(Reg32::Edx), u32::from(mode.2));
+            assert_eq!((m.cpu.reg(Reg32::Esi), m.cpu.reg(Reg32::Edi)), (123, 456));
+            assert_eq!(m.cpu.eflags, flags);
+            assert!(!m.guest_tools_active()); // Querying a mode starts no helper lease.
+        }
+        m.set_recommended_display_mode(None);
+        m.bus.reset(0);
+        assert_eq!(
+            call(&mut m.bus.magic, 5, 99, 123, 456, 0),
+            [0, 0, 0, 0, 456]
+        );
     }
 
     #[test]

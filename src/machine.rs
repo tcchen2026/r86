@@ -4,7 +4,9 @@
 mod bus_diagnostics;
 mod clock;
 mod magic;
-pub use magic::{DisplayMode, DisplayResult};
+pub use magic::{
+    DisplayMode, DisplayResult, RECOMMENDED_CARDPUTER_MODE, RECOMMENDED_DESKTOP_MODE,
+};
 #[cfg(test)]
 mod sound_tests;
 #[cfg(test)]
@@ -945,6 +947,13 @@ impl Machine {
 
     pub fn guest_display_result(&self) -> Option<DisplayResult> {
         self.bus.magic.display_result
+    }
+
+    /// Recommendation for a fresh tools install (magic command 5). Frontends
+    /// set it before boot; library/deterministic callers default to none.
+    /// Guest resets preserve this host setting.
+    pub fn set_recommended_display_mode(&mut self, mode: Option<DisplayMode>) {
+        self.bus.magic.recommended_display_mode = mode;
     }
 
     /// Host wait after HLT, bounded so UI input remains responsive. Never used
@@ -2385,6 +2394,7 @@ impl HostBus {
         fresh.clock.write_tsc(0);
         fresh.magic.utc_seconds = self.magic.utc_seconds;
         fresh.magic.utc_offset = self.magic.utc_offset;
+        fresh.magic.recommended_display_mode = self.magic.recommended_display_mode;
         fresh.rtc_epoch_seconds = self.rtc_epoch_seconds;
         fresh.rtc_epoch_tick = self.rtc_epoch_tick;
         fresh.rtc_frozen = self.rtc_frozen;

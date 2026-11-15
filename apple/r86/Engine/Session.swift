@@ -29,7 +29,7 @@ final class Session {
             if let url = Bookmarks.access(path, in: machine.directory) { scoped.append(url) }
         }
         var error: UnsafeMutablePointer<CChar>?
-        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path, &error) else {
+        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path, 1024, 768, &error) else {
             scoped.forEach { $0.stopAccessingSecurityScopedResource() }
             throw R86Error(message: R86.take(error) ?? "Cannot start \(machine.name)")
         }

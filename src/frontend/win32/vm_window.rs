@@ -16,6 +16,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use r86::devices::Ps2ButtonState;
+use r86::machine::RECOMMENDED_DESKTOP_MODE;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::HiDpi::{
@@ -125,7 +126,12 @@ pub fn open(
 ) -> Result<HWND, String> {
     let vm = Vm::load(directory.clone())?;
     let (name, volume) = (vm.name.clone(), vm.volume);
-    let running = Running::start(vm, firmware.clone(), logs.clone())?;
+    let running = Running::start(
+        vm,
+        firmware.clone(),
+        logs.clone(),
+        Some(RECOMMENDED_DESKTOP_MODE),
+    )?;
     let audio = Audio::start(running.shared.clone());
     let class = w!("r86Vm");
     // SAFETY: plain Win32 window creation; the class and title strings live
@@ -579,7 +585,12 @@ impl VmWindow {
         }
         let vm = Vm::load(self.directory.clone())?;
         self.volume = vm.volume;
-        let running = Running::start(vm, self.firmware.clone(), self.logs.clone())?;
+        let running = Running::start(
+            vm,
+            self.firmware.clone(),
+            self.logs.clone(),
+            Some(RECOMMENDED_DESKTOP_MODE),
+        )?;
         self.audio = Some(Audio::start(running.shared.clone()));
         self.running = Some(running);
         self.state = State::Running;

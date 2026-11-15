@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use r86::devices::{Ps2ButtonState, RenderMode, VgaModeInfo};
-use r86::machine::{GuestStepStatus, Machine};
+use r86::machine::{DisplayMode, GuestStepStatus, Machine};
 use r86::network::UserNetwork;
 
 use super::keys::{self, InputKey};
@@ -110,7 +110,12 @@ pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Running {
     /// Lock the VM, build its machine and start the core thread. A fatal
     /// error's report goes to `logs` (run_log.rs).
-    pub fn start(vm: Vm, firmware: PathBuf, logs: PathBuf) -> Result<Self, String> {
+    pub fn start(
+        vm: Vm,
+        firmware: PathBuf,
+        logs: PathBuf,
+        recommended_mode: Option<DisplayMode>,
+    ) -> Result<Self, String> {
         let lock_file = super::vm_store::lock_vm(&vm.directory)?;
         let no_jit = std::env::args().any(|arg| arg == "--no-jit");
         let shared = Arc::new(Shared {
@@ -139,6 +144,7 @@ impl Running {
                 let core = (|| -> Result<Core, String> {
                     set_core_qos()?;
                     let mut machine = config.machine(&firmware, "vgabios-stdvga.bin")?;
+                    machine.set_recommended_display_mode(recommended_mode);
                     machine.enable_boot_splash();
                     let network = if vm.network {
                         machine.attach_network();

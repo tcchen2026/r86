@@ -20,6 +20,10 @@
  * shows a console. Commands print to a redirected output, the parent console
  * (AttachConsole, XP), or a new console that waits for Enter before closing.
  * cmd.exe does not wait for GUI programs: use `start /wait` for the exit code.
+ * A fresh install applies the host's recommended 16-bit resolution when it
+ * can switch now. A new driver or mode defers a Yes/No choice to one RunOnce
+ * at this user's next logon. Updates keep the user's resolution. Successful
+ * installs offer "r86 tools installed. Restart now?"; No closes the installer.
  *
  * The Display control panel hides modes smaller than 640x480, such as the
  * handheld VGA BIOS's 640x340; EnumDisplaySettings and ChangeDisplaySettings
@@ -47,9 +51,11 @@ static int nt; /* Windows NT, 2000 or XP */
 #define MAGIC_POINTER 2
 #define MAGIC_REQUEST 3
 #define MAGIC_REPORT 4
+#define MAGIC_RECOMMENDED_MODE 5
 #define MAGIC_CAP_POINTER 2
 #define MAGIC_CAP_REQUESTS 4
-#define TOOL_VERSION 3
+#define MAGIC_CAP_RECOMMENDED_MODE 8
+#define TOOL_VERSION 4
 
 struct magic_regs { DWORD a, b, c, d, s, i; };
 
@@ -167,8 +173,8 @@ static int list_modes(void)
     }
 }
 
-/* Switches and saves the mode; returns the DISP_CHANGE code, with `text`. */
-static LONG change_mode(DWORD width, DWORD height, DWORD bits, const char **text)
+/* Applies a mode with the caller's persistence flags; returns DISP_CHANGE. */
+static LONG change_mode(DWORD width, DWORD height, DWORD bits, DWORD flags, const char **text)
 {
     DEVMODEA mode;
     LONG code;
@@ -179,7 +185,7 @@ static LONG change_mode(DWORD width, DWORD height, DWORD bits, const char **text
     mode.dmPelsHeight = height;
     mode.dmBitsPerPel = bits;
     mode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL;
-    code = ChangeDisplaySettingsA(&mode, CDS_UPDATEREGISTRY);
+    code = ChangeDisplaySettingsA(&mode, flags);
     switch (code) {
     case DISP_CHANGE_SUCCESSFUL: *text = "switched"; break;
     case DISP_CHANGE_RESTART: *text = "saved; restart Windows to use it"; break;
@@ -193,7 +199,7 @@ static LONG change_mode(DWORD width, DWORD height, DWORD bits, const char **text
 static int set_mode(DWORD width, DWORD height, DWORD bits)
 {
     const char *text;
-    LONG code = change_mode(width, height, bits, &text);
+    LONG code = change_mode(width, height, bits, CDS_UPDATEREGISTRY, &text);
     say("%lu x %lu, %lu bit: %s\r\n", width, height, bits, text);
     return code == DISP_CHANGE_SUCCESSFUL || code == DISP_CHANGE_RESTART ? 0 : 1;
 }
@@ -424,6 +430,8 @@ static const char install_dir[] = "C:\\R86";
 static const char install_exe[] = "C:\\R86\\R86-TOOL.EXE";
 static const char autorun_command[] = "\"C:\\R86\\R86-TOOL.EXE\" autorun";
 static const char run_key[] = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const char run_once_key[] = "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce";
+static const char recommend_entry[] = "r86 Recommended Display";
 static const char vga_id[] = "PCI\\VEN_1234&DEV_1111";
 static const char vbemp_message[] =
     "Windows 2000/XP need the VBEMP display driver. Its license allows "
@@ -485,14 +493,14 @@ static int regular_file(const char *path)
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-static DWORD startup_entry(HKEY hive, const char *name, const char *command)
+static DWORD startup_entry(HKEY hive, const char *path, const char *name, const char *command)
 {
     HKEY key;
     LONG code;
     if (command)
-        code = RegCreateKeyExA(hive, run_key, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
+        code = RegCreateKeyExA(hive, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key, NULL);
     else
-        code = RegOpenKeyExA(hive, run_key, 0, KEY_SET_VALUE, &key);
+        code = RegOpenKeyExA(hive, path, 0, KEY_SET_VALUE, &key);
     if (!command && code == ERROR_FILE_NOT_FOUND) return ERROR_SUCCESS;
     if (code != ERROR_SUCCESS) return code;
     code = command ? RegSetValueExA(key, name, 0, REG_SZ, (const BYTE *)command,
@@ -552,7 +560,9 @@ DWORD r86_start_helper(struct tool_result *r)
     return result(r, 0, "Installed helper started");
 }
 
-DWORD r86_install(struct tool_result *r)
+/* Also used by a driver-only install which needs the deferred dialog. Copying
+ * the utility does not register or start the logon helper. */
+static DWORD install_files(struct tool_result *r)
 {
     const char *names[] = {"R86-TOOL.EXE", "README.TXT", "LICENSE.TXT"};
     char image[MAX_PATH], dir[MAX_PATH], source[MAX_PATH], dest[MAX_PATH];
@@ -580,13 +590,108 @@ DWORD r86_install(struct tool_result *r)
                 return failure(r, "Set installed file attributes", GetLastError());
         }
     }
-    code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", autorun_command);
+    return 0;
+}
+
+DWORD r86_install(struct tool_result *r)
+{
+    DWORD code = install_files(r);
+    if (code) return code;
+    code = startup_entry(HKEY_LOCAL_MACHINE, run_key, "r86 Tool", autorun_command);
     if (code) return failure(r, "Register all-user logon helper (administrator required on NT)", code);
-    code = startup_entry(HKEY_CURRENT_USER, "r86 Mouse", NULL);
+    code = startup_entry(HKEY_CURRENT_USER, run_key, "r86 Mouse", NULL);
     if (code) return failure(r, "Remove old per-user helper entry", code);
     code = r86_start_helper(r);
     if (code) return code;
     return result(r, 0, "Installed in C:\\R86; helper started and registered for every user's logon");
+}
+
+static int mode_offered(DWORD width, DWORD height, DWORD bits)
+{
+    DEVMODEA mode;
+    DWORD i;
+    for (i = 0;; i++) {
+        memset(&mode, 0, sizeof mode);
+        mode.dmSize = sizeof mode;
+        if (!EnumDisplaySettingsA(NULL, i, &mode)) return 0;
+        if (mode.dmPelsWidth == width && mode.dmPelsHeight == height && mode.dmBitsPerPel == bits)
+            return 1;
+    }
+}
+
+static DWORD recommend_after_logon(DWORD width, DWORD height, struct tool_result *r)
+{
+    char command[128];
+    DWORD code;
+    /* The choice must remain available after the tools disc is ejected.
+     * Driver-only installs copy the utility without enabling the helper. */
+    if (!regular_file(install_exe) && install_files(r)) return r->code;
+    wsprintfA(command, "\"%s\" recommend %lu %lu", install_exe, width, height);
+    code = startup_entry(HKEY_CURRENT_USER, run_once_key, recommend_entry, command);
+    if (code) return failure(r, "Schedule resolution choice at next logon", code);
+    return result(r, ERROR_SUCCESS_REBOOT_REQUIRED, "A recommended resolution choice will be offered at your next logon");
+}
+
+/* Successful installs use the recommendation once. Updates leave the mode
+ * alone and cancel any unanswered choice from an earlier fresh install. */
+static DWORD install_recommendation(int fresh, int driver_installed, struct tool_result *r)
+{
+    struct magic_regs mode;
+    const char *text;
+    LONG changed;
+    DWORD code;
+    result(r, 0, "");
+    if (!fresh) {
+        code = startup_entry(HKEY_CURRENT_USER, run_once_key, recommend_entry, NULL);
+        return code ? failure(r, "Remove pending resolution choice", code) : 0;
+    }
+    if (!r86_present() || !(magic_call(MAGIC_VERSION, 0, 0, 0).b & MAGIC_CAP_RECOMMENDED_MODE)) return 0;
+    mode = magic_call(MAGIC_RECOMMENDED_MODE, 0, 0, 0);
+    if (mode.a != 1 || mode.d != 16 || !valid_size(mode.b, mode.c)) return 0;
+    if (driver_installed) {
+        /* EnumDisplaySettings may still describe the old driver. Ensure the
+         * new VMDisp9x registry list has the size before its first boot. */
+        if (!nt) add_9x_mode(mode.b, mode.c, 16);
+        return recommend_after_logon(mode.b, mode.c, r);
+    }
+    /* Do not save a pending mode before the user can decline it at logon.
+     * A transient attempt which needs a reboot leaves the registry alone. */
+    changed = change_mode(mode.b, mode.c, 16, 0, &text);
+    if (changed == DISP_CHANGE_SUCCESSFUL) {
+        changed = change_mode(mode.b, mode.c, 16, CDS_UPDATEREGISTRY, &text);
+        if (changed == DISP_CHANGE_SUCCESSFUL || changed == DISP_CHANGE_RESTART) {
+            wsprintfA(r->message, "Recommended display mode: %lu x %lu, 16-bit colour", mode.b, mode.c);
+            return 0;
+        }
+    } else if (changed == DISP_CHANGE_RESTART) {
+        return recommend_after_logon(mode.b, mode.c, r);
+    } else if (changed == DISP_CHANGE_BADMODE) {
+        if (!nt && add_9x_mode(mode.b, mode.c, 16) >= 0)
+            return recommend_after_logon(mode.b, mode.c, r);
+        return 0; /* Fixed driver list, or no VMDisp9x: no automatic change. */
+    }
+    r->code = ERROR_INVALID_DATA;
+    wsprintfA(r->message, "Recommended resolution: %s (display code %ld)", text, changed);
+    return r->code;
+}
+
+/* RunOnce deletes its value before running this command. Never re-register
+ * it, and silently finish if the new driver's list still lacks the mode. */
+static int recommend_at_logon(DWORD width, DWORD height)
+{
+    char prompt[128];
+    const char *text;
+    LONG code;
+    if (!valid_size(width, height) || !mode_offered(width, height, 16)) return 0;
+    wsprintfA(prompt, "Switch to %lux%lu, recommended for this device?", width, height);
+    if (MessageBoxA(NULL, prompt, "r86 tools", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+    code = change_mode(width, height, 16, CDS_UPDATEREGISTRY, &text);
+    if (code != DISP_CHANGE_SUCCESSFUL && code != DISP_CHANGE_RESTART) {
+        wsprintfA(prompt, "Could not switch resolution: %s (display code %ld)", text, code);
+        MessageBoxA(NULL, prompt, "r86 tools", MB_OK | MB_ICONEXCLAMATION);
+        return 1;
+    }
+    return 0;
 }
 
 /* Only needed when uninstall is running from the installed EXE itself.
@@ -628,10 +733,12 @@ DWORD r86_uninstall(struct tool_result *r)
     int reboot = 0;
     code = r86_stop_helper(r);
     if (code) return code;
-    code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", NULL);
+    code = startup_entry(HKEY_LOCAL_MACHINE, run_key, "r86 Tool", NULL);
     if (code) return failure(r, "Remove all-user logon entry", code);
-    code = startup_entry(HKEY_CURRENT_USER, "r86 Mouse", NULL);
+    code = startup_entry(HKEY_CURRENT_USER, run_key, "r86 Mouse", NULL);
     if (code) return failure(r, "Remove old per-user helper entry", code);
+    code = startup_entry(HKEY_CURRENT_USER, run_once_key, recommend_entry, NULL);
+    if (code) return failure(r, "Remove pending resolution choice", code);
     for (i = 0; i < 3; i++) {
         join_path(path, install_dir, names[i]);
         if (!regular_file(path)) continue;
@@ -847,6 +954,17 @@ DWORD r86_install_display(HWND parent, const char *directory, struct tool_result
         BOOL reboot = FALSE, ok;
         DEVMODEA mode;
         LONG changed;
+        /* Preserve the user's resolution when reinstalling VBEMP. A generic
+         * 4/8-bit VGA desktop still needs a safe 16-bit setting for VBEMP. */
+        memset(&mode, 0, sizeof mode);
+        mode.dmSize = sizeof mode;
+        if (!EnumDisplaySettingsA(NULL, ENUM_CURRENT_SETTINGS, &mode)) {
+            mode.dmPelsWidth = GetSystemMetrics(SM_CXSCREEN);
+            mode.dmPelsHeight = GetSystemMetrics(SM_CYSCREEN);
+            mode.dmBitsPerPel = 16;
+        }
+        if (mode.dmBitsPerPel < 16) mode.dmBitsPerPel = 16;
+        mode.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
         if (!setup) return r->code;
         code = find_vga(parent, &devices, &device, hardware_id);
         if (devices != INVALID_HANDLE_VALUE) p_SetupDiDestroyDeviceInfoList(devices);
@@ -864,21 +982,15 @@ DWORD r86_install_display(HWND parent, const char *directory, struct tool_result
         code = ok ? 0 : GetLastError();
         FreeLibrary(library);
         if (code) return failure(r, "Install VBEMP for PCI\\VEN_1234&DEV_1111", code);
-        memset(&mode, 0, sizeof mode);
-        mode.dmSize = sizeof mode;
-        mode.dmBitsPerPel = 16;
-        mode.dmPelsWidth = 640;
-        mode.dmPelsHeight = 480;
-        mode.dmFields = DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT;
         changed = ChangeDisplaySettingsA(&mode, CDS_UPDATEREGISTRY);
         if (changed != DISP_CHANGE_SUCCESSFUL && changed != DISP_CHANGE_RESTART) {
             r->code = ERROR_INVALID_DATA;
-            wsprintfA(r->message, "VBEMP installed, but saving 16-bit colour failed (display code %ld). Do not use 256 colours.", changed);
+            wsprintfA(r->message, "VBEMP installed, but preserving the display setting failed (display code %ld). Do not use 256 colours.", changed);
             return r->code;
         }
         return result(r, reboot || changed == DISP_CHANGE_RESTART ? ERROR_SUCCESS_REBOOT_REQUIRED : 0,
-                      reboot || changed == DISP_CHANGE_RESTART ? "VBEMP installed; 16-bit colour saved; restart Windows"
-                                                              : "VBEMP installed; display saved at 640 x 480, 16-bit colour");
+                      reboot || changed == DISP_CHANGE_RESTART ? "VBEMP installed; display setting saved; restart Windows"
+                                                              : "VBEMP installed; display setting saved");
     }
 }
 
@@ -1083,7 +1195,7 @@ static void restart_windows(void)
     open_token = (void *)GetProcAddress(advapi, "OpenProcessToken");
     lookup = (void *)GetProcAddress(advapi, "LookupPrivilegeValueA");
     adjust = (void *)GetProcAddress(advapi, "AdjustTokenPrivileges");
-    if (!(GetVersion() & 0x80000000) && open_token && lookup && adjust &&
+    if (nt && open_token && lookup && adjust &&
         open_token(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
         privilege.PrivilegeCount = 1;
         privilege.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
@@ -1094,6 +1206,15 @@ static void restart_windows(void)
     if (!ExitWindowsEx(EWX_REBOOT, 0))
         MessageBoxA(window, "Windows did not restart. Restart it from the Start menu.",
                     "r86 tools", MB_OK | MB_ICONEXCLAMATION);
+}
+
+static void install_finished(void)
+{
+    if (MessageBoxA(window, "r86 tools installed. Restart now?", "r86 tools",
+                    MB_YESNO | MB_ICONQUESTION) == IDYES)
+        restart_windows();
+    if (window) DestroyWindow(window);
+    own_console = 0; /* No means close, also for the command-line installer. */
 }
 
 static int checked(int id)
@@ -1114,7 +1235,8 @@ static void run(int install)
     char text[2200];
     struct tool_result r;
     HCURSOR cursor;
-    int restart = 0;
+    int restart = 0, ok = 1, selected = 0, driver_installed = 0;
+    int fresh = !regular_file(install_exe);
     unsigned i;
 
     text[0] = 0;
@@ -1129,12 +1251,22 @@ static void run(int install)
         lstrcatA(text, "\r\n\r\nThe display driver stays installed; Device Manager can change it.");
     } else {
         if (checked(ID_HELPER)) {
+            selected = 1;
             r86_install(&r);
             report(text, "Helper", &r, &restart);
+            ok &= !r.code || r.code == ERROR_SUCCESS_REBOOT_REQUIRED;
         }
         if (checked(ID_DISPLAY)) {
+            selected = 1;
             r86_install_display(window, vbemp_dir[0] ? vbemp_dir : NULL, &r);
             report(text, "Display driver", &r, &restart);
+            driver_installed = !r.code || r.code == ERROR_SUCCESS_REBOOT_REQUIRED;
+            ok &= driver_installed;
+        }
+        if (selected && ok) {
+            install_recommendation(fresh, driver_installed, &r);
+            if (r.message[0]) report(text, "Display", &r, &restart);
+            ok = !r.code || r.code == ERROR_SUCCESS_REBOOT_REQUIRED;
         }
         if (!text[0])
             lstrcpyA(text, "Nothing is selected.");
@@ -1144,7 +1276,9 @@ static void run(int install)
     for (i = 0; i < 4; i++)
         EnableWindow(GetDlgItem(window, buttons[i]), TRUE);
     show_installed();
-    if (restart && MessageBoxA(window, "Restart Windows now to finish?", "r86 tools",
+    if (install && selected && ok)
+        install_finished();
+    else if (!install && restart && MessageBoxA(window, "Restart Windows now to finish?", "r86 tools",
                                MB_YESNO | MB_ICONQUESTION) == IDYES)
         restart_windows();
 }
@@ -1310,7 +1444,7 @@ static void apply_mode(void)
 
     if (i < 0)
         return;
-    change_mode(modes[i].width, modes[i].height, modes[i].bits, &result);
+    change_mode(modes[i].width, modes[i].height, modes[i].bits, CDS_UPDATEREGISTRY, &result);
     wsprintfA(text, "%lu x %lu, %lu-bit: %s.", modes[i].width, modes[i].height, modes[i].bits, result);
     SetDlgItemTextA(window, ID_STATUS, text);
 }
@@ -1330,7 +1464,7 @@ static int logon_entry(void)
 static void set_logon(void)
 {
     int on = checked(ID_LOGON);
-    DWORD code = startup_entry(HKEY_LOCAL_MACHINE, "r86 Tool", on ? autorun_command : NULL);
+    DWORD code = startup_entry(HKEY_LOCAL_MACHINE, run_key, "r86 Tool", on ? autorun_command : NULL);
     struct tool_result r;
 
     if (code) {
@@ -1651,7 +1785,7 @@ static void display_request(DWORD kind, DWORD width, DWORD height, DWORD bits)
     DWORD result;
 
     if (kind == 1) {
-        code = change_mode(width, height, bits, &text);
+        code = change_mode(width, height, bits, CDS_UPDATEREGISTRY, &text);
         result = code == DISP_CHANGE_SUCCESSFUL ? 0 : code == DISP_CHANGE_RESTART ? 1
                : code == DISP_CHANGE_BADMODE ? 2 : 3;
     } else {
@@ -1844,11 +1978,23 @@ void start(void)
         status = !installed_image() ? installer() : settings_in_helper() ? 0 : helper(1, 1);
     else if (!lstrcmpiA(command, "autorun"))
         status = *spaces(s) ? usage() : helper(1, 0);
+    else if (!lstrcmpiA(command, "recommend")) {
+        /* Internal RunOnce command: malformed or obsolete entries stay quiet. */
+        status = (s = number(s, &width)) && (s = number(s, &height)) && !*spaces(s)
+                   ? recommend_at_logon(width, height) : 2;
+    }
     else if (!lstrcmpiA(command, "install") || !lstrcmpiA(command, "uninstall")) {
         if (*spaces(s)) status = usage();
         else {
-            status = !lstrcmpiA(command, "install") ? r86_install(&operation) : r86_uninstall(&operation);
+            int installing = !lstrcmpiA(command, "install");
+            int fresh = !regular_file(install_exe);
+            status = installing ? r86_install(&operation) : r86_uninstall(&operation);
             say("%s (result %lu)\r\n", operation.message, operation.code);
+            if (installing && (!status || status == ERROR_SUCCESS_REBOOT_REQUIRED)) {
+                status = install_recommendation(fresh, 0, &operation);
+                if (operation.message[0]) say("%s (result %lu)\r\n", operation.message, operation.code);
+                if (!status || status == ERROR_SUCCESS_REBOOT_REQUIRED) install_finished();
+            }
         }
     } else if (!lstrcmpiA(command, "driver")) {
         char directory[MAX_PATH + 1];
@@ -1856,8 +2002,18 @@ void start(void)
         s = next_word(s, directory, sizeof directory);
         if (lstrcmpiA(command, "display") || *spaces(s) || lstrlenA(directory) >= MAX_PATH) status = usage();
         else {
+            int fresh = !regular_file(install_exe);
             status = r86_install_display(NULL, directory, &operation);
             say("%s (result %lu)\r\n", operation.message, operation.code);
+            if (!status || status == ERROR_SUCCESS_REBOOT_REQUIRED) {
+                int driver_status = status;
+                status = install_recommendation(fresh, 1, &operation);
+                if (operation.message[0]) say("%s (result %lu)\r\n", operation.message, operation.code);
+                if (!status || status == ERROR_SUCCESS_REBOOT_REQUIRED) {
+                    if (!status) status = driver_status;
+                    install_finished();
+                }
+            }
         }
     } else if (!lstrcmpiA(command, "modes"))
         status = list_modes();
