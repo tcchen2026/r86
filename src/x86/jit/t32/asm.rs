@@ -1,7 +1,7 @@
 //! Thumb-2 (T32) emission for Armv7-M and Armv8-M Mainline cores such as the
 //! Cortex-M33. Only base encodings are produced: no A32, no DSP extension
 //! (PKHBT, UXTAB), no floating point. Every instruction is 32 bits wide except
-//! IT and BX, and the buffer holds halfwords. Wide constants use MOVW/MOVT, so
+//! IT, BX and diagnostic BLX, and the buffer holds halfwords. Wide constants use MOVW/MOVT, so
 //! there is no literal pool and `finish` cannot fail. A conditional instruction
 //! is an IT block of one instruction; see [`Assembler::with_cond`].
 //!
@@ -502,6 +502,13 @@ impl Assembler {
         self.code.push(0x4700 | (r(rm) as u16) << 3);
     }
 
+    /// BLX rm: diagnostic Rust callback with the usual AAPCS link register.
+    #[cfg(any(feature = "jit-profile", test))]
+    pub fn blx(&mut self, rm: Reg) {
+        assert!(self.cond.is_none(), "no call inside with_cond");
+        self.code.push(0x4780 | (r(rm) as u16) << 3);
+    }
+
     /// MRS rd, APSR.
     pub fn mrs(&mut self, rd: Reg) {
         self.wide(0xf3ef, 0x8000 | r(rd) << 8);
@@ -863,6 +870,8 @@ mod tests {
             ),
             // bx r1
             (|a| a.bx(R1), &[0x4708]),
+            // blx r12
+            (|a| a.blx(R12), &[0x47e0]),
             // mrs r12, apsr
             (|a| a.mrs(R12), &[0xf3ef, 0x8c00]),
             // msr apsr_nzcvq, r12

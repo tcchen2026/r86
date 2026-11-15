@@ -1606,6 +1606,33 @@ impl Cpu {
         )
     }
 
+    /// Checked JIT data access: read/write permission, base, inclusive bounds.
+    /// Empty expand-down ranges and unsupported descriptors get no permission.
+    #[cfg(feature = "jit-t32")]
+    pub(crate) fn jit_data_segment_range(&self, seg: SegmentReg) -> (u32, u32, u32, u32) {
+        let cache = self.seg(seg);
+        let access = cache.flags & 0xff;
+        let (low, high) = if access & 0x1c == 0x14 {
+            let high = if cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
+                u32::MAX
+            } else {
+                0xffff
+            };
+            if cache.limit >= high {
+                return (0, cache.base, 0, 0);
+            }
+            (cache.limit + 1, high)
+        } else {
+            (0, cache.limit)
+        };
+        let rights = if seg != SegmentReg::Cs && cache.selector & !3 != 0 && access & 0x18 == 0x10 {
+            1 | (access & 2)
+        } else {
+            0
+        };
+        (u32::from(rights), cache.base, low, high)
+    }
+
     #[inline(never)]
     fn update_flat_segment_mask(&mut self, seg: SegmentReg) {
         let bit = 1u8 << seg as u8;

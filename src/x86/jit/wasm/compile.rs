@@ -2128,6 +2128,9 @@ impl Compiler<'_> {
     }
     fn instruction(&mut self, insn: Instruction) {
         match insn.op {
+            Op::Loop { .. } | Op::PushAll { .. } | Op::PopAll { .. } => {
+                unreachable!("extended operations are not decoded for wasm")
+            }
             Op::Mmx { .. } | Op::PushSegment { .. } | Op::PopSegment { .. } => {
                 unreachable!("filtered by supported")
             }

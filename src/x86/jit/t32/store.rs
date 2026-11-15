@@ -25,6 +25,8 @@ pub struct Record {
     pub source_len: u32,
     #[cfg(feature = "jit-profile")]
     pub opcode: u16,
+    #[cfg(feature = "jit-profile")]
+    pub memory: u8,
 }
 
 impl Record {
@@ -40,6 +42,8 @@ impl Record {
         source_len: 0,
         #[cfg(feature = "jit-profile")]
         opcode: 0,
+        #[cfg(feature = "jit-profile")]
+        memory: 0,
     };
 
     fn is(&self, eip: u32, facts: u32, backing: u64) -> bool {

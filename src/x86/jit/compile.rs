@@ -292,6 +292,9 @@ pub(super) fn flag_requirements(block: &Block) -> Vec<u32> {
         if matches!(instruction.op, Op::LoadFlagsByte) {
             live |= 0xd5;
         }
+        if matches!(instruction.op, Op::Loop { zero: Some(_), .. }) {
+            live |= 0x40;
+        }
         if let Op::Branch {
             condition: Some(BranchCondition::Flags(condition)),
             ..
@@ -2708,6 +2711,9 @@ pub fn block(
             }
             Op::IndirectJump { src } => read_value(&mut a, LHS, src, site.as_ref(), &mut faults),
             Op::Branch { .. } => {}
+            Op::Loop { .. } | Op::PushAll { .. } | Op::PopAll { .. } => {
+                unreachable!("extended operations are not decoded for arm64")
+            }
         }
         if matches!(instruction.op, Op::Movs { .. } | Op::String { .. }) {
             segments.set(block_facts);

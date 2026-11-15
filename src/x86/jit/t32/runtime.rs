@@ -1,7 +1,7 @@
 //! Thumb-2 block dispatch for the shared Machine.
 //!
 //! A block is keyed by its EIP, the backing byte from the current execute
-//! translation and the flat-segment facts it was compiled under. It may run
+//! translation and the segment facts it was compiled under. It may run
 //! while that translation exists and its CodePages version is unchanged; the
 //! interpreter's fetch path owns every page walk and fetch fault. After a
 //! version change the page is watched again, which revokes writable aliases,
@@ -35,13 +35,375 @@
 //! bit 0 set (Thumb state).
 
 use super::arena::Arena;
-use super::lower::{self, EXIT_BOUNDARY, EXIT_INTERPRET, Frame, STACK_FACT, TABLE_BITS};
+use super::lower::{
+    self, EXIT_ATTENTION, EXIT_BOUNDARY, EXIT_INTERPRET, EXIT_SHADOW, Frame, STACK_FACT,
+    STACK32_FACT, TABLE_BITS,
+};
 use super::store::{Record, Store};
 use crate::machine::HostBus;
-use crate::x86::cpu::SegmentReg;
+use crate::x86::cpu::{SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
 use crate::x86::jit::decode;
 use crate::x86::{BackingToken, BatchResult, BatchStop, Bus, Cpu, Interpreter, LinearAddr};
+#[cfg(feature = "jit-profile")]
+use alloc::collections::BTreeMap;
 use alloc::{boxed::Box, format, string::String, vec::Vec};
+#[cfg(feature = "jit-profile")]
+use profile::{Iteration, NativeReturn, TableCause, Target};
+
+#[cfg(feature = "jit-profile")]
+#[path = "profile_code16.rs"]
+mod code16;
+
+// Diagnostic state and all its callers disappear without jit-profile.
+#[cfg(feature = "jit-profile")]
+mod profile {
+    use super::{Cpu, SegmentReg};
+    use crate::x86::cpu::{CR0_PE, CR0_PG, CR0_WP, SegmentCache};
+    use alloc::{collections::BTreeMap, string::String, vec::Vec};
+    use core::fmt::Write;
+
+    // Ineligible causes are exclusive, in the existing guard's check order.
+    pub enum Iteration {
+        Shadow,
+        Halted,
+        Code16,
+        CsLimit,
+        TfVm,
+        Sequential,
+        Native,
+        Interpret,
+        ColdNew,
+        ColdCounting,
+    }
+    pub enum NativeReturn {
+        InterpretGuard,
+        BudgetExhausted,
+        DispatchResolved,
+        NextBlockOverLimit,
+        UnsupportedEntry,
+        FetchMiss,
+        InvalidatedCode,
+        TargetUncompiled,
+        Attention,
+        Shadow,
+        Other,
+    }
+    pub enum TableCause {
+        ArenaReset,
+        CodeEpoch,
+        CodePage,
+        Cr3Changed,
+        Cr3NonGlobal,
+        Cr0OrCs,
+        Invlpg,
+        FactsChanged,
+        GlobalEpochChanged,
+        OtherContext,
+        InitialSync,
+    }
+    #[derive(Default)]
+    pub enum Target {
+        #[default]
+        FetchMiss,
+        Uncompiled,
+        Invalidated,
+        Unsupported,
+        Native,
+    }
+
+    #[derive(Clone, Copy)]
+    pub struct CpuContext {
+        cr0_mapping: u32,
+        cr3: u32,
+        cs: SegmentCache,
+        facts: u32,
+        global: u64,
+    }
+    impl CpuContext {
+        pub fn capture(cpu: &Cpu, facts: u32, global: u64) -> Self {
+            Self {
+                cr0_mapping: cpu.cr0 & (CR0_PE | CR0_PG | CR0_WP),
+                cr3: cpu.cr3,
+                cs: cpu.seg(SegmentReg::Cs),
+                facts,
+                global,
+            }
+        }
+    }
+
+    #[derive(Default)]
+    pub struct Counters {
+        pub code16: super::code16::Counters,
+        pub iterations: [u64; 10],
+        pub native_returns: [u64; 11],
+        pub native_steps: [u64; 8],
+        pub invoke_limits: [u64; 5],
+        pub table_clears: [u64; 11],
+        pub table_retirements: [u64; 11],
+        pub entry_rejected: u64,
+        pub attention_limits: u64,
+        pub attention_ends: u64,
+        pub returned_steps: u64,
+        pub control_attention_returns: u64,
+        pub shadow_continues: u64,
+        pub attention_continues: u64,
+        pub address16_unclassified: u64,
+        pub mov_nonflat: [u64; 7],
+        pub invocation_start: u64,
+        pub checked_segments: BTreeMap<(u16, u32, u32, bool, u8), [u64; 11]>,
+        pub checked_pages: BTreeMap<u32, u64>,
+        pub target: Target,
+        pub context: Option<CpuContext>,
+    }
+    impl Counters {
+        pub fn mov_segment(&mut self, cpu: &Cpu, key: u8) {
+            let segment = if key & 7 == SegmentReg::Ds as u8 + 1 {
+                SegmentReg::Ds
+            } else {
+                SegmentReg::Ss
+            };
+            let cache = cpu.seg(segment);
+            let access = cache.flags & 0xff;
+            // Rejecting descriptor kinds take precedence over geometry, so
+            // base/limit counts do not include unusable or read-only writes.
+            let cause = if cache.selector & !3 == 0 {
+                0
+            } else if access & 0x18 == 0x18 {
+                1
+            } else if access & 0x1c == 0x14 {
+                2
+            } else if key & 8 != 0 && access & 2 == 0 {
+                3
+            } else if cache.base != 0 {
+                4
+            } else if cache.limit != u32::MAX {
+                5
+            } else {
+                6
+            };
+            self.mov_nonflat[cause] += 1;
+        }
+
+        pub fn limit(&mut self, limit: u64) {
+            let bucket = match limit {
+                0 => 0,
+                1 => 1,
+                2..=15 => 2,
+                16..=255 => 3,
+                _ => 4,
+            };
+            self.invoke_limits[bucket] += 1;
+        }
+
+        // One sample for each actual native entry, including a resolved
+        // dispatch miss which resumes inside the same Rust invoke call.
+        pub fn steps(&mut self, steps: u32) {
+            let bucket = match steps {
+                0 => 0,
+                1 => 1,
+                2..=3 => 2,
+                4..=7 => 3,
+                8..=15 => 4,
+                16..=31 => 5,
+                32..=63 => 6,
+                _ => 7,
+            };
+            self.native_steps[bucket] += 1;
+            self.returned_steps += u64::from(steps);
+        }
+
+        pub fn unresolved(&mut self) {
+            let reason = match self.target {
+                Target::Native => NativeReturn::NextBlockOverLimit,
+                Target::FetchMiss => NativeReturn::FetchMiss,
+                Target::Uncompiled => NativeReturn::TargetUncompiled,
+                Target::Invalidated => NativeReturn::InvalidatedCode,
+                Target::Unsupported => NativeReturn::UnsupportedEntry,
+            };
+            self.native_returns[reason as usize] += 1;
+        }
+
+        // Attribution is by observations at sync, not an instruction trace.
+        // CR0/CS and CR3 changes take precedence. Among the remaining clears,
+        // changed facts take precedence over a simultaneous global epoch change.
+        pub fn context_cause(&self, next: CpuContext) -> TableCause {
+            match self.context {
+                None => TableCause::InitialSync,
+                Some(old) if old.cr0_mapping != next.cr0_mapping || old.cs != next.cs => {
+                    TableCause::Cr0OrCs
+                }
+                Some(old) if old.cr3 != next.cr3 => TableCause::Cr3Changed,
+                Some(old) if old.facts != next.facts => TableCause::FactsChanged,
+                Some(old) if old.global != next.global => TableCause::GlobalEpochChanged,
+                Some(_) => TableCause::OtherContext,
+            }
+        }
+
+        pub fn report(&self, out: &mut String) {
+            fn row(out: &mut String, name: &str, names: &[&str], counts: &[u64]) {
+                let _ = write!(
+                    out,
+                    "t32 profile {name}: total={}",
+                    counts.iter().sum::<u64>()
+                );
+                for (label, count) in names.iter().zip(counts) {
+                    let _ = write!(out, " {label}={count}");
+                }
+                out.push('\n');
+            }
+            row(
+                out,
+                "iterations",
+                &[
+                    "shadow",
+                    "halted",
+                    "code16",
+                    "cs_limit",
+                    "tf_vm",
+                    "sequential",
+                    "native",
+                    "interpret",
+                    "cold_new",
+                    "cold_counting",
+                ],
+                &self.iterations,
+            );
+            row(
+                out,
+                "native_returns",
+                &[
+                    "interpret_guard",
+                    "budget_exhausted",
+                    "dispatch_resolved",
+                    "next_block_over_limit",
+                    "unsupported_entry",
+                    "fetch_miss",
+                    "invalidated_code",
+                    "target_uncompiled",
+                    "attention",
+                    "shadow",
+                    "other",
+                ],
+                &self.native_returns,
+            );
+            row(
+                out,
+                "native_steps",
+                &["0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"],
+                &self.native_steps,
+            );
+            row(
+                out,
+                "invoke_limits",
+                &["0", "1", "2-15", "16-255", "256+"],
+                &self.invoke_limits,
+            );
+            let causes = [
+                "arena_reset",
+                "code_epoch",
+                "code_page",
+                "cr3_changed",
+                "cr3_nonglobal",
+                "cr0_or_cs",
+                "invlpg",
+                "facts_changed",
+                "global_epoch_changed",
+                "other_context",
+                "initial_sync",
+            ];
+            row(out, "table_clears", &causes, &self.table_clears);
+            row(out, "table_retirements", &causes, &self.table_retirements);
+            row(
+                out,
+                "mov_nonflat",
+                &[
+                    "null",
+                    "code",
+                    "expand_down",
+                    "read_only",
+                    "base",
+                    "limit",
+                    "other",
+                ],
+                &self.mov_nonflat,
+            );
+            let mut segments: Vec<_> = self.checked_segments.iter().collect();
+            segments.sort_by_key(|(_, counts)| core::cmp::Reverse(counts[0]));
+            // Keep cumulative diagnostic rows complete so two snapshots can
+            // be subtracted before ranking a workload phase on the host.
+            for ((selector, base, limit, big, cpl), counts) in segments {
+                let _ = writeln!(
+                    out,
+                    "t32 checked segment: selector={selector:04x} base={base:08x} limit={limit:08x} big={big} cpl={cpl} count={} windows={:?}",
+                    counts[0],
+                    &counts[1..]
+                );
+            }
+            let mut pages: Vec<_> = self.checked_pages.iter().collect();
+            pages.sort_by_key(|(_, count)| core::cmp::Reverse(**count));
+            for (page, count) in pages {
+                let _ = writeln!(out, "t32 checked page: eip={page:08x} count={count}");
+            }
+            let _ = writeln!(
+                out,
+                "t32 profile invoke: entry_rejected={} attention_limits={} attention_ends={} returned_steps={}",
+                self.entry_rejected,
+                self.attention_limits,
+                self.attention_ends,
+                self.returned_steps
+            );
+            let _ = writeln!(
+                out,
+                "t32 profile controls: attention_returns={} shadow_continues={} attention_continues={}",
+                self.control_attention_returns, self.shadow_continues, self.attention_continues,
+            );
+            let _ = writeln!(
+                out,
+                "t32 profile entry_decode: address16_unclassified={}",
+                self.address16_unclassified
+            );
+        }
+    }
+}
+
+/// One diagnostic invocation; native code cannot change cached segments or CPL.
+#[cfg(feature = "jit-profile")]
+struct CheckedInvocation {
+    counters: *mut profile::Counters,
+    segments: [crate::x86::cpu::SegmentCache; 5],
+    cpl: u8,
+    start: u64,
+    budget: u32,
+}
+
+/// Called only by diagnostic generated code with its invocation-owned context.
+#[cfg(feature = "jit-profile")]
+pub(super) unsafe extern "C" fn profile_checked(
+    context: usize,
+    segment: u32,
+    eip: u32,
+    remaining: u32,
+) {
+    // SAFETY: invoke keeps the context and counters alive until native return;
+    // generated code preserves the AAPCS registers and never calls concurrently.
+    let invocation = unsafe { &mut *(context as *mut CheckedInvocation) };
+    let counters = unsafe { &mut *invocation.counters };
+    let cache = invocation.segments[segment as usize];
+    let key = (
+        cache.selector,
+        cache.base,
+        cache.limit,
+        cache.flags & crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG != 0,
+        invocation.cpl,
+    );
+    let counts = counters.checked_segments.entry(key).or_default();
+    counts[0] += 1;
+    let step = invocation.start + u64::from(invocation.budget - remaining);
+    if let Some(count) = counts.get_mut(1 + (step / 25_000_000) as usize) {
+        *count += 1;
+    }
+    *counters.checked_pages.entry(eip & !0xfff).or_default() += 1;
+}
 
 const HEAT: usize = 4096;
 const HOT: u8 = 16;
@@ -54,7 +416,7 @@ const WINDOW: usize = 480;
 const TF: u32 = 1 << 8;
 const VM: u32 = 1 << 17;
 /// DS/ES/SS flat read and write proofs, plus the 32-bit stack proof.
-const FACTS: u32 = 0b1101 | 0b1101 << 8 | STACK_FACT;
+const FACTS: u32 = 0b1101 | 0b1101 << 8 | STACK_FACT | STACK32_FACT;
 const PLANE: usize = 1 << TABLE_BITS;
 
 #[derive(Debug, Default)]
@@ -110,6 +472,10 @@ pub struct Engine {
     /// Interpreted entries by opcode; see `profile_key`.
     #[cfg(feature = "jit-profile")]
     unsupported: Box<[u64; 2048]>,
+    #[cfg(feature = "jit-profile")]
+    unsupported_memory: BTreeMap<(u16, u8), u64>,
+    #[cfg(feature = "jit-profile")]
+    profile: profile::Counters,
 }
 
 /// A valid native block.
@@ -126,8 +492,8 @@ enum Lookup {
     Native(Native),
     /// The interpreter executes this instruction; the next may be native.
     Interpret,
-    /// Not yet admitted.
-    Cold,
+    /// Not yet admitted. True when this address was not being counted.
+    Cold(bool),
 }
 
 /// What the block index holds for the current EIP.
@@ -169,11 +535,19 @@ impl Engine {
             stats: Stats::default(),
             #[cfg(feature = "jit-profile")]
             unsupported: Box::new([0; 2048]),
+            #[cfg(feature = "jit-profile")]
+            unsupported_memory: BTreeMap::new(),
+            #[cfg(feature = "jit-profile")]
+            profile: profile::Counters::default(),
         })
     }
 
     pub(crate) fn clear(&mut self, bus: &mut HostBus) -> Result<(), String> {
         self.store.clear();
+        #[cfg(feature = "jit-profile")]
+        {
+            self.profile.table_clears[TableCause::ArenaReset as usize] += 1;
+        }
         self.clear_table();
         self.arena.reset(self.shared_bytes);
         // No block can observe an old version after this point.
@@ -204,13 +578,29 @@ impl Engine {
         );
         #[cfg(feature = "jit-profile")]
         {
+            if code16::ENABLED {
+                self.profile.code16.report(&mut report);
+            }
+            self.profile.report(&mut report);
             let mut top: Vec<_> = (0..2048).filter(|&i| self.unsupported[i] != 0).collect();
             top.sort_by_key(|&i| core::cmp::Reverse(self.unsupported[i]));
-            for i in top.into_iter().take(32) {
+            for i in top {
                 report += &format!(
                     "interpreted entry {}: {}\n",
                     profile_name(i as u16),
                     self.unsupported[i]
+                );
+            }
+            let mut memory: Vec<_> = self.unsupported_memory.iter().collect();
+            memory.sort_by_key(|(_, count)| core::cmp::Reverse(**count));
+            for (&(opcode, key), count) in memory {
+                let segment = ["ES", "CS", "SS", "DS", "FS", "GS"][usize::from((key & 7) - 1)];
+                let missing = ["none", "flat_read", "flat_write", "CS"][usize::from(key >> 4 & 3)];
+                report += &format!(
+                    "interpreted memory entry {}: segment={segment} access={} missing={missing} addr16={} count={count}\n",
+                    profile_name(opcode),
+                    if key & 8 != 0 { "write" } else { "read" },
+                    key & 64 != 0,
                 );
             }
         }
@@ -219,7 +609,12 @@ impl Engine {
 
     fn facts(cpu: &Cpu) -> u32 {
         let (flat, flat_write) = cpu.jit_segment_masks();
-        (flat | flat_write << 8) & FACTS
+        let stack32 = if cpu.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
+            STACK32_FACT
+        } else {
+            0
+        };
+        (flat | flat_write << 8 | stack32) & FACTS
     }
 
     /// Remove the table entries that `retire` selects by page and version.
@@ -246,28 +641,59 @@ impl Engine {
             facts: Self::facts(cpu),
             cs_base: cpu.seg(SegmentReg::Cs).base,
         };
+        #[cfg(feature = "jit-profile")]
+        let observed = profile::CpuContext::capture(cpu, context.facts, context.global);
         let code = bus.jit_code_epoch();
         if code != self.code {
             match bus.jit_single_retired_version(self.code) {
-                Some(version) => self.retire_table(|_, page| page == version),
-                None => self.clear_table(),
+                Some(version) => {
+                    #[cfg(feature = "jit-profile")]
+                    {
+                        self.profile.table_retirements[TableCause::CodePage as usize] += 1;
+                    }
+                    self.retire_table(|_, page| page == version)
+                }
+                None => {
+                    #[cfg(feature = "jit-profile")]
+                    {
+                        self.profile.table_clears[TableCause::CodeEpoch as usize] += 1;
+                    }
+                    self.clear_table()
+                }
             }
             self.code = code;
         }
         let mapping = cpu.jit_mapping_epoch();
         let invalidated = cpu.take_jit_invalidated_range();
         if self.context != Some(context) {
+            #[cfg(feature = "jit-profile")]
+            {
+                let cause = self.profile.context_cause(observed);
+                self.profile.table_clears[cause as usize] += 1;
+            }
             self.clear_table();
             self.context = Some(context);
         } else {
             if self.mapping != mapping {
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.profile.table_retirements[TableCause::Cr3NonGlobal as usize] += 1;
+                }
                 self.retire_table(|page, _| page & 1 == 0);
             }
             if let Some((base, mask)) = invalidated {
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.profile.table_retirements[TableCause::Invlpg as usize] += 1;
+                }
                 self.retire_table(|page, _| page & mask == base);
             }
         }
         self.mapping = mapping;
+        #[cfg(feature = "jit-profile")]
+        {
+            self.profile.context = Some(observed);
+        }
     }
 
     fn insert(&mut self, record: Record) {
@@ -283,9 +709,17 @@ impl Engine {
         let linear = cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip);
         // A miss stays an architectural fetch for the interpreter.
         let Some(hit) = cpu.fetch_cache_lookup(LinearAddr(linear)) else {
+            #[cfg(feature = "jit-profile")]
+            {
+                self.profile.target = Target::FetchMiss;
+            }
             return Probe::Known(Lookup::Interpret);
         };
         let Some(slot) = self.store.find(cpu.eip, Self::facts(cpu), hit.backing.0) else {
+            #[cfg(feature = "jit-profile")]
+            {
+                self.profile.target = Target::Uncompiled;
+            }
             return Probe::Unknown(hit.backing);
         };
         let mut record = self.store.get(slot);
@@ -304,7 +738,11 @@ impl Engine {
             {
                 self.stats.invalidations += 1;
                 self.store.remove(slot);
-                return Probe::Known(Lookup::Cold);
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.profile.target = Target::Invalidated;
+                }
+                return Probe::Known(Lookup::Cold(false));
             }
             self.store.revalidate(slot, version, version_ptr);
             record.version_ptr = version_ptr;
@@ -312,10 +750,32 @@ impl Engine {
         }
         if record.address == 0 {
             #[cfg(feature = "jit-profile")]
+            {
+                self.profile.target = Target::Unsupported;
+            }
+            #[cfg(feature = "jit-profile")]
             if profile {
                 self.unsupported[usize::from(record.opcode)] += 1;
+                if record.memory & 7 != 0 {
+                    *self
+                        .unsupported_memory
+                        .entry((record.opcode, record.memory))
+                        .or_default() += 1;
+                    if matches!(record.opcode & 0x3ff, 0x88..=0x8b)
+                        && matches!(record.memory & 7, 3 | 4)
+                        && matches!(record.memory >> 4 & 3, 1 | 2)
+                    {
+                        self.profile.mov_segment(cpu, record.memory);
+                    }
+                } else if record.memory & 64 != 0 {
+                    self.profile.address16_unclassified += 1;
+                }
             }
             return Probe::Known(Lookup::Interpret);
+        }
+        #[cfg(feature = "jit-profile")]
+        {
+            self.profile.target = Target::Native;
         }
         Probe::Known(Lookup::Native(Native {
             address: record.address as usize,
@@ -336,11 +796,11 @@ impl Engine {
             [(cpu.eip ^ (cpu.eip >> 12) ^ (backing.0 as u32 >> 7)) as usize & (HEAT - 1)];
         if heat.0 != cpu.eip {
             *heat = (cpu.eip, 1);
-            return Ok(Lookup::Cold);
+            return Ok(Lookup::Cold(true));
         }
         heat.1 += 1;
         if heat.1 < HOT {
-            return Ok(Lookup::Cold);
+            return Ok(Lookup::Cold(false));
         }
         *heat = (0, 0);
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
@@ -351,7 +811,7 @@ impl Engine {
             .min(WINDOW)
             .min((u32::MAX - cpu.eip) as usize + 1);
         let bytes = bus.jit_code_bytes(offset, window);
-        let decoded = decode::block(bytes, cpu.eip, BLOCK_INSTRUCTIONS);
+        let decoded = decode::block_extended(bytes, cpu.eip, BLOCK_INSTRUCTIONS);
         let mut record = Record {
             eip: cpu.eip,
             facts,
@@ -364,6 +824,8 @@ impl Engine {
             source_len: 0,
             #[cfg(feature = "jit-profile")]
             opcode: profile_key(bytes),
+            #[cfg(feature = "jit-profile")]
+            memory: profile_memory(bytes, &decoded, facts),
         };
         let Some(compiled) = lower::block(&decoded, facts) else {
             self.stats.unsupported_entries += 1;
@@ -415,16 +877,24 @@ impl Engine {
     }
 
     /// Run a chain starting with `block` if it fits `limit`. Returns completed
-    /// instructions and whether the chain stopped before an instruction that
-    /// the interpreter must execute.
+    /// instructions and the exit code. Only EXIT_INTERPRET leaves before the
+    /// current instruction; attention/shadow exits have completed it.
     fn invoke(
         &mut self,
         cpu: &mut Cpu,
         bus: &mut HostBus,
         block: Native,
         limit: u64,
-    ) -> Option<(u64, bool)> {
+    ) -> Option<(u64, u32)> {
+        #[cfg(feature = "jit-profile")]
+        {
+            self.profile.limit(limit);
+        }
         if u64::from(block.instructions) > limit {
+            #[cfg(feature = "jit-profile")]
+            {
+                self.profile.entry_rejected += 1;
+            }
             return None;
         }
         let plane = self.publish(cpu, block);
@@ -437,14 +907,34 @@ impl Engine {
             remaining: budget,
             table: self.table[plane..].as_ptr() as usize as u32,
             dispatch: self.dispatch as u32,
+            popf_mask: crate::x86::interp::popfd_change_mask(cpu).unwrap_or(0),
+            quiet: u32::from(bus.batch_interrupts_quiet()),
+            selectors: [
+                SegmentReg::Es,
+                SegmentReg::Cs,
+                SegmentReg::Ss,
+                SegmentReg::Ds,
+                SegmentReg::Fs,
+                SegmentReg::Gs,
+            ]
+            .map(|seg| u32::from(cpu.seg(seg).selector)),
             ..Frame::default()
         };
         frame.set_eflags(cpu.effective_eflags());
-        let (bases, limits, based, based_write) = cpu.jit_based_segments();
-        let fs_gs = |mask: u32| (mask >> SegmentReg::Fs as u32) & 3;
-        frame.based = fs_gs(based) | fs_gs(based_write) << 2;
-        frame.bases = bases;
-        frame.limits = limits;
+        frame.set_segments(cpu);
+        #[cfg(feature = "jit-profile")]
+        let mut checked = CheckedInvocation {
+            start: self.profile.invocation_start,
+            counters: &mut self.profile,
+            segments: lower::DATA_SEGMENTS.map(|seg| cpu.seg(seg)),
+            cpl: cpu.cpl(),
+            budget,
+        };
+        #[cfg(feature = "jit-profile")]
+        if lower::PROFILE_CHECKED {
+            frame.checked_profile = &mut checked as *mut CheckedInvocation as usize as u32;
+            frame.checked_callback = profile_checked as *const () as usize as u32;
+        }
         let mut address = block.address;
         loop {
             // A lookup below may promote a code page, which revokes write
@@ -452,6 +942,8 @@ impl Engine {
             let (tlb, state) = cpu.translation_cache.jit_view();
             frame.tlb = tlb as usize as u32;
             frame.tlb_state = state as u32;
+            #[cfg(feature = "jit-profile")]
+            let before = frame.remaining;
             // SAFETY: the entry, dispatcher and blocks were emitted for this
             // ABI and published in the live arena; table entries name only
             // blocks validated in the current context. The frame outlives the
@@ -463,7 +955,22 @@ impl Engine {
                 entry(&mut frame, address);
             }
             self.stats.invocations += 1;
+            #[cfg(feature = "jit-profile")]
+            {
+                self.profile.steps(before - frame.remaining);
+            }
             if frame.exit != EXIT_BOUNDARY || frame.remaining == 0 {
+                #[cfg(feature = "jit-profile")]
+                {
+                    let reason = match frame.exit {
+                        EXIT_INTERPRET => NativeReturn::InterpretGuard,
+                        EXIT_BOUNDARY => NativeReturn::BudgetExhausted,
+                        EXIT_ATTENTION => NativeReturn::Attention,
+                        EXIT_SHADOW => NativeReturn::Shadow,
+                        _ => NativeReturn::Other,
+                    };
+                    self.profile.native_returns[reason as usize] += 1;
+                }
                 break;
             }
             // A dispatch miss with budget left. No guest register, flag or
@@ -476,8 +983,18 @@ impl Engine {
                     self.publish(cpu, next);
                     address = next.address;
                     self.stats.resolved += 1;
+                    #[cfg(feature = "jit-profile")]
+                    {
+                        self.profile.native_returns[NativeReturn::DispatchResolved as usize] += 1;
+                    }
                 }
-                _ => break,
+                _ => {
+                    #[cfg(feature = "jit-profile")]
+                    {
+                        self.profile.unresolved();
+                    }
+                    break;
+                }
             }
         }
         let executed = u64::from(budget - frame.remaining);
@@ -485,7 +1002,7 @@ impl Engine {
         cpu.eip = frame.eip;
         cpu.jit_commit_flags(frame.eflags());
         cpu.advance_tsc(executed);
-        Some((executed, frame.exit == EXIT_INTERPRET))
+        Some((executed, frame.exit))
     }
 
     pub(crate) fn run_batch(
@@ -495,6 +1012,11 @@ impl Engine {
         start: u64,
         budget: u64,
     ) -> Result<BatchResult, String> {
+        // Code met for the first time is probably run once. It goes through
+        // the interpreter's own loop, a short batch per lookup: one engine
+        // iteration per instruction costs about three times the instruction.
+        // Once an address is being counted, interpretation stops at each
+        // transfer so that admission sees every visit.
         const COLD_BATCH: u64 = 16;
         bus.sync_ioram(cpu);
         let mut ran = 0;
@@ -502,27 +1024,88 @@ impl Engine {
         // successor is no block entry; interpretation continues to a transfer.
         let mut cold = None::<u32>;
         while ran < budget {
+            #[cfg(feature = "jit-profile")]
+            let profile_pm16 = code16::ENABLED && code16::pm16(cpu);
+            #[cfg(not(feature = "jit-profile"))]
+            let profile_pm16 = false;
+            #[cfg(feature = "jit-profile")]
+            if code16::ENABLED {
+                if profile_pm16 {
+                    self.profile.code16.observe(cpu);
+                } else {
+                    self.profile.code16.leave();
+                }
+            }
             let shadowed = cpu.interrupt_shadow();
             let eligible = !shadowed
                 && !cpu.halted
                 && !cpu.code_default16()
                 && cpu.seg(SegmentReg::Cs).limit == u32::MAX
                 && cpu.eflags & (TF | VM) == 0;
+            #[cfg(feature = "jit-profile")]
+            if !eligible {
+                let reason = if shadowed {
+                    Iteration::Shadow
+                } else if cpu.halted {
+                    Iteration::Halted
+                } else if cpu.code_default16() {
+                    Iteration::Code16
+                } else if cpu.seg(SegmentReg::Cs).limit != u32::MAX {
+                    Iteration::CsLimit
+                } else {
+                    Iteration::TfVm
+                };
+                self.profile.iterations[reason as usize] += 1;
+            }
             let (limit, attention) = bus
                 .batch_attention_limit(start.wrapping_add(ran), budget - ran)
                 .unwrap_or((1, false));
+            let sequential = cold.is_some_and(|eip| cpu.eip.wrapping_sub(eip).wrapping_sub(1) < 15);
             cold = None;
-            if eligible {
+            let mut first = false;
+            if eligible && sequential {
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.profile.iterations[Iteration::Sequential as usize] += 1;
+                }
+                cold = Some(cpu.eip);
+            } else if eligible {
                 self.sync(cpu, bus);
                 let native = match self.lookup(cpu, bus)? {
-                    Lookup::Native(block) => self.invoke(cpu, bus, block, limit),
-                    Lookup::Interpret => None,
-                    Lookup::Cold => {
-                        cold = Some(cpu.eip);
+                    Lookup::Native(block) => {
+                        #[cfg(feature = "jit-profile")]
+                        {
+                            self.profile.iterations[Iteration::Native as usize] += 1;
+                            self.profile.attention_limits += u64::from(attention);
+                            self.profile.invocation_start = start.wrapping_add(ran);
+                        }
+                        self.invoke(cpu, bus, block, limit)
+                    }
+                    Lookup::Interpret => {
+                        #[cfg(feature = "jit-profile")]
+                        {
+                            self.profile.iterations[Iteration::Interpret as usize] += 1;
+                        }
+                        None
+                    }
+                    Lookup::Cold(new) => {
+                        #[cfg(feature = "jit-profile")]
+                        {
+                            let kind = if new {
+                                Iteration::ColdNew
+                            } else {
+                                Iteration::ColdCounting
+                            };
+                            self.profile.iterations[kind as usize] += 1;
+                        }
+                        first = new;
+                        if !new {
+                            cold = Some(cpu.eip);
+                        }
                         None
                     }
                 };
-                if let Some((executed, interpret)) = native {
+                if let Some((executed, exit)) = native {
                     ran += executed;
                     self.stats.native_steps += executed;
                     if executed != 0 {
@@ -531,7 +1114,34 @@ impl Engine {
                             cpu.tsc().wrapping_sub(1),
                         );
                     }
-                    if executed == limit && attention {
+                    let control = matches!(exit, EXIT_ATTENTION | EXIT_SHADOW);
+                    // Establish STI's shadow before Machine can observe IRQs.
+                    // Quiet control exits can stay in this batch; the shared
+                    // helper also clears jit_commit_flags' IF-rise attention.
+                    if exit == EXIT_SHADOW {
+                        cpu.inhibit_maskable_interrupts();
+                    }
+                    if control
+                        && crate::x86::interp::continue_after_interrupt_shadow(
+                            cpu,
+                            bus,
+                            executed < limit,
+                        )
+                    {
+                        #[cfg(feature = "jit-profile")]
+                        {
+                            self.profile.shadow_continues += u64::from(exit == EXIT_SHADOW);
+                            self.profile.attention_continues += u64::from(exit == EXIT_ATTENTION);
+                        }
+                        continue;
+                    }
+                    if control || (executed == limit && attention) {
+                        #[cfg(feature = "jit-profile")]
+                        {
+                            self.profile.attention_ends +=
+                                u64::from(executed == limit && attention);
+                            self.profile.control_attention_returns += u64::from(control);
+                        }
                         return Ok(BatchResult {
                             ran,
                             stop: BatchStop::Attention {
@@ -540,20 +1150,20 @@ impl Engine {
                             },
                         });
                     }
-                    if !interpret {
+                    if exit != EXIT_INTERPRET {
                         continue;
                     }
                     self.stats.memory_exits += 1;
                 }
             }
-            let mut batch = if cold.is_some() {
+            let mut batch = if first {
                 Interpreter::run_batch(
                     cpu,
                     bus,
                     start.wrapping_add(ran),
                     (budget - ran).min(COLD_BATCH),
                 )
-            } else if eligible || shadowed {
+            } else if eligible || shadowed || profile_pm16 {
                 Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
             } else {
                 Interpreter::run_batch(cpu, bus, start.wrapping_add(ran), budget - ran)
@@ -567,6 +1177,10 @@ impl Engine {
             }
             ran += batch.ran;
             self.stats.interpreted_steps += batch.ran;
+            #[cfg(feature = "jit-profile")]
+            if profile_pm16 && !code16::pm16(cpu) {
+                self.profile.code16.leave();
+            }
             if !matches!(batch.stop, BatchStop::Budget) {
                 return Ok(BatchResult {
                     ran,
@@ -581,9 +1195,78 @@ impl Engine {
     }
 }
 
-/// Profile bucket of an entry's first instruction: the opcode after prefixes
-/// (0x100 + second byte for 0F), ModRM reg and form for common groups at
-/// 0x200, and 0x400 for an operand-size prefix.
+/// Segment (plus one), access, missing fact, and 67h bit of an entry operand.
+#[cfg(feature = "jit-profile")]
+fn profile_memory(bytes: &[u8], decoded: &decode::Block, facts: u32) -> u8 {
+    let prefix_len = bytes
+        .iter()
+        .take(15)
+        .take_while(|b| {
+            matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64..=0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        })
+        .count();
+    let prefixes = &bytes[..prefix_len];
+    let address16 = prefixes.contains(&0x67);
+    let operand = decoded
+        .instructions
+        .first()
+        .and_then(|i| lower::profile_memory(i.op, facts));
+    // The decoder rejects 67h before producing an Op. Classify MOV's explicit
+    // operand directly for A3, including the different 16-bit default segment.
+    // This is diagnostic metadata only; it never admits or executes an opcode.
+    let operand = operand.or_else(|| {
+        let opcode = *bytes.get(prefix_len)?;
+        if !address16 || !matches!(opcode, 0x88..=0x8b | 0xa0..=0xa3) {
+            return None;
+        }
+        let mut segment = SegmentReg::Ds;
+        if opcode < 0xa0 {
+            let modrm = *bytes.get(prefix_len + 1)?;
+            if modrm >= 0xc0 {
+                return None;
+            }
+            if matches!(modrm & 7, 2 | 3) || (modrm & 7 == 6 && modrm & 0xc0 != 0) {
+                segment = SegmentReg::Ss;
+            }
+        }
+        for prefix in prefixes {
+            segment = match prefix {
+                0x26 => SegmentReg::Es,
+                0x2e => SegmentReg::Cs,
+                0x36 => SegmentReg::Ss,
+                0x3e => SegmentReg::Ds,
+                0x64 => SegmentReg::Fs,
+                0x65 => SegmentReg::Gs,
+                _ => segment,
+            };
+        }
+        let write = matches!(opcode, 0x88 | 0x89 | 0xa2 | 0xa3);
+        Some((
+            segment,
+            write,
+            lower::profile_segment(segment, write, facts),
+        ))
+    });
+    let Some((segment, write, allowed)) = operand else {
+        return u8::from(address16) << 6;
+    };
+    let missing = if allowed {
+        0
+    } else if segment == SegmentReg::Cs {
+        3
+    } else if write {
+        2
+    } else {
+        1
+    };
+    segment as u8 + 1 | (u8::from(write) << 3) | missing << 4 | u8::from(address16) << 6
+}
+
+/// Profile bucket: opcode (0x100 for 0F), common ModRM groups at 0x200,
+/// and 0x400 for an operand-size prefix.
 #[cfg(feature = "jit-profile")]
 fn profile_key(bytes: &[u8]) -> u16 {
     let bytes = &bytes[..bytes.len().min(15)];

@@ -294,6 +294,14 @@ pub enum Op {
         src: Value,
         bits: u8,
     },
+    /// Extended decoder only; stack order includes the original SP/ESP.
+    PushAll {
+        bits: u8,
+    },
+    /// Extended decoder only; the saved SP/ESP slot is skipped.
+    PopAll {
+        bits: u8,
+    },
     Call {
         target: Value,
         bits: u8,
@@ -308,6 +316,12 @@ pub enum Op {
     Branch {
         condition: Option<BranchCondition>,
         target: u32,
+    },
+    /// Decrement ECX without changing flags, then branch while nonzero and,
+    /// for LOOP(E/NE), while ZF has the requested value. Extended decoder only.
+    Loop {
+        target: u32,
+        zero: Option<bool>,
     },
 }
 
@@ -337,6 +351,7 @@ impl Op {
             Self::Push { src, .. } => src.is_memory(),
             Self::Call { target, .. } => target.is_memory(),
             Self::Pop { .. }
+            | Self::PopAll { .. }
             | Self::PopSegment { .. }
             | Self::PopFlags { .. }
             | Self::Return { .. }
@@ -380,6 +395,7 @@ impl Op {
                 }
                 | Self::PushFlags { .. }
                 | Self::Push { .. }
+                | Self::PushAll { .. }
                 | Self::PushSegment { .. }
                 | Self::Call { .. }
         )
@@ -440,6 +456,7 @@ pub struct Block {
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
+    extended: bool,
 }
 
 impl Reader<'_> {
@@ -560,6 +577,14 @@ impl Reader<'_> {
             return None;
         }
         let op = match opcode {
+            0x0e | 0x16 if self.extended => Op::PushSegment {
+                segment: if opcode == 0x0e {
+                    SegmentReg::Cs
+                } else {
+                    SegmentReg::Ss
+                },
+                bits,
+            },
             0x06 | 0x1e => Op::PushSegment {
                 segment: if opcode == 0x06 {
                     SegmentReg::Es
@@ -707,6 +732,8 @@ impl Reader<'_> {
                 src: Value::Register(Register::encoded(opcode & 7, bits)),
                 bits,
             },
+            0x60 if self.extended => Op::PushAll { bits },
+            0x61 if self.extended => Op::PopAll { bits },
             0x68 | 0x6a => Op::Push {
                 src: Value::Immediate(if opcode == 0x6a {
                     self.byte()? as i8 as i32 as u32
@@ -952,6 +979,19 @@ impl Reader<'_> {
                     target,
                 }
             }
+            // Address-size prefixes are rejected by the prefix reader.
+            opcode @ 0xe0..=0xe2 if self.extended && bits == 32 => {
+                let relative = self.byte()? as i8 as i32;
+                let next = eip.wrapping_add((self.at - start) as u32);
+                Op::Loop {
+                    target: next.wrapping_add_signed(relative),
+                    zero: match opcode {
+                        0xe0 => Some(false),
+                        0xe1 => Some(true),
+                        _ => None,
+                    },
+                }
+            }
             0xe3 if bits == 32 => {
                 let relative = self.byte()? as i8 as i32;
                 let next = eip.wrapping_add((self.at - start) as u32);
@@ -1182,7 +1222,20 @@ impl Reader<'_> {
 }
 
 pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
-    let mut reader = Reader { bytes, at: 0 };
+    read_block(bytes, eip, limit, false)
+}
+
+/// As `block`, plus the operations only the Thumb-2 backend lowers.
+pub fn block_extended(bytes: &[u8], eip: u32, limit: usize) -> Block {
+    read_block(bytes, eip, limit, true)
+}
+
+fn read_block(bytes: &[u8], eip: u32, limit: usize, extended: bool) -> Block {
+    let mut reader = Reader {
+        bytes,
+        at: 0,
+        extended,
+    };
     let mut result = Block {
         instructions: Vec::new(),
         byte_len: 0,
@@ -1203,6 +1256,7 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
         if matches!(
             instruction.op,
             Op::Branch { .. }
+                | Op::Loop { .. }
                 | Op::LoadSegment { .. }
                 | Op::PopSegment { .. }
                 | Op::SetInterrupt
