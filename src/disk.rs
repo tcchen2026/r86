@@ -16,6 +16,8 @@ pub enum DiskError {
     ReadOnly,
     #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
     BrowserIo,
+    #[cfg(all(feature = "mcu", not(feature = "host")))]
+    PlatformIo,
     #[cfg(feature = "host")]
     Io(std::io::Error),
 }
@@ -29,6 +31,8 @@ impl fmt::Display for DiskError {
             Self::BrowserIo => {
                 f.write_str("browser storage operation failed; see storage diagnostics")
             }
+            #[cfg(all(feature = "mcu", not(feature = "host")))]
+            Self::PlatformIo => f.write_str("platform disk operation failed"),
             #[cfg(feature = "host")]
             Self::Io(error) => error.fmt(f),
         }
@@ -50,6 +54,8 @@ enum Storage {
     Memory(Vec<u8>),
     #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
     Browser(u32),
+    #[cfg(all(feature = "mcu", not(feature = "host")))]
+    Platform(u32),
     #[cfg(feature = "host")]
     File(file::FileDisk),
 }
@@ -64,6 +70,24 @@ pub struct Disk {
 }
 
 impl Disk {
+    /// The platform owns this drive's sectors for the lifetime of the disk.
+    /// `r86_disk_io` is synchronous: operation 0 fills `len` bytes, 1 reads
+    /// them without modifying the buffer, and 2 flushes (null buffer, len 0).
+    /// A sector is 512 bytes; 0 means success and any other result is an I/O error.
+    #[cfg(all(feature = "mcu", not(feature = "host")))]
+    pub fn platform(drive: u32, sectors: u64, writable: bool) -> Result<Self, DiskError> {
+        if sectors == 0 || sectors > MAX_SECTORS {
+            return Err(DiskError::OutOfRange);
+        }
+        Ok(Self {
+            storage: Storage::Platform(drive),
+            sectors,
+            writable,
+            frozen: false,
+            changes: BTreeMap::new(),
+        })
+    }
+
     /// The JS host validates the backing descriptor before attaching it;
     /// `drive` identifies that backing for the lifetime of this instance.
     #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
@@ -154,6 +178,10 @@ impl Disk {
             Storage::Browser(drive) => {
                 crate::browser::read(*drive, sector * SECTOR_SIZE as u64, data)?
             }
+            #[cfg(all(feature = "mcu", not(feature = "host")))]
+            Storage::Platform(drive) => {
+                platform_io(*drive, 0, sector as u32, data.as_mut_ptr(), data.len())?
+            }
         }
         if !self.changes.is_empty() {
             let end = sector + (data.len() / SECTOR_SIZE) as u64;
@@ -192,6 +220,14 @@ impl Disk {
             Storage::Browser(drive) => {
                 crate::browser::write(*drive, sector * SECTOR_SIZE as u64, data)?
             }
+            #[cfg(all(feature = "mcu", not(feature = "host")))]
+            Storage::Platform(drive) => platform_io(
+                *drive,
+                1,
+                sector as u32,
+                data.as_ptr().cast_mut(),
+                data.len(),
+            )?,
         }
         Ok(())
     }
@@ -208,6 +244,10 @@ impl Disk {
         if let Storage::Browser(drive) = &self.storage {
             crate::browser::flush(*drive)?;
         }
+        #[cfg(all(feature = "mcu", not(feature = "host")))]
+        if let Storage::Platform(drive) = &self.storage {
+            platform_io(*drive, 2, 0, core::ptr::null_mut(), 0)?;
+        }
         #[cfg(feature = "host")]
         if self.writable {
             if let Storage::File(file) = &mut self.storage {
@@ -215,6 +255,26 @@ impl Disk {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(feature = "mcu", not(feature = "host")))]
+fn platform_io(
+    drive: u32,
+    operation: u32,
+    sector: u32,
+    bytes: *mut u8,
+    len: usize,
+) -> Result<(), DiskError> {
+    unsafe extern "C" {
+        fn r86_disk_io(drive: u32, operation: u32, sector: u32, bytes: *mut u8, len: usize) -> i32;
+    }
+    // SAFETY: Disk checked the range/alignment; its caller owns the complete
+    // buffer until this synchronous hook returns. Writes may only read it.
+    if unsafe { r86_disk_io(drive, operation, sector, bytes, len) } == 0 {
+        Ok(())
+    } else {
+        Err(DiskError::PlatformIo)
     }
 }
 

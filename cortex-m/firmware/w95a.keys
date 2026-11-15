@@ -1,0 +1,173 @@
+# W95A: Intern -> Lead. Frozen micro95, 16 MiB RAM, deterministic clock.
+# End at 650000000 steps. All make/break events are at least 2 M steps apart.
+# Desktop focus: Ctrl+Esc, Esc leaves Start focused; two Tabs return to icons.
+# Starts/draw margins were selected on the host with wait-frame-stable and PNGs.
+# Solitaire: two deals and ten arrow/Enter/Space actions; Ski: ten directions.
+# DOS command launch is attempted, but this seed reports insufficient resources.
+# Format: step set-2 hex bytes, or step !shot name; comments follow #.
+250000000 !shot desktop
+# Start-menu-twice
+250000000 14 76 # ctrl+esc
+252000000 f0 76 f0 14 # ctrl+esc
+254000000 !shot start-1
+254000000 76 # esc
+256000000 f0 76 # esc
+258000000 14 76 # ctrl+esc
+260000000 f0 76 f0 14 # ctrl+esc
+262000000 !shot start-2
+262000000 76 # esc
+264000000 f0 76 # esc
+266000000 !shot start-closed
+# Focus-desktop
+266000000 0d # tab
+268000000 f0 0d # tab
+270000000 0d # tab
+272000000 f0 0d # tab
+274000000 1d # w
+276000000 f0 1d # w
+278000000 5a # enter
+280000000 f0 5a # enter
+300500000 !shot winmine
+# Minesweeper-three-new-games
+300500000 06 # f2
+302500000 f0 06 # f2
+304500000 06 # f2
+306500000 f0 06 # f2
+308500000 06 # f2
+310500000 f0 06 # f2
+312500000 11 34 # alt+g
+314500000 f0 34 f0 11 # alt+g
+316500000 e0 72 # down
+318500000 e0 f0 72 # down
+320500000 e0 72 # down
+322500000 e0 f0 72 # down
+324500000 e0 72 # down
+326500000 e0 f0 72 # down
+328500000 !shot winmine-game
+328500000 76 # esc
+330500000 f0 76 # esc
+332500000 11 0c # alt+f4
+334500000 f0 0c f0 11 # alt+f4
+# Solitaire
+336500000 e0 75 # up
+338500000 e0 f0 75 # up
+340500000 5a # enter
+342500000 f0 5a # enter
+355500000 !shot sol
+355500000 11 34 # alt+g
+357500000 f0 34 f0 11 # alt+g
+359500000 23 # d
+361500000 f0 23 # d
+364250000 !shot sol-deal-1
+364250000 11 34 # alt+g
+366250000 f0 34 f0 11 # alt+g
+368250000 23 # d
+370250000 f0 23 # d
+372750000 !shot sol-deal-2
+# Sol-ten-key-actions
+372750000 e0 74 # right
+374750000 e0 f0 74 # right
+376750000 e0 72 # down
+378750000 e0 f0 72 # down
+380750000 5a # enter
+382750000 f0 5a # enter
+384750000 29 # space
+386750000 f0 29 # space
+388750000 e0 6b # left
+390750000 e0 f0 6b # left
+392750000 e0 75 # up
+394750000 e0 f0 75 # up
+396750000 e0 74 # right
+398750000 e0 f0 74 # right
+400750000 5a # enter
+402750000 f0 5a # enter
+404750000 e0 72 # down
+406750000 e0 f0 72 # down
+408750000 29 # space
+410750000 f0 29 # space
+412750000 !shot sol-keys
+412750000 11 0c # alt+f4
+414750000 f0 0c f0 11 # alt+f4
+# Ski
+416750000 e0 75 # up
+418750000 e0 f0 75 # up
+420750000 5a # enter
+422750000 f0 5a # enter
+433500000 !shot ski
+# Ski-ten-moves
+433500000 e0 72 # down
+435500000 e0 f0 72 # down
+437500000 e0 6b # left
+439500000 e0 f0 6b # left
+441500000 e0 72 # down
+443500000 e0 f0 72 # down
+445500000 e0 74 # right
+447500000 e0 f0 74 # right
+449500000 e0 72 # down
+451500000 e0 f0 72 # down
+453500000 e0 6b # left
+455500000 e0 f0 6b # left
+457500000 e0 72 # down
+459500000 e0 f0 72 # down
+461500000 e0 74 # right
+463500000 e0 f0 74 # right
+465500000 e0 72 # down
+467500000 e0 f0 72 # down
+469500000 e0 75 # up
+471500000 e0 f0 75 # up
+473500000 !shot ski-moves
+473500000 11 0c # alt+f4
+475500000 f0 0c f0 11 # alt+f4
+# My-Computer
+477500000 e0 6c # home
+479500000 e0 f0 6c # home
+481500000 5a # enter
+483500000 f0 5a # enter
+500500000 !shot my-computer
+500500000 e0 72 # down
+502500000 e0 f0 72 # down
+504500000 5a # enter
+506500000 f0 5a # enter
+530500000 !shot drive-c
+530500000 e0 74 # right
+532500000 e0 f0 74 # right
+534500000 e0 6b # left
+536500000 e0 f0 6b # left
+538500000 5a # enter
+540500000 f0 5a # enter
+556750000 !shot windows-folder
+556750000 66 # back
+558750000 f0 66 # back
+565000000 !shot parent
+565000000 11 0c # alt+f4
+567000000 f0 0c f0 11 # alt+f4
+569000000 11 0c # alt+f4
+571000000 f0 0c f0 11 # alt+f4
+# DOS-prompt
+573000000 14 76 # ctrl+esc
+575000000 f0 76 f0 14 # ctrl+esc
+577000000 2d # r
+579000000 f0 2d # r
+581000000 21 # c
+583000000 f0 21 # c
+585000000 44 # o
+587000000 f0 44 # o
+589000000 3a # m
+591000000 f0 3a # m
+593000000 3a # m
+595000000 f0 3a # m
+597000000 1c # a
+599000000 f0 1c # a
+601000000 31 # n
+603000000 f0 31 # n
+605000000 23 # d
+607000000 f0 23 # d
+609000000 5a # enter
+611000000 f0 5a # enter
+625500000 !shot dos-unavailable
+# Dismiss the DOS resource error; close the remaining My Computer window.
+625500000 5a # Enter
+627500000 f0 5a
+629500000 11 0c # Alt+F4
+631500000 f0 0c f0 11
+650000000 !shot final

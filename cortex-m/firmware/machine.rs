@@ -4,6 +4,8 @@
 //! (`guest.ram`, `config.bin`). This firmware loads both through semihosting,
 //! runs the shared interpreter or the Thumb-2 JIT (a flag in `config.bin`
 //! selects), and forwards the guest's serial output. `run.sh` drives it.
+//! With `mcu`, config word 7 can instead select a BIOS-booted PC with 16 MiB
+//! guest RAM and a frozen semihosting disk. `pc.sh` drives that bounded mode.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 

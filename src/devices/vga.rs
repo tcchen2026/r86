@@ -7,7 +7,11 @@ use font8x8::legacy::BASIC_LEGACY;
 pub const LEGACY_VGA_BASE: u64 = 0x000a_0000;
 pub const LEGACY_VGA_LEN: u64 = 0x0002_0000;
 pub const DEFAULT_LFB_BASE: u64 = 0xe000_0000;
-pub const DEFAULT_LFB_LEN: u64 = 0x0100_0000;
+pub const DEFAULT_LFB_LEN: u64 = if cfg!(feature = "mcu") {
+    0x0010_0000
+} else {
+    0x0100_0000
+};
 pub const VRAM_SIZE: usize = DEFAULT_LFB_LEN as usize;
 const VRAM_PAGES: usize = VRAM_SIZE / 4096;
 

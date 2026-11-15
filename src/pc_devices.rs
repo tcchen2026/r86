@@ -1,3 +1,4 @@
+use crate::devices::vga::DEFAULT_LFB_LEN;
 use crate::disk::{Disk, DiskError};
 use alloc::{
     string::{String, ToString},
@@ -419,7 +420,7 @@ impl PciConfig {
             }
             (2, 0, 0x10) => {
                 let old = self.vga_bar0;
-                self.vga_bar0 = merge(self.vga_bar0) & 0xff00_0000;
+                self.vga_bar0 = merge(self.vga_bar0) & !(DEFAULT_LFB_LEN as u32 - 1);
                 return self.vga_mem_enabled() && old != self.vga_bar0;
             }
             _ => {}
@@ -428,7 +429,7 @@ impl PciConfig {
     }
 
     pub fn vga_lfb_base(&self) -> u64 {
-        u64::from(self.vga_bar0 & 0xff00_0000)
+        u64::from(self.vga_bar0 & !(DEFAULT_LFB_LEN as u32 - 1))
     }
 
     pub fn net_port(&self, port: u16) -> Option<u8> {
@@ -1402,6 +1403,8 @@ impl IdeChannel {
             DiskError::ReadOnly => ATA_ERR_ABORT,
             #[cfg(all(feature = "web-frontend", target_arch = "wasm32"))]
             DiskError::BrowserIo => 0x40,
+            #[cfg(all(feature = "mcu", not(feature = "host")))]
+            DiskError::PlatformIo => 0x40,
             #[cfg(feature = "host")]
             DiskError::Io(_) => 0x40, // uncorrectable data / host I/O failure
         };
@@ -2677,7 +2680,14 @@ mod tests {
         pci.write_addr(0x8000_1010);
         assert_eq!(pci.read_data_u32(), 0xe000_0008);
         pci.write_data_u32(0xffff_ffff);
-        assert_eq!(pci.read_data_u32(), 0xff00_0008);
+        assert_eq!(
+            pci.read_data_u32(),
+            if cfg!(feature = "mcu") {
+                0xfff0_0008
+            } else {
+                0xff00_0008
+            }
+        );
         pci.write_data_u32(0xe000_0000);
         pci.write_addr(0x8000_103c);
         assert_eq!(pci.read_data_u32() & 0xffff, 0x0000);

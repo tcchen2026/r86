@@ -408,6 +408,20 @@ impl Machine {
         machine
     }
 
+    /// Builds the BIOS-booted PC on guest RAM owned by the bare-metal platform.
+    #[cfg(not(feature = "host"))]
+    pub fn new_firmware_in(
+        ram: &'static mut [u8],
+        display: FirmwareDisplay,
+    ) -> Result<Self, String> {
+        Ok(Self::from_parts(
+            Cpu::new(),
+            HostBus::firmware_with_ram(ram, display)?,
+            TraceMode::Off,
+            PerfMode::Disabled,
+        ))
+    }
+
     fn boot_reload_is_external(&self) -> bool {
         #[cfg(not(feature = "host"))]
         if matches!(self.boot_image, Some(BootImage::Preloaded)) {
@@ -2209,8 +2223,8 @@ impl HostBus {
             .map_err(|err| format!("failed to build firmware region map: {err:?}"))?;
         regions
             .push(PhysRegion::fb_dirty_tracked(
-                PhysAddr(0xe000_0000),
-                0x0100_0000,
+                PhysAddr(crate::devices::vga::DEFAULT_LFB_BASE),
+                crate::devices::vga::DEFAULT_LFB_LEN,
             ))
             .map_err(|err| format!("failed to build firmware region map: {err:?}"))?;
         regions
@@ -11937,6 +11951,49 @@ mod host_bus_tests {
             bus.read_phys_u32(PhysAddr(0xfd00_0008)).unwrap(),
             0xaabb_ccdd
         );
+    }
+
+    #[cfg(feature = "mcu")]
+    #[test]
+    fn mcu_vga_aperture_bounds_backing_and_cached_pages() {
+        use crate::devices::vga::{DEFAULT_LFB_BASE, DEFAULT_LFB_LEN};
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        bus.io_write_u8(0x92, 2).unwrap();
+        assert_eq!(bus.vga.vram_len(), 1 << 20);
+        assert_eq!(DEFAULT_LFB_LEN, 1 << 20);
+        assert_eq!(
+            bus.regions
+                .classify(PhysAddr(DEFAULT_LFB_BASE + DEFAULT_LFB_LEN), 1),
+            PhysRegionKind::Hole
+        );
+        bus.io_write_u16(0x1ce, 10).unwrap();
+        assert_eq!(bus.io_read_u16(0x1cf).unwrap(), 16);
+        bus.io_write_u32(0xcf8, 0x8000_1010).unwrap();
+        bus.io_write_u32(0xcfc, u32::MAX).unwrap();
+        assert_eq!(bus.io_read_u32(0xcfc).unwrap(), 0xfff0_0008);
+        // A valid 1 MiB alignment which the ordinary 16 MiB BAR would mask off.
+        let base = 0xe010_0000;
+        bus.io_write_u32(0xcfc, base).unwrap();
+        assert_eq!(bus.pci.vga_lfb_base(), u64::from(base));
+        for (index, value) in [(1, 640), (2, 480), (3, 8), (4, 0x41)] {
+            bus.io_write_u16(0x1ce, index).unwrap();
+            bus.io_write_u16(0x1cf, value).unwrap();
+        }
+        let end = u64::from(base) + DEFAULT_LFB_LEN;
+        let token = bus.ioram_page(PhysAddr(end - 4096), true).unwrap();
+        // SAFETY: the grant covers the last complete backing page.
+        unsafe { (token.0 as *mut u8).add(4095).write(0xa5) };
+        assert_eq!(bus.read_phys_u8(PhysAddr(end - 1)).unwrap(), 0xa5);
+        assert!(bus.vga.dirty_page(255));
+        assert!(!bus.vga.dirty_page(256));
+        assert!(bus.ioram_page(PhysAddr(end), false).is_none());
+        assert!(bus.ioram_page(PhysAddr(end), true).is_none());
+        assert!(!PcVga::contains_lfb(end - 1, 2, u64::from(base)));
+        assert!(!bus.vga.lfb_write_u8(end, u64::from(base), 0xff));
+        bus.io_write_u16(0x1ce, 5).unwrap();
+        bus.io_write_u16(0x1cf, 16).unwrap();
+        assert!(bus.ioram_page(PhysAddr(0xa0000), false).is_none());
+        assert!(bus.ioram_page(PhysAddr(0xa0000), true).is_none());
     }
 
     #[test]

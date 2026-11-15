@@ -10,6 +10,8 @@ autobins = false
 default = ["host", "jit"]
 host = ["machine", "bus-instruction-context", "dep:flate2", "dep:toml", "dep:libc", "dep:fatfs", "dep:chrono", "dep:windows"]
 machine = ["dep:font8x8"]
+# Microcontrollers with tens of MiB of RAM: a 1 MiB VGA aperture/backing.
+mcu = ["machine"]
 web-frontend = ["machine"]
 wasm-jit = ["web-frontend", "jit"]
 # Attribute unclaimed bus accesses to the current x86 instruction. Firmware can
