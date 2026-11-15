@@ -58,6 +58,10 @@ void r86_vm_free(R86Vm *vm);  // turn off now, flush disks
 void r86_vm_command(const R86Vm *vm, uint32_t command);
 void r86_vm_key(const R86Vm *vm, uint16_t mac_key_code, bool down);
 void r86_vm_mouse(const R86Vm *vm, int32_t dx, int32_t dy, uint32_t buttons);
+// Absolute 0..65535 across the screen, for the guest's r86 tools helper while
+// r86_vm_pointer_active; wheel steps, positive scrolls down.
+void r86_vm_pointer(const R86Vm *vm, uint16_t x, uint16_t y, uint32_t buttons, int16_t wheel);
+bool r86_vm_pointer_active(const R86Vm *vm);
 void r86_vm_change_cd(const R86Vm *vm, const char *path);  // NULL ejects
 void r86_vm_set_volume(const R86Vm *vm, uint32_t percent);
 void r86_vm_set_remote(const R86Vm *vm, bool on);  // web console on 127.0.0.1

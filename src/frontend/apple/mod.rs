@@ -38,6 +38,7 @@ mod ws_frontend;
 use std::ffi::{CStr, CString, c_char};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use r86::devices::Ps2ButtonState;
 use runner::{Command, Running};
@@ -466,6 +467,37 @@ pub unsafe extern "C" fn r86_vm_mouse(vm: *const R86Vm, dx: i32, dy: i32, button
     };
     // SAFETY: caller contract.
     unsafe { &*vm }.0.send(Command::Mouse(dx, dy, buttons));
+}
+
+/// Absolute position, 0..=65535 across the guest screen on each axis,
+/// buttons as for r86_vm_mouse and wheel steps (positive scrolls down), for
+/// the guest's r86 tools helper while r86_vm_pointer_active is true.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_pointer(
+    vm: *const R86Vm,
+    x: u16,
+    y: u16,
+    buttons: u32,
+    wheel: i16,
+) {
+    // SAFETY: caller contract.
+    unsafe { &*vm }
+        .0
+        .send(Command::Pointer(x, y, (buttons & 7) as u8, wheel));
+}
+
+/// The guest's r86 tools helper takes absolute pointer input: the pointer
+/// needs no capture.
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_pointer_active(vm: *const R86Vm) -> bool {
+    // SAFETY: caller contract.
+    unsafe { &*vm }.0.shared.pointer.load(Ordering::Relaxed)
 }
 
 /// Insert a CD image, or eject with NULL. The outcome arrives as a message.

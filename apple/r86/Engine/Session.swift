@@ -95,6 +95,14 @@ final class Session {
         r86_vm_mouse(vm, dx, dy, buttons)
     }
 
+    /// The guest's r86 tools helper follows the Mac pointer: no capture.
+    var pointerActive: Bool { r86_vm_pointer_active(vm) }
+
+    /// Absolute position, 0...65535 across the guest screen.
+    func pointer(x: UInt16, y: UInt16, buttons: UInt32, wheel: Int16) {
+        r86_vm_pointer(vm, x, y, buttons, wheel)
+    }
+
     /// Insert a CD image picked in a file panel, or eject with nil.
     func changeCD(_ url: URL?) {
         if let url {

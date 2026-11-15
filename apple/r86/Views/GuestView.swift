@@ -4,6 +4,8 @@ import SwiftUI
 
 /// The guest screen in SwiftUI. Keyboard and mouse need AppKit events:
 /// physical key codes, key-up and modifier changes, and relative motion.
+/// While the guest's r86 tools helper runs, the pointer is absolute instead:
+/// the guest follows the Mac pointer and nothing is captured.
 struct GuestScreen: NSViewRepresentable {
     let session: Session
     let scaling: DisplayScaling
@@ -45,9 +47,12 @@ final class GuestNSView: NSView {
     private var link: CADisplayLink?
     private var imageSize = CGSize.zero
     private var captured = false
+    private var absolute = false
     private var buttons: UInt32 = 0
     private var heldModifiers = Set<UInt16>()
     private var motion = CGPoint.zero
+    private var position: (x: UInt16, y: UInt16) = (0, 0)
+    private var wheel: CGFloat = 0
     private var resignObserver: NSObjectProtocol?
 
     private static let commandKeys: Set<UInt16> = [0x36, 0x37]
@@ -77,6 +82,7 @@ final class GuestNSView: NSView {
         let link = displayLink(target: self, selector: #selector(step(_:)))
         link.add(to: .main, forMode: .common)
         self.link = link
+        window.acceptsMouseMovedEvents = true
         resignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: window, queue: .main
         ) { [weak self] _ in
@@ -96,6 +102,13 @@ final class GuestNSView: NSView {
     }
 
     @objc private func step(_ link: CADisplayLink) {
+        let active = session?.pointerActive ?? false
+        if active != absolute {
+            // The helper took over, or stopped: drop the capture or the buttons.
+            endCapture()
+            buttons = 0
+            absolute = active
+        }
         guard let image = session?.newImage() else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -192,28 +205,44 @@ final class GuestNSView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        guard captured else { return beginCapture() }
-        press(1, true)
+        guard captured || absolute else { return beginCapture() }
+        press(1, true, event)
     }
 
-    override func mouseUp(with event: NSEvent) { press(1, false) }
-    override func rightMouseDown(with event: NSEvent) { if captured { press(2, true) } }
-    override func rightMouseUp(with event: NSEvent) { press(2, false) }
-    override func otherMouseDown(with event: NSEvent) { if captured { press(4, true) } }
-    override func otherMouseUp(with event: NSEvent) { press(4, false) }
+    override func mouseUp(with event: NSEvent) { press(1, false, event) }
+    override func rightMouseDown(with event: NSEvent) { press(2, true, event) }
+    override func rightMouseUp(with event: NSEvent) { press(2, false, event) }
+    override func otherMouseDown(with event: NSEvent) { press(4, true, event) }
+    override func otherMouseUp(with event: NSEvent) { press(4, false, event) }
     override func mouseMoved(with event: NSEvent) { move(event) }
     override func mouseDragged(with event: NSEvent) { move(event) }
     override func rightMouseDragged(with event: NSEvent) { move(event) }
     override func otherMouseDragged(with event: NSEvent) { move(event) }
 
-    private func press(_ bit: UInt32, _ down: Bool) {
-        guard captured || !down else { return }
+    override func scrollWheel(with event: NSEvent) {
+        guard absolute else { return }
+        // A wheel notch is one step; a trackpad gives points, about ten a step.
+        // Positive steps scroll down, as the Mac's own scrolling would.
+        wheel -= event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / 10 : event.scrollingDeltaY
+        let steps = wheel.rounded(.towardZero)
+        wheel -= steps
+        if steps != 0 { point(event, wheel: Int16(max(-127, min(127, steps))), always: true) }
+    }
+
+    private func press(_ bit: UInt32, _ down: Bool, _ event: NSEvent) {
+        guard captured || absolute || !down else { return }
         let before = buttons
         buttons = down ? buttons | bit : buttons & ~bit
-        if buttons != before { session?.mouse(dx: 0, dy: 0, buttons: buttons) }
+        guard buttons != before else { return }
+        if absolute {
+            point(event, always: true)
+        } else {
+            session?.mouse(dx: 0, dy: 0, buttons: buttons)
+        }
     }
 
     private func move(_ event: NSEvent) {
+        if absolute { return point(event) }
         guard captured else { return }
         // Keep fractions of a pixel for the next event.
         motion.x += event.deltaX
@@ -225,6 +254,20 @@ final class GuestNSView: NSView {
         if dx != 0 || dy != 0 {
             session?.mouse(dx: Int32(dx), dy: Int32(dy), buttons: buttons)
         }
+    }
+
+    /// Absolute position for the guest's helper, clamped to the guest screen.
+    /// Moves outside the view count only while a button is held; button and
+    /// wheel changes always do.
+    private func point(_ event: NSEvent, wheel: Int16 = 0, always: Bool = false) {
+        let frame = screen.frame
+        let p = convert(event.locationInWindow, from: nil)
+        guard frame.width > 1, frame.height > 1, always || buttons != 0 || bounds.contains(p) else { return }
+        func scale(_ v: CGFloat, _ origin: CGFloat, _ size: CGFloat) -> UInt16 {
+            UInt16(max(0, min(1, (v - origin) / (size - 1))) * 65535)
+        }
+        position = (scale(p.x, frame.minX, frame.width), scale(p.y, frame.minY, frame.height))
+        session?.pointer(x: position.x, y: position.y, buttons: buttons, wheel: wheel)
     }
 
     private func beginCapture() {
@@ -248,6 +291,10 @@ final class GuestNSView: NSView {
 
     /// Focus left the window: release the pointer and everything held.
     private func releaseInput() {
+        if absolute && buttons != 0 {
+            buttons = 0
+            session?.pointer(x: position.x, y: position.y, buttons: 0, wheel: 0)
+        }
         endCapture()
         heldModifiers.removeAll()
         session?.send(.releaseInput)

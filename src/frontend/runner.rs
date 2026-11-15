@@ -45,7 +45,6 @@ pub enum Command {
     Mouse(i32, i32, Ps2ButtonState),
     /// Absolute position, 0..=65535 across the screen, buttons (1 left, 2
     /// right, 4 middle) and wheel steps, for the guest's r86 tools helper.
-    #[cfg_attr(feature = "apple", allow(dead_code))] // The Mac app does not send it yet.
     Pointer(u16, u16, u8, i16),
     Cd(Option<PathBuf>),
     Volume(u8),
