@@ -130,8 +130,12 @@ cat >"$app/Info.plist" <<PLIST
 	<string>26.0</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Apache-2.0; see the bundled licenses</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_r86._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>Guests on the user-mode network can reach devices on your local network.</string>
+	<string>Remote Management serves the web console to computers on your network, and guests on the user-mode network can reach devices on it.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

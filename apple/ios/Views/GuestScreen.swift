@@ -74,7 +74,12 @@ final class GuestUIView: UIView {
     /// Direct touch: one finger points; a quick tap clicks, moving drags,
     /// holding still right-clicks.
     private var finger: UITouch?
+    /// Where the finger landed, and where its click goes (the last tap's
+    /// spot for a double tap).
+    private var down = CGPoint.zero
     private var start = CGPoint.zero
+    /// The last tap, for double-clicks.
+    private var lastTap: (time: TimeInterval, at: CGPoint)?
     private var dragging = false
     private var heldDown = false
     private var holdTimer: Timer?
@@ -270,7 +275,8 @@ final class GuestUIView: UIView {
     private func directBegan(_ touches: Set<UITouch>, _ event: UIEvent?) {
         guard finger == nil, let touch = touches.first else { return }
         finger = touch
-        start = touch.location(in: self)
+        down = touch.location(in: self)
+        start = down
         if touch.type == .indirectPointer {
             // A mouse or trackpad click: the buttons come with the event.
             let mask = event?.buttonMask ?? .primary
@@ -280,6 +286,14 @@ final class GuestUIView: UIView {
         }
         dragging = false
         heldDown = false
+        // A second tap soon after the last and near it lands on the same
+        // spot: Windows' double-click area is a few pixels, fingers land
+        // farther apart.
+        if let tap = lastTap, touch.timestamp - tap.time < 0.5,
+           hypot(start.x - tap.at.x, start.y - tap.at.y) < 24 {
+            start = tap.at
+        }
+        lastTap = nil
         point(start, buttons: 0)
         holdTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.longPress() }
@@ -293,7 +307,7 @@ final class GuestUIView: UIView {
             point(p, buttons: pointerButtons)
             return
         }
-        if !dragging && !heldDown && hypot(p.x - start.x, p.y - start.y) > 8 {
+        if !dragging && !heldDown && hypot(p.x - down.x, p.y - down.y) > 8 {
             holdTimer?.invalidate()
             dragging = true
             point(start, buttons: 1)
@@ -311,8 +325,9 @@ final class GuestUIView: UIView {
         } else if dragging {
             point(p, buttons: 0)
         } else if !heldDown && !cancelled {
-            point(p, buttons: 1)
-            point(p, buttons: 0)
+            point(start, buttons: 1)
+            point(start, buttons: 0)
+            lastTap = (finger.timestamp, start)
             tick()
         }
         self.finger = nil

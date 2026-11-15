@@ -99,7 +99,15 @@ Contracts:
   tap locks them. Held keys repeat after 0.45 s at 30 per second. The key row
   rides on the system keyboard.
 - Pointer: with the guest's r86 tools helper, touches, an iPad pointer and
-  the wheel are absolute; without it, the trackpad sends relative PS/2.
+  the wheel are absolute; without it, the trackpad sends relative PS/2. A
+  tap within 0.5 s and 24 points of the last one clicks the same spot, so
+  Windows sees a double-click.
 - Background pauses the running machine; returning resumes it. If iOS ends
-  the app meanwhile, the machine is off. No remote management: the web
-  console listens on 127.0.0.1, and iOS suspends r86 while Safari shows it.
+  the app meanwhile, the machine is off.
+- Remote management (More menu) serves the web console on 0.0.0.0, the
+  first free port of 8086-8095, for computers on the local network, while
+  r86 is in the foreground. Each start makes a new 6-digit access code; the
+  WebSocket needs it (?code=), the page asks for it, and the menu shows the
+  address and code. Turning it on also shows the Local Network alert (a
+  Bonjour browse for _r86._tcp): accepting connections needs no permission
+  (TN3179), but guests on the user-mode network reaching LAN devices do.

@@ -363,7 +363,7 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 // Any close, stalled connect or stalled reply drops the socket and reconnects
 // with backoff; the next hello resyncs screen, serial and events from scratch.
 let ws = null, ready = false, session = 0;
-let retry = 0, retryTimer = 0, openedAt = 0;
+let retry = 0, retryTimer = 0, openedAt = 0, askingCode = false;
 let queue = [], inflight = null, pendingJson = null, mouse = null;
 
 function request(msg) {
@@ -441,10 +441,36 @@ function drop(reason) {
   // The wizard closes its page once it has the image.
   if (imported) { $("dot").classList.remove("on"); $("state").textContent = "sent"; return; }
   if (wasReady) note(reason, true);
+  else askCode();
   const delay = Math.min(5000, 500 * 2 ** retry++);
   setUi(false);
   $("state").textContent = `${reason} · retrying in ${(delay / 1000).toFixed(1)} s`;
   retryTimer = setTimeout(connect, delay);
+}
+
+// A console with an access code (r86 on iPhone and iPad) refuses the
+// WebSocket without it: ask for the code the app shows, then reload with it.
+async function askCode() {
+  if (askingCode) return;
+  askingCode = true;
+  let required = false;
+  try { required = (await (await fetch("/access")).text()).trim() === "code"; } catch {}
+  if (required) {
+    const params = new URLSearchParams(location.search);
+    const code = prompt(params.has("code")
+      ? "Wrong access code. Enter the code r86 shows under More › Remote Management:"
+      : "Access code (r86 shows it under More › Remote Management):");
+    if (code) {
+      params.set("code", code.trim());
+      location.search = params.toString();
+    } else {
+      clearTimeout(retryTimer);
+      retryTimer = 0;
+      $("state").textContent = "access code needed · reload to enter it";
+    }
+    return;
+  }
+  askingCode = false;
 }
 
 function reconnectNow() {

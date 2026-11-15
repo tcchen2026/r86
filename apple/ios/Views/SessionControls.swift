@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Control capsule
 
@@ -112,8 +113,9 @@ struct PowerMenu: View {
     }
 }
 
-/// Machine actions. No remote management: its web console listens on
-/// 127.0.0.1 only, and iOS suspends r86 while Safari shows it.
+/// Machine actions. Remote management serves the web console to computers
+/// on the local network, with a new access code each time, while r86 is in
+/// the foreground; the section title shows where to open it.
 struct MoreMenu: View {
     @Environment(Library.self) private var library
     @Environment(Stage.self) private var stage
@@ -130,7 +132,17 @@ struct MoreMenu: View {
                     Button("Eject") { library.changeCD(machine.id, nil) }
                         .disabled(machine.iso == nil)
                 }
-                Divider()
+                Section(remoteTitle) {
+                    Toggle("Remote Management", isOn: Binding(
+                        get: { machine.remoteURL != nil },
+                        set: { on in
+                            if on { LocalNetwork.ask() }
+                            library.setRemote(machine.id, on)
+                        }))
+                    if let url = machine.remoteURL {
+                        Button("Copy Address", systemImage: "doc.on.doc") { UIPasteboard.general.url = url }
+                    }
+                }
             }
             Button("Edit \(machine.name)…", systemImage: "slider.horizontal.3") { stage.present(.edit(machine.id)) }
                 .disabled(machine.isLive)
@@ -148,6 +160,18 @@ struct MoreMenu: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .accessibilityLabel("More")
+    }
+
+    /// Off: what remote management is. On: the address and access code to
+    /// type on the computer; Copy Address carries both.
+    private var remoteTitle: String {
+        guard let url = machine.remoteURL, let host = url.host() else {
+            return "Web console for a computer on this network"
+        }
+        let address = url.port.map { "\(host):\($0)" } ?? host
+        let code = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first { $0.name == "code" }?.value
+        return code.map { "Open http://\(address) · code \($0)" } ?? "Open http://\(address)"
     }
 }
 
