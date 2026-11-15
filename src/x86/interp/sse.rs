@@ -1,6 +1,8 @@
 //! SSE/SSE2 interpretation, reached only by the corresponding 0F dispatch arms.
 //! Mandatory prefixes are literal bytes, independent of CS default operand size.
 
+mod float;
+
 use super::*;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -32,6 +34,9 @@ pub(super) fn execute<B: Bus>(
     let reg = ((modrm >> 3) & 7) as usize;
     use Form::*;
     match (opcode, form) {
+        (0x2a | 0x2c..=0x2f | 0x51..=0x5f | 0xc2 | 0xe6, _) => {
+            return float::execute(cpu, bus, form, opcode, modrm, address16, eip);
+        }
         // MOVUPS/UPD/SS/SD, MOVAPS/APD, MOVDQA/DQU.
         (0x10..=0x11, _) | (0x28..=0x29, None | P66) | (0x6f | 0x7f, P66 | F3) => {
             sse_available(cpu, eip)?;

@@ -17,9 +17,10 @@ A mode is data, not a second implementation.
 - There is one interpreter, one Cargo package and one set of devices
   (AGENTS.md: do not fork the interpreter). A mode selects a guest CPU model
   and whether the APIC platform is attached.
-- Modern's instructions are extra arms of the shared two-byte opcode
-  dispatch, gated by the CPU model. NX is one branch in the existing PAE
-  page walker. The APIC is an optional device beside the 8259 pair.
+- SSE and SSE2 are arms of the shared two-byte opcode dispatch and execute
+  in both modes; Modern's SSE3 adds arms gated by the CPU model. NX is one
+  branch in the existing PAE page walker. The APIC is an optional device
+  beside the 8259 pair.
 - Everything else is shared and behaves identically in both modes: real
   mode, V86 and 16-bit code in the interpreter only, the JITs for 32-bit
   code segments, SoftMMU, SeaBIOS, IDE, VGA/VBE, sound, network, USB, guest
@@ -36,8 +37,8 @@ A mode is data, not a second implementation.
   per VM) and guarded on CPU state the way MMX is today
   (`soft::mmx_available`, `src/x86/jit/compile.rs`).
 - The interpreter is compiled once. The CPU model is a field read only on
-  cold paths: CPUID, MSR access, CR4 writes, the entry to the SSE module and
-  a PAE page walk after a translation miss. No hot path tests it, so there
+  cold paths: CPUID, MSR access, CR4 writes, the SSE3 arms and a PAE page
+  walk after a translation miss. No hot path tests it, so there
   is nothing to specialise and no reason to instantiate the interpreter per
   mode. Doing so would double the interpreter's code for no gain.
 
@@ -47,7 +48,7 @@ A mode is data, not a second implementation.
 |---|---|---|
 | Status | Implemented; the only mode | Not implemented; not started |
 | CPU model | Pentium II class: family 6 model 5, CPUID signature 0652h. 32-bit | Core Duo class: family 6 model 14, signature 06E8h. 32-bit |
-| Instruction set | x87, MMX, CMOV, CMPXCHG8B, SYSENTER, FXSAVE. No SSE | Retro's, plus SSE, SSE2, SSE3 |
+| Instruction set | x87, MMX, CMOV, CMPXCHG8B, SYSENTER, FXSAVE. SSE and SSE2 execute but CPUID does not report them | Retro's, plus SSE3; CPUID reports SSE, SSE2 and SSE3 |
 | Paging | 32-bit, PSE, PSE-36, PAE. No NX | Retro's, plus NX through EFER.NXE |
 | Interrupts | Dual 8259 PIC | Local APIC and I/O APIC; the 8259 pair remains (virtual wire) |
 | ACPI | FADT, FACS, RSDT, DSDT; PM timer; S5 only | Retro's, plus a MADT |
@@ -67,9 +68,12 @@ storage.
 
 1. **Retro is the default** and the mode of every existing VM, seed and
    benchmark. Nothing about Modern changes a Retro machine's guest-visible
-   behaviour, with one recorded exception: the page-fault error code's
+   behaviour, with two recorded exceptions: the page-fault error code's
    instruction-fetch bit becomes correct on both (debt CPU-2 in
-   [IMPLEMENTATION_DEBT.md](IMPLEMENTATION_DEBT.md)).
+   [IMPLEMENTATION_DEBT.md](IMPLEMENTATION_DEBT.md)), and SSE and SSE2
+   execute on Retro without being reported, because the interpreter is too
+   slow for guests to choose SSE paths (user, 2026-11-15). Their
+   floating-point exceptions always behave as masked (debt SSE-1).
 2. **The mode is chosen when a VM is created and never changed.** Windows
    2000 and XP bind their HAL to the interrupt controller at install time; a
    disk installed in one mode is not expected to boot in the other.

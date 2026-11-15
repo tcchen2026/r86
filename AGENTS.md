@@ -58,8 +58,10 @@ existing implementation, not the required replacement structure.
 ## Machine modes: Retro and Modern
 
 - **Retro** is the machine implemented today (Pentium II class CPU, 8259 PIC,
-  ACPI) and the mode of every existing VM. **Modern** is planned and not
-  implemented (SSE/SSE2/SSE3, NX, APIC; Windows 7 and 10 32-bit).
+  ACPI) and the mode of every existing VM. Its interpreter also executes SSE
+  and SSE2, which its CPUID does not report (user, 2026-11-15). **Modern**
+  is planned and not implemented (SSE/SSE2/SSE3, NX, APIC; Windows 7 and 10
+  32-bit).
 - A mode is a CPU model plus the APIC platform inside the one shared
   interpreter, compiled once. Do not fork or duplicate the interpreter,
   devices or JITs per mode. Modern must not slow Retro.

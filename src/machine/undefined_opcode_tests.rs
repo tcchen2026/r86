@@ -49,12 +49,12 @@ fn user_machine() -> Machine {
 #[test]
 fn pentium2_undefined_opcodes_deliver_idt_and_keep_bounded_diagnostics() {
     for code in [
-        &[0xf3, 0x0f, 0x2c, 0x05, 0x08, 0x18, 0x3e, 0x01][..], // XP's CVTTSS2SI
-        &[0xf2, 0x0f, 0xd0, 0xc1],                             // SSE3 ADDSUBPS
-        &[0x0f, 0xae, 0x25, 0x00, 0xf0, 0xff, 0xff],           // XSAVE is also absent
-        &[0xdb, 0x08],                                         // FISTTP m32int
-        &[0xdd, 0x08],                                         // FISTTP m64int
-        &[0xdf, 0x08],                                         // FISTTP m16int
+        &[0xf3, 0x0f, 0x12, 0xc1][..],               // SSE3 MOVSLDUP
+        &[0xf2, 0x0f, 0xd0, 0xc1],                   // SSE3 ADDSUBPS
+        &[0x0f, 0xae, 0x25, 0x00, 0xf0, 0xff, 0xff], // XSAVE is also absent
+        &[0xdb, 0x08],                               // FISTTP m32int
+        &[0xdd, 0x08],                               // FISTTP m64int
+        &[0xdf, 0x08],                               // FISTTP m16int
     ] {
         let mut m = user_machine();
         m.bus.ram[0x1200..0x1200 + code.len()].copy_from_slice(code);
@@ -137,8 +137,14 @@ fn pentium2_undefined_opcodes_deliver_idt_and_keep_bounded_diagnostics() {
     assert_eq!(m.undefined_opcodes().count(), 0);
 
     // Implemented SSE/SSE2 executes without an absent-opcode diagnostic.
-    for code in [&[0x0f, 0xe0, 0xc0][..], &[0x66, 0x0f, 0xef, 0xc0]] {
+    for code in [
+        &[0x0f, 0xe0, 0xc0][..],
+        &[0x66, 0x0f, 0xef, 0xc0],
+        &[0xf3, 0x0f, 0x2c, 0xc1], // CVTTSS2SI, including MXCSR=0 as on XP.
+        &[0xf3, 0x0f, 0x5e, 0xc1], // DIVSS 0/0 returns masked NaN, never #UD.
+    ] {
         let mut m = user_machine();
+        m.cpu.fpu.mxcsr = 0;
         m.bus.ram[0x1200..0x1200 + code.len()].copy_from_slice(code);
         assert!(m.run_steps(1).unwrap().stop.is_none());
         assert_eq!(m.cpu.eip, 0x200 + code.len() as u32);

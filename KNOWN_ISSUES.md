@@ -108,10 +108,11 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
 ## Limits by design
 
-CPUID remains Pentium II. SSE/SSE2 moves and packed integer instructions
-execute in the interpreter, but floating-point arithmetic and conversions
-are not implemented yet. Sound is SB16 with OPL2: no OPL3, MPU-401,
-recording or ADPCM.
+CPUID remains Pentium II. SSE/SSE2 executes in the interpreter without being
+advertised: arithmetic rounds to nearest, conversions honor MXCSR.RC, and
+SIMD floating-point exceptions return masked results regardless of masks.
+PE is not raised, and tininess at the smallest-normal rounding boundary is
+not modeled. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
 Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
 HID tablet. The JITs compile only 32-bit code segments outside
 virtual-8086 mode: real-mode, V86 and 16-bit protected-mode code always

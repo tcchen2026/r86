@@ -3064,19 +3064,18 @@ fn execute_0f<B: Bus>(
         0x34 => sysenter(cpu, start_eip)?,
         0x35 => sysexit(cpu, start_eip)?,
         0x10..=0x17
-        | 0x28..=0x29
-        | 0x2b
-        | 0x50
+        | 0x28..=0x2f
+        | 0x50..=0x5f
         | 0x6c..=0x6d
         | 0x70
-        | 0xc3..=0xc6
+        | 0xc2..=0xc6
         | 0xd4
         | 0xd6..=0xd7
         | 0xda
         | 0xde
         | 0xe0
         | 0xe3..=0xe4
-        | 0xe7
+        | 0xe6..=0xe7
         | 0xea
         | 0xee
         | 0xf4
@@ -8803,21 +8802,10 @@ pub(super) fn sse_available(cpu: &Cpu, eip: u32) -> Result<(), StepError> {
     Ok(())
 }
 
-// S3 arithmetic will call this before committing a destination. PE is not
-// raised by policy; see SSE-1 in design/IMPLEMENTATION_DEBT.md. The unchanged
-// CR4 mask cannot enable OSXMMEXCPT, so an unmasked SIMD exception is #UD.
-#[allow(dead_code)]
-pub(super) fn sse_check_exceptions(cpu: &mut Cpu, flags: u32, eip: u32) -> Result<(), StepError> {
-    let mut raised = flags & 0x1f;
-    let unmasked = raised & !(cpu.fpu.mxcsr >> 7);
-    if unmasked & 0x07 != 0 {
-        raised &= 0x07; // A pre-computation exception suppresses post-computation flags.
-    }
-    cpu.fpu.mxcsr |= raised;
-    if unmasked != 0 {
-        return Err(StepError::InvalidOpcode { eip });
-    }
-    Ok(())
+// Retro OSes do not enable SIMD exception handling. Always retain the masked
+// response and sticky IE..UE, never PE or a SIMD trap (debt SSE-1).
+pub(super) fn sse_record_exceptions(cpu: &mut Cpu, flags: u32) {
+    cpu.fpu.mxcsr |= flags & 0x1f;
 }
 
 fn mmx_emms(cpu: &mut Cpu, eip: u32) -> Result<(), StepError> {
@@ -13874,6 +13862,7 @@ mod tests {
     use super::*;
 
     mod sse;
+    mod sse_float;
     use crate::x86::addr::PhysAddr;
     use crate::x86::cpu::{
         CR0_EM, CR0_MP, CR0_WP, CR4_MCE, CR4_OSFXSR, CR4_PAE, CR4_PCE, CR4_PGE, CR4_PSE, CR4_PVI,
@@ -21859,26 +21848,16 @@ mod tests {
     }
 
     #[test]
-    fn sse_state_exception_policy_keeps_five_flags_suppresses_pe_and_uses_ud() {
-        for flag in [1, 2, 4, 8, 16] {
+    fn sse_state_exception_policy_ignores_masks_preserves_five_flags_and_suppresses_pe() {
+        for masks in [0, 0x1f80] {
             let mut cpu = flat_cpu();
-            assert_eq!(sse_check_exceptions(&mut cpu, flag, 0x24), Ok(()));
-            assert_eq!(cpu.fpu.mxcsr, 0x1f80 | flag);
-            cpu.fpu.mxcsr = 0;
-            let err = sse_check_exceptions(&mut cpu, flag, 0x24).unwrap_err();
-            assert_eq!(err, StepError::InvalidOpcode { eip: 0x24 });
-            assert_eq!(err.exception(0x24), Some((6, None, 0x24)));
-            assert_eq!(cpu.fpu.mxcsr, flag);
+            cpu.fpu.mxcsr = masks;
+            sse_record_exceptions(&mut cpu, 0x3f);
+            assert_eq!(cpu.fpu.mxcsr, masks | 0x1f);
+            cpu.fpu.mxcsr = masks | 0x20;
+            sse_record_exceptions(&mut cpu, 0);
+            assert_eq!(cpu.fpu.mxcsr, masks | 0x20);
         }
-        let mut cpu = flat_cpu();
-        cpu.fpu.mxcsr = 0;
-        assert_eq!(sse_check_exceptions(&mut cpu, 0x20, 0x24), Ok(()));
-        assert_eq!(cpu.fpu.mxcsr, 0);
-        assert!(sse_check_exceptions(&mut cpu, 0x19, 0x24).is_err());
-        assert_eq!(cpu.fpu.mxcsr, 1); // Unmasked IE suppresses OE/UE.
-        cpu.fpu.mxcsr = 0x20; // A previously loaded PE stays sticky, without a fault.
-        assert_eq!(sse_check_exceptions(&mut cpu, 0, 0x24), Ok(()));
-        assert_eq!(cpu.fpu.mxcsr, 0x20);
     }
 
     #[test]
