@@ -429,7 +429,7 @@ static const char vbemp_message[] =
     "Windows 2000/XP need the VBEMP display driver. Its license allows "
     "only unmodified, non-commercial, standalone distribution, so r86 "
     "cannot include it with its Apache-2.0 tools. Download it from "
-    "https://r86.run/vbemp, attach it as a CD or folder, and run "
+    "https://r86.xyz/vbemp, attach it as a CD or folder, and run "
     "r86-tool again to install it.";
 
 static DWORD result(struct tool_result *r, DWORD code, const char *message)

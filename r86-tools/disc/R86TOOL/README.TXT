@@ -34,7 +34,7 @@ Windows 95/98/Me: attach the r86 tools CD for VMDisp9x. Windows 95 also needs
 the Microsoft SetupAPI redistributable; it is not bundled here.
 Windows 2000/XP: provide the original extracted VBEMP VBE20 package on a CD
 or pass its root or the directory containing vbemppnp.inf and vbemp.sys.
-VBEMP is not on the public tools CD. See https://r86.run/vbemp. Use 16-bit
+VBEMP is not on the public tools CD. See https://r86.xyz/vbemp. Use 16-bit
 colour; 256 colours can crash winlogon. NT 4 display setup remains manual.
 
 r86's web console (View, Guest resolution) asks the running helper to switch
