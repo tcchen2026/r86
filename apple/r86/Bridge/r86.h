@@ -68,8 +68,8 @@ void r86_vm_pointer(const R86Vm *vm, uint16_t x, uint16_t y, uint32_t buttons, i
 bool r86_vm_pointer_active(const R86Vm *vm);
 void r86_vm_change_cd(const R86Vm *vm, const char *path);  // NULL ejects
 void r86_vm_set_volume(const R86Vm *vm, uint32_t percent);
-void r86_vm_set_remote(const R86Vm *vm, bool on);  // web console on 127.0.0.1
-char *r86_vm_remote_url(const R86Vm *vm);  // NULL while remote management is off
+void r86_vm_set_remote(const R86Vm *vm, bool on);  // iOS LAN with code; macOS loopback
+char *r86_vm_remote_url(const R86Vm *vm);  // includes code when needed; NULL while off
 char *r86_vm_log(const R86Vm *vm);  // the fatal error report, NULL without one
 void r86_vm_status(const R86Vm *vm, R86Status *status);
 char *r86_vm_take_message(const R86Vm *vm);  // NULL when none

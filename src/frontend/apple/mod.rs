@@ -545,7 +545,7 @@ pub unsafe extern "C" fn r86_vm_set_volume(vm: *const R86Vm, percent: u32) {
         .send(Command::Volume(percent.min(100) as u8));
 }
 
-/// Start or stop remote management: the web console, for this Mac only.
+/// Start or stop the web console: iOS LAN with an access code, macOS loopback.
 /// The outcome arrives as a message; it ends when the VM turns off.
 ///
 /// # Safety

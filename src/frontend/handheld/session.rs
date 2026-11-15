@@ -968,7 +968,7 @@ pub fn console_listener() -> Result<TcpListener, String> {
 fn start_remote(ctx: &Ctx) -> Result<Remote, String> {
     let listener = console_listener()?;
     let (iso, tools) = (Some(ctx.iso.clone()), ctx.share.join(TOOLS_ISO));
-    let remote = Remote::new(listener, SLICE_STEPS, None, false, iso, tools)?;
+    let remote = Remote::new(listener, SLICE_STEPS, None, false, iso, tools, None)?;
     // The device log also gets the address, for setups without a view of the panel.
     eprintln!("r86-handheld: remote management at {}", remote.url());
     Ok(remote)

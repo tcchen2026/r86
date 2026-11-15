@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -12,6 +12,55 @@ pub const PIXEL_FORMAT_RGBA: u32 = 1;
 pub const FRAME_HEADER_LEN: usize = 32;
 /// Largest client binary message (an upload chunk or remote-CD reply).
 pub const MAX_BINARY_FRAME: u64 = 1 << 20;
+
+/// One console's code and cooldown, shared by all its connection workers.
+pub struct AccessCode {
+    pub code: String,
+    blocked_until: Mutex<Option<Instant>>,
+}
+
+impl AccessCode {
+    #[cfg(target_os = "ios")]
+    pub fn random() -> Result<Self, String> {
+        loop {
+            let mut bytes = [0u8; 4];
+            // SAFETY: getentropy writes to this four-byte buffer (limit 256).
+            if unsafe { libc::getentropy(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+                return Err(format!(
+                    "Cannot generate remote access code: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let value = u32::from_ne_bytes(bytes);
+            // Reject the incomplete range so all six-digit codes are equally likely.
+            if value < u32::MAX / 1_000_000 * 1_000_000 {
+                return Ok(Self {
+                    code: format!("{:06}", value % 1_000_000),
+                    blocked_until: Mutex::new(None),
+                });
+            }
+        }
+    }
+
+    fn accepts(&self, query: &str) -> Result<bool, String> {
+        let mut blocked_until = self
+            .blocked_until
+            .lock()
+            .map_err(|_| "websocket access-code lock poisoned")?;
+        let now = Instant::now();
+        if blocked_until.is_some_and(|until| now < until) {
+            return Ok(false);
+        }
+        let mut codes = query
+            .split('&')
+            .filter_map(|part| part.strip_prefix("code="));
+        if codes.next() == Some(self.code.as_str()) && codes.next().is_none() {
+            return Ok(true);
+        }
+        *blocked_until = Some(now + Duration::from_secs(1));
+        Ok(false)
+    }
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Message {
@@ -40,7 +89,10 @@ impl WebSocket {
     // HTTP and WebSocket share a port. Only the embedded page is served; no
     // guest or host files are exposed by URL. Each connection has its own I/O
     // worker so a slow reader never holds the machine thread.
-    pub fn accept(mut stream: TcpStream) -> Result<Option<Self>, String> {
+    pub fn accept(
+        mut stream: TcpStream,
+        access: Option<&AccessCode>,
+    ) -> Result<Option<Self>, String> {
         stream
             .set_nodelay(true)
             .map_err(|err| format!("failed to set TCP_NODELAY: {err}"))?;
@@ -53,7 +105,8 @@ impl WebSocket {
         let request = read_http_request(&mut stream)?;
         let mut line = request.lines().next().unwrap_or("").split_whitespace();
         let method = line.next().unwrap_or("");
-        let path = line.next().unwrap_or("").split('?').next().unwrap_or("");
+        let target = line.next().unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
         if method != "GET" || line.next() != Some("HTTP/1.1") {
             http_reply(
                 &mut stream,
@@ -67,6 +120,11 @@ impl WebSocket {
             .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
         if !upgrade {
             let (status, mime, body): (_, _, &[u8]) = match path {
+                "/access" => (
+                    "200 OK",
+                    "text/plain",
+                    if access.is_some() { b"code" } else { b"open" },
+                ),
                 "/" | "/ws_ui.html" => (
                     "200 OK",
                     "text/html; charset=utf-8",
@@ -87,6 +145,17 @@ impl WebSocket {
                 "400 Bad Request",
                 "text/plain",
                 b"Expected WebSocket version 13 on /ws\n",
+            )?;
+            return Ok(None);
+        }
+        if let Some(access) = access
+            && !access.accepts(query)?
+        {
+            http_reply(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"Access denied\n",
             )?;
             return Ok(None);
         }
@@ -578,6 +647,72 @@ fn sha256_digest(input: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_upgrade_access_code_and_cooldown() {
+        fn request(access: Option<Arc<AccessCode>>, path: &str, upgrade: bool) -> String {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let server = std::thread::spawn(move || {
+                WebSocket::accept(listener.accept().unwrap().0, access.as_deref())
+                    .unwrap()
+                    .is_some()
+            });
+            let headers = if upgrade {
+                "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            } else {
+                ""
+            };
+            write!(
+                client,
+                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"
+            )
+            .unwrap();
+            let mut bytes = Vec::new();
+            client.read_to_end(&mut bytes).unwrap();
+            let response = String::from_utf8_lossy(&bytes).into_owned();
+            assert_eq!(
+                server.join().unwrap(),
+                response.starts_with("HTTP/1.1 101 ")
+            );
+            response
+        }
+
+        let access = Arc::new(AccessCode {
+            code: "012345".into(),
+            blocked_until: Mutex::new(None),
+        });
+        let protected = |path, upgrade| request(Some(access.clone()), path, upgrade);
+        let denied = |response: String| assert!(response.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        let upgraded = |response: String| {
+            assert!(response.starts_with("HTTP/1.1 101 Switching Protocols\r\n"))
+        };
+
+        denied(protected("/ws", true));
+        denied(protected("/ws?code=012345", true)); // missing code starts cooldown too
+        for path in ["/", "/r86.png", "/access"] {
+            let page = protected(path, false);
+            assert!(page.starts_with("HTTP/1.1 200 OK\r\n"));
+            if path == "/access" {
+                assert!(page.ends_with("\r\n\r\ncode"));
+                assert!(!page.contains("012345"));
+            }
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        denied(protected("/ws?code=999999", true));
+        denied(protected("/ws?code=012345", true)); // a new connection cannot bypass it
+        std::thread::sleep(Duration::from_secs(1));
+        upgraded(protected("/ws?view=1&code=012345", true));
+        upgraded(protected("/?code=012345", true)); // legacy upgrade path is gated too
+        denied(protected("/ws?code=012345&code=999999", true));
+
+        upgraded(request(None, "/ws", true));
+        upgraded(request(None, "/", true));
+        assert!(request(None, "/access", false).ends_with("\r\n\r\nopen"));
+    }
 
     #[test]
     fn fragmented_messages_are_reassembled_around_control_frames() {

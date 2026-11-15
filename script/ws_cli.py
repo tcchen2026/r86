@@ -35,6 +35,17 @@ The same port serves the embedded browser console at http://HOST:PORT/ and
 plain RFC 6455 WebSocket at /ws (legacy / also works). This client
 uses ``websockets.sync.client`` and does not use TLS or protocol extensions.
 
+The iOS app's LAN console requires a six-digit access code, regenerated each
+time remote management starts. Its page URL includes ``?code=NNNNNN``; the
+page forwards that query to ``/ws``. This client accepts ``--code NNNNNN``
+(overriding a code in ``--url``). Missing or wrong codes receive HTTP 403.
+After a failed code, every upgrade is rejected for one second across all
+connections to that console, including correct codes; established sockets
+are unaffected. Mac/Windows loopback, handheld and r86-run consoles stay open.
+Public ``GET /access`` returns plain text ``code`` or ``open`` without the
+code itself. The page and its icon remain public; only an accepted upgrade
+can access guest data or send commands.
+
 Text frames carry UTF-8 JSON request/response objects. Server binary frames
 carry raw RGBA screenshots or display frames; client binary frames (at most
 1 MiB) carry virtual-media upload data or remote-CD read replies.
@@ -501,12 +512,19 @@ class WsClient:
     ``websockets`` library.
     """
 
-    def __init__(self, url, timeout_sec):
+    def __init__(self, url, timeout_sec, code=None):
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "ws":
             raise WsError("only ws:// URLs are supported")
         if not parsed.hostname:
             raise WsError("websocket URL needs a host")
+        if code is not None:
+            if len(code) != 6 or not code.isascii() or not code.isdecimal():
+                raise WsError("--code needs six ASCII digits")
+            query = [(key, value) for key, value in urllib.parse.parse_qsl(
+                parsed.query, keep_blank_values=True) if key != "code"]
+            query.append(("code", code))
+            url = parsed._replace(query=urllib.parse.urlencode(query)).geturl()
         self.timeout_sec = timeout_sec
         self.conn = ws_connect(
             url,
@@ -625,6 +643,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--url", default="ws://127.0.0.1:8765")
+    parser.add_argument("--code", help="six-digit access code for the iOS console")
     parser.add_argument("--timeout-sec", type=float, default=7200.0)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -891,7 +910,7 @@ def main(argv):
     """CLI entry point used by both humans and test scripts."""
 
     args = build_parser().parse_args(argv)
-    client = WsClient(args.url, args.timeout_sec)
+    client = WsClient(args.url, args.timeout_sec, args.code)
     try:
         if args.command == "hello":
             print_json(client.hello)

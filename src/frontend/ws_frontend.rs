@@ -1586,6 +1586,7 @@ pub struct Remote {
     port: u16,
     /// Bound to loopback: only this computer can connect.
     local: bool,
+    access: Option<Arc<ws::AccessCode>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -1595,7 +1596,8 @@ impl Remote {
     /// and Windows apps). `jobs` enables finite debugger jobs, which need a host loop
     /// that steps the machine for them. With `save_dir`, uploaded discs are
     /// saved there instead of held in memory. `tools_iso` is the r86 tools
-    /// disc media-tools inserts; it may be missing.
+    /// disc media-tools inserts; it may be missing. `access` gates upgrades
+    /// on the iOS console; other callers pass None.
     pub fn new(
         listener: TcpListener,
         slice_steps: u64,
@@ -1603,6 +1605,7 @@ impl Remote {
         jobs: bool,
         save_dir: Option<PathBuf>,
         tools_iso: PathBuf,
+        access: Option<ws::AccessCode>,
     ) -> Result<Self, String> {
         let record = record_path
             .map(|path| {
@@ -1618,7 +1621,8 @@ impl Remote {
         let local = listener
             .local_addr()
             .is_ok_and(|addr| addr.ip().is_loopback());
-        let (rx, port, stop) = listen(listener)?;
+        let access = access.map(Arc::new);
+        let (rx, port, stop) = listen(listener, access.clone())?;
         let mut service = Service::new();
         service.jobs = jobs;
         service.save_dir = save_dir;
@@ -1630,12 +1634,13 @@ impl Remote {
             record,
             port,
             local,
+            access,
             stop,
         })
     }
 
     /// The address to open: 127.0.0.1 for a loopback console, else the one
-    /// other devices on the network reach.
+    /// other devices on the network reach. Includes the access code when set.
     #[allow(dead_code)] // The embedding API; r86-run drives itself.
     pub fn url(&self) -> String {
         let host = if self.local {
@@ -1643,7 +1648,12 @@ impl Remote {
         } else {
             lan_address().unwrap_or_else(|| "this-device".into())
         };
-        format!("http://{host}:{}/", self.port)
+        let mut url = format!("http://{host}:{}/", self.port);
+        if let Some(access) = &self.access {
+            url.push_str("?code=");
+            url.push_str(&access.code);
+        }
+        url
     }
 
     /// Whether the console wants the guest to run (Resume, Power on) or not
@@ -1851,7 +1861,7 @@ pub struct Import {
 
 impl Import {
     pub fn new(listener: TcpListener, kind: ImageKind, dir: PathBuf) -> Result<Self, String> {
-        let (rx, port, stop) = listen(listener)?;
+        let (rx, port, stop) = listen(listener, None)?;
         Ok(Self {
             rx,
             port,
@@ -1981,6 +1991,7 @@ impl Drop for Import {
 /// own worker thread, which owns only the socket and bounded messages.
 fn listen(
     listener: TcpListener,
+    access: Option<Arc<ws::AccessCode>>,
 ) -> Result<(mpsc::Receiver<Request>, u16, Arc<AtomicBool>), String> {
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let (tx, rx) = mpsc::sync_channel(64);
@@ -2001,8 +2012,9 @@ fn listen(
             active.fetch_add(1, Ordering::Relaxed);
             let active = active.clone();
             let tx = tx.clone();
+            let access = access.clone();
             std::thread::spawn(move || {
-                let _ = connection(stream, id, &tx);
+                let _ = connection(stream, id, &tx, access.as_deref());
                 let _ = tx.send(Request::Disconnect(id));
                 active.fetch_sub(1, Ordering::Relaxed);
             });
@@ -2075,7 +2087,15 @@ pub fn serve_ws(
     let listener = TcpListener::bind(addr).map_err(|e| format!("web server {addr}: {e}"))?;
     let local = listener.local_addr().map_err(|e| e.to_string())?;
     println!("web console: http://{local}/ (WebSocket: ws://{local}/ws)");
-    let mut remote = Remote::new(listener, slice_steps, record_path, true, None, tools_iso)?;
+    let mut remote = Remote::new(
+        listener,
+        slice_steps,
+        record_path,
+        true,
+        None,
+        tools_iso,
+        None,
+    )?;
     remote
         .service
         .event(machine, "start", "server ready; paused");
@@ -2176,8 +2196,9 @@ fn connection(
     stream: std::net::TcpStream,
     id: usize,
     tx: &mpsc::SyncSender<Request>,
+    access: Option<&ws::AccessCode>,
 ) -> Result<(), String> {
-    let Some(mut socket) = ws::WebSocket::accept(stream)? else {
+    let Some(mut socket) = ws::WebSocket::accept(stream, access)? else {
         return Ok(());
     };
     // The insert acknowledgement and the first unsolicited read may queue
@@ -2270,7 +2291,8 @@ mod import_tests {
     fn remote_cd_socket_reply_bypasses_core_queue_and_disconnect_ejects() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let mut remote = Remote::new(listener, 1000, None, true, None, PathBuf::new()).unwrap();
+        let mut remote =
+            Remote::new(listener, 1000, None, true, None, PathBuf::new(), None).unwrap();
         let mut machine = Machine::new(0x10000);
         machine.attach_secondary_cdrom(Vec::new());
         let (close, close_rx) = mpsc::channel();

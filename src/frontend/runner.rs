@@ -592,14 +592,23 @@ impl Core {
         Ok(())
     }
 
-    /// Serves the web console to this computer only: other devices cannot
-    /// connect, and Windows' firewall does not ask. Uploaded discs stay in
-    /// memory.
+    /// iOS serves the local network with a fresh access code. The Mac and Windows
+    /// apps serve this computer only, so other devices cannot connect and Windows'
+    /// firewall does not ask. Uploaded discs stay in memory.
     fn start_remote(&self) -> Result<Remote, String> {
+        let host = if cfg!(target_os = "ios") {
+            "0.0.0.0"
+        } else {
+            "127.0.0.1"
+        };
         let listener = REMOTE_PORTS
             .clone()
-            .find_map(|port| TcpListener::bind(("127.0.0.1", port)).ok())
+            .find_map(|port| TcpListener::bind((host, port)).ok())
             .ok_or("No free port for remote management (8086-8095).")?;
+        #[cfg(target_os = "ios")]
+        let access = Some(super::ws::AccessCode::random()?);
+        #[cfg(not(target_os = "ios"))]
+        let access = None;
         let mut remote = Remote::new(
             listener,
             SLICE_STEPS,
@@ -607,6 +616,7 @@ impl Core {
             false,
             None,
             self.tools_iso.clone(),
+            access,
         )?;
         remote.set_running(&self.machine, !self.paused);
         Ok(remote)
