@@ -1,3 +1,5 @@
+mod sse;
+
 use crate::x86::addr::{LinearAddr, PhysAddr};
 use crate::x86::cpu::{
     CR0_EM, CR0_MP, CR0_PE, CR0_PG, CR0_TS, CR4_DE, CR4_MCE, CR4_OSFXSR, CR4_PAE, CR4_PCE, CR4_PGE,
@@ -3061,6 +3063,65 @@ fn execute_0f<B: Bus>(
         0x33 => rdpmc(cpu, start_eip)?,
         0x34 => sysenter(cpu, start_eip)?,
         0x35 => sysexit(cpu, start_eip)?,
+        0x10..=0x17
+        | 0x28..=0x29
+        | 0x2b
+        | 0x50
+        | 0x6c..=0x6d
+        | 0x70
+        | 0xc3..=0xc6
+        | 0xd4
+        | 0xd6..=0xd7
+        | 0xda
+        | 0xde
+        | 0xe0
+        | 0xe3..=0xe4
+        | 0xe7
+        | 0xea
+        | 0xee
+        | 0xf4
+        | 0xf6..=0xf7
+        | 0xfb => {
+            return sse::execute(
+                cpu,
+                bus,
+                prefix,
+                operand_size_prefix,
+                opcode2,
+                address16,
+                start_eip,
+            );
+        }
+        0x60..=0x6b
+        | 0x6e..=0x6f
+        | 0x71..=0x76
+        | 0x7e..=0x7f
+        | 0xd1..=0xd3
+        | 0xd5
+        | 0xd8..=0xd9
+        | 0xdb..=0xdd
+        | 0xdf
+        | 0xe1..=0xe2
+        | 0xe5
+        | 0xe8..=0xe9
+        | 0xeb..=0xed
+        | 0xef
+        | 0xf1..=0xf3
+        | 0xf5
+        | 0xf8..=0xfa
+        | 0xfc..=0xfe
+            if operand_size_prefix || !matches!(prefix, Prefix::None) =>
+        {
+            return sse::execute(
+                cpu,
+                bus,
+                prefix,
+                operand_size_prefix,
+                opcode2,
+                address16,
+                start_eip,
+            );
+        }
         0x60..=0x6b
         | 0x74..=0x76
         | 0xd1..=0xd3
@@ -3077,22 +3138,18 @@ fn execute_0f<B: Bus>(
         | 0xf5
         | 0xf8..=0xfa
         | 0xfc..=0xfe => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_binary_op(cpu, bus, opcode2, modrm, address16, start_eip)?;
         }
         0x6e => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_movd_to_mmx(cpu, bus, modrm, address16, start_eip)?;
         }
         0x6f => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_movq_to_mmx(cpu, bus, modrm, address16, start_eip)?;
         }
         0x71..=0x73 => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_shift_imm(cpu, bus, opcode2, modrm, address16, start_eip)?;
         }
@@ -3101,12 +3158,10 @@ fn execute_0f<B: Bus>(
             mmx_emms(cpu, start_eip)?;
         }
         0x7e => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_movd_from_mmx(cpu, bus, modrm, address16, start_eip)?;
         }
         0x7f => {
-            reject_sse_prefixes(prefix, operand_size_prefix, start_eip)?;
             let modrm = fetch_u8(cpu, bus)?;
             mmx_movq_from_mmx(cpu, bus, modrm, address16, start_eip)?;
         }
@@ -8720,8 +8775,8 @@ fn reject_sse_prefixes(
     eip: u32,
 ) -> Result<(), StepError> {
     // Bochs fetchdecode32 separates mandatory 66 from effective operand size.
-    // MMX and the supported 0F AE forms also work in 16-bit code; their mandatory
-    // 66/F2/F3 alternatives remain unavailable on this P6.
+    // The supported 0F AE forms and EMMS also work in 16-bit code,
+    // but do not have supported mandatory 66/F2/F3 alternatives.
     if operand_size_prefix || !matches!(prefix, Prefix::None) {
         return Err(StepError::InvalidOpcode { eip });
     }
@@ -13817,6 +13872,8 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod sse;
     use crate::x86::addr::PhysAddr;
     use crate::x86::cpu::{
         CR0_EM, CR0_MP, CR0_WP, CR4_MCE, CR4_OSFXSR, CR4_PAE, CR4_PCE, CR4_PGE, CR4_PSE, CR4_PVI,

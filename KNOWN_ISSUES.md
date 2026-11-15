@@ -103,12 +103,15 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   refused by `HostBus::check_write_range` and stops the machine.
 - device: reading the IDE data port during a write transfer drops the
   write (`IdeChannel::read_data_u8`, `finish_data_if_drained`).
-- cpu: FXSAVE/FXRSTOR test alignment on the segment offset, not the
-  linear address (`aligned_fxsave_memory`).
+- cpu: FXSAVE/FXRSTOR and aligned SSE memory operands test alignment on
+  the segment offset, not the linear address (`aligned_fxsave_memory`).
 
 ## Limits by design
 
-No SSE. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
+CPUID remains Pentium II. SSE/SSE2 moves and packed integer instructions
+execute in the interpreter, but floating-point arithmetic and conversions
+are not implemented yet. Sound is SB16 with OPL2: no OPL3, MPU-401,
+recording or ADPCM.
 Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
 HID tablet. The JITs compile only 32-bit code segments outside
 virtual-8086 mode: real-mode, V86 and 16-bit protected-mode code always

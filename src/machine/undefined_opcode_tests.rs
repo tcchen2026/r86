@@ -50,7 +50,7 @@ fn user_machine() -> Machine {
 fn pentium2_undefined_opcodes_deliver_idt_and_keep_bounded_diagnostics() {
     for code in [
         &[0xf3, 0x0f, 0x2c, 0x05, 0x08, 0x18, 0x3e, 0x01][..], // XP's CVTTSS2SI
-        &[0x0f, 0xe0, 0x05, 0x00, 0xf0, 0xff, 0xff],           // PAVGB, unmapped operand
+        &[0xf2, 0x0f, 0xd0, 0xc1],                             // SSE3 ADDSUBPS
         &[0x0f, 0xae, 0x25, 0x00, 0xf0, 0xff, 0xff],           // XSAVE is also absent
         &[0xdb, 0x08],                                         // FISTTP m32int
         &[0xdd, 0x08],                                         // FISTTP m64int
@@ -136,13 +136,22 @@ fn pentium2_undefined_opcodes_deliver_idt_and_keep_bounded_diagnostics() {
     assert!(m.run_steps(1).unwrap().stop.is_some());
     assert_eq!(m.undefined_opcodes().count(), 0);
 
+    // Implemented SSE/SSE2 executes without an absent-opcode diagnostic.
+    for code in [&[0x0f, 0xe0, 0xc0][..], &[0x66, 0x0f, 0xef, 0xc0]] {
+        let mut m = user_machine();
+        m.bus.ram[0x1200..0x1200 + code.len()].copy_from_slice(code);
+        assert!(m.run_steps(1).unwrap().stop.is_none());
+        assert_eq!(m.cpu.eip, 0x200 + code.len() as u32);
+        assert_eq!(m.undefined_opcodes().count(), 0);
+    }
+
     let mut m = user_machine();
     let original = m.cpu.clone();
     for index in 0..=UNDEFINED_OPCODE_LIMIT {
         m.cpu = original.clone();
         m.cpu.eip = 0x4000 + index as u32 * 16;
         let address = 0x1000 + m.cpu.eip as usize;
-        m.bus.ram[address..address + 3].copy_from_slice(&[0x0f, 0xe0, 0xc0]);
+        m.bus.ram[address..address + 4].copy_from_slice(&[0xf2, 0x0f, 0xd0, 0xc0]);
         assert!(m.run_steps(1).unwrap().stop.is_none());
     }
     assert_eq!(m.undefined_opcodes().count(), UNDEFINED_OPCODE_LIMIT);
