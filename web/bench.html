@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>r86 Safari Wasm check</title>
+<style>
+  :root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+  body { max-width: 960px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin-bottom: .4rem; font-size: 1.8rem; }
+  p { margin: .6rem 0; }
+  .scores { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin: 1.5rem 0; }
+  .score { border: 1px solid #8887; border-radius: .7rem; padding: 1rem; min-width: 0; }
+  .number { display: block; font-size: clamp(2rem, 6vw, 3.7rem); font-weight: 650; font-variant-numeric: tabular-nums; }
+  .note { font-size: .85rem; overflow-wrap: anywhere; }
+  .buttons { display: flex; flex-wrap: wrap; gap: .6rem; }
+  button { font: inherit; padding: .6rem 1rem; cursor: pointer; }
+  #status { min-height: 1.5em; }
+  canvas { display: block; max-width: 100%; height: auto; margin: 1rem 0; background: #000; }
+  [hidden] { display: none; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: .8rem; }
+  @media (max-width: 550px) { .scores { gap: .4rem; } .score { padding: .6rem; } }
+</style>
+<h1>r86 · Safari Wasm check</h1>
+<p>ReactOS live CD → language dialog. 128 MiB RAM, realtime clock, read-only ISO.</p>
+<p>Open in Safari on the iPhone for timing. Chromium is a functional check only.</p>
+<div class="buttons">
+  <button data-engines="interp,jit">Run both</button>
+  <button data-engines="interp">Run interp</button>
+  <button data-engines="jit">Run JIT</button>
+</div>
+<p id="status" role="status">Ready. Keep this page in the foreground during the run.</p>
+<div class="scores">
+  <div class="score">Interpreter<span id="interp-number" class="number">—</span>busy MIPS<p id="interp-note" class="note">Not run</p></div>
+  <div class="score">Wasm JIT<span id="jit-number" class="number">—</span>busy MIPS<p id="jit-note" class="note">Not run</p></div>
+  <div class="score">JIT / interp<span id="ratio" class="number">—</span>busy ratio<p class="note">Wasm interpreter baseline</p></div>
+</div>
+<p class="note">Busy MIPS = steps / (time in pc.run − disk reads). Wall MIPS includes loading, compilation and idle turns.
+The G0 decision also needs native app MIPS on the same phone and ISO.</p>
+<p id="probe">Probe has not run.</p>
+<p id="artifact" class="note"></p>
+<canvas id="frame" width="800" height="600" hidden aria-label="Final guest display"></canvas>
+<details><summary>Full result JSON</summary><pre id="result"></pre></details>
+<script type="module" src="/bench.mjs"></script>
+</html>
