@@ -50,7 +50,8 @@ pub(super) fn cache_limits() -> (usize, usize) {
         .ok()
         .is_some_and(|info| small_host(&info))
     {
-        return (32 * 1024 * 1024, 1024);
+        // Tables are committed on use; 1536 avoids early clears on small Linux hosts.
+        return (32 * 1024 * 1024, 1536);
     }
     #[cfg(target_os = "macos")]
     if macos::small_host() {
