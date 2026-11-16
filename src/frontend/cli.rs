@@ -16,6 +16,8 @@ mod config;
 mod disk_files;
 #[path = "keys.rs"]
 mod keys;
+#[path = "measure.rs"]
+mod measure;
 #[path = "media.rs"]
 mod media;
 #[path = "protocol.rs"]
@@ -311,6 +313,7 @@ fn run_machine_output(
     }
 
     let mut replay = ReplaySchedule::load(args.replay.as_deref())?;
+    let mut measurement = None;
     let mut completed_budget = true;
     let mut matched_serial_expectation = args.expect_serial.is_none();
     let mut serial_observed = 0u64;
@@ -320,6 +323,7 @@ fn run_machine_output(
         && network.is_none()
         && !args.realtime_clock
         && replay.is_empty()
+        && args.measure_from_step.is_none()
         && input_after_matcher.is_none()
         && expect_matcher.is_none();
     if args.steps != 0 && can_bulk_run {
@@ -331,6 +335,12 @@ fn run_machine_output(
     } else {
         let deadline = machine.step_count().saturating_add(args.steps);
         while machine.step_count() < deadline {
+            if measurement.is_none() && args.measure_from_step == Some(machine.step_count()) {
+                println!("measurement begin step={}", machine.step_count());
+                print!("{}", machine.jit_report());
+                std::io::stdout().flush().map_err(|e| e.to_string())?;
+                measurement = Some(measure::Measurement::start()?);
+            }
             replay.apply_due(machine)?;
             if let Some(net) = &mut network {
                 net.poll(machine).map_err(|e| format!("network: {e}"))?;
@@ -340,14 +350,17 @@ fn run_machine_output(
             } else {
                 deadline - machine.step_count()
             };
-            let status = if replay.is_empty() {
-                machine
-                    .run_until_serial_output(budget)?
-                    .stop
-                    .unwrap_or(GuestStepStatus::Continue)
+            let next_input = replay.next_step().unwrap_or(deadline).min(deadline);
+            let next_boundary = if measurement.is_none() {
+                args.measure_from_step.unwrap_or(deadline).min(next_input)
             } else {
-                machine.step_once()?
+                next_input
             };
+            let budget = budget.min(next_boundary.saturating_sub(machine.step_count()));
+            let status = machine
+                .run_until_serial_output(budget)?
+                .stop
+                .unwrap_or(GuestStepStatus::Continue);
             audio.pump(machine)?;
             if !matches!(status, GuestStepStatus::Continue) {
                 if matches!(status, GuestStepStatus::Halted) {
@@ -360,11 +373,7 @@ fn run_machine_output(
                     }
                     // An external input can wake a halted CPU before the next
                     // device deadline. Never skip over its recorded timestamp.
-                    let next_input = replay
-                        .events
-                        .get(replay.next)
-                        .map_or(deadline, |event| event.step.min(deadline));
-                    let remaining = next_input.saturating_sub(machine.step_count());
+                    let remaining = next_boundary.saturating_sub(machine.step_count());
                     if machine.advance_halted(remaining) {
                         continue;
                     }
@@ -400,6 +409,12 @@ fn run_machine_output(
             }
         }
     }
+    if let Some(measurement) = measurement {
+        measurement.finish(machine.step_count())?;
+    } else if args.measure_from_step.is_some() {
+        return Err("run stopped before the measurement boundary".into());
+    }
+    replay.apply_due(machine)?;
     if completed_budget && args.steps != 0 {
         println!("completed {} steps: {}", args.steps, machine.cpu_summary());
         let eip = machine.cpu().eip;
@@ -663,26 +678,55 @@ impl ReplaySchedule {
         };
         let text = fs::read_to_string(path)
             .map_err(|err| format!("failed to read replay file {path}: {err}"))?;
-        let mut events = Vec::new();
-        for (order, line) in text.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let step = json_u64(line, "step")?
-                .ok_or_else(|| format!("replay line {} missing step", order + 1))?;
-            events.push(ReplayEvent {
-                order,
-                step,
-                line: line.to_string(),
-            });
-        }
-        events.sort_by(|a, b| a.step.cmp(&b.step).then(a.order.cmp(&b.order)));
+        let events = Self::parse(&text)?;
         Ok(Self {
             events,
             next: 0,
             mouse_buttons: Ps2ButtonState::default(),
         })
+    }
+
+    fn parse(text: &str) -> Result<Vec<ReplayEvent>, String> {
+        let mut events = Vec::new();
+        for (order, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (step, line) = if line.starts_with('{') {
+                let step = json_u64(line, "step")?
+                    .ok_or_else(|| format!("replay line {} missing step", order + 1))?;
+                (step, line.to_string())
+            } else {
+                let mut words = line.split('#').next().unwrap().split_whitespace();
+                let step = words
+                    .next()
+                    .unwrap()
+                    .parse::<u64>()
+                    .map_err(|_| format!("replay line {} has an invalid step", order + 1))?;
+                let data = words.collect::<Vec<_>>();
+                if data.first() == Some(&"!shot") && data.len() == 2 {
+                    // Cortex-M scripts include screenshot markers; batch replay
+                    // delivers keys only. --print-frame-hash observes the result.
+                    continue;
+                }
+                let hex = data.join(" ");
+                if hex.is_empty() || parse_hex_bytes(&hex)?.is_empty() {
+                    return Err(format!("replay line {} needs set-2 hex bytes", order + 1));
+                }
+                (
+                    step,
+                    format!("{{\"cmd\":\"send-scancodes\",\"hex\":\"{hex}\"}}"),
+                )
+            };
+            events.push(ReplayEvent { order, step, line });
+        }
+        events.sort_by(|a, b| a.step.cmp(&b.step).then(a.order.cmp(&b.order)));
+        Ok(events)
+    }
+
+    fn next_step(&self) -> Option<u64> {
+        self.events.get(self.next).map(|event| event.step)
     }
 
     fn apply_due(&mut self, machine: &mut Machine) -> Result<(), String> {
@@ -804,6 +848,7 @@ struct Args {
     firmware_display: Option<FirmwareDisplay>,
     mem_mib: usize,
     steps: u64,
+    measure_from_step: Option<u64>,
     cmdline: String,
     host_decompress_kernel: bool,
     host_decompress_initrd: bool,
@@ -868,6 +913,7 @@ impl Args {
         let mut firmware_display = None;
         let mut mem_mib = DEFAULT_MEM_MIB;
         let mut steps = DEFAULT_STEPS;
+        let mut measure_from_step = None;
         let mut cmdline = String::from(
             "console=ttyS0,115200n8 earlyprintk=serial,ttyS0,115200 loglevel=7 nozswap",
         );
@@ -979,6 +1025,13 @@ impl Args {
                     steps = take_value(&mut args, "--steps")?
                         .parse()
                         .map_err(|_| "--steps expects an integer".to_string())?;
+                }
+                "--measure-from-step" => {
+                    measure_from_step = Some(
+                        take_value(&mut args, "--measure-from-step")?
+                            .parse()
+                            .map_err(|_| "--measure-from-step expects an integer".to_string())?,
+                    );
                 }
                 "--cmdline" => {
                     cmdline = take_value(&mut args, "--cmdline")?;
@@ -1133,6 +1186,18 @@ impl Args {
                 "initrd overlays and dumps require Linux boot images or a BIOS boot ISO".into(),
             );
         }
+        if measure_from_step.is_some_and(|from| from >= steps)
+            || (measure_from_step.is_some()
+                && (realtime_clock || sdl2 || term || ws_listen.is_some()))
+        {
+            return Err(
+                "--measure-from-step needs a deterministic batch run and a step before --steps"
+                    .into(),
+            );
+        }
+        if replay.is_some() && (sdl2 || term || ws_listen.is_some()) {
+            return Err("--replay requires a batch run".into());
+        }
         if replay.is_some() && realtime_clock {
             return Err("--replay requires --clock deterministic".into());
         }
@@ -1189,6 +1254,7 @@ impl Args {
             firmware_display,
             mem_mib,
             steps,
+            measure_from_step,
             cmdline,
             host_decompress_kernel,
             host_decompress_initrd,
@@ -1260,7 +1326,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--tools-iso FILE] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\n--tools-iso selects the web console tools disc; defaults to r86_tools.iso beside the executable, optional at startup.\nCPU: JIT by default on supported ARM64 Linux/macOS builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nBoot splash: BIOS boots in the web console or SDL2 with the realtime clock show r86's logo for 3 s (ESC: boot menu).\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--tools-iso FILE] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--measure-from-step N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\n--tools-iso selects the web console tools disc; defaults to r86_tools.iso beside the executable, optional at startup.\nCPU: JIT by default on supported ARM64 Linux/macOS builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\n--replay FILE accepts recorded WebSocket JSON lines or STEP SET2_HEX_BYTES lines; # comments and STEP !shot NAME markers are ignored. Inputs are delivered at exact committed steps, including the final step; requires a deterministic batch run.\n--measure-from-step N reports cumulative JIT counters at N and wall/user/sys time for N..--steps (CPU time on Unix). Requires a deterministic batch run.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nBoot splash: BIOS boots in the web console or SDL2 with the realtime clock show r86's logo for 3 s (ESC: boot menu).\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]
@@ -1268,6 +1334,27 @@ mod tests {
     use super::keys::parse_ps2_key;
     use super::*;
     use r86::devices::Ps2Key;
+
+    #[test]
+    fn replay_step_keys_preserve_same_step_order_and_validate_bytes() {
+        let events =
+            ReplaySchedule::parse("# keys\n10 14 76 # press\n10 f0 76 f0 14\n12 !shot final\n")
+                .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].step, 10);
+        assert_eq!(events[1].step, 10);
+        assert_eq!(
+            json_string(&events[0].line, "hex").unwrap().unwrap(),
+            "14 76"
+        );
+        assert_eq!(
+            json_string(&events[1].line, "hex").unwrap().unwrap(),
+            "f0 76 f0 14"
+        );
+        assert!(ReplaySchedule::parse("10 zz").is_err());
+        assert!(ReplaySchedule::parse("-1 14").is_err());
+        assert!(ReplaySchedule::parse("10").is_err());
+    }
 
     #[test]
     fn segmented_code_dump_and_ws_read_cs_base() {

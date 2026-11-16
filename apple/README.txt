@@ -52,6 +52,10 @@ Contracts:
   of code per VM; hosts below 1 GiB RAM retain 32 MiB.
   This follows Apple's one-region contract. CI tests pool reuse/isolation;
   code-signing enforcement and the app lifecycle still need real-Mac checks.
+  Cold admission uses the shared ARM64 entry-counting policy in
+  src/x86/jit/runtime.rs: HOT8, a 1 MiB packed heat table, and cold batches
+  ending at every decoder block boundary. Negative entries and precise exits
+  remain single-step. Linux measurements do not establish Mac speed.
 - Input: physical key codes (keymap.rs), ⌘ only when the user passes it on,
   mouse captured by a click and released with ⌃⌥ (PS/2, relative).
 - Display: the core thread renders RGBA at most every 16.7 ms; the window

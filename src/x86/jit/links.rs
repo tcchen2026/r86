@@ -34,7 +34,8 @@ use core::mem::{offset_of, size_of};
 pub const SLOTS: usize = 1024;
 pub const PAGE_BYTES: usize = 4096;
 pub const INTERPRET: u32 = 1;
-pub const COLD: u32 = 3; // Cold visit counts are 2..=3; native offsets are four-byte aligned.
+// Reserved non-native entries; admission heat lives outside the dispatch table.
+pub const COLD: u32 = 3;
 
 pub const fn slot(linear: u32) -> usize {
     (linear as usize >> 12) & (SLOTS - 1)
@@ -261,4 +262,65 @@ pub fn emit_dispatch(a: &mut Assembler, miss: Label) {
         );
     }
     a.b(matched);
+}
+
+#[cfg(all(test, a64_jit))]
+mod tests {
+    use super::*;
+    use crate::x86::Cpu;
+    use crate::x86::jit::{code::CodeArena, compile, decode, soft::View};
+
+    #[test]
+    fn dispatch_rejects_all_cold_counts_and_accepts_a_native_offset() {
+        let mut arena = CodeArena::with_limits(64 * 1024, 1).unwrap();
+        let stubs = compile::entry().unwrap();
+        let entry = arena.publish(&stubs.words).unwrap();
+        let dispatch = arena.address(entry, stubs.dispatch_offset).unwrap();
+        let finish = arena.address(entry, stubs.return_offset).unwrap();
+        let table = arena.allocate_entries();
+        let entries = arena.entries_pointer(table);
+        let mut links = [Link::EMPTY; SLOTS];
+        links[0] = Link {
+            tag: 1 << 32,
+            entries,
+        };
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x100, 0);
+        let mut view = View::new(&mut cpu, false);
+        for count in 0..=COLD {
+            arena.entries_mut(table)[0x100] = count;
+            let mut frame = Frame::from_cpu(&cpu, 1);
+            frame.memory = core::ptr::from_mut(&mut view).cast();
+            frame.native_entry = dispatch;
+            frame.links = links.as_mut_ptr();
+            frame.link_context = 1 << 32;
+            // SAFETY: the matching link owns the live table. Every tested
+            // sentinel must return without attempting to execute that table.
+            unsafe { arena.invoke(entry, &mut frame).unwrap() };
+            assert_eq!(frame.eip, cpu.eip);
+            assert_eq!(frame.regs, cpu.regs);
+            assert_eq!(frame.completed, 0);
+            assert_eq!(frame.remaining, 1);
+        }
+        let decoded = decode::block(&[0x40], 0x100, 1); // inc eax
+        let mut code = compile::block(&decoded, None, 0).unwrap();
+        let body = arena.publish_block(&mut code).unwrap();
+        let address = arena.address(body, 0).unwrap();
+        let displacement = (address as isize - entries as isize) as i32;
+        assert!(displacement < 0);
+        arena.entries_mut(table)[0x100] = displacement as u32;
+        let mut frame = Frame::from_cpu(&cpu, 1);
+        frame.memory = core::ptr::from_mut(&mut view).cast();
+        frame.native_entry = dispatch;
+        frame.dispatch_entry = finish;
+        frame.return_entry = finish;
+        frame.links = links.as_mut_ptr();
+        frame.link_context = 1 << 32;
+        // SAFETY: the native displacement points into this arena's live code.
+        unsafe { arena.invoke(entry, &mut frame).unwrap() };
+        assert_eq!(frame.eip, 0x101);
+        assert_eq!(frame.regs[0], cpu.regs[0].wrapping_add(1));
+        assert_eq!(frame.completed, 1);
+        assert_eq!(frame.remaining, 0);
+    }
 }

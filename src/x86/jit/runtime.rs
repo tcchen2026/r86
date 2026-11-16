@@ -1,4 +1,4 @@
-//! AArch64 invocation/lookup owner for Linux hosts.
+//! AArch64 admission, invocation and lookup owner.
 //! The code arena selects executable mappings at build time.
 //!
 //! Lookups require a valid shared execute translation and the recorded backing
@@ -9,17 +9,27 @@
 //! A renewed watch may retain a page's compiled entries only after comparing
 //! every byte used by its native and negative entries. Retain or retire the
 //! whole page together: a same-page direct branch can reach any of those bodies.
-//! This comparison follows execute revalidation and writable-alias revocation;
-//! it never restores old version tokens or survives the owning process.
+//! Compare under exclusive CPU/bus ownership after execute revalidation. Renew
+//! the watch and revoke writable aliases before republishing any retained link.
 //! Execute revalidation is per page: the previous per-PC tags caused about
 //! 88 million context-related exits in the firmware workload. Restoring all
 //! entries of a revalidated page reduced a development cold boot from 48.1 to
 //! 32.5 seconds on the RPi, without changing its 1,975,715,720 guest steps.
 //! These single-run diagnostics justify the structure, not final acceptance.
 //!
-//! Unsupported instructions execute once through the interpreter at their exact
-//! PC, with the existing fault and attempted-tick behavior. Compiler/publication
-//! failures are errors, never an excuse to silently switch engines.
+//! Admission counts block entries, with HOT=8 on every ARM64 host. A fixed
+//! 1 MiB table holds 131,072 packed tags/counts. Tags use EIP, RAM offset and
+//! the page record's code-restart number. Count-only lookups install no watch.
+//! Recorded code-byte changes restart heat; data-only writes retain it.
+//! Collisions replace counts; internal capacity/table clears halve them and
+//! external resets zero them. There is no time expiry or per-byte heat array.
+//!
+//! Cold interpretation ends at every decoder block boundary (including untaken
+//! branches), page crossing, 32 instructions, or a precise event/fault boundary.
+//! Negative entries, missing execute proofs, memory/division exits and shadows
+//! use the dedicated single-instruction kernel. Ordinary ineligible batches and
+//! single-step handoffs carry no cold observer. Unsupported successors receive
+//! their own lookup. Compiler/publication failures are errors, never fallback.
 //!
 //! Build r86-run with `--features jit` for aarch64-unknown-linux-musl (using
 //! RUSTFLAGS='-C linker=rust-lld' when cross compiling), then select
@@ -72,29 +82,70 @@ impl Hasher for PageHasher {
     }
 }
 
-// With a reduced table pool, cold-only pages keep 2 bits per byte instead of a
-// native dispatch table. Promotion preserves admission/negative entries and
-// drops this 1 KiB allocation.
+pub(crate) const HOT: u8 = 8;
+const HEAT_SLOTS: usize = 131072;
+const COLD_BATCH: u64 = 32;
+
+// A scheduling hint, never a native-code identity. The upper 56 bits hold a
+// tag; the low byte holds a saturating count. Exactly 1 MiB on every ARM64 host.
+#[derive(Clone, Copy, Default)]
+struct Heat(u64);
+
+impl Heat {
+    fn key(eip: u32, backing: u64, restart: u64) -> (usize, u64) {
+        let mut hash = ((u64::from(eip) << 32) ^ backing) ^ restart.rotate_left(17);
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        (hash as usize & (HEAT_SLOTS - 1), hash & !255)
+    }
+
+    fn count(self) -> u8 {
+        self.0 as u8
+    }
+
+    fn matches(self, tag: u64) -> bool {
+        self.0 & !255 == tag
+    }
+
+    fn visit(&mut self, tag: u64) -> bool {
+        let count = if self.matches(tag) {
+            (self.count() + 1).min(HOT)
+        } else {
+            1
+        };
+        self.0 = tag | u64::from(count);
+        count == HOT
+    }
+
+    fn decay(&mut self) {
+        self.0 = (self.0 & !255) | u64::from(self.count() / 2);
+    }
+}
+
+// A cold-only page needs just its negative-entry bitmap (512 B). Visit heat is
+// bounded independently; promotion expands negative decisions into a native
+// table and drops this allocation. No table is allocated for a counted-only page.
 enum PageEntries {
-    Cold(Box<[u8; PAGE_BYTES / 4]>),
+    Cold(Box<[u64; PAGE_BYTES / 64]>),
     Native(TableIndex),
 }
 
 impl PageEntries {
     fn get(&self, arena: &CodeArena, offset: usize) -> u32 {
         match self {
-            Self::Cold(visits) => u32::from((visits[offset / 4] >> ((offset % 4) * 2)) & 3),
+            Self::Cold(negative) => ((negative[offset / 64] >> (offset % 64)) & 1) as u32,
             Self::Native(table) => arena.entries(*table)[offset],
         }
     }
 
     fn set(&mut self, arena: &mut CodeArena, offset: usize, entry: u32) {
         match self {
-            Self::Cold(visits) => {
-                debug_assert!(entry <= COLD);
-                let shift = (offset % 4) * 2;
-                visits[offset / 4] =
-                    (visits[offset / 4] & !(3 << shift)) | ((entry as u8) << shift);
+            Self::Cold(negative) => {
+                debug_assert!(entry <= INTERPRET);
+                let bit = 1u64 << (offset % 64);
+                negative[offset / 64] =
+                    (negative[offset / 64] & !bit) | (u64::from(entry) << (offset % 64));
             }
             Self::Native(table) => arena.entries_mut(*table)[offset] = entry,
         }
@@ -110,10 +161,10 @@ impl PageEntries {
     fn promote(&mut self, arena: &mut CodeArena) -> TableIndex {
         match self {
             Self::Native(table) => *table,
-            Self::Cold(visits) => {
+            Self::Cold(negative) => {
                 let table = arena.allocate_entries();
                 for (offset, word) in arena.entries_mut(table).iter_mut().enumerate() {
-                    *word = u32::from((visits[offset / 4] >> ((offset % 4) * 2)) & 3);
+                    *word = ((negative[offset / 64] >> (offset % 64)) & 1) as u32;
                 }
                 *self = Self::Native(table);
                 table
@@ -123,7 +174,7 @@ impl PageEntries {
 
     fn clear(&mut self, arena: &mut CodeArena) {
         match self {
-            Self::Cold(visits) => visits.fill(0),
+            Self::Cold(negative) => negative.fill(0),
             Self::Native(table) => arena.entries_mut(*table).fill(0),
         }
     }
@@ -131,9 +182,11 @@ impl PageEntries {
 
 struct CompiledPage {
     version: u64,
-    content: Option<Box<CodeContent>>,
+    version_ptr: *const u64,
+    restart: u64,
+    content: Box<CodeContent>,
     // Once promoted, live links address a stable arena table for every x86 byte.
-    // Zero is unseen, one is interpreted, two/three count cold visits; larger
+    // Zero is unseen, one is interpreted, 2..=COLD are reserved; larger
     // values are signed byte offsets from the table's RX address. Code precedes
     // metadata in the same bounded mapping, so native displacements are negative
     // and cannot collide with sentinels. Cold entries use ordinary semantics.
@@ -147,17 +200,19 @@ struct CompiledPage {
 }
 
 impl CompiledPage {
-    fn new(version: u64, arena: &mut CodeArena) -> Self {
+    fn new(version: u64, version_ptr: *const u64, arena: &mut CodeArena) -> Self {
         // Full pools (large hosts) keep a table per visited page, so pages
         // without native code still dispatch through links.
         let entries = if arena.table_capacity() < ENTRY_TABLES {
-            PageEntries::Cold(Box::new([0; PAGE_BYTES / 4]))
+            PageEntries::Cold(Box::new([0; PAGE_BYTES / 64]))
         } else {
             PageEntries::Native(arena.allocate_entries())
         };
         Self {
             version,
-            content: None,
+            version_ptr,
+            restart: 0,
+            content: CodeContent::new(),
             entries,
             #[cfg(target_os = "linux")]
             faults: Vec::new(),
@@ -173,14 +228,11 @@ impl CompiledPage {
         #[cfg(target_os = "linux")]
         self.faults.clear();
         self.pending_edges.clear();
-        match &mut self.content {
-            Some(content) => {
-                content.clear();
-            }
-            // Cold-only pages can simply restart admission after a write.
-            None if self.entries.native().is_some() => self.content = Some(CodeContent::new()),
-            None => {}
-        }
+        self.content.clear();
+        self.restart = self
+            .restart
+            .checked_add(1)
+            .expect("JIT page restart exhausted");
     }
 }
 
@@ -197,6 +249,12 @@ impl NativeBlock {
         // Only shadow entries read it; ordinary native dispatch is unchanged.
         unsafe { *(self.body as *const u32) == compile::ONE_INSTRUCTION_ENTRY }
     }
+}
+
+enum Lookup {
+    Native(NativeBlock),
+    Cold,
+    Interpret,
 }
 
 fn relative_entry(entries: *const u32, displacement: u32) -> usize {
@@ -293,6 +351,16 @@ struct CodeStamp {
 pub struct Stats {
     pub native_steps: u64,
     pub interpreted_steps: u64,
+    #[cfg(feature = "jit-profile")]
+    pub eligible_interpreted_steps: u64,
+    #[cfg(feature = "jit-profile")]
+    pub heat_replacements: u64,
+    #[cfg(feature = "jit-profile")]
+    pub admissions: u64,
+    #[cfg(feature = "jit-profile")]
+    pub heat_replacements_ge4: u64,
+    #[cfg(any(test, feature = "jit-profile"))]
+    pub cold_batches: u64,
     pub compiled_blocks: u64,
     pub content_changes: u64,
     #[cfg(any(test, feature = "jit-profile"))]
@@ -382,6 +450,7 @@ pub struct Engine {
     returns: Box<links::ReturnStack>,
     cs_base: u32,
     block_facts: u32,
+    heat: Box<[Heat]>,
     code_epoch: u64,
     mapping_epoch: Option<u64>,
     #[cfg(feature = "jit-profile")]
@@ -396,7 +465,6 @@ pub struct Engine {
 
 impl Engine {
     pub fn new() -> Result<Self, String> {
-        // Small Linux hosts trade more whole-cache clears for bounded memory.
         let (bytes, tables) = cache_limits();
         Self::with_limits(bytes, tables)
     }
@@ -433,6 +501,7 @@ impl Engine {
             returns: Box::new(links::ReturnStack::new()),
             cs_base: 0,
             block_facts: 0,
+            heat: vec![Heat::default(); HEAT_SLOTS].into_boxed_slice(),
             code_epoch: 0,
             mapping_epoch: None,
             #[cfg(feature = "jit-profile")]
@@ -473,9 +542,19 @@ impl Engine {
     }
 
     pub(crate) fn clear(&mut self, bus: &mut HostBus) -> Result<(), String> {
+        self.heat.fill(Heat::default());
+        self.reclaim(bus)
+    }
+
+    fn reclaim(&mut self, bus: &mut HostBus) -> Result<(), String> {
         self.links.fill(Link::EMPTY);
         self.global_links.fill(0);
+        // Rewritten pages lose their nonzero restart identity here. Their
+        // next visit replaces the old half-count; unchanged pages retain it.
         self.pages.clear();
+        for heat in &mut self.heat {
+            heat.decay();
+        }
         self.arena.clear();
         // No compiled code or published link can observe an old version now.
         // Reclaim write watches with their code, including capacity evictions;
@@ -725,7 +804,7 @@ impl Engine {
         cpu.fill_fetch_cursor_after(cpu.eip, backing, 1, window as u32);
     }
 
-    fn lookup(&mut self, cpu: &mut Cpu, bus: &mut HostBus) -> Result<Option<NativeBlock>, String> {
+    fn lookup(&mut self, cpu: &mut Cpu, bus: &mut HostBus) -> Result<Lookup, String> {
         self.sync_mapping(cpu);
         self.sync_code(bus);
         let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip));
@@ -737,14 +816,14 @@ impl Engine {
             // clear drops the allocation only after invalidating all links.
             let entry = unsafe { *link.entries.add(offset) };
             if entry > COLD {
-                return Ok(Some(NativeBlock {
+                return Ok(Lookup::Native(NativeBlock {
                     body: relative_entry(link.entries, entry),
                 }));
             }
             // Opcode diagnostics intentionally revisit the negative cache.
             #[cfg(not(feature = "jit-profile"))]
             if entry == INTERPRET {
-                return Ok(None);
+                return Ok(Lookup::Interpret);
             }
         }
         bus.instruction_address(linear.0);
@@ -755,13 +834,13 @@ impl Engine {
             .fetch_cache_lookup(linear)
             .or_else(|| crate::x86::mmu::try_resident_fetch_translation(cpu, bus, linear))
         else {
-            return Ok(None);
+            return Ok(Lookup::Interpret);
         };
         let global = cpu.fetch_translation_is_global(linear);
         let recheck = cpu.fetch_recheck(linear);
         let window = (PAGE_BYTES - offset).min(480);
         let window = window.min((u32::MAX - cpu.eip) as usize + 1);
-        let (backing, mut version, mut version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+        let backing = bus.jit_ram_offset(hit.backing);
         // Preserve the full EIP origin and segment qualifications in one word.
         // Lookup hashes and compares two u64s instead of three scalar fields;
         // no qualification bits are discarded, including unaligned CS bases.
@@ -769,80 +848,86 @@ impl Engine {
             u64::from(cpu.eip.wrapping_sub(offset as u32)) | (u64::from(self.block_facts) << 32),
             backing - offset as u64,
         );
-        let (page_entries, entry) =
-            if let Some(page) = self.pages.get_mut(&key) {
-                if page.version != version {
-                    if page.content.as_ref().is_some_and(|content| {
-                        content.matches(bus.jit_code_bytes(key.1, content.end))
-                    }) {
-                        // sync_code retired the old links; jit_code_stamp renewed
-                        // the watch and revoked writable aliases before this proof.
-                        page.version = version;
-                        #[cfg(any(test, feature = "jit-profile"))]
-                        {
-                            self.stats.content_reuses += 1;
-                        }
-                    } else {
-                        page.invalidate(version, &mut self.arena);
-                        self.stats.content_changes += 1;
+        let mut restart = 0;
+        if let Some(page) = self.pages.get_mut(&key) {
+            // SAFETY: the CodePages owner outlives all page records; cache
+            // reclamation drops records before releasing its stable cells.
+            let observed = unsafe { *page.version_ptr };
+            if page.version != observed || observed & 1 == 0 {
+                if page
+                    .content
+                    .matches(bus.jit_code_bytes(key.1, page.content.end))
+                {
+                    page.version = observed;
+                    #[cfg(any(test, feature = "jit-profile"))]
+                    {
+                        self.stats.content_reuses += 1;
                     }
+                } else {
+                    page.invalidate(observed, &mut self.arena);
+                    self.stats.content_changes += 1;
                 }
-                let entry = page.entries.get(&self.arena, offset);
-                if entry == INTERPRET || entry > COLD {
-                    #[cfg(feature = "jit-profile")]
-                    if entry == INTERPRET {
-                        self.unsupported[usize::from(page.opcodes[offset])] += 1;
-                    }
-                    if let Some(table) = page.entries.native() {
-                        let entries = self.arena.entries_pointer(table);
-                        self.link(
-                            linear.0,
-                            version,
-                            version_ptr,
-                            entries,
-                            global,
-                            recheck,
-                            hit,
-                        );
-                        return Ok((entry > COLD).then_some(NativeBlock {
+            }
+            restart = page.restart;
+            let entry = page.entries.get(&self.arena, offset);
+            if entry == INTERPRET || entry > COLD {
+                // Only reuse/publication renews the watch. An even version is
+                // compared again on a later count-only lookup: ordinary writes
+                // to an unwatched page do not change that version cell.
+                let (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+                page.version = version;
+                #[cfg(feature = "jit-profile")]
+                if entry == INTERPRET {
+                    self.unsupported[usize::from(page.opcodes[offset])] += 1;
+                }
+                if let Some(table) = page.entries.native() {
+                    let entries = self.arena.entries_pointer(table);
+                    self.link(
+                        linear.0,
+                        version,
+                        version_ptr,
+                        entries,
+                        global,
+                        recheck,
+                        hit,
+                    );
+                    if entry > COLD {
+                        return Ok(Lookup::Native(NativeBlock {
                             body: relative_entry(entries, entry),
                         }));
                     }
-                    return Ok(None);
                 }
-                (&mut page.entries, entry)
-            } else {
-                if self.pages.len() >= ENTRY_TABLES {
-                    self.stats.table_clears += 1;
-                    // Bound all page metadata, including cold-only pages, even
-                    // when neither native pool is full. Reclaim everything.
-                    self.clear(bus)?;
-                    (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-                }
-                let page = self
-                    .pages
-                    .entry(key)
-                    .or_insert_with(|| CompiledPage::new(version, &mut self.arena));
-                (&mut page.entries, 0)
-            };
-        if entry < COLD {
-            // Compilation and publication cost are part of a cold boot. Wait
-            // for a third visit before emitting a block; cold passes retain
-            // ordinary interpretation and architectural fetch behavior.
-            page_entries.set(&mut self.arena, offset, entry.max(1) + 1);
-            if let Some(table) = page_entries.native() {
-                let entries = self.arena.entries_pointer(table);
-                self.link(
-                    linear.0,
-                    version,
-                    version_ptr,
-                    entries,
-                    global,
-                    recheck,
-                    hit,
-                );
+                return Ok(Lookup::Interpret);
             }
-            return Ok(None);
+        }
+        // Source versions are execute proofs, not heat identities. A data
+        // write cannot cool entries; only changed recorded code restarts them.
+        // Counting an unrecorded page neither watches it nor revokes aliases.
+        let (slot, tag) = Heat::key(cpu.eip, backing, restart);
+        #[cfg(feature = "jit-profile")]
+        if !self.heat[slot].matches(tag) {
+            self.stats.heat_replacements += u64::from(self.heat[slot].count() != 0);
+            self.stats.heat_replacements_ge4 += u64::from(self.heat[slot].count() >= 4);
+        }
+        if !self.heat[slot].visit(tag) {
+            return Ok(Lookup::Cold);
+        }
+        #[cfg(feature = "jit-profile")]
+        {
+            self.stats.admissions += 1;
+        }
+        let (_, mut version, mut version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+        // Counted-only pages consume no entry table or CompiledPage. Bound the
+        // admitted page metadata as before, outside any active native stack.
+        let new_page = !self.pages.contains_key(&key);
+        if new_page
+            && (self.pages.len() >= ENTRY_TABLES
+                || (self.arena.table_capacity() == ENTRY_TABLES
+                    && self.arena.tables_used() == self.arena.table_capacity()))
+        {
+            self.stats.table_clears += 1;
+            self.reclaim(bus)?;
+            (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
         }
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
         let compilation_start = std::time::Instant::now();
@@ -894,10 +979,13 @@ impl Engine {
             )
             .map_err(|error| format!("JIT compiler at {:#x}: {error:?}", cpu.eip))?;
             if self.arena.tables_used() == self.arena.table_capacity()
-                && self.pages[&key].entries.native().is_none()
+                && self
+                    .pages
+                    .get(&key)
+                    .is_none_or(|page| page.entries.native().is_none())
             {
                 self.stats.table_clears += 1;
-                self.clear(bus)?;
+                self.reclaim(bus)?;
                 (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
             }
             let entry = match self.arena.publish_block(&mut code) {
@@ -906,7 +994,7 @@ impl Engine {
                     // No active native stack exists here; reclaiming an arena
                     // invalidates all handles, lookup entries and pending edges.
                     // Emitted blocks contain no old-arena/table addresses.
-                    self.clear(bus)?;
+                    self.reclaim(bus)?;
                     (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
                     self.arena.publish_block(&mut code)
                 }
@@ -924,8 +1012,10 @@ impl Engine {
         let page = self
             .pages
             .entry(key)
-            .or_insert_with(|| CompiledPage::new(version, &mut self.arena));
-        if let Some(content) = &mut page.content {
+            .or_insert_with(|| CompiledPage::new(version, version_ptr, &mut self.arena));
+        page.version = version;
+        {
+            let content = &mut page.content;
             // A negative decision depends on at most one architectural
             // instruction. Keeping its first 15 bytes unchanged cannot make an
             // overlong or unsupported instruction eligible. A page/EIP boundary
@@ -996,7 +1086,7 @@ impl Engine {
                 hit,
             );
         }
-        Ok(native)
+        Ok(native.map_or(Lookup::Interpret, Lookup::Native))
     }
 
     pub(crate) fn run_batch(
@@ -1007,8 +1097,10 @@ impl Engine {
         budget: u64,
     ) -> Result<BatchResult, String> {
         bus.sync_ioram(cpu);
+        bus.jit_prepare_code_pages();
         let mut ran = 0;
         while ran < budget {
+            let mut cold = false;
             let mut repeat = None;
             #[cfg(feature = "jit-profile")]
             let mut write_token_miss = false;
@@ -1027,10 +1119,15 @@ impl Engine {
             let native_limit = if shadowed { 1 } else { limit };
             let native_attention = attention || shadowed;
             if eligible {
-                if let Some(NativeBlock { body }) = self
-                    .lookup(cpu, bus)?
-                    .filter(|block| !shadowed || block.is_single_instruction())
-                {
+                let entry = self.lookup(cpu, bus)?;
+                cold = matches!(entry, Lookup::Cold);
+                let native = match entry {
+                    Lookup::Native(block) if !shadowed || block.is_single_instruction() => {
+                        Some(block)
+                    }
+                    _ => None,
+                };
+                if let Some(NativeBlock { body }) = native {
                     cpu.begin_instruction();
                     cpu.segment_override = None;
                     let mut frame = Frame::from_cpu(cpu, native_limit);
@@ -1165,7 +1262,7 @@ impl Engine {
                             continue;
                         }
                         #[cfg(feature = "jit-profile")]
-                        self.lookup(cpu, bus)?; // Update optional opcode counts.
+                        self.lookup(cpu, bus)?; // Opcode counts.
                     }
                     assert!(matches!(frame.exit_kind, 0..=4), "unknown JIT exit kind");
                     #[cfg(any(test, feature = "jit-profile"))]
@@ -1225,11 +1322,30 @@ impl Engine {
             }
             #[cfg(feature = "jit-profile")]
             let epoch_before = cpu.jit_mapping_epoch();
+            #[cfg(feature = "jit-profile")]
+            let eligible_before = cpu.jit_eligible_interpreted;
             let mut batch = if let Some(repeat) = repeat {
+                #[cfg(feature = "jit-profile")]
+                {
+                    cpu.jit_eligible_interpreted += u64::from(eligible);
+                }
                 Interpreter::resume_repeat(cpu, bus, start.wrapping_add(ran), &repeat)
             } else if eligible {
                 self.prepare_interpreter_fetch(cpu);
-                Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
+                if cold && !shadowed {
+                    #[cfg(any(test, feature = "jit-profile"))]
+                    {
+                        self.stats.cold_batches += 1;
+                    }
+                    Interpreter::run_cold(
+                        cpu,
+                        bus,
+                        start.wrapping_add(ran),
+                        (budget - ran).min(COLD_BATCH),
+                    )
+                } else {
+                    Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
+                }
             } else if cpu.interrupt_shadow() {
                 // The ordinary batch truncates this state to one instruction.
                 // Reuse its single-instruction kernel, retaining the forced
@@ -1253,6 +1369,11 @@ impl Engine {
                     u64::from(write_token_miss && cpu.jit_mapping_epoch() != epoch_before);
             }
             self.stats.interpreted_steps += batch.ran;
+            #[cfg(feature = "jit-profile")]
+            {
+                self.stats.eligible_interpreted_steps +=
+                    cpu.jit_eligible_interpreted.wrapping_sub(eligible_before);
+            }
             if !matches!(batch.stop, BatchStop::Budget) {
                 return Ok(BatchResult {
                     ran,
@@ -1272,11 +1393,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compact_page_promotion_preserves_admission_and_negative_entries() {
+    fn heat_word_admits_at_threshold_and_restarts_on_tag_replacement() {
+        assert_eq!(core::mem::size_of::<Heat>() * HEAT_SLOTS, 1024 * 1024);
+        let (_, tag) = Heat::key(0x1234, 0x5678, 0);
+        let (_, rewritten) = Heat::key(0x1234, 0x5678, 1);
+        let mut heat = Heat::default();
+        for visit in 1..=HOT {
+            assert_eq!(heat.visit(tag), visit == HOT);
+        }
+        assert!(heat.visit(tag));
+        assert!(!heat.visit(rewritten));
+        for visit in 2..=HOT {
+            assert_eq!(heat.visit(rewritten), visit == HOT);
+        }
+        assert!(!heat.visit(tag));
+    }
+
+    #[test]
+    fn compact_page_promotion_preserves_negative_entries() {
         let mut arena = CodeArena::with_limits(64 * 1024, 1).unwrap();
-        let mut page = CompiledPage::new(1, &mut arena);
+        let mut page = CompiledPage::new(1, core::ptr::null(), &mut arena);
         for offset in 0..PAGE_BYTES {
-            page.entries.set(&mut arena, offset, (offset % 4) as u32);
+            page.entries.set(&mut arena, offset, offset as u32 & 1);
         }
         assert_eq!(arena.tables_used(), 0);
         assert!(page.entries.native().is_none());
@@ -1284,18 +1422,20 @@ mod tests {
         assert_eq!(arena.tables_used(), 1);
         let pointer = arena.entries_pointer(table);
         for offset in 0..PAGE_BYTES {
-            // Both aliases expose the same packed-state expansion to dispatch.
-            assert_eq!(page.entries.get(&arena, offset), (offset % 4) as u32);
-            assert_eq!(unsafe { pointer.add(offset).read() }, (offset % 4) as u32);
+            // Both aliases expose the same negative entries.
+            let expected = offset as u32 & 1;
+            assert_eq!(page.entries.get(&arena, offset), expected);
+            assert_eq!(unsafe { pointer.add(offset).read() }, expected);
         }
         page.invalidate(2, &mut arena);
         assert!(arena.entries(table).iter().all(|&entry| entry == 0));
         assert_eq!(arena.tables_used(), 1);
-        let mut cold = CompiledPage::new(1, &mut arena);
+        let mut cold = CompiledPage::new(1, core::ptr::null(), &mut arena);
         cold.entries.set(&mut arena, 4095, INTERPRET);
         cold.invalidate(2, &mut arena);
         assert_eq!(cold.entries.get(&arena, 4095), 0);
-        assert!(cold.content.is_none());
+        assert_eq!(cold.content.end, 0);
+        assert_eq!(cold.restart, 1);
         assert_eq!(arena.tables_used(), 1);
     }
 }

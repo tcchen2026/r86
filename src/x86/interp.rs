@@ -648,7 +648,7 @@ impl Interpreter {
     ) -> BatchResult {
         #[cfg(all(feature = "r86chip-native", target_arch = "riscv32"))]
         let _chip_cache = crate::chipinterp::native::CacheScope::enter(cpu);
-        Self::run_counted_batch::<B, false>(
+        Self::run_counted_batch::<B, false, false>(
             cpu,
             bus,
             start_step,
@@ -670,11 +670,23 @@ impl Interpreter {
         budget: u64,
         cold: &mut crate::x86::jit::wasm::runtime::ColdEntries,
     ) -> BatchResult {
-        Self::run_counted_batch::<B, false>(cpu, bus, start_step, budget, Some(cold))
+        Self::run_counted_batch::<B, false, false>(cpu, bus, start_step, budget, Some(cold))
     }
 
-    /// The JIT's single-instruction fallback uses the same semantics without
-    /// carrying error payload temporaries around an interpreter loop backedge.
+    /// ARM64 cold execution stops at each decoder block boundary, including
+    /// untaken branches. A separate specialization keeps these observations
+    /// out of both ordinary batches and precise single-instruction handoffs.
+    #[cfg(a64_jit)]
+    pub(crate) fn run_cold<B: Bus>(
+        cpu: &mut Cpu,
+        bus: &mut B,
+        start_step: u64,
+        budget: u64,
+    ) -> BatchResult {
+        Self::run_counted_batch::<B, false, true>(cpu, bus, start_step, budget)
+    }
+
+    /// Precise JIT handoffs use a specialization without a loop backedge.
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
         all(feature = "jit", feature = "machine", target_arch = "arm"),
@@ -682,7 +694,7 @@ impl Interpreter {
     ))]
     pub(crate) fn run_one<B: Bus>(cpu: &mut Cpu, bus: &mut B, start_step: u64) -> BatchResult {
         let shadowed = cpu.interrupt_shadow();
-        let mut result = Self::run_counted_batch::<B, true>(
+        let mut result = Self::run_counted_batch::<B, true, false>(
             cpu,
             bus,
             start_step,
@@ -707,7 +719,7 @@ impl Interpreter {
     /// record themselves at their actual event; none inflate the denominator.
     /// This does not change guest TSC, event deadlines or instruction stepping.
     #[inline(always)]
-    fn run_counted_batch<B: Bus, const SINGLE: bool>(
+    fn run_counted_batch<B: Bus, const SINGLE: bool, const CONTROL: bool>(
         cpu: &mut Cpu,
         bus: &mut B,
         start_step: u64,
@@ -720,7 +732,7 @@ impl Interpreter {
         #[cfg(feature = "r86chip")]
         let before = cpu.chip_counts.incomplete();
         let result = if budget <= u64::from(u32::MAX) {
-            Self::run_batch_inner::<B, SINGLE>(
+            Self::run_batch_inner::<B, SINGLE, CONTROL>(
                 cpu,
                 bus,
                 start_step,
@@ -729,7 +741,7 @@ impl Interpreter {
                 until_control,
             )
         } else {
-            Self::run_large_batch::<B, SINGLE>(
+            Self::run_large_batch::<B, SINGLE, CONTROL>(
                 cpu,
                 bus,
                 start_step,
@@ -756,7 +768,7 @@ impl Interpreter {
     /// returns at its exact boundary; only a fully consumed chunk continues.
     #[cold]
     #[inline(never)]
-    fn run_large_batch<B: Bus, const SINGLE: bool>(
+    fn run_large_batch<B: Bus, const SINGLE: bool, const CONTROL: bool>(
         cpu: &mut Cpu,
         bus: &mut B,
         start_step: u64,
@@ -768,7 +780,7 @@ impl Interpreter {
         let mut ran = 0;
         loop {
             let part = (budget - ran).min(u64::from(u32::MAX)) as u32;
-            let batch = Self::run_batch_inner::<B, SINGLE>(
+            let batch = Self::run_batch_inner::<B, SINGLE, CONTROL>(
                 cpu,
                 bus,
                 start_step.wrapping_add(ran),
@@ -790,7 +802,7 @@ impl Interpreter {
     }
 
     #[inline(never)]
-    fn run_batch_inner<B: Bus, const SINGLE: bool>(
+    fn run_batch_inner<B: Bus, const SINGLE: bool, const CONTROL: bool>(
         cpu: &mut Cpu,
         bus: &mut B,
         start_step: u64,
@@ -845,6 +857,16 @@ impl Interpreter {
         let mut instruction_eip;
         let reason = 'batch: loop {
             let instruction_step = start_step.wrapping_add(u64::from(chunk_len - chunk_left));
+            #[cfg(all(a64_jit, feature = "jit-profile"))]
+            {
+                // Diagnostic only: classify every interpreted attempt, even
+                // when a batch changes guest mode before returning to the JIT.
+                cpu.jit_eligible_interpreted += u64::from(
+                    !cpu.code_default16()
+                        && cpu.seg(SegmentReg::Cs).limit == u32::MAX
+                        && cpu.eflags & ((1 << 8) | (1 << 17)) == 0,
+                );
+            }
             // Every operation still uses its existing Result-returning helper.
             // Errors leave the batch at this instruction; a successful handler
             // reaches the backedge without constructing a per-instruction result.
@@ -880,6 +902,8 @@ impl Interpreter {
             let mut opcode = step_try!(fetch_u8(cpu, bus));
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             let mut dynamic_control = false;
+            #[cfg(a64_jit)]
+            let mut cold_boundary = false;
 
             // Prefixes occupy entries in the same dispatch table as ordinary
             // opcodes. Only their cold arm scans more prefix bytes; each handler
@@ -938,7 +962,10 @@ impl Interpreter {
                     0xfa => step_try!(cli(cpu, start_eip)),
                     0xfb => {
                         step_try!(sti(cpu, start_eip));
-                        if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1) {
+                        if SINGLE
+                            || CONTROL
+                            || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
+                        {
                             stop!(BatchStepStop::Attention);
                         }
                     }
@@ -981,7 +1008,9 @@ impl Interpreter {
                         step_try!(pop_segment(cpu, bus, seg, operand16, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
-                            if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
+                            if SINGLE
+                                || CONTROL
+                                || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
                             {
                                 stop!(BatchStepStop::Attention);
                             }
@@ -1878,7 +1907,9 @@ impl Interpreter {
                         step_try!(load_segment(cpu, bus, seg, selector, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
-                            if SINGLE || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
+                            if SINGLE
+                                || CONTROL
+                                || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
                             {
                                 stop!(BatchStepStop::Attention);
                             }
@@ -2555,6 +2586,10 @@ impl Interpreter {
                         {
                             dynamic_control = matches!(op, 2..=5);
                         }
+                        #[cfg(a64_jit)]
+                        {
+                            cold_boundary = matches!(op, 2..=5);
+                        }
                         let dst = step_try!(decode_rm32(cpu, bus, modrm, address16));
                         step_try!(lockable_group_inc_dec_rm32(lock_prefix, dst, op, start_eip));
                         if operand16 {
@@ -2700,6 +2735,13 @@ impl Interpreter {
                         {
                             dynamic_control = matches!(opcode2, 0x34 | 0x35);
                         }
+                        #[cfg(a64_jit)]
+                        {
+                            cold_boundary = matches!(
+                                opcode2,
+                                0x34 | 0x35 | 0x80..=0x8f | 0xa1 | 0xa9 | 0xb2 | 0xb4 | 0xb5
+                            );
+                        }
                         if lock_prefix && !lock_prefix_candidate_0f(opcode2) {
                             stop!(BatchStepStop::Error(StepError::InvalidOpcode {
                                 eip: start_eip
@@ -2774,6 +2816,29 @@ impl Interpreter {
             };
             if bus_attention {
                 stop!(BatchStepStop::Attention);
+            }
+            #[cfg(a64_jit)]
+            if CONTROL
+                && (cold_boundary
+                    || matches!(opcode,
+                        0x07 | 0x17 | 0x1f | 0x70..=0x7f | 0x8e | 0x9a | 0xa4 | 0xa5 |
+                        0xc2..=0xc5 | 0xca..=0xcf | 0xe0..=0xe3 | 0xe8..=0xeb | 0xfb)
+                    || (!matches!(prefix, Prefix::None)
+                        && matches!(opcode, 0x6c..=0x6f | 0xa6 | 0xa7 | 0xaa..=0xaf))
+                    || (cpu.seg(SegmentReg::Cs).base.wrapping_add(start_eip)
+                        ^ cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip))
+                        & !4095
+                        != 0)
+            {
+                // At the last instruction, retain the ordinary attention/shadow
+                // boundary below. A block edge must not postpone a due event.
+                if chunk_left > 1 {
+                    cpu.materialize_flags();
+                    return BatchResult {
+                        ran: instruction_step.wrapping_sub(start_step).wrapping_add(1),
+                        stop: BatchStop::Budget,
+                    };
+                }
             }
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             if let Some(cold) = until_control.as_deref_mut() {

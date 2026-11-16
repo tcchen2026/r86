@@ -26,8 +26,8 @@ use core::cell::Cell;
 /// Only bytes used by translated instructions or negative-cache decisions are
 /// dependencies. Other bytes can become data or code later. Record new spans
 /// from the current qualified backing bytes, never from an earlier page image.
-/// Native publication starts recording after the first invalidation; Wasm
-/// records before deferred publication so late results can be validated.
+/// Record from the first admission so data-only writes retain native entries
+/// and heat. Wasm records before deferred publication to validate late results.
 /// The cache owner bounds the number of snapshots and charges their storage.
 #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
 pub(crate) struct CodeContent {

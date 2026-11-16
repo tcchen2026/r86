@@ -317,6 +317,9 @@ impl LazyFlags {
 #[repr(C)]
 #[derive(Clone, Debug)]
 pub struct Cpu {
+    /// Diagnostic-only interpreted attempts satisfying the ARM64 entry mode guard.
+    #[cfg(all(a64_jit, feature = "jit-profile"))]
+    pub(crate) jit_eligible_interpreted: u64,
     pub regs: [u32; 8],
     pub eip: u32,
     pub eflags: u32,
@@ -1190,6 +1193,8 @@ impl Cpu {
         // Bochs init.cc initializes real caches as present, accessed RW data.
         let real_seg = SegmentCache::new(0, 0, 0xffff, 0x0093);
         Self {
+            #[cfg(all(a64_jit, feature = "jit-profile"))]
+            jit_eligible_interpreted: 0,
             regs: [0; 8],
             eip: 0,
             eflags: 0x0000_0002,

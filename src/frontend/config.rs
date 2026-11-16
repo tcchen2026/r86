@@ -28,9 +28,8 @@ fn kind(key: &str) -> Option<Kind> {
         | "debug-ring"
         | "perf-counters"
         | "print-frame-hash" => Kind::Flag,
-        "size-mib" | "mem-mib" | "steps" | "ws-slice-steps" | "sdl2-slice-steps" | "sdl2-scale" => {
-            Kind::Number
-        }
+        "size-mib" | "mem-mib" | "steps" | "measure-from-step" | "ws-slice-steps"
+        | "sdl2-slice-steps" | "sdl2-scale" => Kind::Number,
         "serial-input" | "serial-input-file" | "serial-command" | "bootlocal-command"
         | "initrd-file" | "initrd-tree" | "net-forward" => Kind::Repeated,
         "create-vhd" | "iso" | "tools-iso" | "bootsector" | "boot-linux-kernel"

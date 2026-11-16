@@ -4,9 +4,7 @@
 mod bus_diagnostics;
 mod clock;
 mod magic;
-pub use magic::{
-    DisplayMode, DisplayResult, RECOMMENDED_CARDPUTER_MODE, RECOMMENDED_DESKTOP_MODE,
-};
+pub use magic::{DisplayMode, DisplayResult, RECOMMENDED_CARDPUTER_MODE, RECOMMENDED_DESKTOP_MODE};
 #[cfg(test)]
 mod sound_tests;
 #[cfg(test)]
@@ -2876,6 +2874,21 @@ impl HostBus {
         (offset as u64, version, pages.version_ptr(offset >> 12))
     }
 
+    #[cfg(a64_jit)]
+    pub(crate) fn jit_prepare_code_pages(&mut self) {
+        // Allocate version cells before the first fetch witness is made.
+        // All cells start unwatched: admission alone promotes individual pages.
+        self.jit_code_pages
+            .get_or_insert_with(|| crate::x86::jit::validity::CodePages::new(self.ram.len()));
+    }
+
+    #[cfg(a64_jit)]
+    pub(crate) fn jit_ram_offset(&self, token: BackingToken) -> u64 {
+        // A qualified fetch token already refers to this stable RAM allocation.
+        // Admission counts do not install a code watch or revoke writable aliases.
+        (token.0 as usize - self.ram.as_ptr() as usize) as u64
+    }
+
     #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
     pub(crate) fn jit_backing_offset(&self, token: BackingToken) -> u32 {
         // The fetch-cache hit already certifies backing in this stable RAM.
@@ -5391,7 +5404,7 @@ mod host_bus_tests {
                 let compiled = engine.stats.compiled_blocks;
                 let interpreted = engine.stats.interpreted_steps;
                 let reused = engine.stats.content_reuses;
-                for budget in [1, 3, 2048] {
+                for budget in [1, 3, 4096] {
                     let reference =
                         Interpreter::run_batch(&mut expected, &mut reference_bus, steps, budget);
                     let native = engine
@@ -5412,7 +5425,12 @@ mod host_bus_tests {
                 } else if phase == 3 {
                     assert!(engine.stats.content_changes > 0);
                     assert!(engine.stats.compiled_blocks > compiled);
-                    assert!(engine.stats.interpreted_steps < interpreted + 32);
+                    // A changed source restarts entry admission. Each loop has
+                    // at most four instructions before returning to its head.
+                    assert!(
+                        engine.stats.interpreted_steps
+                            < interpreted + 4 * (u64::from(crate::x86::jit::runtime::HOT) + 2)
+                    );
                 }
             }
             assert!(engine.stats.native_steps > 4000);
@@ -5447,7 +5465,8 @@ mod host_bus_tests {
         };
         let mut reference = make(false);
         let mut native = make(true);
-        for (phase, budget) in [20, 20, 1, 3, 100].into_iter().enumerate() {
+        let warm = u64::from(crate::x86::jit::runtime::HOT) * 5 + 10;
+        for (phase, budget) in [warm, warm, 1, 3, 100].into_iter().enumerate() {
             if phase == 1 {
                 // Execute the already compiled store with a code-page target.
                 // It must exit before replacing the following INC with DEC.
@@ -5480,6 +5499,269 @@ mod host_bus_tests {
 
     #[cfg(a64_jit)]
     #[test]
+    fn jit_cold_counted_source_write_keeps_heat_without_a_watch() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        let mut bus = HostBus::new(0x4000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        bus.ram[0x1000..0x1003].copy_from_slice(&[0x40, 0xeb, 0xfd]);
+        Interpreter::run_batch(&mut cpu, &mut bus, 0, 2);
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut step = 2;
+        for _ in 1..HOT {
+            assert_eq!(
+                engine.run_batch(&mut cpu, &mut bus, step, 2).unwrap().ran,
+                2
+            );
+            step += 2;
+        }
+        assert_eq!(engine.stats.compiled_blocks, 0);
+        assert!(
+            bus.jit_code_pages
+                .as_ref()
+                .is_none_or(|pages| !pages.watched(1))
+        );
+        bus.write_phys_u8(PhysAddr(0x1000), 0x48).unwrap();
+        let eax = cpu.regs[0];
+        engine.run_batch(&mut cpu, &mut bus, step, 2).unwrap();
+        assert_eq!(engine.stats.compiled_blocks, 1);
+        assert_eq!(cpu.regs[0], eax.wrapping_sub(1));
+        assert_eq!(engine.stats.native_steps, 2);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_recorded_code_restarts_heat_but_data_keeps_it() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        let mut bus = HostBus::new(0x4000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        for at in [0x1000, 0x1100, 0x1200] {
+            bus.ram[at..at + 3].copy_from_slice(&[0x40, 0xeb, 0xfd]);
+        }
+        Interpreter::run_batch(&mut cpu, &mut bus, 0, 2);
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut step = 2;
+        let mut run = |engine: &mut Engine, cpu: &mut Cpu, bus: &mut HostBus, eip, visits| {
+            cpu.eip = eip;
+            let batch = engine.run_batch(cpu, bus, step, visits * 2).unwrap();
+            assert_eq!(batch.ran, visits * 2);
+            step += batch.ran;
+        };
+        run(&mut engine, &mut cpu, &mut bus, 0x1000, u64::from(HOT));
+        run(&mut engine, &mut cpu, &mut bus, 0x1100, u64::from(HOT - 1));
+        bus.write_phys_u8(PhysAddr(0x1f00), 0xff).unwrap();
+        run(&mut engine, &mut cpu, &mut bus, 0x1100, 1);
+        assert_eq!(engine.stats.compiled_blocks, 2);
+        assert_eq!(engine.stats.content_changes, 0);
+        run(&mut engine, &mut cpu, &mut bus, 0x1200, u64::from(HOT - 1));
+        bus.write_phys_u8(PhysAddr(0x1000), 0x48).unwrap();
+        for visit in 1..=HOT {
+            run(&mut engine, &mut cpu, &mut bus, 0x1200, 1);
+            assert_eq!(engine.stats.compiled_blocks, 2 + u64::from(visit == HOT));
+        }
+        assert_eq!(engine.stats.content_changes, 1);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_capacity_clear_halves_heat_external_reset_zeroes_it() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        let mut bus = HostBus::new(0x4000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        for at in [0x1000, 0x2000] {
+            bus.ram[at..at + 3].copy_from_slice(&[0x40, 0xeb, 0xfd]);
+            cpu.eip = at as u32;
+            Interpreter::run_batch(&mut cpu, &mut bus, 0, 2);
+        }
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut step = 0;
+        for at in [0x1000, 0x2000] {
+            cpu.eip = at;
+            let ran = engine
+                .run_batch(&mut cpu, &mut bus, step, u64::from(HOT) * 2)
+                .unwrap()
+                .ran;
+            step += ran;
+        }
+        assert_eq!(engine.stats.table_clears, 1);
+        cpu.eip = 0x1000;
+        for visit in 1..=HOT / 2 {
+            engine.run_batch(&mut cpu, &mut bus, step, 2).unwrap();
+            step += 2;
+            assert_eq!(
+                engine.stats.compiled_blocks,
+                2 + u64::from(visit == HOT / 2)
+            );
+        }
+        engine.clear(&mut bus).unwrap();
+        for visit in 1..=HOT {
+            engine.run_batch(&mut cpu, &mut bus, step, 2).unwrap();
+            step += 2;
+            assert_eq!(engine.stats.compiled_blocks, 3 + u64::from(visit == HOT));
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_target_inside_a_compiled_block_gets_its_own_entry() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        let mut bus = HostBus::new(0x4000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        bus.ram[0x1000..0x1004].copy_from_slice(&[0x40, 0x41, 0xeb, 0xfc]);
+        Interpreter::run_batch(&mut cpu, &mut bus, 0, 3);
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut step = 3;
+        engine
+            .run_batch(&mut cpu, &mut bus, step, u64::from(HOT) * 3)
+            .unwrap();
+        step += u64::from(HOT) * 3;
+        assert_eq!(engine.stats.compiled_blocks, 1);
+        let before = cpu.regs;
+        let native_before = engine.stats.native_steps;
+        for visit in 1..=HOT {
+            cpu.eip = 0x1001;
+            assert_eq!(
+                engine.run_batch(&mut cpu, &mut bus, step, 2).unwrap().ran,
+                2
+            );
+            step += 2;
+            assert_eq!(engine.stats.compiled_blocks, 1 + u64::from(visit == HOT));
+        }
+        assert_eq!(cpu.regs[0], before[0]);
+        assert_eq!(cpu.regs[1], before[1].wrapping_add(u32::from(HOT)));
+        assert_eq!(cpu.eip, 0x1000);
+        assert_eq!(engine.stats.native_steps - native_before, 2);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_negative_entry_interprets_only_itself_in_a_loop() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        let mut bus = HostBus::new(0x4000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        // INC; FNOP; INC; JMP. The native predecessor and the lookup path both
+        // reach the negative entry; its native successor must remain visible.
+        bus.ram[0x1000..0x1006].copy_from_slice(&[0x40, 0xd9, 0xd0, 0x41, 0xeb, 0xfa]);
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let warm = u64::from(HOT) * 4 * 4;
+        engine.run_batch(&mut cpu, &mut bus, 0, warm).unwrap();
+        let interpreted = engine.stats.interpreted_steps;
+        let native = engine.stats.native_steps;
+        let cold = engine.stats.cold_batches;
+        engine.run_batch(&mut cpu, &mut bus, warm, 400).unwrap();
+        assert_eq!(cpu.eip, 0x1000);
+        assert_eq!(engine.stats.interpreted_steps - interpreted, 100);
+        assert_eq!(engine.stats.native_steps - native, 300);
+        assert_eq!(engine.stats.cold_batches, cold);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_every_block_head_counts_before_its_predecessor_is_native() {
+        use crate::x86::jit::runtime::{Engine, HOT};
+        let mut long = vec![0x40; 40];
+        long.extend([0xeb, 0xd6]);
+        for (name, start, code, steps, interpreted_per_pass) in [
+            (
+                "untaken branches",
+                0x1000,
+                vec![0x40, 0x70, 0, 0x41, 0x70, 0, 0x42, 0xeb, 0xf7],
+                6,
+                0,
+            ),
+            ("MOVS", 0x1000, vec![0xa4, 0x40, 0xeb, 0xfc], 3, 0),
+            ("32 instruction bound", 0x1000, long, 41, 0),
+            // A page-straddling MOV remains interpreted; both surrounding
+            // native blocks must count while its predecessor is still cold.
+            (
+                "straddling instruction",
+                0x1ffc,
+                vec![
+                    0x40, 0x41, 0xb8, 0, 0, 0, 0, 0x42, 0xe9, 0xf3, 0xff, 0xff, 0xff,
+                ],
+                5,
+                1,
+            ),
+        ] {
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(start, 0);
+            cpu.regs[6] = 0x3000;
+            cpu.regs[7] = 0x3400;
+            let mut bus = HostBus::new(0x5000);
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            bus.ram[start as usize..start as usize + code.len()].copy_from_slice(&code);
+            Interpreter::run_batch(&mut cpu, &mut bus, 0, steps);
+            assert_eq!(cpu.eip, start, "{name}");
+            let mut engine = Engine::with_limits(64 * 1024, 2).unwrap();
+            let warm = u64::from(HOT) * steps;
+            engine.run_batch(&mut cpu, &mut bus, steps, warm).unwrap();
+            let native = engine.stats.native_steps;
+            let interpreted = engine.stats.interpreted_steps;
+            engine
+                .run_batch(&mut cpu, &mut bus, steps + warm, steps)
+                .unwrap();
+            assert_eq!(cpu.eip, start, "{name}");
+            assert_eq!(
+                engine.stats.interpreted_steps - interpreted,
+                interpreted_per_pass,
+                "{name}"
+            );
+            assert_eq!(
+                engine.stats.native_steps - native,
+                steps - interpreted_per_pass,
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_cold_batch_observes_attention_in_straight_line_code_and_on_a_transfer() {
+        for transfer in [false, true] {
+            let make = || {
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1000, 0);
+                let mut bus = HostBus::new(0x4000);
+                bus.ram[0x1000..0x1080].fill(0x40); // INC EAX
+                if transfer {
+                    bus.ram[0x1007..0x1009].copy_from_slice(&[0xeb, 0xfe]);
+                }
+                bus.attention = false;
+                bus.next_attention_step = 7;
+                (cpu, bus)
+            };
+            let (mut actual, mut bus) = make();
+            let (mut expected, mut reference) = make();
+            let mut engine = crate::x86::jit::runtime::Engine::with_limits(64 * 1024, 1).unwrap();
+            let want = Interpreter::run_batch(&mut expected, &mut reference, 0, 64);
+            let got = engine.run_batch(&mut actual, &mut bus, 0, 64).unwrap();
+            assert_eq!(got, want);
+            assert!(got.ran < 64);
+            assert_eq!(actual.regs, expected.regs);
+            assert_eq!(actual.eip, expected.eip);
+            assert_eq!(actual.tsc(), expected.tsc());
+            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+            assert_eq!(engine.stats.cold_batches, 1);
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
     fn jit_lazy_tables_reclaim_only_for_another_native_page() {
         let make = || {
             let mut cpu = Cpu::new();
@@ -5500,11 +5782,14 @@ mod host_bus_tests {
         let (mut expected, mut reference_bus) = make();
         let (mut actual, mut native_bus) = make();
         let mut engine = crate::x86::jit::runtime::Engine::with_limits(64 * 1024, 1).unwrap();
-        let mut runs = alloc::vec![(0x1000, 128)];
+        let mut runs = alloc::vec![(0x1000, 256)];
         for page in 3..16 {
-            runs.extend(core::iter::repeat_n((page * 4096, 1), 8));
+            runs.extend(core::iter::repeat_n(
+                (page * 4096, 1),
+                usize::from(crate::x86::jit::runtime::HOT) + 2,
+            ));
         }
-        runs.extend([(0x2000, 128), (0x1000, 128)]);
+        runs.extend([(0x2000, 256), (0x1000, 256)]);
         let mut steps = 0;
         for (index, (eip, budget)) in runs.iter().copied().enumerate() {
             expected.eip = eip;
@@ -6089,7 +6374,7 @@ mod host_bus_tests {
                         let (mut expected, mut expected_bus) = make();
                         let (mut actual, mut actual_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                        for round in 0..4 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             let destination = if case == 1 { 0x6fff } else { 0x6ffe };
                             let high = if case == 3 { 0x1234_0000 } else { 0 };
                             let esp = high | (destination + if operand16 { 2 } else { 4 });
@@ -6135,7 +6420,9 @@ mod host_bus_tests {
                                     if case == 4 { &[0, 0] } else { &[0xef, 0xbe] }
                                 );
                             }
-                            if round == 3 && matches!(case, 0 | 4) {
+                            if round == u64::from(crate::x86::jit::runtime::HOT) + 3
+                                && matches!(case, 0 | 4)
+                            {
                                 assert_eq!(engine.stats.native_memory_writes, before + 1);
                             }
                             if case == 3 {
@@ -6225,9 +6512,9 @@ mod host_bus_tests {
                     }
                     let before_native = engine.stats.native_steps;
                     let reference =
-                        Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 128);
+                        Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 512);
                     let native = engine
-                        .run_batch(&mut actual, &mut native_bus, steps, 128)
+                        .run_batch(&mut actual, &mut native_bus, steps, 512)
                         .unwrap();
                     assert_eq!(
                         native, reference,
@@ -6386,7 +6673,7 @@ mod host_bus_tests {
             let (mut expected, mut expected_bus) = make();
             let (mut actual, mut actual_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..3 {
+            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                 expected.eip = 0x1000;
                 actual.eip = 0x1000;
                 let reference =
@@ -6604,16 +6891,18 @@ mod host_bus_tests {
                         let (mut actual, mut actual_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                         let mut steps = 0;
-                        for _ in 0..20 {
+                        for _ in 0..usize::from(crate::x86::jit::runtime::HOT) * 4 {
+                            let native = engine
+                                .run_batch(&mut actual, &mut actual_bus, steps, 101)
+                                .unwrap();
+                            // Cold STI is an allowed earlier attention boundary.
+                            // Compare all architectural state at that exact stop.
                             let reference = Interpreter::run_batch(
                                 &mut expected,
                                 &mut expected_bus,
                                 steps,
-                                101,
+                                native.ran,
                             );
-                            let native = engine
-                                .run_batch(&mut actual, &mut actual_bus, steps, 101)
-                                .unwrap();
                             assert_eq!(
                                 native, reference,
                                 "bits={bits} cpl={cpl} iopl={iopl} value={value:x}"
@@ -6706,7 +6995,11 @@ mod host_bus_tests {
                     let (mut actual, mut actual_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                     let mut steps = 301;
-                    for budget in [1, 2, 8, 1, 2, 8, 8, 8] {
+                    for budget in [1, 2, 8]
+                        .into_iter()
+                        .cycle()
+                        .take(usize::from(crate::x86::jit::runtime::HOT) * 4)
+                    {
                         for cpu in [&mut expected, &mut actual] {
                             cpu.eip = 0x1000;
                             cpu.regs[0] = 0xaabb_ccdd;
@@ -6810,7 +7103,8 @@ mod host_bus_tests {
                             let (mut actual, mut actual_bus) = make();
                             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                             let mut steps = 0;
-                            for round in 0..5 {
+                            let hot = usize::from(crate::x86::jit::runtime::HOT);
+                            for round in 0..hot + 3 {
                                 for cpu in [&mut expected, &mut actual] {
                                     cpu.eip = 0x1000;
                                     cpu.halted = false;
@@ -6871,7 +7165,7 @@ mod host_bus_tests {
                                             "cpl={cpl} iopl={iopl} cr4={control:x} flags={initial:x} next={next:x?} round={round} result={native:?}"
                                         );
                                         assert_ne!(actual.effective_eflags() & 0x200, 0);
-                                        if round >= 3 {
+                                        if round >= hot {
                                             assert_eq!(engine.stats.interpreted_steps, interpreted);
                                         }
                                     }
@@ -6940,8 +7234,9 @@ mod host_bus_tests {
                     let (mut actual, mut actual_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                     let mut steps = 0;
-                    for round in 0..10 {
-                        let shadowed = !(6..8).contains(&round);
+                    let hot = usize::from(crate::x86::jit::runtime::HOT);
+                    for round in 0..hot + 6 {
+                        let shadowed = !(hot + 2..hot + 4).contains(&round);
                         for cpu in [&mut expected, &mut actual] {
                             cpu.eip = 0x1000;
                             cpu.halted = false;
@@ -6976,7 +7271,7 @@ mod host_bus_tests {
                         assert_eq!(actual.tsc(), expected.tsc());
                         assert_eq!(actual.cr2, expected.cr2);
                         assert_eq!(actual_bus.ram, expected_bus.ram);
-                        if completes_natively && shadowed && round >= 3 {
+                        if completes_natively && shadowed && round >= hot + 1 {
                             assert_eq!(engine.stats.native_steps, before + 1);
                         }
                         steps += result.ran;
@@ -7078,7 +7373,7 @@ mod host_bus_tests {
                 // Establish native coverage before injecting the fault. Cold
                 // admission is allowed to interpret the first few visits.
                 let mut step = 0;
-                for _ in 0..4 {
+                for _ in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     for cpu in [&mut actual, &mut expected] {
                         cpu.eip = 0x1000;
                         cpu.regs[4] = 0x6000;
@@ -7156,7 +7451,7 @@ mod host_bus_tests {
                 let (mut expected, mut reference_bus) = make();
                 let (mut actual, mut native_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..3 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     expected.eip = 0x1000;
                     actual.eip = 0x1000;
                     let reference =
@@ -7220,7 +7515,7 @@ mod host_bus_tests {
                             let (mut expected, mut reference_bus) = make();
                             let (mut actual, mut native_bus) = make();
                             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                            for round in 0..3 {
+                            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                                 for (cpu, bus) in [
                                     (&mut expected, &mut reference_bus),
                                     (&mut actual, &mut native_bus),
@@ -7231,7 +7526,9 @@ mod host_bus_tests {
                                     cpu.regs[6] = 0x20000;
                                     cpu.regs[7] = 0x30000;
                                     // Bulk STOS does not fill the scalar TLB.
-                                    if count != 0 && round == 2 {
+                                    if count != 0
+                                        && round == u64::from(crate::x86::jit::runtime::HOT) + 3
+                                    {
                                         mmu::read_linear_u8(
                                             cpu,
                                             bus,
@@ -7310,7 +7607,7 @@ mod host_bus_tests {
             let (mut expected, mut reference_bus) = make();
             let (mut actual, mut native_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..3 {
+            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                 for cpu in [&mut expected, &mut actual] {
                     cpu.eip = 0x1000;
                     cpu.regs[0] = match case {
@@ -7378,7 +7675,7 @@ mod host_bus_tests {
                     let (mut expected, mut reference_bus) = make();
                     let (mut actual, mut native_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                    for round in 0..4 {
+                    for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                         for (cpu, bus) in [
                             (&mut expected, &mut reference_bus),
                             (&mut actual, &mut native_bus),
@@ -7480,7 +7777,7 @@ mod host_bus_tests {
                         let (mut expected, mut expected_bus) = make();
                         let (mut actual, mut actual_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                        for round in 0..4 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             for cpu in [&mut expected, &mut actual] {
                                 cpu.eip = 0x1000;
                                 cpu.regs[1] = 17;
@@ -7527,7 +7824,9 @@ mod host_bus_tests {
                                 | (u32::from(difference & 0x80 != 0) << 7)
                                 | (u32::from((lhs ^ rhs) & (lhs ^ difference) & 0x80 != 0) << 11);
                             assert_eq!(actual.effective_eflags() & 0x8d5, flags);
-                            if round == 3 && (prefix.is_none() || (!backward && base == 0)) {
+                            if round == u64::from(crate::x86::jit::runtime::HOT) + 3
+                                && (prefix.is_none() || (!backward && base == 0))
+                            {
                                 assert_eq!(
                                     engine.stats.native_memory_reads - before,
                                     2 * u64::from(done)
@@ -7571,7 +7870,7 @@ mod host_bus_tests {
                     let (mut expected, mut expected_bus) = make();
                     let (mut actual, mut actual_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                    for round in 0..4 {
+                    for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                         for (cpu, bus) in [
                             (&mut expected, &mut expected_bus),
                             (&mut actual, &mut actual_bus),
@@ -7642,7 +7941,7 @@ mod host_bus_tests {
                                 _ => 0x7000,
                             }
                         );
-                        if round == 3 && done != 0 {
+                        if round == u64::from(crate::x86::jit::runtime::HOT) + 3 && done != 0 {
                             assert!(engine.stats.native_memory_reads > before);
                             if !matches!(case, 2 | 5) {
                                 assert_eq!(engine.stats.partial_repeats, partial_before + 1);
@@ -7691,7 +7990,7 @@ mod host_bus_tests {
                 let (mut expected, mut reference_bus) = make();
                 let (mut actual, mut native_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..3 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     for cpu in [&mut expected, &mut actual] {
                         cpu.eip = 0x1000;
                         cpu.regs[0] = if (prefix == 0xf3) != early_stop {
@@ -7761,7 +8060,7 @@ mod host_bus_tests {
                         let (mut expected, mut reference_bus) = make();
                         let (mut actual, mut native_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                        for round in 0..3 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             for cpu in [&mut expected, &mut actual] {
                                 cpu.eip = 0x1000;
                                 cpu.regs[1] = count;
@@ -7772,7 +8071,9 @@ mod host_bus_tests {
                                     0x21040
                                 };
                             }
-                            if round == 2 && (prefix.is_none() || count != 0) {
+                            if round == u64::from(crate::x86::jit::runtime::HOT) + 3
+                                && (prefix.is_none() || count != 0)
+                            {
                                 // Bulk interpreter copies deliberately bypass
                                 // the software TLB. Check that cold miss above,
                                 // then warm it through ordinary data accesses
@@ -7857,7 +8158,7 @@ mod host_bus_tests {
             let (mut expected, mut reference_bus) = make();
             let (mut actual, mut native_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..3 {
+            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                 for cpu in [&mut expected, &mut actual] {
                     cpu.eip = 0x1000;
                     cpu.regs[1] = 4;
@@ -7941,7 +8242,7 @@ mod host_bus_tests {
             let (mut expected, mut reference_bus) = make();
             let (mut actual, mut native_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..3 {
+            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                 expected.eip = 0x1000;
                 actual.eip = 0x1000;
                 let reference =
@@ -7995,7 +8296,7 @@ mod host_bus_tests {
                 let (mut expected, mut reference_bus) = make();
                 let (mut actual, mut native_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..3 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     expected.eip = 0x1000;
                     actual.eip = 0x1000;
                     let reference =
@@ -8068,7 +8369,7 @@ mod host_bus_tests {
                 let (mut expected, mut expected_bus) = make();
                 let (mut actual, mut actual_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..3 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     expected.eip = 0x1000;
                     actual.eip = 0x1000;
                     let reference = Interpreter::run_batch(
@@ -8513,7 +8814,7 @@ mod host_bus_tests {
                 for fault in [false, true] {
                     let stack_base = if fault { 0x7000 } else { 0x6800 };
                     let physical = if fault { 0xb000 } else { 0xa800 };
-                    for round in 0..4 {
+                    for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                         for bus in [&mut expected_bus, &mut actual_bus] {
                             write_ram_u32(
                                 bus,
@@ -8743,7 +9044,11 @@ mod host_bus_tests {
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
             let mut steps = 0;
             for phase in 0..9 {
-                for _ in 0..if phase == 0 { 4 } else { 1 } {
+                for _ in 0..if phase == 0 {
+                    u64::from(crate::x86::jit::runtime::HOT) + 4
+                } else {
+                    1
+                } {
                     for budget in [0, 1, 2, 3, 6] {
                         for attention in [false, true] {
                             for bus in [&mut expected_bus, &mut actual_bus] {
@@ -8938,7 +9243,11 @@ mod host_bus_tests {
             }
             // Compile the embedded stream first. The outer MOV must consume
             // its complete immediate, while both streams may join at 1005h.
-            for entry in [0x1001, 0x1000, 0x1002] {
+            for entry in [0x1001, 0x1000, 0x1002]
+                .into_iter()
+                .cycle()
+                .take((usize::from(crate::x86::jit::runtime::HOT) + 2) * 3)
+            {
                 expected.eip = entry;
                 actual.eip = entry;
                 for budget in [1, 3, 13, 127] {
@@ -9526,7 +9835,7 @@ mod host_bus_tests {
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                         // The first visit may only establish execute access;
                         // subsequent visits must reach native admission too.
-                        for round in 0..4 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             for (cpu, bus) in [
                                 (&mut expected, &mut reference_bus),
                                 (&mut actual, &mut native_bus),
@@ -9691,7 +10000,10 @@ mod host_bus_tests {
             let (mut expected, mut expected_bus) = make();
             let (mut actual, mut actual_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for phase in 0..5 {
+            let mut steps = 0;
+            for phase in
+                core::iter::repeat_n(0, usize::from(crate::x86::jit::runtime::HOT) + 4).chain(1..5)
+            {
                 for (cpu, bus) in [
                     (&mut expected, &mut expected_bus),
                     (&mut actual, &mut actual_bus),
@@ -9726,15 +10038,12 @@ mod host_bus_tests {
                     bus.attention = false;
                     bus.vga.clear_dirty();
                 }
-                let reference = Interpreter::run_batch(
-                    &mut expected,
-                    &mut expected_bus,
-                    phase * budget,
-                    budget,
-                );
+                let reference =
+                    Interpreter::run_batch(&mut expected, &mut expected_bus, steps, budget);
                 let native = engine
-                    .run_batch(&mut actual, &mut actual_bus, phase * budget, budget)
+                    .run_batch(&mut actual, &mut actual_bus, steps, budget)
                     .unwrap();
+                steps += native.ran;
                 assert_eq!(native, reference, "shape={shape} phase={phase}");
                 assert_eq!(actual.regs, expected.regs);
                 assert_eq!(actual.eip, expected.eip);
@@ -9814,7 +10123,12 @@ mod host_bus_tests {
                 let (mut expected, mut expected_bus) = make();
                 let (mut actual, mut actual_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for (phase, selector) in [0x18, 0xfffc, 0, 0x38].into_iter().enumerate() {
+                for (phase, selector) in [0x18, 0xfffc, 0, 0x38]
+                    .into_iter()
+                    .cycle()
+                    .take(usize::from(crate::x86::jit::runtime::HOT) + 4)
+                    .enumerate()
+                {
                     for cpu in [&mut expected, &mut actual] {
                         cpu.eip = 0x1000;
                         cpu.regs[0] = 0x1234_5678;
@@ -9922,9 +10236,9 @@ mod host_bus_tests {
                 }
                 let native_steps = engine.stats.native_steps;
                 let reference =
-                    Interpreter::run_batch(&mut expected, &mut expected_bus, phase * 103, 103);
+                    Interpreter::run_batch(&mut expected, &mut expected_bus, phase * 1027, 1027);
                 let native = engine
-                    .run_batch(&mut actual, &mut actual_bus, phase * 103, 103)
+                    .run_batch(&mut actual, &mut actual_bus, phase * 1027, 1027)
                     .unwrap();
                 assert_eq!(native, reference, "address={address:x} phase={phase}");
                 assert_eq!(actual.regs, expected.regs);
@@ -9996,7 +10310,7 @@ mod host_bus_tests {
                 let (mut expected, mut expected_bus) = make();
                 let (mut actual, mut actual_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..4 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     for cpu in [&mut expected, &mut actual] {
                         cpu.eip = 0x1000;
                         cpu.regs = [0x7fff_ffff, 0x1234, 0x5678, 0x9abc, 0xf000, 0, 0x6ffd, 0];
@@ -10217,7 +10531,7 @@ mod host_bus_tests {
                 let (mut expected, mut expected_bus) = make();
                 let (mut actual, mut actual_bus) = make();
                 let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                for round in 0..4 {
+                for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                     for cpu in [&mut expected, &mut actual] {
                         cpu.eip = 0x1000;
                         cpu.regs = [0, 0, 0x7fff_ffff, 0, 0, 0, address, 0];
@@ -10305,8 +10619,9 @@ mod host_bus_tests {
                     let (mut actual, mut actual_bus) = make();
                     let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
                     let mut steps = 0;
-                    for budget in [1, 2, 3, 7, 127, 10_001] {
-                        if budget == 127 {
+                    let warm = u64::from(crate::x86::jit::runtime::HOT) * 32;
+                    for budget in [1, 2, 3, 7, warm, 10_001] {
+                        if budget == warm {
                             // Reuse one indirect call site with a new destination.
                             if form == 1 {
                                 expected.regs[6] = 0x3000;
@@ -10530,7 +10845,7 @@ mod host_bus_tests {
                         let (mut expected, mut expected_bus) = make();
                         let (mut actual, mut actual_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                        for round in 0..4 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             for (cpu, bus) in [
                                 (&mut expected, &mut expected_bus),
                                 (&mut actual, &mut actual_bus),
@@ -10737,7 +11052,7 @@ mod host_bus_tests {
                         let (mut expected, mut expected_bus) = make();
                         let (mut actual, mut actual_bus) = make();
                         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-                        for round in 0..4 {
+                        for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                             for (cpu, bus) in [
                                 (&mut expected, &mut expected_bus),
                                 (&mut actual, &mut actual_bus),
@@ -10847,9 +11162,9 @@ mod host_bus_tests {
                 }
                 let before_data = native_bus.ram[0x8000..0x8004].to_vec();
                 let reference =
-                    Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 60);
+                    Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 512);
                 let native = engine
-                    .run_batch(&mut actual, &mut native_bus, steps, 60)
+                    .run_batch(&mut actual, &mut native_bus, steps, 512)
                     .unwrap();
                 assert_eq!(native, reference);
                 assert_eq!(actual.regs, expected.regs);
@@ -10863,7 +11178,7 @@ mod host_bus_tests {
                     assert_eq!(&native_bus.ram[0x8000..0x8004], &before_data);
                     assert!(!matches!(native.stop, BatchStop::Budget));
                 } else {
-                    assert_eq!(native.ran, 60);
+                    assert_eq!(native.ran, 512);
                     assert_eq!(native.stop, BatchStop::Budget);
                 }
                 steps += native.ran;
@@ -10952,7 +11267,11 @@ mod host_bus_tests {
                     0x7fff_ffff,
                     0x8000_0000,
                     u32::MAX,
-                ] {
+                ]
+                .into_iter()
+                .cycle()
+                .take(usize::from(crate::x86::jit::runtime::HOT) + 16)
+                {
                     for cpu in [&mut expected, &mut actual] {
                         cpu.eip = 0x1000;
                         cpu.regs = [
@@ -11121,7 +11440,7 @@ mod host_bus_tests {
             let (mut expected, mut expected_bus) = make();
             let (mut actual, mut actual_bus) = make();
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..3 {
+            for round in 0..u64::from(crate::x86::jit::runtime::HOT) + 4 {
                 expected.eip = 0x1000;
                 actual.eip = 0x1000;
                 let reference =
@@ -12777,13 +13096,19 @@ mod host_bus_tests {
         for following in [&[0x90, 0x43][..], &[0xf4], &[0xe6, 0x80], &[0x0f, 0xff]] {
             let mut bus = HostBus::new(0x10000);
             bus.ram[0x1000] = 0xfb;
+            bus.ram[0x1800] = 0x90;
             bus.ram[0x1001..0x1001 + following.len()].copy_from_slice(following);
             let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            for round in 0..6 {
+            for round in 0..=crate::x86::jit::runtime::HOT + 2 {
                 let mut cpu = Cpu::new();
-                cpu.enter_protected_flat(0x1000, 0x8000);
+                cpu.enter_protected_flat(0x1800, 0x8000);
                 bus.attention = false;
                 bus.next_attention_step = u64::MAX;
+                // Each fresh Cpu needs a resident fetch proof before the
+                // repeated entry can count toward native admission.
+                assert_eq!(Interpreter::run_one(&mut cpu, &mut bus, 0).ran, 1);
+                cpu.eip = 0x1000;
+                cpu.set_tsc(0);
                 let native_before = engine.stats.native_steps;
                 let expected = if following[0] == 0x90 { 3 } else { 2 };
                 let mut ran = 0;
@@ -12832,7 +13157,7 @@ mod host_bus_tests {
                         }
                     )),
                 }
-                if round == 5 {
+                if round == crate::x86::jit::runtime::HOT + 2 {
                     assert_eq!(calls, 1);
                     assert!(engine.stats.native_steps > native_before);
                 }
