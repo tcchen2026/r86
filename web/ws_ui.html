@@ -35,6 +35,7 @@
   #menubar { display: flex; align-items: center; gap: 2px; height: 34px; padding: 0 6px;
     background: var(--panel); border-bottom: 1px solid var(--line); user-select: none; }
   #menubar h1 { font-size: 14px; margin: 0 10px 0 6px; letter-spacing: .5px; }
+  #engine { margin-left: auto; padding: 0 8px; font: 12px var(--mono); color: var(--muted); white-space: nowrap; }
   nav { display: flex; gap: 2px; }
   .menu { position: relative; }
   .menu > .title { background: none; border: 0; border-radius: 4px; padding: 4px 10px; }
@@ -227,6 +228,7 @@
       </div>
     </div>
   </nav>
+  <span id="engine" title="CPU engine"></span>
 </header>
 <div id="upload" hidden>
   <span id="upload-text"></span><progress id="upload-bar" max="1" value="0"></progress>
@@ -488,6 +490,7 @@ setInterval(() => {
 
 function online(id, hello) {
   retry = 0;
+  $("engine").textContent = hello.engine ?? "";
   if (hello.import) { showImport(hello.import); return; }
   serialPre.textContent = ""; eventsPre.textContent = "";
   frameGen = undefined; serialNext = 0; eventNext = 0;
@@ -574,6 +577,7 @@ async function pollStatus() {
   }
   lastStep = json.step; lastTime = now;
   running = json.execution.running;
+  $("engine").textContent = json.engine ?? "";
   showPower(json.powered_off);
   showMouse(json);
   showDisplay(json);
