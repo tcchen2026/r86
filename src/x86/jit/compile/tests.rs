@@ -9,6 +9,7 @@ use crate::x86::jit::{
 };
 use crate::x86::{BatchStop, Bus, Cpu, Interpreter, MemError, PhysAddr};
 
+mod extended;
 mod mmx;
 
 struct Bytes(Vec<u8>);

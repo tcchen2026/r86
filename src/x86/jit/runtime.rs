@@ -881,7 +881,7 @@ impl Engine {
         // boundary. Compile that entry with the existing one-instruction ABI;
         // otherwise a longer block would be rejected on every shadowed visit.
         let count = if cpu.interrupt_shadow() { 1 } else { 32 };
-        let decoded = decode::block(bus.jit_code_bytes(backing, window), cpu.eip, count);
+        let decoded = decode::block_extended(bus.jit_code_bytes(backing, window), cpu.eip, count);
         let (native, _faults, edges) = if decoded.instructions.is_empty() {
             (None, Vec::new(), Vec::new())
         } else {

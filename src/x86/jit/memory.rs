@@ -284,6 +284,15 @@ pub(crate) fn stack_width(op: Op, write: bool) -> Option<u8> {
 }
 
 pub(crate) fn stack_range(block: &Block, index: usize) -> Option<StackRange> {
+    if let Op::PushAll { bits } | Op::PopAll { bits } = block.instructions[index].op {
+        // One instruction checks all eight slots before changing any register
+        // or memory. Do not merge it with independently committing PUSH/POPs.
+        return Some(StackRange {
+            bytes: bits,
+            end: index + 1,
+            write: matches!(block.instructions[index].op, Op::PushAll { .. }),
+        });
+    }
     let write = matches!(
         block.instructions[index].op,
         Op::Push { .. } | Op::PushFlags { .. }

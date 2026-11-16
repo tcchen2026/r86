@@ -11,10 +11,10 @@ const BINARY: &[u8] = &[
     0xed, 0xef, 0xf1, 0xf2, 0xf3, 0xf5, 0xf8, 0xf9, 0xfa, 0xfc, 0xfd, 0xfe,
 ];
 
-struct Memory(Vec<u8>);
+pub(super) struct Memory(pub(super) Vec<u8>);
 
 impl Memory {
-    fn word(&mut self, at: usize, value: u32) {
+    pub(super) fn word(&mut self, at: usize, value: u32) {
         self.0[at..at + 4].copy_from_slice(&value.to_le_bytes());
     }
 }
@@ -86,7 +86,7 @@ unsafe extern "C" fn refill(view: *mut soft::View, tag: u32, write: u32) -> u64 
     bias
 }
 
-fn invoke(code: &Fixture, cpu: &mut Cpu, memory: &mut Memory, budget: u64) -> Frame {
+pub(super) fn invoke(code: &Fixture, cpu: &mut Cpu, memory: &mut Memory, budget: u64) -> Frame {
     let mut frame = Frame::from_cpu(cpu, budget);
     let mut view = soft::View::new(cpu, true);
     view.bus = (memory as *mut Memory).cast();
@@ -132,7 +132,7 @@ fn setup(bytes: &[u8], seed: u32) -> (Cpu, Memory) {
     (cpu, memory)
 }
 
-fn same(actual: &Cpu, expected: &Cpu) {
+pub(super) fn same(actual: &Cpu, expected: &Cpu) {
     assert_eq!(actual.regs, expected.regs);
     assert_eq!(actual.eip, expected.eip);
     assert_eq!(actual.effective_eflags(), expected.effective_eflags());

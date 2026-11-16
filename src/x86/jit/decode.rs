@@ -294,11 +294,11 @@ pub enum Op {
         src: Value,
         bits: u8,
     },
-    /// Extended decoder only; stack order includes the original SP/ESP.
+    /// Extended (AArch64/Thumb-2) decoder; saves the original SP/ESP.
     PushAll {
         bits: u8,
     },
-    /// Extended decoder only; the saved SP/ESP slot is skipped.
+    /// Extended (AArch64/Thumb-2) decoder; skips the saved SP/ESP slot.
     PopAll {
         bits: u8,
     },
@@ -318,7 +318,7 @@ pub enum Op {
         target: u32,
     },
     /// Decrement ECX without changing flags, then branch while nonzero and,
-    /// for LOOP(E/NE), while ZF has the requested value. Extended decoder only.
+    /// for LOOP(E/NE), while ZF has the requested value. AArch64/Thumb-2 only.
     Loop {
         target: u32,
         zero: Option<bool>,
@@ -1225,7 +1225,7 @@ pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
     read_block(bytes, eip, limit, false)
 }
 
-/// As `block`, plus the operations only the Thumb-2 backend lowers.
+/// As `block`, plus the operations lowered by AArch64 and Thumb-2.
 pub fn block_extended(bytes: &[u8], eip: u32, limit: usize) -> Block {
     read_block(bytes, eip, limit, true)
 }

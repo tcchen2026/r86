@@ -1293,18 +1293,13 @@ fn emit_progress(a: &mut Assembler, _block: &Block, count: u16) {
                                     }
                             )
                     })
-                    .map(|i| {
-                        if matches!(
-                            i.op,
-                            Op::String {
-                                kind: StringOp::Compare,
-                                ..
-                            }
-                        ) {
-                            2
-                        } else {
-                            1
-                        }
+                    .map(|i| match i.op {
+                        Op::PopAll { .. } => 7,
+                        Op::String {
+                            kind: StringOp::Compare,
+                            ..
+                        } => 2,
+                        _ => 1,
                     })
                     .sum::<usize>(),
             ),
@@ -1323,7 +1318,14 @@ fn emit_progress(a: &mut Assembler, _block: &Block, count: u16) {
                                     }
                             )
                     })
-                    .count(),
+                    .map(|i| {
+                        if matches!(i.op, Op::PushAll { .. }) {
+                            8
+                        } else {
+                            1
+                        }
+                    })
+                    .sum::<usize>(),
             ),
             (
                 offset_of!(Frame, loaded_segments),
@@ -2646,6 +2648,68 @@ pub fn block(
                     write_register(&mut a, dst, RESULT);
                 }
             }
+            Op::PushAll { bits } => {
+                // stack_range already qualified every slot. Keeping ESP live
+                // until the last store also saves its original value in slot 3.
+                debug_assert!(stack_cached);
+                for register in 0..8 {
+                    let offset = soft::stack_store(
+                        &mut a,
+                        guest_reg(register),
+                        bits,
+                        (7 - register) as u8 * (bits / 8),
+                    );
+                    faults.push(FaultSite::new(
+                        offset,
+                        instruction.eip,
+                        index as u32,
+                        bits / 8,
+                        true,
+                    ));
+                }
+                a.add_sub_imm(guest_reg(4), guest_reg(4), bits.into(), false, true, false);
+            }
+            Op::PopAll { bits } => {
+                debug_assert!(stack_cached);
+                soft::stack_read_pointer(&mut a, LHS);
+                for (slot, register) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
+                    if register == 4 {
+                        continue;
+                    }
+                    let dst = if bits == 32 {
+                        guest_reg(register)
+                    } else {
+                        RESULT
+                    };
+                    let offset = a.offset() as u32;
+                    a.load_store(
+                        true,
+                        dst,
+                        LHS,
+                        slot as u32 * u32::from(bits / 8),
+                        (bits / 8).trailing_zeros() as u8,
+                    );
+                    faults.push(FaultSite::new(
+                        offset,
+                        instruction.eip,
+                        index as u32,
+                        bits / 8,
+                        false,
+                    ));
+                    if bits == 16 {
+                        write_register(
+                            &mut a,
+                            Register {
+                                index: register as u8,
+                                bits,
+                                shift: 0,
+                            },
+                            RESULT,
+                        );
+                    }
+                }
+                a.add_sub_imm(guest_reg(4), guest_reg(4), bits.into(), false, false, false);
+            }
             Op::Push { src, bits } => {
                 let value = match src {
                     Value::Register(register) if register.shift == 0 => {
@@ -2711,8 +2775,8 @@ pub fn block(
             }
             Op::IndirectJump { src } => read_value(&mut a, LHS, src, site.as_ref(), &mut faults),
             Op::Branch { .. } => {}
-            Op::Loop { .. } | Op::PushAll { .. } | Op::PopAll { .. } => {
-                unreachable!("extended operations are not decoded for arm64")
+            Op::Loop { .. } => {
+                a.add_sub_imm(guest_reg(1), guest_reg(1), 1, false, true, false);
             }
         }
         if matches!(instruction.op, Op::Movs { .. } | Op::String { .. }) {
@@ -2767,43 +2831,59 @@ pub fn block(
             emit_edge(&mut a, page, Some(last.next_eip), false, done, &mut edges);
         }
         Op::Branch {
-            condition: Some(condition),
+            condition: Some(_),
             target,
-        } => {
+        }
+        | Op::Loop { target, .. } => {
             let taken = a.label();
-            match condition {
-                BranchCondition::EcxZero => a.cbz(guest_reg(1), false, false, taken),
-                BranchCondition::Flags(condition) => {
-                    let native =
-                        block.instructions.len().checked_sub(2).and_then(|i| {
+            match last.op {
+                Op::Loop { zero, .. } => {
+                    if let Some(equal) = zero {
+                        let fallthrough = a.label();
+                        a.cbz(guest_reg(1), false, false, fallthrough);
+                        a.tbz(FLAGS, 30, equal, taken);
+                        a.bind(fallthrough);
+                    } else {
+                        a.cbz(guest_reg(1), false, true, taken);
+                    }
+                }
+                Op::Branch {
+                    condition: Some(condition),
+                    ..
+                } => match condition {
+                    BranchCondition::EcxZero => a.cbz(guest_reg(1), false, false, taken),
+                    BranchCondition::Flags(condition) => {
+                        let native = block.instructions.len().checked_sub(2).and_then(|i| {
                             comparison_condition(block.instructions[i].op, condition)
                         });
-                    if let Some(native) = native {
-                        a.b_cond(native, taken);
-                    } else {
-                        match condition >> 1 {
-                            // Packed flag bits can branch without extraction. BE/A can
-                            // test the adjacent C/Z pair without normalizing a boolean.
-                            0 | 1 | 2 | 4 => {
-                                let bit = match condition >> 1 {
-                                    0 => 28,
-                                    1 => 29,
-                                    2 => 30,
-                                    _ => 31,
-                                };
-                                a.tbz(FLAGS, bit, condition & 1 == 0, taken);
-                            }
-                            3 => {
-                                a.bitfield(TMP, FLAGS, 29, 30, false, false);
-                                a.cbz(TMP, false, condition & 1 == 0, taken);
-                            }
-                            _ => {
-                                condition_value(&mut a, condition);
-                                a.cbz(TMP, false, condition & 1 == 0, taken);
+                        if let Some(native) = native {
+                            a.b_cond(native, taken);
+                        } else {
+                            match condition >> 1 {
+                                // Packed flag bits can branch without extraction. BE/A can
+                                // test the adjacent C/Z pair without normalizing a boolean.
+                                0 | 1 | 2 | 4 => {
+                                    let bit = match condition >> 1 {
+                                        0 => 28,
+                                        1 => 29,
+                                        2 => 30,
+                                        _ => 31,
+                                    };
+                                    a.tbz(FLAGS, bit, condition & 1 == 0, taken);
+                                }
+                                3 => {
+                                    a.bitfield(TMP, FLAGS, 29, 30, false, false);
+                                    a.cbz(TMP, false, condition & 1 == 0, taken);
+                                }
+                                _ => {
+                                    condition_value(&mut a, condition);
+                                    a.cbz(TMP, false, condition & 1 == 0, taken);
+                                }
                             }
                         }
                     }
-                }
+                },
+                _ => unreachable!(),
             }
             if let Some(offset) = page.and_then(|page| page.entry_offset(target)) {
                 // Keep the local taken-edge trampoline until publication. A

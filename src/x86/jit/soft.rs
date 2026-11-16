@@ -344,6 +344,12 @@ pub fn stack_load(a: &mut Assembler, value: Reg, bits: u8) -> u32 {
     .access(a, value, false)
 }
 
+/// Materialize the base of an already qualified read window. POPA/POPAD use
+/// fixed slot offsets so ESP remains unchanged until every load completes.
+pub fn stack_read_pointer(a: &mut Assembler, dst: Reg) {
+    a.add_sub(dst, ENTRY, super::frame::guest_reg(4), true, false, false);
+}
+
 /// X11 names the minimum address of the dominating PUSH interval. The compiler
 /// tracks each member's offset; mixed 16/32-bit pushes need unscaled addressing.
 pub fn stack_store(a: &mut Assembler, value: Reg, bits: u8, displacement: u8) -> u32 {
