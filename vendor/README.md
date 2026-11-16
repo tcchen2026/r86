@@ -15,6 +15,9 @@ changes. These are all of them; keep this list current:
   "Press ESC for boot menu" and a bar stepping 10-30-70-100%, then text mode.
   Without the file the wait is unchanged. r86 supplies it through
   `Machine::enable_boot_splash`.
+- `src/bootsplash.c`: the label in `etc/r86-engine` appears at the top right
+  after the POST banner, during the r86 splash (40 columns), and on return
+  to text mode (80 columns). No file means no label; the cursor is preserved.
 - `vgasrc/svgamodes.c`: VBE mode 1A0h, 640x340x16, twice the M5Stack
   CardputerZero's 320x170 LCD; modes 1A1h/1A2h, 936x666 at 16/32 bpp,
   half the iPhone Duo's 1878x1335 upper half in laptop posture, with width

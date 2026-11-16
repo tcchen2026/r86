@@ -57,7 +57,8 @@ impl WsSession {
 
     fn hello(&self, machine: &Machine) -> String {
         let response = format!(
-            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"engine\":\"{}\",\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+            machine.engine_label(),
             machine.step_count(),
             self.slice_steps
         );
@@ -2286,6 +2287,18 @@ mod import_tests {
     use std::io::Read;
     use std::net::TcpStream;
     use std::time::Duration;
+
+    #[test]
+    fn hello_and_status_name_the_active_engine() {
+        let machine = Machine::new(0x10000);
+        let session = WsSession::new(1000, None);
+        for message in [session.hello(&machine), status_json(&machine, true)] {
+            assert_eq!(
+                json_string(&message, "engine").unwrap().as_deref(),
+                Some(machine.engine_label())
+            );
+        }
+    }
 
     #[test]
     fn remote_cd_socket_reply_bypasses_core_queue_and_disconnect_ejects() {

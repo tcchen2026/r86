@@ -1107,10 +1107,29 @@ impl Machine {
             wasm_jit: None,
         };
         machine.set_diagnostics(trace_mode, perf_mode);
+        machine.bus.fw_cfg.set_engine_label(machine.engine_label());
         machine
     }
 
-    /// Select the optional ARM64 Linux or ARMv6K engine. Unsupported hosts fail explicitly;
+    /// The engine selected for this run, including whether its backend is compiled in.
+    pub fn engine_label(&self) -> &'static str {
+        #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
+        if self.wasm_jit.is_some() {
+            return "[WASMJIT]";
+        }
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
+        if self.jit.is_some() {
+            #[cfg(a64_jit)]
+            return "[A64JIT]";
+            #[cfg(all(target_arch = "arm", not(feature = "jit-t32")))]
+            return "[A32JIT]";
+            #[cfg(all(target_arch = "arm", feature = "jit-t32"))]
+            return "[ThumbJIT]";
+        }
+        "[Interpreter (slow!)]"
+    }
+
+    /// Select the compiled-in native JIT. Unsupported hosts fail explicitly;
     /// selecting JIT must never silently select the interpreter instead.
     pub fn set_jit_enabled(&mut self, enabled: bool) -> Result<(), String> {
         self.clear_jit_code()?;
@@ -1121,17 +1140,16 @@ impl Machine {
             } else {
                 None
             };
-            Ok(())
         }
         #[cfg(not(any(a64_jit, all(feature = "jit", target_arch = "arm"))))]
         if enabled {
-            Err(
+            return Err(
                 "the JIT engine requires an ARM64 Linux/macOS or 32-bit ARM build with --features jit"
                     .into(),
-            )
-        } else {
-            Ok(())
+            );
         }
+        self.bus.fw_cfg.set_engine_label(self.engine_label());
+        Ok(())
     }
 
     #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
@@ -1224,6 +1242,7 @@ impl Machine {
             mib as usize * 1024 * 1024,
             threshold as u16,
         ));
+        self.bus.fw_cfg.set_engine_label(self.engine_label());
         Ok(())
     }
 
@@ -4738,6 +4757,68 @@ mod host_bus_tests {
     const PTE_USER: u32 = 1 << 2;
     const PTE_ACCESSED: u32 = 1 << 5;
     const PTE_DIRTY: u32 = 1 << 6;
+
+    #[test]
+    fn engine_label_and_firmware_file_follow_the_active_backend() {
+        fn check(machine: &mut Machine, expected: &str) {
+            assert_eq!(machine.engine_label(), expected);
+            let fw = &mut machine.bus.fw_cfg;
+            fw.select(0x19);
+            let count = u32::from_be_bytes(core::array::from_fn(|_| fw.read_data()));
+            let mut matches = Vec::new();
+            for _ in 0..count {
+                let entry: [u8; 64] = core::array::from_fn(|_| fw.read_data());
+                if entry[8..].starts_with(b"etc/r86-engine\0") {
+                    matches.push((
+                        u32::from_be_bytes(entry[..4].try_into().unwrap()),
+                        u16::from_be_bytes(entry[4..6].try_into().unwrap()),
+                    ));
+                }
+            }
+            assert_eq!(matches.len(), 1);
+            let (len, selector) = matches[0];
+            fw.select(selector);
+            let bytes: Vec<_> = (0..len).map(|_| fw.read_data()).collect();
+            assert_eq!(bytes, expected.as_bytes());
+        }
+
+        let mut machine = Machine::new_firmware(2 << 20, FirmwareDisplay::Vga).unwrap();
+        machine.load_bios_rom(&vec![0; 0x10000]).unwrap();
+        check(&mut machine, "[Interpreter (slow!)]");
+        machine.reboot().unwrap();
+        check(&mut machine, "[Interpreter (slow!)]");
+        machine.set_jit_enabled(false).unwrap();
+        check(&mut machine, "[Interpreter (slow!)]");
+        #[cfg(any(a64_jit, all(feature = "jit", target_arch = "arm")))]
+        {
+            machine.set_jit_enabled(true).unwrap();
+            #[cfg(a64_jit)]
+            let label = "[A64JIT]";
+            #[cfg(all(target_arch = "arm", not(feature = "jit-t32")))]
+            let label = "[A32JIT]";
+            #[cfg(all(target_arch = "arm", feature = "jit-t32"))]
+            let label = "[ThumbJIT]";
+            check(&mut machine, label);
+            machine.reboot().unwrap();
+            check(&mut machine, label);
+            machine.set_jit_enabled(false).unwrap();
+            check(&mut machine, "[Interpreter (slow!)]");
+        }
+        #[cfg(not(any(a64_jit, all(feature = "jit", target_arch = "arm"))))]
+        {
+            assert!(machine.set_jit_enabled(true).is_err());
+            check(&mut machine, "[Interpreter (slow!)]");
+        }
+        #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
+        {
+            machine.configure_wasm_jit(128, 256).unwrap();
+            check(&mut machine, "[WASMJIT]");
+            machine.reboot().unwrap();
+            check(&mut machine, "[WASMJIT]");
+            assert!(machine.configure_wasm_jit(1, 0).is_err());
+            check(&mut machine, "[WASMJIT]");
+        }
+    }
 
     #[test]
     fn segmented_code_trace_reads_cs_base_and_wraps_linear_address() {

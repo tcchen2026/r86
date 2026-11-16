@@ -319,6 +319,7 @@ mod wasm {
         threshold: u32,
     ) -> i32 {
         let s = unsafe { state(handle) };
+        // Machine also updates etc/r86-engine before the firmware boots.
         match s.machine.configure_wasm_jit(mib, threshold) {
             Ok(()) => 0,
             Err(error) => {

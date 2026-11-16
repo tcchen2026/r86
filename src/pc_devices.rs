@@ -150,6 +150,12 @@ impl FwCfgDevice {
         self.set_file("pci1234,1111.rom", bytes.to_vec());
     }
 
+    pub fn set_engine_label(&mut self, label: &str) {
+        if self.enabled {
+            self.set_file("etc/r86-engine", label.as_bytes().to_vec());
+        }
+    }
+
     /// SeaBIOS's boot menu wait shows `logo` with "Press ESC for boot menu"
     /// and a stepped bar for 3 s (vendor/seabios/src/bootsplash.c r86_splash).
     pub fn enable_boot_splash(&mut self, logo: &[u8]) {

@@ -37,6 +37,34 @@ call16_int10(struct bregs *br)
  * VGA text / graphics console
  ****************************************************************/
 
+// r86's active engine occupies the top-right corner without moving the
+// console cursor. Mode 3 has 80 columns; mode 13h has 40.
+static void
+r86_show_engine(int columns)
+{
+    int size;
+    char *label = romfile_loadfile("etc/r86-engine", &size);
+    if (!label || size < 1 || size > columns) {
+        free(label);
+        return;
+    }
+    struct bregs br;
+    memset(&br, 0, sizeof(br));
+    br.ah = 0x03;
+    call16_int10(&br);
+    u16 cursor = br.dx;
+    memset(&br, 0, sizeof(br));
+    br.ah = 0x02;
+    br.dx = columns - size;
+    call16_int10(&br);
+    printf("%s", label);
+    memset(&br, 0, sizeof(br));
+    br.ah = 0x02;
+    br.dx = cursor;
+    call16_int10(&br);
+    free(label);
+}
+
 void
 enable_vga_console(void)
 {
@@ -50,6 +78,7 @@ enable_vga_console(void)
 
     // Write to screen.
     printf("SeaBIOS (version %s)\n", VERSION);
+    r86_show_engine(80);
     display_uuid();
 }
 
@@ -313,6 +342,7 @@ r86_splash(int msec)
                          , R86_SCALE, R86_SCALE, R86_DAC + c);
         }
     free(file);
+    r86_show_engine(40);
 
     // The VGA BIOS font in colour 7 (light grey), row 17, column 8.
     memset(&br, 0, sizeof(br));
@@ -330,5 +360,6 @@ r86_splash(int msec)
     memset(&br, 0, sizeof(br));
     br.ax = 0x0003;
     call16_int10(&br);
+    r86_show_engine(80);
     return key;
 }

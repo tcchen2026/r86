@@ -7,6 +7,84 @@ use r86::machine::{GuestStepStatus, Machine};
 
 #[test]
 #[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
+fn seabios_shows_the_engine_on_post_splash_and_restored_text() {
+    // Optional captures let a reviewer inspect the actual firmware pixels.
+    fn capture(machine: &Machine, name: &str) {
+        let Some(dir) = std::env::var_os("R86_FIRMWARE_CAPTURE_DIR") else {
+            return;
+        };
+        let mode = machine.vga().mode_info();
+        let mut rgba = vec![0; usize::from(mode.width) * usize::from(mode.height) * 4];
+        machine.vga().render_rgba(&mut rgba).unwrap();
+        let mut ppm = format!("P6\n{} {}\n255\n", mode.width, mode.height).into_bytes();
+        for pixel in rgba.chunks_exact(4) {
+            ppm.extend_from_slice(&pixel[..3]);
+        }
+        std::fs::write(std::path::Path::new(&dir).join(name), ppm).unwrap();
+    }
+
+    for splash in [false, true] {
+        let mut machine = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
+        machine
+            .load_bios_rom(include_bytes!("../firmware/seabios/bios.bin"))
+            .unwrap();
+        machine
+            .load_option_rom(
+                0xc0000,
+                include_bytes!("../firmware/seabios/vgabios-stdvga.bin"),
+            )
+            .unwrap();
+        if splash {
+            machine.enable_boot_splash();
+        }
+        machine.reset_bios();
+        let label = machine.engine_label();
+        let mut post_seen = false;
+        let mut splash_seen = false;
+        let mut booted = false;
+        while machine.step_count() < 150_000_000 {
+            machine.run_steps(10_000).unwrap();
+            let mode = machine.vga().mode_info();
+            let text = machine.text_snapshot();
+            if mode.mode == r86::devices::RenderMode::Text {
+                let row = text.lines().next().unwrap_or("");
+                if row.starts_with("SeaBIOS") && row.ends_with(label) {
+                    assert_eq!(row.find(label), Some(80 - label.len()));
+                    if !post_seen && !splash {
+                        capture(&machine, "e2-post.ppm");
+                    }
+                    post_seen = true;
+                }
+                if text.contains("No bootable device") {
+                    assert_eq!(row.find(label), Some(80 - label.len()), "{text}");
+                    booted = true;
+                    break;
+                }
+            } else if splash && !splash_seen && (mode.width, mode.height) == (320, 200) {
+                let mut rgba = vec![0; 320 * 200 * 4];
+                machine.vga().render_rgba(&mut rgba).unwrap();
+                // The bar is drawn after both the label and the menu hint.
+                if rgba[(160 * 320 + 60) * 4..][..3] == [0, 0, 0] {
+                    continue;
+                }
+                let lit = |x: usize, y: usize| rgba[(y * 320 + x) * 4..][..3] != [0, 0, 0];
+                let left = (40 - label.len()) * 8;
+                assert!((0..8).all(|y| (0..left).all(|x| !lit(x, y))));
+                for (index, byte) in label.bytes().enumerate() {
+                    let ink = (0..8).any(|y| (0..8).any(|x| lit(left + index * 8 + x, y)));
+                    assert_eq!(ink, byte != b' ', "label cell {index}");
+                }
+                capture(&machine, "e2-splash.ppm");
+                splash_seen = true;
+            }
+        }
+        assert!(post_seen && booted, "{}", machine.text_snapshot());
+        assert_eq!(splash_seen, splash);
+    }
+}
+
+#[test]
+#[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
 fn seabios_discovers_vga_rom_and_draws_after_reset() {
     let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
     let mut disk = vec![0; 8 << 20];

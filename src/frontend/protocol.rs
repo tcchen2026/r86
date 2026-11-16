@@ -100,7 +100,7 @@ pub fn status_json(machine: &Machine, ok: bool) -> String {
     let mode = machine.vga().mode_info();
     let cs = machine.cpu().seg(SegmentReg::Cs);
     format!(
-        "{{\"type\":\"status\",\"ok\":{},\"step\":{},\"clock\":\"{}\",\"cpu\":{{\"eip\":{},\"eax\":{},\"ebx\":{},\"ecx\":{},\"edx\":{},\"esi\":{},\"edi\":{},\"ebp\":{},\"esp\":{},\"eflags\":{},\"cr0\":{},\"cr2\":{},\"cr3\":{},\"cr4\":{},\"cs\":{},\"cs_base\":{},\"cs_limit\":{},\"cs_flags\":{},\"idtr_base\":{},\"idtr_limit\":{},\"gdtr_base\":{},\"gdtr_limit\":{},\"halted\":{}}},\"serial_len\":{},\"vga\":{{\"mode\":\"{}\",\"width\":{},\"height\":{},\"bpp\":{},\"stride\":{},\"dirty\":{}}},\"pic\":{{\"mask1\":{},\"mask2\":{},\"isr1\":{},\"isr2\":{},\"base1\":{},\"base2\":{}}},\"rtc\":{{\"irq8\":{},\"a\":{},\"b\":{},\"c\":{},\"next_tick\":{}}},\"ps2\":{{\"irq1\":{},\"irq12\":{},\"kbd_dropped\":{},\"aux_dropped\":{}}},\"reset_requested\":{},\"reset_count\":{},\"powered_off\":{}}}",
+        "{{\"type\":\"status\",\"ok\":{},\"step\":{},\"clock\":\"{}\",\"engine\":\"{}\",\"cpu\":{{\"eip\":{},\"eax\":{},\"ebx\":{},\"ecx\":{},\"edx\":{},\"esi\":{},\"edi\":{},\"ebp\":{},\"esp\":{},\"eflags\":{},\"cr0\":{},\"cr2\":{},\"cr3\":{},\"cr4\":{},\"cs\":{},\"cs_base\":{},\"cs_limit\":{},\"cs_flags\":{},\"idtr_base\":{},\"idtr_limit\":{},\"gdtr_base\":{},\"gdtr_limit\":{},\"halted\":{}}},\"serial_len\":{},\"vga\":{{\"mode\":\"{}\",\"width\":{},\"height\":{},\"bpp\":{},\"stride\":{},\"dirty\":{}}},\"pic\":{{\"mask1\":{},\"mask2\":{},\"isr1\":{},\"isr2\":{},\"base1\":{},\"base2\":{}}},\"rtc\":{{\"irq8\":{},\"a\":{},\"b\":{},\"c\":{},\"next_tick\":{}}},\"ps2\":{{\"irq1\":{},\"irq12\":{},\"kbd_dropped\":{},\"aux_dropped\":{}}},\"reset_requested\":{},\"reset_count\":{},\"powered_off\":{}}}",
         ok,
         machine.step_count(),
         if machine.uses_realtime_clock() {
@@ -108,6 +108,7 @@ pub fn status_json(machine: &Machine, ok: bool) -> String {
         } else {
             "deterministic"
         },
+        machine.engine_label(),
         machine.cpu().eip,
         machine.cpu().reg(Reg32::Eax),
         machine.cpu().reg(Reg32::Ebx),

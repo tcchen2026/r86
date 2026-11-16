@@ -58,6 +58,10 @@ should read and store that object before sending commands. The hello/status
 objects advertise capabilities, current step, frame size/mode details, and
 device counters when available. This script preserves the hello in
 ``WsClient.hello``.
+For a VM, both ``hello`` and ``status`` include ``engine``: the active engine
+label, brackets included (``[Interpreter (slow!)]``, ``[A64JIT]``, ``[WASMJIT]``,
+``[A32JIT]`` or ``[ThumbJIT]``). It reflects the enabled, compiled backend,
+not the saved VM preference. Import-only connections have no engine field.
 
 JSON command model
 ==================
