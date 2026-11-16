@@ -50,7 +50,7 @@ char *r86_library_create_existing(const char *root, const char *name, const char
 char *r86_library_export(const char *directory, const char *disk_out, char **config);
 char *r86_library_import(const char *root, const char *config, const char *disk,
                          char **directory);
-// cpu-engine: auto|jit|interpreter (legacy interp accepted). Changes a stopped VM.
+// cpu-engine: auto|jit|interpreter (legacy interp means auto). Changes a stopped VM.
 // auto selects JIT whenever available, regardless of the OS preset.
 // Native builds without the JIT interpret auto and jit VMs.
 // New VMs default to auto. --no-jit overrides launch without changing the file.

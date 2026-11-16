@@ -34,10 +34,11 @@ Contracts:
 - New VMs use cpu-engine="auto": select JIT whenever available, regardless of
   the OS preset; otherwise use the interpreter. All 16-bit code still uses
   the shared interpreter. Explicit choices are "jit" and
-  "interpreter"; existing "interp" settings remain readable. watchOS always
-  interprets; iOS fast mode is described below. --no-jit forces interpretation
-  without saving that override. Edit machine offers Auto, JIT and Interpreter
-  (slow); the choice applies at the next start and appears in the VM details.
+  "interpreter"; legacy "interp", the old automatic default, reads as "auto".
+  watchOS always interprets; iOS fast mode is described below. --no-jit forces
+  interpretation without saving that override. Edit machine offers Auto, JIT
+  and Interpreter (slow); the choice applies at the next start and appears in
+  the VM details.
   The C API exposes the saved preference as "engine" in library JSON and accepts
   the "cpu-engine" key in r86_library_set.
 - Each core thread requests user-interactive QoS before constructing Machine.

@@ -14,6 +14,12 @@ use super::guest_os::OsPreset;
 pub const CONFIG: &str = "vm.toml";
 pub const BIOS: &str = "bios.bin";
 
+// vm.toml used "interp" for the old host-dependent automatic default.
+// Explicit interpretation is stored as "interpreter"; CLI aliases are separate.
+fn stored_engine(engine: &str) -> &str {
+    if engine == "interp" { "auto" } else { engine }
+}
+
 #[derive(Clone, Debug)]
 pub struct Vm {
     pub directory: PathBuf,
@@ -158,7 +164,7 @@ impl Vm {
             iso: None,
             cdrom: true,
             usb_tablet: false,
-            engine: if DEFAULT_JIT { "jit" } else { "interp" }.into(),
+            engine: "auto".into(),
             boot_order: "disk".into(),
             bios: None,
             vga_bios: None,
@@ -178,10 +184,7 @@ impl Vm {
         if !(1..=131072).contains(&self.disk_mib) {
             return Err("Disk capacity must be between 1 MiB and 128 GiB.".into());
         }
-        if !matches!(
-            self.engine.as_str(),
-            "auto" | "interp" | "interpreter" | "jit"
-        ) {
+        if !matches!(stored_engine(&self.engine), "auto" | "interpreter" | "jit") {
             return Err("Unknown CPU engine.".into());
         }
         if !matches!(self.boot_order.as_str(), "disk" | "cdrom") {
@@ -262,7 +265,7 @@ impl Vm {
                 Some(Value::Boolean(value)) => *value,
                 _ => return Err("Invalid usb-tablet setting".into()),
             },
-            engine: text("cpu-engine")?,
+            engine: stored_engine(&text("cpu-engine")?).into(),
             boot_order: text("boot-order")?,
             scale: match table.get("scale") {
                 None => "aspect".into(),
@@ -297,10 +300,11 @@ impl Vm {
 
     fn to_toml(&self) -> Result<String, String> {
         let mut table = Table::new();
+        let engine = stored_engine(&self.engine).to_owned();
         for (key, value) in [
             ("name", &self.name),
             ("os", &self.os),
-            ("cpu-engine", &self.engine),
+            ("cpu-engine", &engine),
             ("boot-order", &self.boot_order),
             ("scale", &self.scale),
             ("notes", &self.notes),
@@ -527,7 +531,7 @@ impl Vm {
     /// Auto requests JIT for every guest OS, independently of this host's
     /// native JIT capability.
     pub fn wants_jit(&self) -> bool {
-        matches!(self.engine.as_str(), "auto" | "jit")
+        matches!(stored_engine(&self.engine), "auto" | "jit")
     }
 }
 

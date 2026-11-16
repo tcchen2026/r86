@@ -964,9 +964,14 @@ impl Args {
                 }
                 "--cpu-engine" => {
                     jit = match take_value(&mut args, "--cpu-engine")?.as_str() {
-                        "interp" => false,
+                        "auto" => DEFAULT_JIT,
+                        "interpreter" | "interp" => false,
                         "jit" => true,
-                        _ => return Err("--cpu-engine expects interp or jit".into()),
+                        _ => {
+                            return Err(
+                                "--cpu-engine expects auto, jit, interpreter or interp".into()
+                            );
+                        }
                     };
                 }
                 "--bootsector" => bootsector = Some(take_value(&mut args, "--bootsector")?.into()),
@@ -1326,7 +1331,7 @@ fn bootsync_script() -> Vec<u8> {
 }
 
 fn usage() -> String {
-    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine interp|jit] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--tools-iso FILE] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--measure-from-step N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\n--tools-iso selects the web console tools disc; defaults to r86_tools.iso beside the executable, optional at startup.\nCPU: JIT by default on supported ARM64 Linux/macOS builds; interpreter on other hosts.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\n--replay FILE accepts recorded WebSocket JSON lines or STEP SET2_HEX_BYTES lines; # comments and STEP !shot NAME markers are ignored. Inputs are delivered at exact committed steps, including the final step; requires a deterministic batch run.\n--measure-from-step N reports cumulative JIT counters at N and wall/user/sys time for N..--steps (CPU time on Unix). Requires a deterministic batch run.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nBoot splash: BIOS boots in the web console or SDL2 with the realtime clock show r86's logo for 3 s (ESC: boot menu).\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
+    "usage: cargo run --bin r86-run -- [--config FILE.toml] [--cpu-engine auto|jit|interpreter|interp] [--no-jit] [--clock realtime|deterministic] [--iso FILE|--no-cdrom] [--tools-iso FILE] [--boot-linux-kernel FILE --boot-linux-initrd FILE] [--boot-order disk|cdrom] [--bootsector FILE] [--bios FILE] [--vga-bios FILE|--no-vga-bios] [--hdd IMAGE] [--hdd-writable|--hdd-frozen] [--audio-wav PATH] [--usb-tablet] [--net none|user] [--net-forward tcp:HOSTPORT:GUESTPORT] [--do-not-exit-when-poweroff] [--firmware-display serial|vga] [--mem-mib 128] [--steps N] [--measure-from-step N] [--cmdline TEXT] [--host-decompress-kernel] [--guest-decompress-initrd] [--initrd-file HOST:GUEST[:MODE]] [--initrd-tree HOST[:GUEST]] [--bootlocal-command TEXT] [--serial-input TEXT] [--serial-input-file PATH] [--serial-input-after TEXT] [--serial-command TEXT] [--expect-serial TEXT] [--dump-initrd PATH] [--dump-prepared-iso PATH] [--ws-listen ADDR] [--ws-slice-steps N] [--ws-record PATH] [--term|--sdl2] [--sdl2-slice-steps N] [--sdl2-scale N] [--sdl2-grab-mouse] [--replay PATH] [--minimal-ring] [--debug-ring] [--perf-counters] [--print-frame-hash] [--expect-frame-hash HEX]\n       r86-run --create-vhd disk.vhd --size-mib 8192\n\nBoot: BIOS by default, with an empty CD-ROM drive and no hard disk.\nBIOS defaults: bios.bin and vgabios-stdvga.bin beside the executable.\nLinux boot: supply both --boot-linux-kernel and --boot-linux-initrd as external files.\n--iso inserts a CD-ROM image; --no-cdrom removes the drive.\n--tools-iso selects the web console tools disc; defaults to r86_tools.iso beside the executable, optional at startup.\nCPU: auto selects JIT whenever available; interpreter or interp forces interpretation.\n--no-jit forces the interpreter, overriding --cpu-engine.\nClock: realtime by default; deterministic uses instruction ticks for tests/replay.\n--replay FILE accepts recorded WebSocket JSON lines or STEP SET2_HEX_BYTES lines; # comments and STEP !shot NAME markers are ignored. Inputs are delivered at exact committed steps, including the final step; requires a deterministic batch run.\n--measure-from-step N reports cumulative JIT counters at N and wall/user/sys time for N..--steps (CPU time on Unix). Requires a deterministic batch run.\nHDD images: dynamic VHD or raw; --hdd-writable persists guest writes.\n--hdd-frozen requires --hdd and a read-only base; writes stay in memory across guest reboots, then are discarded on process exit. No cap beyond disk capacity; incompatible with --hdd-writable.\nUSB tablet: off by default. --usb-tablet adds PIIX3 UHCI and an absolute HID pointer.\nNetwork: off by default. --net user supplies IPv4 TCP, DHCP and DNS A; forwards bind 127.0.0.1.\nBoot splash: BIOS boots in the web console or SDL2 with the realtime clock show r86's logo for 3 s (ESC: boot menu).\nPower-off: flush disks and exit by default; --do-not-exit-when-poweroff keeps the process alive. --ws-listen always stays up.\nPrecedence: built-in defaults < TOML < CLI (regardless of --config position).\nValue options accept --name=value; flags accept --flag=true or --flag=false.\nTOML keys match long option names without --; relative paths use the working directory.\nRepeated CLI inputs replace the corresponding TOML list. See design/CONFIGURATION.md.".to_string()
 }
 
 #[cfg(test)]
@@ -1527,6 +1532,17 @@ mod tests {
 
     #[test]
     fn jit_engine_obeys_toml_and_cli_precedence() {
+        for (engine, jit) in [
+            ("auto", DEFAULT_JIT),
+            ("jit", true),
+            ("interpreter", false),
+            ("interp", false),
+        ] {
+            let config = TestConfig::new(&format!("cpu-engine = '{engine}'\n"));
+            assert_eq!(config.parse(&[]).unwrap().jit, jit, "{engine}");
+            let args = Args::parse([format!("--cpu-engine={engine}")].into_iter()).unwrap();
+            assert_eq!(args.jit, jit, "{engine}");
+        }
         let config = TestConfig::new("cpu-engine = 'jit'\n");
         let configured = config.parse(&[]).unwrap();
         assert!(configured.jit);
@@ -1549,6 +1565,12 @@ mod tests {
         assert!(config.parse(&[]).unwrap().jit);
         assert!(!config.parse(&["--no-jit"]).unwrap().jit);
         assert!(!config.parse(&["--cpu-engine=jit", "--no-jit"]).unwrap().jit);
+        assert!(
+            !config
+                .parse(&["--cpu-engine=auto", "--no-jit"])
+                .unwrap()
+                .jit
+        );
         assert!(config.parse(&["--no-jit=false"]).unwrap().jit);
         let config = TestConfig::new("cpu-engine = 'jit'\nno-jit = true\n");
         assert!(!config.parse(&[]).unwrap().jit);

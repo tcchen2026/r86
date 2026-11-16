@@ -121,11 +121,7 @@ fn vm_json(vm: &Vm) -> String {
         vm.volume,
         vm.network,
         json(&vm.notes),
-        json(if vm.engine == "interp" {
-            "interpreter"
-        } else {
-            &vm.engine
-        }),
+        json(&vm.engine),
     )
 }
 
@@ -241,7 +237,6 @@ unsafe fn new_vm(
         name.unwrap_or_default(),
         preset,
     );
-    vm.engine = "auto".into();
     vm.memory = memory_mib;
     vm.disk_mib = disk_mib;
     vm
@@ -382,7 +377,7 @@ pub unsafe extern "C" fn r86_library_import(
 
 /// Change one setting of a stopped VM. Keys and values as in vm.toml:
 /// os, memory-mib, boot-order, iso ("" ejects), cdrom, scale, volume,
-/// network, notes, cpu-engine (auto | jit | interpreter; legacy interp accepted).
+/// network, notes, cpu-engine (auto | jit | interpreter; legacy interp means auto).
 ///
 /// # Safety
 /// All arguments are valid C strings.
@@ -837,7 +832,7 @@ mod tests {
         // contract explicitly permits a NULL pixel buffer with zero capacity.
         unsafe {
             for (engine, memory, os) in [
-                ("interp", 16, "Windows 2000"),
+                ("interpreter", 16, "Windows 2000"),
                 ("interpreter", 16, "DOS"),
                 ("jit", 513, "Windows 2000"),
                 ("auto", 513, "DOS"),
@@ -860,7 +855,7 @@ mod tests {
                 );
                 assert!(error.is_null());
             }
-            vm.engine = "auto".into();
+            vm.engine = "interp".into();
             vm.memory = 16;
             vm.os = "DOS".into();
             vm.save().unwrap();
@@ -1077,6 +1072,17 @@ mod tests {
                 .is_null()
             );
             assert_eq!(Vm::load(directory.clone()).unwrap().engine, "auto");
+            let config = directory.join(vm_store::CONFIG);
+            let mut legacy: toml::Table =
+                std::fs::read_to_string(&config).unwrap().parse().unwrap();
+            legacy.insert("cpu-engine".into(), toml::Value::String("interp".into()));
+            std::fs::write(&config, toml::to_string(&legacy).unwrap()).unwrap();
+            let migrated = Vm::load(directory.clone()).unwrap();
+            assert_eq!(migrated.engine, "auto");
+            assert!(migrated.wants_jit());
+            migrated.save().unwrap();
+            let saved: toml::Table = std::fs::read_to_string(&config).unwrap().parse().unwrap();
+            assert_eq!(saved["cpu-engine"].as_str(), Some("auto"));
             for engine in ["jit", "interpreter", "interp", "auto"] {
                 let value = CString::new(engine).unwrap();
                 assert!(
@@ -1084,23 +1090,19 @@ mod tests {
                         .is_null()
                 );
                 let vm = Vm::load(directory.clone()).unwrap();
-                assert_eq!(vm.engine, engine);
-                assert_eq!(vm.wants_jit(), matches!(engine, "jit" | "auto"));
+                let stored = if engine == "interp" { "auto" } else { engine };
+                assert_eq!(vm.engine, stored);
+                assert_eq!(vm.wants_jit(), engine != "interpreter");
                 assert_eq!(
                     vm.jit_enabled(),
-                    r86::machine::DEFAULT_JIT && matches!(engine, "jit" | "auto")
+                    r86::machine::DEFAULT_JIT && engine != "interpreter"
                 );
                 let listed = CString::from_raw(r86_library_list(root_c.as_ptr()));
-                let shown = if engine == "interp" {
-                    "interpreter"
-                } else {
-                    engine
-                };
                 assert!(
                     listed
                         .to_str()
                         .unwrap()
-                        .contains(&format!("\"engine\":\"{shown}\""))
+                        .contains(&format!("\"engine\":\"{stored}\""))
                 );
             }
             let error = r86_library_set(

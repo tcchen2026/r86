@@ -322,9 +322,14 @@ mod tests {
             "VM".into(),
             guest_os::by_name("Windows 98"),
         );
+        assert_eq!(vm.engine, "auto");
         for engine in ["auto", "jit", "interpreter", "interp"] {
             vm.engine = engine.into();
             assert_eq!(launch_config(&vm, false).engine, engine);
+            assert_eq!(
+                launch_config(&vm, false).wants_jit(),
+                engine != "interpreter"
+            );
             assert!(!launch_config(&vm, true).jit_enabled());
             assert_eq!(vm.engine, engine);
         }
