@@ -178,8 +178,26 @@ there is no OS-specific crash detector. Host process aborts, SIGKILL and host
 failure terminate WebSocket too; in-memory evidence cannot survive those events.
 Save diagnostics/logs on a separate client when durable capture is needed.
 
-``memory`` reads physical RAM only (max 64 KiB). Normal diagnostics do not perform
-MMU/MMIO reads or change A/D bits. The legacy explicit ``guest-bytes`` probe uses
+``memory`` reads RAM (default 256 bytes, maximum 64 KiB). ``linear: true``
+walks the current CR0/CR3/CR4 RAM page tables, including PAE and large pages,
+without using cached translations or latched PDPTEs. It ignores R/W and U/S,
+sets no A/D bits, changes no CPU state and never accesses a device. Missing
+pages, reserved page-table bits and non-RAM tables/targets fail with the first
+failing linear address. Replies include ``linear`` (false by default).
+Physical addresses name raw RAM independently of A20; linear walks and their
+final targets follow A20. ROM, VGA/MMIO and holes are excluded in both modes.
+
+``memory-write`` takes ``address``, hexadecimal ``hex`` (ASCII whitespace is
+allowed), and optional ``linear`` with the same translation rules. At most
+64 KiB is accepted, with every destination resolved and validated before any
+store; even edits to the request's own page tables use that initial mapping.
+Malformed, unmapped or non-RAM requests write nothing. Writes notify code-page
+tracking and retire CPU translation/fetch caches. Architectural PAE PDPTE
+latches still follow guest CR3 reloads. Empty writes are no-ops. The ``ack``
+includes ``address``, ``linear``, ``bytes``, ``step`` and ``applied_step``. Like
+input commands, writes apply at a committed boundary and are included in
+``--ws-record`` for replay.
+Normal diagnostics do not change A/D bits. The legacy ``guest-bytes`` probe uses
 the MMU and may update A/D bits; it is not used by automatic crash capture.
 Its ``eip`` and ``start`` are CS-relative offsets; bytes are read at the current
 CS base plus ``start``, with 32-bit wrapping, through the diagnostic MMU path.
@@ -195,7 +213,8 @@ Commands implemented by the current harness:
     {"cmd":"logs", "serial_from": optional N, "event_from": optional N,
      "limit": optional N}
     {"cmd":"diagnostics"}
-    {"cmd":"memory", "address": PHYSICAL_ADDRESS, "length": optional N}
+    {"cmd":"memory", "address": ADDRESS, "length": optional N, "linear": optional BOOL}
+    {"cmd":"memory-write", "address": ADDRESS, "hex": "..", "linear": optional BOOL}
     {"cmd":"guest-bytes"}
     {"cmd":"frame", "since": optional GENERATION}
     {"cmd":"power-button"}
@@ -666,6 +685,11 @@ def build_parser():
     memory = sub.add_parser("memory")
     memory.add_argument("address", type=lambda s: int(s, 0))
     memory.add_argument("--length", type=int, default=256)
+    memory.add_argument("--linear", action="store_true")
+    write = sub.add_parser("memory-write")
+    write.add_argument("address", type=lambda s: int(s, 0))
+    write.add_argument("hex")
+    write.add_argument("--linear", action="store_true")
     frame = sub.add_parser("frame")
     frame.add_argument("path")
     frame.add_argument("--since", type=int)
@@ -755,7 +779,9 @@ def command_object(args):
     if args.command == "logs":
         return {"cmd": "logs", "serial_from": args.serial_from, "event_from": args.event_from}
     if args.command == "memory":
-        return {"cmd": "memory", "address": args.address, "length": args.length}
+        return {"cmd": "memory", "address": args.address, "length": args.length, "linear": args.linear}
+    if args.command == "memory-write":
+        return {"cmd": "memory-write", "address": args.address, "hex": args.hex, "linear": args.linear}
     if args.command == "frame":
         return {"cmd": "frame", **({"since": args.since} if args.since is not None else {})}
     if args.command == "hello":

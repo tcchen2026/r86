@@ -383,6 +383,8 @@ trait TraceSink {
     fn push<P: PerfSink>(&mut self, step: u64, cpu: &Cpu, ram: &[u8], perf: &mut P);
 }
 
+pub const DEBUG_MEMORY_LIMIT: usize = 64 * 1024;
+
 pub struct Machine {
     cpu: Cpu,
     bus: HostBus,
@@ -478,6 +480,92 @@ impl Machine {
     pub fn ram(&self) -> &[u8] {
         &self.bus.ram
     }
+
+    /// Read ordinary RAM without device accesses, A/D updates or cache fills.
+    /// Physical addresses name raw RAM; linear addresses follow current RAM
+    /// page tables and A20, ignoring page permissions and cached translations.
+    pub fn read_memory(
+        &self,
+        address: u64,
+        length: usize,
+        linear: bool,
+    ) -> Result<Vec<u8>, String> {
+        let ranges = self.debug_memory_ranges(address, length, linear)?;
+        let mut bytes = Vec::with_capacity(length);
+        for range in ranges {
+            bytes.extend_from_slice(&self.bus.ram[range]);
+        }
+        Ok(bytes)
+    }
+
+    /// Resolve and validate every destination before any store, including when
+    /// the payload changes its own page tables. Debugger stores retire cached
+    /// translations so the next instruction observes edits to code or mappings.
+    pub fn write_memory(&mut self, address: u64, bytes: &[u8], linear: bool) -> Result<(), String> {
+        let ranges = self.debug_memory_ranges(address, bytes.len(), linear)?;
+        let mut data = bytes.iter().copied();
+        for range in ranges {
+            for index in range {
+                let phys = PhysAddr(index as u64);
+                self.bus
+                    .before_cached_ram_write(PhysWrite::new(WriteOrigin::Debug, phys, 1))
+                    .expect("validated debugger RAM write notification");
+                self.bus
+                    .write_cached_ram_u8(phys, data.next().unwrap())
+                    .expect("validated debugger RAM store");
+            }
+        }
+        if !bytes.is_empty() {
+            self.cpu.invalidate_translation_context();
+        }
+        Ok(())
+    }
+
+    fn debug_memory_ranges(
+        &self,
+        address: u64,
+        length: usize,
+        linear: bool,
+    ) -> Result<Vec<core::ops::Range<usize>>, String> {
+        if length > DEBUG_MEMORY_LIMIT {
+            return Err("memory length exceeds 65536".into());
+        }
+        let kind = if linear { "linear" } else { "physical" };
+        let end = address
+            .checked_add(length as u64)
+            .ok_or_else(|| format!("{kind} address {address:#x}: range overflow"))?;
+        let mut ranges = Vec::new();
+        let mut current = address;
+        while current < end {
+            let physical = if linear {
+                let addr = u32::try_from(current).map_err(|_| {
+                    format!("linear address {current:#x}: outside 32-bit address space")
+                })?;
+                let phys =
+                    crate::x86::mmu::debug_translate(&self.cpu, LinearAddr(addr), |p, len| {
+                        let p = self.bus.cpu_phys_addr(p);
+                        let range = self.bus.debug_ram_range(p, len).ok()?;
+                        let mut bytes = [0; 8];
+                        bytes[..len].copy_from_slice(&self.bus.ram[range]);
+                        Some(u64::from_le_bytes(bytes))
+                    })
+                    .map_err(|why| format!("linear address {current:#x}: {why}"))?;
+                self.bus.cpu_phys_addr(phys)
+            } else {
+                PhysAddr(current)
+            };
+            let len = (end - current).min(4096 - (current & 4095)) as usize;
+            ranges.push(self.bus.debug_ram_range(physical, len).map_err(|offset| {
+                format!(
+                    "{kind} address {:#x}: target is not RAM",
+                    current + offset as u64
+                )
+            })?);
+            current += len as u64;
+        }
+        Ok(ranges)
+    }
+
     pub fn step_count(&self) -> u64 {
         self.step
     }
@@ -2775,6 +2863,21 @@ impl HostBus {
         }
     }
 
+    // Debugger reads and preflight never call a device or acquire a mutable
+    // RAM grant. Check individual bytes to identify the first failing address.
+    fn debug_ram_range(
+        &self,
+        address: PhysAddr,
+        len: usize,
+    ) -> Result<core::ops::Range<usize>, usize> {
+        for offset in 0..len {
+            let addr = address.0.checked_add(offset as u64).ok_or(offset)?;
+            self.ram_byte_index(PhysAddr(addr)).map_err(|_| offset)?;
+        }
+        let start = address.0 as usize;
+        Ok(start..start + len)
+    }
+
     fn backing_byte_index(&self, addr: PhysAddr) -> Result<usize, MemError> {
         match self.classify_phys_kind(addr, 1) {
             PhysRegionKind::Ram | PhysRegionKind::Rom => self.backing_index_for_len(addr, 1),
@@ -4801,6 +4904,238 @@ mod host_bus_tests {
     const PTE_USER: u32 = 1 << 2;
     const PTE_ACCESSED: u32 = 1 << 5;
     const PTE_DIRTY: u32 = 1 << 6;
+
+    fn debug_paged_machine(pae: bool) -> Machine {
+        let mut machine = Machine::new_firmware(8 << 20, FirmwareDisplay::Vga).unwrap();
+        machine.cpu.enter_protected_flat(0x400000, 0);
+        machine.cpu.cr0 |= CR0_PG | crate::x86::cpu::CR0_WP;
+        machine.cpu.cr3 = 0x1000;
+        if pae {
+            machine.cpu.cr4 = crate::x86::cpu::CR4_PAE;
+            machine.bus.write_backing_u64(0x1000, 0x2001);
+            machine.bus.write_backing_u64(0x2010, 0x3001);
+            machine.bus.write_backing_u64(0x3000, 0x6001);
+            machine.bus.write_backing_u64(0x3008, 0x9001);
+        } else {
+            write_ram_u32(&mut machine.bus, 0x1004, 0x2001);
+            write_ram_u32(&mut machine.bus, 0x2000, 0x6001);
+            write_ram_u32(&mut machine.bus, 0x2004, 0x9001);
+        }
+        machine
+    }
+
+    #[test]
+    fn debug_memory_walks_ram_without_accessed_or_dirty_updates() {
+        // No paging, 4K pages, 4M PSE pages, and PAE 4K/2M pages. Present
+        // supervisor/read-only entries with A/D clear must permit debugging.
+        for mode in 0..5 {
+            let mut machine = debug_paged_machine(mode >= 3);
+            let mut cs = machine.cpu.seg(SegmentReg::Cs);
+            cs.selector |= 3;
+            machine.cpu.set_seg_cache(SegmentReg::Cs, cs);
+            assert_eq!(machine.cpu.cpl(), 3);
+            let physical = match mode {
+                0 => {
+                    machine.cpu.cr0 &= !CR0_PG;
+                    [0x400ffe, 0x400fff, 0x401000, 0x401001]
+                }
+                2 => {
+                    machine.cpu.cr4 = crate::x86::cpu::CR4_PSE;
+                    write_ram_u32(&mut machine.bus, 0x1004, 0x400081);
+                    [0x400ffe, 0x400fff, 0x401000, 0x401001]
+                }
+                4 => {
+                    machine.bus.write_backing_u64(0x2010, 0x400081);
+                    [0x400ffe, 0x400fff, 0x401000, 0x401001]
+                }
+                _ => [0x6ffe, 0x6fff, 0x9000, 0x9001],
+            };
+            for (address, byte) in physical.into_iter().zip([1, 2, 3, 4]) {
+                machine.write_memory(address, &[byte], false).unwrap();
+            }
+            let before = machine.ram().to_vec();
+            assert_eq!(
+                machine.read_memory(0x400ffe, 4, true).unwrap(),
+                [1, 2, 3, 4]
+            );
+            assert_eq!(machine.ram(), before);
+            machine.write_memory(0x400ffe, &[5, 6, 7, 8], true).unwrap();
+            assert_eq!(&machine.ram()[0x1000..0x4000], &before[0x1000..0x4000]);
+            for (address, byte) in physical.into_iter().zip([5, 6, 7, 8]) {
+                assert_eq!(machine.read_memory(address, 1, false).unwrap(), [byte]);
+            }
+            assert_eq!(machine.bus.tracked_writes.debug, 8);
+        }
+    }
+
+    #[test]
+    fn debug_memory_rejects_entire_invalid_requests() {
+        let mut machine = debug_paged_machine(false);
+        let data = [0x5a; 4];
+        for entry in [0, 0xa0001, 0xc0001, 0xe0000001] {
+            write_ram_u32(&mut machine.bus, 0x2004, entry);
+            let before = machine.ram().to_vec();
+            let tracked = machine.bus.tracked_writes.total;
+            for error in [
+                machine.read_memory(0x400ffe, 4, true).unwrap_err(),
+                machine.write_memory(0x400ffe, &data, true).unwrap_err(),
+            ] {
+                assert!(error.contains("linear address 0x401000"), "{error}");
+            }
+            assert_eq!(machine.ram(), before);
+            assert_eq!(machine.bus.tracked_writes.total, tracked);
+        }
+        for (address, bytes, linear, failing) in [
+            (0x9fffe, data.as_slice(), false, "physical address 0xa0000"),
+            (0x800000, &data, false, "physical address 0x800000"),
+            (0x100000000, &data, true, "linear address 0x100000000"),
+        ] {
+            let before = machine.ram().to_vec();
+            assert!(
+                machine
+                    .write_memory(address, bytes, linear)
+                    .unwrap_err()
+                    .contains(failing)
+            );
+            assert!(
+                machine
+                    .read_memory(address, bytes.len(), linear)
+                    .unwrap_err()
+                    .contains(failing)
+            );
+            assert_eq!(machine.ram(), before);
+        }
+        // A page-table read must not fall through to VGA or truncate a PAE address.
+        write_ram_u32(&mut machine.bus, 0x1004, 0xa0001);
+        let before = machine.ram().to_vec();
+        assert!(
+            machine
+                .read_memory(0x400ffe, 1, true)
+                .unwrap_err()
+                .contains("0x400ffe")
+        );
+        assert!(
+            machine
+                .write_memory(0x400ffe, &data, true)
+                .unwrap_err()
+                .contains("0x400ffe")
+        );
+        assert_eq!(machine.ram(), before);
+        let mut pae = debug_paged_machine(true);
+        pae.bus.write_backing_u64(0x3000, 0x1_0000_6001);
+        let before = pae.ram().to_vec();
+        assert!(
+            pae.write_memory(0x400ffe, &[1], true)
+                .unwrap_err()
+                .contains("0x400ffe")
+        );
+        assert_eq!(pae.ram(), before);
+
+        let before = machine.ram().to_vec();
+        assert!(
+            machine
+                .write_memory(0, &vec![1; DEBUG_MEMORY_LIMIT + 1], false)
+                .is_err()
+        );
+        assert!(
+            machine
+                .read_memory(0, DEBUG_MEMORY_LIMIT + 1, false)
+                .is_err()
+        );
+        assert!(machine.write_memory(u64::MAX, &data, false).is_err());
+        assert_eq!(machine.ram(), before);
+        machine
+            .write_memory(0x10000, &vec![1; DEBUG_MEMORY_LIMIT], false)
+            .unwrap();
+        assert_eq!(
+            machine
+                .read_memory(0x10000, DEBUG_MEMORY_LIMIT, false)
+                .unwrap(),
+            vec![1; DEBUG_MEMORY_LIMIT]
+        );
+    }
+
+    #[test]
+    fn debug_memory_edits_retire_data_and_fetch_translations() {
+        let mut machine = debug_paged_machine(false);
+        machine.bus.ram[0x6000..0x6006].copy_from_slice(&[0xb8, 1, 0, 0, 0, 0x11]);
+        machine.bus.ram[0x9000..0x9006].copy_from_slice(&[0xb8, 2, 0, 0, 0, 0x22]);
+        machine.run_steps(1).unwrap();
+        assert_eq!(machine.cpu.reg(Reg32::Eax), 1);
+        assert_eq!(
+            mmu::read_linear_u8(
+                &mut machine.cpu,
+                &mut machine.bus,
+                LinearAddr(0x400005),
+                AccessKind::Read
+            )
+            .unwrap(),
+            0x11
+        );
+        machine
+            .write_memory(0x2000, &0x9001u32.to_le_bytes(), false)
+            .unwrap();
+        machine.cpu.eip = 0x400000;
+        machine.run_steps(1).unwrap();
+        assert_eq!(machine.cpu.reg(Reg32::Eax), 2);
+        assert_eq!(
+            mmu::read_linear_u8(
+                &mut machine.cpu,
+                &mut machine.bus,
+                LinearAddr(0x400005),
+                AccessKind::Read
+            )
+            .unwrap(),
+            0x22
+        );
+
+        // Physical debugging remains raw RAM; only linear accesses gate A20.
+        machine.cpu.cr0 &= !CR0_PG;
+        machine.bus.set_a20(false);
+        machine.write_memory(0x100010, &[0xaa], false).unwrap();
+        machine.write_memory(0x100010, &[0xbb], true).unwrap();
+        assert_eq!(machine.read_memory(0x100010, 1, false).unwrap(), [0xaa]);
+        assert_eq!(machine.read_memory(0x100010, 1, true).unwrap(), [0xbb]);
+        assert_eq!(machine.ram()[0x10], 0xbb);
+    }
+
+    #[test]
+    fn debug_memory_write_uses_the_mapping_validated_before_the_first_store() {
+        let mut machine = debug_paged_machine(false);
+        // First destination aliases the PTE for the second destination.
+        write_ram_u32(&mut machine.bus, 0x2000, 0x2001);
+        machine
+            .write_memory(0x400004, &0u32.to_le_bytes(), true)
+            .unwrap();
+        assert!(machine.read_memory(0x401000, 1, true).is_err());
+        write_ram_u32(&mut machine.bus, 0x2004, 0x9001);
+        let mut bytes = vec![0; 4093];
+        bytes[4092] = 0x5a;
+        machine.write_memory(0x400004, &bytes, true).unwrap();
+        assert_eq!(machine.ram()[0x9000], 0x5a);
+        assert_eq!(machine.bus.read_backing_u32(0x2004), 0);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn debug_memory_write_retires_already_compiled_code() {
+        let mut machine = Machine::new(0x10000);
+        machine.cpu.enter_protected_flat(0x1000, 0);
+        machine
+            .write_memory(0x1000, &[0x40, 0xeb, 0xfd], false)
+            .unwrap(); // INC EAX; JMP
+        machine.set_jit_enabled(true).unwrap();
+        machine.run_steps(20_000).unwrap();
+        assert_eq!(machine.cpu.reg(Reg32::Eax), 10_000);
+        assert!(machine.jit.as_ref().unwrap().stats.native_steps > 1000);
+        let compiled = machine.jit.as_ref().unwrap().stats.compiled_blocks;
+        let native = machine.jit.as_ref().unwrap().stats.native_steps;
+        machine.write_memory(0x1000, &[0x48], false).unwrap(); // DEC EAX
+        machine.run_steps(20_000).unwrap();
+        assert_eq!(machine.cpu.reg(Reg32::Eax), 0);
+        assert!(machine.jit.as_ref().unwrap().stats.compiled_blocks > compiled);
+        assert!(machine.jit.as_ref().unwrap().stats.native_steps > native + 1000);
+    }
 
     #[test]
     fn engine_label_and_firmware_file_follow_the_active_backend() {

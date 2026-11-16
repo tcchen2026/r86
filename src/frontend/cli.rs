@@ -761,6 +761,10 @@ impl ReplaySchedule {
         let cmd =
             json_string(line, "cmd")?.ok_or_else(|| "replay event missing cmd".to_string())?;
         match cmd.as_str() {
+            "memory-write" => {
+                let (address, linear, bytes) = parse_memory_write(line)?;
+                machine.write_memory(address, &bytes, linear)?;
+            }
             "power-button" => machine.press_power_button(),
             "reset" => machine.reboot()?,
             "media-eject" => machine.change_cdrom(Vec::new())?,
@@ -1339,6 +1343,41 @@ mod tests {
     use super::keys::parse_ps2_key;
     use super::*;
     use r86::devices::Ps2Key;
+
+    #[test]
+    fn debug_memory_writes_replay_at_the_recorded_step() {
+        let mut machine = Machine::new(0x10000);
+        let mut boot = [0; 512];
+        boot[..2].copy_from_slice(&[0xeb, 0xfe]);
+        boot[510..].copy_from_slice(&[0x55, 0xaa]);
+        machine.load_bootsector(&boot).unwrap();
+        machine.enter_bootsector();
+        let mut replay = ReplaySchedule::load(None).unwrap();
+        replay.events = ReplaySchedule::parse(
+            "{\"step\":7,\"cmd\":\"memory-write\",\"address\":16384,\"hex\":\"01abff\",\"linear\":false}\n\
+             {\"step\":7,\"cmd\":\"memory-write\",\"address\":16385,\"hex\":\"ee\",\"linear\":true}\n"
+        ).unwrap();
+        machine.run_steps(6).unwrap();
+        replay.apply_due(&mut machine).unwrap();
+        assert_eq!(machine.read_memory(16384, 3, false).unwrap(), [0, 0, 0]);
+        machine.run_steps(1).unwrap();
+        replay.apply_due(&mut machine).unwrap();
+        assert_eq!(
+            machine.read_memory(16384, 3, false).unwrap(),
+            [1, 0xee, 0xff]
+        );
+        replay.ensure_finished().unwrap();
+        let before = machine.ram().to_vec();
+        assert!(
+            replay
+                .apply_event(
+                    &mut machine,
+                    r#"{"cmd":"memory-write","address":65535,"hex":"aabb","linear":true}"#
+                )
+                .is_err()
+        );
+        assert_eq!(machine.ram(), before);
+    }
 
     #[test]
     fn replay_step_keys_preserve_same_step_order_and_validate_bytes() {

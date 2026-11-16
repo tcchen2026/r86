@@ -274,6 +274,36 @@ pub fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Memory ranges must not silently truncate fractions or exponents.
+pub fn memory_integer(json: &str, key: &str) -> Result<Option<u64>, String> {
+    let Some(raw) = json_value(json, key)? else {
+        return Ok(None);
+    };
+    let raw = raw.split([',', '}']).next().unwrap().trim();
+    if !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("JSON key {key} is not an unsigned integer"));
+    }
+    raw.parse()
+        .map(Some)
+        .map_err(|_| format!("JSON key {key} is not an unsigned integer"))
+}
+
+/// The same request validation is used for live debugger writes and replay.
+pub fn parse_memory_write(json: &str) -> Result<(u64, bool, Vec<u8>), String> {
+    let address = memory_integer(json, "address")?.ok_or("memory-write requires address")?;
+    let linear = json_bool(json, "linear")?.unwrap_or(false);
+    let hex = json_string(json, "hex")?.ok_or("memory-write requires hex")?;
+    if hex
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .count()
+        > r86::machine::DEBUG_MEMORY_LIMIT * 2
+    {
+        return Err("memory length exceeds 65536".into());
+    }
+    Ok((address, linear, parse_hex_bytes(&hex)?))
+}
+
 pub fn hex_nibble(byte: u8) -> Option<u8> {
     match byte {
         b'0'..=b'9' => Some(byte - b'0'),

@@ -57,7 +57,7 @@ impl WsSession {
 
     fn hello(&self, machine: &Machine) -> String {
         let response = format!(
-            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"engine\":\"{}\",\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"engine\":\"{}\",\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"memory-write\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
             machine.engine_label(),
             machine.step_count(),
             self.slice_steps
@@ -927,19 +927,29 @@ impl Service {
             }
             "memory" => {
                 let address =
-                    json_u64(message, "address")?.ok_or("memory requires physical RAM address")?;
-                let length = json_u64(message, "length")?.unwrap_or(256);
-                if length > 65536 {
-                    return Err("memory length exceeds 65536".into());
-                }
-                let end = address.checked_add(length).ok_or("memory range overflow")?;
-                if end > machine.ram().len() as u64 {
-                    return Err("memory range is outside RAM".into());
-                }
+                    memory_integer(message, "address")?.ok_or("memory requires address")?;
+                let linear = json_bool(message, "linear")?.unwrap_or(false);
+                let length = memory_integer(message, "length")?.unwrap_or(256);
+                let length = usize::try_from(length).map_err(|_| "memory length exceeds 65536")?;
+                let bytes = machine.read_memory(address, length, linear)?;
                 format!(
-                    "{{\"type\":\"memory\",\"ok\":true,\"step\":{},\"address\":{address},\"hex\":\"{}\"}}",
+                    "{{\"type\":\"memory\",\"ok\":true,\"step\":{},\"address\":{address},\"linear\":{linear},\"hex\":\"{}\"}}",
                     machine.step_count(),
-                    hex_encode(&machine.ram()[address as usize..end as usize])
+                    hex_encode(&bytes)
+                )
+            }
+            "memory-write" => {
+                let (address, linear, bytes) = parse_memory_write(message)?;
+                machine.write_memory(address, &bytes, linear)?;
+                self.clients.get_mut(&id).unwrap().session.record_line(&format!(
+                    "{{\"step\":{},\"cmd\":\"memory-write\",\"address\":{address},\"linear\":{linear},\"hex\":\"{}\"}}",
+                    machine.step_count(), hex_encode(&bytes)
+                ))?;
+                format!(
+                    "{{\"type\":\"ack\",\"ok\":true,\"cmd\":\"memory-write\",\"step\":{},\"applied_step\":{},\"address\":{address},\"linear\":{linear},\"bytes\":{}}}",
+                    machine.step_count(),
+                    machine.step_count(),
+                    bytes.len()
                 )
             }
             "media" | "media-begin" | "media-file" | "media-dir" | "media-cancel"
@@ -2287,6 +2297,97 @@ mod import_tests {
     use std::io::Read;
     use std::net::TcpStream;
     use std::time::Duration;
+
+    #[test]
+    fn debug_memory_commands_validate_and_record_committed_writes() {
+        let path =
+            std::env::temp_dir().join(format!("r86-memory-record-{}.jsonl", std::process::id()));
+        let record = Arc::new(fs::File::create(&path).unwrap());
+        let mut service = Service::new();
+        let (reply, _rx) = mpsc::sync_channel(2);
+        service.clients.insert(
+            1,
+            Client {
+                session: WsSession::new(1000, Some(record)),
+                reply: Arc::new(reply),
+                remote: Arc::new(Mutex::new(RemoteSlot::default())),
+            },
+        );
+        let mut machine = Machine::new(0x10000);
+        let mut boot = [0; 512];
+        boot[..2].copy_from_slice(&[0xeb, 0xfe]);
+        boot[510..].copy_from_slice(&[0x55, 0xaa]);
+        machine.load_bootsector(&boot).unwrap();
+        machine.enter_bootsector();
+        machine.run_steps(7).unwrap();
+        let hello = service
+            .command(&mut machine, 1, r#"{"cmd":"hello"}"#)
+            .unwrap()
+            .unwrap()
+            .text;
+        assert!(hello.contains("\"memory-write\""));
+        for linear in [false, true] {
+            let write = format!(
+                r#"{{"cmd":"memory-write","address":16384,"hex":"01 AB ff","linear":{linear}}}"#
+            );
+            let ack = service
+                .command(&mut machine, 1, &write)
+                .unwrap()
+                .unwrap()
+                .text;
+            assert_eq!(json_u64(&ack, "applied_step").unwrap(), Some(7));
+            assert_eq!(json_u64(&ack, "bytes").unwrap(), Some(3));
+            let read =
+                format!(r#"{{"cmd":"memory","address":16384,"length":3,"linear":{linear}}}"#);
+            let response = service
+                .command(&mut machine, 1, &read)
+                .unwrap()
+                .unwrap()
+                .text;
+            assert_eq!(
+                json_string(&response, "hex").unwrap().as_deref(),
+                Some("01abff")
+            );
+            assert_eq!(json_bool(&response, "linear").unwrap(), Some(linear));
+        }
+        let original = machine.ram().to_vec();
+        for command in [
+            r#"{"cmd":"memory-write","address":16384,"hex":"01gg"}"#.to_string(),
+            r#"{"cmd":"memory-write","address":16384,"hex":"0"}"#.into(),
+            r#"{"cmd":"memory-write","address":65535,"hex":"aabb"}"#.into(),
+            r#"{"cmd":"memory-write","address":-1,"hex":"aa"}"#.into(),
+            r#"{"cmd":"memory-write","address":1.5,"hex":"aa"}"#.into(),
+            r#"{"cmd":"memory-write","address":1e2,"hex":"aa"}"#.into(),
+            r#"{"cmd":"memory-write","address":1,"hex":"aa","linear":"true"}"#.into(),
+            r#"{"cmd":"memory","address":0,"length":65537}"#.into(),
+            r#"{"cmd":"memory","address":0,"length":1.5}"#.into(),
+            format!(
+                r#"{{"cmd":"memory-write","address":0,"hex":"{}"}}"#,
+                "ab".repeat(65537)
+            ),
+        ] {
+            assert!(
+                service.command(&mut machine, 1, &command).is_err(),
+                "{command}"
+            );
+            assert_eq!(machine.ram(), original);
+        }
+        let recorded = fs::read_to_string(&path).unwrap();
+        assert_eq!(recorded.lines().count(), 2);
+        for (line, linear) in recorded.lines().zip([false, true]) {
+            assert_eq!(json_u64(line, "step").unwrap(), Some(7));
+            assert_eq!(
+                json_string(line, "cmd").unwrap().as_deref(),
+                Some("memory-write")
+            );
+            assert_eq!(
+                parse_memory_write(line).unwrap(),
+                (16384, linear, vec![1, 0xab, 0xff])
+            );
+        }
+        drop(service);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn hello_and_status_name_the_active_engine() {

@@ -244,6 +244,81 @@ const PAE_PDPTE_RESERVED_MASK: u64 = PAE_LEGACY_HIGH_RESERVED_MASK | 0x0000_0000
 const PAE_ENTRY_RESERVED_MASK: u64 = PAE_LEGACY_HIGH_RESERVED_MASK;
 const PAE_PDE_2M_RESERVED_MASK: u64 = PAE_LEGACY_HIGH_RESERVED_MASK | 0x0000_0000_001f_e000;
 
+/// Debugger walk of the current RAM tables, independent of cached translations
+/// and latched PDPTEs. The reader admits RAM only; no permissions, A/D stores,
+/// cache fills or guest faults. Reserved address bits follow the guest model.
+#[cfg(feature = "machine")]
+pub(crate) fn debug_translate(
+    cpu: &Cpu,
+    linear: LinearAddr,
+    mut read: impl FnMut(PhysAddr, usize) -> Option<u64>,
+) -> Result<PhysAddr, &'static str> {
+    if cpu.cr0 & CR0_PG == 0 {
+        return Ok(PhysAddr(u64::from(linear.0)));
+    }
+    let mut entry = |address, width, reserved| {
+        let value = read(PhysAddr(address), width).ok_or("page table is not RAM")?;
+        if value & 1 == 0 {
+            return Err("page not present");
+        }
+        if value & reserved != 0 {
+            return Err("reserved page-table bits");
+        }
+        Ok(value)
+    };
+    if cpu.cr4 & CR4_PAE != 0 {
+        let pdpte = entry(
+            u64::from(cpu.cr3 & PAE_CR3_MASK) + u64::from(linear.0 >> 30) * 8,
+            8,
+            PAE_PDPTE_RESERVED_MASK,
+        )?;
+        let pde = entry(
+            (pdpte & PAE_4K_PAGE_MASK) + u64::from((linear.0 >> 21) & 511) * 8,
+            8,
+            PAE_ENTRY_RESERVED_MASK,
+        )?;
+        if pde & PAE_PDE_PS != 0 {
+            if pde & PAE_PDE_2M_RESERVED_MASK != 0 {
+                return Err("reserved page-table bits");
+            }
+            return Ok(PhysAddr(
+                (pde & PAE_2M_PAGE_MASK) | (u64::from(linear.0) & PAE_2M_PAGE_OFFSET_MASK),
+            ));
+        }
+        let pte = entry(
+            (pde & PAE_4K_PAGE_MASK) + u64::from((linear.0 >> 12) & 511) * 8,
+            8,
+            PAE_ENTRY_RESERVED_MASK,
+        )?;
+        return Ok(PhysAddr(
+            (pte & PAE_4K_PAGE_MASK) | u64::from(linear.0 & 4095),
+        ));
+    }
+    let pde = entry(
+        u64::from(cpu.cr3 & PAGE_MASK) + u64::from(linear.0 >> 22) * 4,
+        4,
+        0,
+    )? as u32;
+    if cpu.cr4 & CR4_PSE != 0 && pde & PDE_PS != 0 {
+        if pde & PDE_4M_PSE36_RESERVED_MASK != 0 {
+            return Err("reserved page-table bits");
+        }
+        return Ok(PhysAddr(
+            u64::from(pde & LARGE_PAGE_MASK)
+                | (u64::from(pde & PDE_4M_PSE36_HIGH_ADDR_MASK) << 19)
+                | u64::from(linear.0 & LARGE_PAGE_OFFSET_MASK),
+        ));
+    }
+    let pte = entry(
+        u64::from(pde & PAGE_MASK) + u64::from((linear.0 >> 12) & 1023) * 4,
+        4,
+        0,
+    )?;
+    Ok(PhysAddr(
+        (pte & u64::from(PAGE_MASK)) | u64::from(linear.0 & 4095),
+    ))
+}
+
 pub fn translate<B: Bus>(
     cpu: &mut Cpu,
     bus: &mut B,
