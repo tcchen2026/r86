@@ -352,27 +352,41 @@ impl Vhd {
         Ok(())
     }
 
-    fn read(&mut self, file: &mut File, sector: u64, data: &mut [u8]) -> io::Result<()> {
-        for (i, dst) in data.chunks_exact_mut(SECTOR_SIZE).enumerate() {
-            let lba = sector + i as u64;
-            let block = (lba / self.block_sectors) as usize;
-            let within = (lba % self.block_sectors) as usize;
-            if self.bat[block] == FREE {
-                dst.fill(0);
-                continue;
-            }
-            self.load_bitmap(file, block)?;
-            if self.bitmap[within / 8] & (0x80 >> (within % 8)) == 0 {
-                dst.fill(0);
+    fn read(&mut self, file: &mut File, mut sector: u64, mut data: &mut [u8]) -> io::Result<()> {
+        while !data.is_empty() {
+            let block = (sector / self.block_sectors) as usize;
+            let within = (sector % self.block_sectors) as usize;
+            let limit = (self.block_sectors - within as u64).min((data.len() / SECTOR_SIZE) as u64)
+                as usize;
+            let allocated = self.bat[block] != FREE;
+            let (present, count) = if allocated {
+                self.load_bitmap(file, block)?;
+                let present = |i: usize| self.bitmap[i / 8] & (0x80 >> (i % 8)) != 0;
+                let value = present(within);
+                let mut count = 1;
+                while count < limit && present(within + count) == value {
+                    count += 1;
+                }
+                (value, count)
             } else {
+                (false, limit)
+            };
+            let (span, rest) = data.split_at_mut(count * SECTOR_SIZE);
+            if present {
+                // A multi-sector host read needs one I/O per contiguous bitmap
+                // run, not one seek/read per sector. Clear bits still read zero.
                 read_at(
                     file,
                     u64::from(self.bat[block]) * 512
                         + self.bitmap.len() as u64
                         + within as u64 * 512,
-                    dst,
+                    span,
                 )?;
+            } else {
+                span.fill(0);
             }
+            sector += count as u64;
+            data = rest;
         }
         Ok(())
     }
