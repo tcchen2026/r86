@@ -50,11 +50,12 @@ out="$apple/build/ios-$kind"
 app="$out/r86.app"
 
 [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ] || { echo "build_ios.sh: needs an Apple silicon Mac" >&2; exit 1; }
-for tool in xcrun cargo codesign plutil; do
+for tool in xcrun cargo codesign plutil python3; do
     command -v "$tool" >/dev/null || { echo "build_ios.sh: $tool not found" >&2; exit 1; }
 done
 
 "$apple/build-rust.sh" "$target"
+python3 "$root/script/build_wasm.py" --jit
 
 # The hinge and reserved-region APIs arrived in the iOS 27.1 SDK.
 sdk_version=$(xcrun --sdk "$sdk" --show-sdk-version)
@@ -94,6 +95,11 @@ xcrun --sdk "$sdk" actool ios/Assets.xcassets --compile "$app" --platform "$sdk"
 # Firmware, the DOS kit (script/build_freedos_image.py or the pinned
 # release), the tools CD when this checkout has it, and the licenses.
 cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" "$app/"
+mkdir -p "$app/web"
+for asset in vm.html vm.mjs vm-worker.mjs wasm.mjs jit.mjs; do
+    cp "$root/web/$asset" "$app/web/"
+done
+cp "$root/web/dist/r86-jit.wasm" "$app/web/"
 cp "$root/tmp/freedos/share/dos.zip" "$app/"
 if [ -f "$root/assets/r86_tools.iso" ]; then
     cp "$root/assets/r86_tools.iso" "$app/"
@@ -141,6 +147,11 @@ cat >"$app/Info.plist" <<PLIST
 	<true/>
 	<key>MinimumOSVersion</key>
 	<string>26.0</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSHumanReadableCopyright</key>
 	<string>Apache-2.0; see the bundled licenses</string>
 	<key>NSBonjourServices</key>

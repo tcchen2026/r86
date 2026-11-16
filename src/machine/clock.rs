@@ -163,16 +163,20 @@ impl Clock {
         let _ = value;
     }
 
-    #[cfg(feature = "host")]
-    pub fn wait_duration(&self, deadline: u64) -> std::time::Duration {
-        use std::time::Duration;
+    #[cfg(any(
+        feature = "host",
+        all(feature = "web-frontend", target_arch = "wasm32")
+    ))]
+    pub fn wait_duration(&self, deadline: u64) -> core::time::Duration {
+        use core::time::Duration;
         let Some(clock) = &self.realtime else {
             return Duration::from_millis(1);
         };
-        let now = clock.origin.elapsed().as_nanos() * u128::from(TICKS_PER_SECOND) / 1_000_000_000;
+        let now = clock.elapsed_ns() * u128::from(TICKS_PER_SECOND) / 1_000_000_000;
         let remaining = u128::from(deadline).saturating_sub(now);
         Duration::from_nanos(
-            (remaining * 1_000_000_000 / u128::from(TICKS_PER_SECOND)).min(1_000_000) as u64,
+            (remaining * 1_000_000_000 / u128::from(TICKS_PER_SECOND)).min(u128::from(u64::MAX))
+                as u64,
         )
     }
 }

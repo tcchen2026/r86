@@ -1080,7 +1080,8 @@ impl Ps2Key {
         }
     }
 
-    fn set2_make(self) -> u8 {
+    /// Set-2 make code for a named, non-extended key.
+    pub fn set2_make(self) -> u8 {
         match self {
             Self::A => 0x1c,
             Self::B => 0x32,

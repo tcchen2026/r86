@@ -8,6 +8,12 @@
 //! kind 4 is the cumulative report. Neither endpoint changes guest state.
 
 #[cfg(target_arch = "wasm32")]
+#[allow(dead_code)]
+mod keys;
+#[cfg(target_arch = "wasm32")]
+mod vm_control;
+
+#[cfg(target_arch = "wasm32")]
 mod wasm {
     use r86::FirmwareDisplay;
     use r86::devices::ps2::Ps2ButtonState;
@@ -21,6 +27,7 @@ mod wasm {
         pixels: Vec<u8>,
         error: String,
         async_stack: Vec<u32>,
+        input: super::vm_control::Input,
     }
 
     // This ABI is private to the worker. It owns the handle and may not call
@@ -62,7 +69,12 @@ mod wasm {
             };
             machine.attach_disk(disk);
         }
-        machine.attach_browser_cdrom(1, cd_bytes as usize, sectors == 0.0);
+        if flags & 16 == 0 {
+            machine.attach_browser_cdrom(1, cd_bytes as usize, sectors == 0.0);
+        }
+        if flags & 32 != 0 {
+            machine.attach_usb_tablet();
+        }
         machine.set_boot_order(if flags & 1 != 0 {
             BootOrder::CdromFirst
         } else {
@@ -78,6 +90,7 @@ mod wasm {
             pixels: Vec::new(),
             error: String::new(),
             async_stack: Vec::new(),
+            input: super::vm_control::Input::default(),
         }))
     }
 
@@ -123,6 +136,9 @@ mod wasm {
         until_serial: u32,
     ) -> i32 {
         let s = unsafe { state(handle) };
+        if s.input.paused {
+            return 1;
+        }
         let result = if until_serial != 0 {
             s.machine.run_until_serial_output(u64::from(budget))
         } else {
@@ -179,15 +195,81 @@ mod wasm {
 
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn r86_mouse(handle: *mut WebMachine, dx: i32, dy: i32, buttons: u32) {
-        unsafe { state(handle) }.machine.inject_mouse(
-            dx.clamp(-32768, 32767) as i16,
-            dy.clamp(-32768, 32767) as i16,
+        let s = unsafe { state(handle) };
+        s.input.mouse(
+            &mut s.machine,
+            dx,
+            dy,
             Ps2ButtonState {
                 left: buttons & 1 != 0,
                 right: buttons & 2 != 0,
                 middle: buttons & 4 != 0,
             },
         );
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_app_configure(handle: *mut WebMachine, width: u32, height: u32) {
+        let mode = if width == 0 || height == 0 {
+            None
+        } else {
+            Some((width as u16, height as u16, 16))
+        };
+        super::vm_control::prepare(&mut unsafe { state(handle) }.machine, mode);
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_app_control(handle: *mut WebMachine, action: u32) -> i32 {
+        let s = unsafe { state(handle) };
+        match s.input.control(&mut s.machine, action) {
+            Ok(()) => 0,
+            Err(error) => {
+                s.error = error;
+                -1
+            }
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_key(handle: *mut WebMachine, code: u32, down: u32) {
+        if let Ok(code) = u16::try_from(code)
+            && let Some(key) = super::keys::InputKey::from_wire(code)
+        {
+            let s = unsafe { state(handle) };
+            s.input.key(&mut s.machine, key, down != 0);
+        }
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_pointer(
+        handle: *mut WebMachine,
+        x: u32,
+        y: u32,
+        buttons: u32,
+        wheel: i32,
+    ) {
+        let s = unsafe { state(handle) };
+        s.input.pointer(
+            &mut s.machine,
+            x.min(65535) as u16,
+            y.min(65535) as u16,
+            (buttons & 7) as u8,
+            wheel.clamp(-32768, 32767) as i16,
+        );
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_pointer_active(handle: *mut WebMachine) -> u32 {
+        u32::from(unsafe { state(handle) }.machine.guest_pointer_active())
+    }
+
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn r86_halted_wait_ms(handle: *mut WebMachine) -> f64 {
+        unsafe { state(handle) }
+            .machine
+            .halted_wait_duration()
+            .as_secs_f64()
+            * 1000.0
     }
 
     #[unsafe(no_mangle)]

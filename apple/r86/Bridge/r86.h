@@ -58,12 +58,25 @@ char *r86_library_set(const char *directory, const char *key, const char *value)
 char *r86_library_delete(const char *directory);
 void r86_string_free(char *s);
 
-// Running VMs. Each owns one core thread.
+// Running VMs. Each owns its core or web-host thread.
 // A fatal error's report goes to logs/<VM folder>.log.
 // Recommended resolution for a fresh tools install, at 16 bpp. Use 0,0 for none.
 R86Vm *r86_vm_start(const char *directory, const char *firmware, const char *logs,
                     uint16_t recommended_width, uint16_t recommended_height,
                     char **error);
+// Web engine (iOS): the page owns CPU/RAM/devices/screen; this library
+// owns disks and serves them on 127.0.0.1. Selects jit, or auto for Windows/
+// ReactOS, with at most 512 MiB. NULL with *error == NULL: call r86_vm_start.
+R86Vm *r86_vm_start_web(const char *directory, const char *firmware, const char *logs,
+                        uint16_t recommended_width, uint16_t recommended_height,
+                        char **error);
+char *r86_vm_web_url(const R86Vm *vm);  // NULL for a native VM
+// 0 waiting, 1 page runs the machine, 2 unsupported (probe failed or no page
+// within 20 s): free the VM and call r86_vm_start. Native VMs return 0.
+uint32_t r86_vm_web_state(const R86Vm *vm);
+// Web VMs use the same commands/input/status/messages/logs. Frame reads report
+// size/serial only and return false (NULL pixels, capacity 0 is safe); audio
+// reads return 0, volume is ignored. CD change/remote report unavailable once.
 void r86_vm_free(R86Vm *vm);  // turn off now, flush disks
 // 0 pause, 1 resume, 2 reset, 3 power button, 4 Ctrl+Alt+Del, 5 release input
 void r86_vm_command(const R86Vm *vm, uint32_t command);

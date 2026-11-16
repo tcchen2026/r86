@@ -143,3 +143,8 @@ required-features = ["host"]
 name = "apple_jit_regions"
 path = "tests/apple/jit_regions.rs"
 required-features = ["host"]
+
+[[example]]
+name = "web_host"
+path = "tests/apple/web_host.rs"
+required-features = ["apple"]

@@ -958,9 +958,16 @@ impl Machine {
 
     /// Host wait after HLT, bounded so UI input remains responsive. Never used
     /// to limit a runnable CPU. Device deadlines use oscillator ticks.
-    #[cfg(feature = "host")]
-    pub fn halted_wait_duration(&self) -> std::time::Duration {
-        self.bus.clock.wait_duration(self.bus.next_device_event())
+    #[cfg(any(
+        feature = "host",
+        all(feature = "web-frontend", target_arch = "wasm32")
+    ))]
+    pub fn halted_wait_duration(&self) -> core::time::Duration {
+        let wait = self.bus.clock.wait_duration(self.bus.next_device_event());
+        // Preserve the native 1 ms cap. A Worker receives commands during
+        // its timer wait, so it can sleep to the device event.
+        let cap_ms = if cfg!(feature = "host") { 1 } else { 1000 };
+        wait.min(core::time::Duration::from_millis(cap_ms))
     }
 
     /// Advance a deterministic HLT wait to the next device event or the caller's

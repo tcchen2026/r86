@@ -3,7 +3,7 @@
 //!
 //! - Library calls take the app's library root or a VM directory
 //!   and return NULL on success or an error string. Lists are JSON.
-//! - A running VM is an opaque `R86Vm` owning one core thread. Any thread may
+//! - A running VM is an opaque `R86Vm` owning its core or web-host thread. Any thread may
 //!   call the r86_vm_* functions; the audio callback only reads audio.
 //! - Strings are UTF-8. Every returned string is freed with r86_string_free.
 
@@ -28,6 +28,8 @@ mod runner;
 #[path = "../vm_store.rs"]
 #[allow(dead_code)]
 mod vm_store;
+#[path = "../web_host.rs"]
+mod web_host;
 #[path = "../ws.rs"]
 mod ws;
 // Remote management; r86-run's server loop and debugger jobs are unused.
@@ -477,6 +479,72 @@ pub unsafe extern "C" fn r86_vm_start(
     }
 }
 
+/// Start the loopback disk host for a web VM. NULL/NULL means use the
+/// native engine. See r86.h for selection and startup/fallback states.
+///
+/// # Safety
+/// The paths are valid C strings and `error` is writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_start_web(
+    directory: *const c_char,
+    firmware: *const c_char,
+    logs: *const c_char,
+    recommended_width: u16,
+    recommended_height: u16,
+    error: *mut *mut c_char,
+) -> *mut R86Vm {
+    // SAFETY: forwarded caller contract.
+    unsafe { *error = std::ptr::null_mut() };
+    let (directory, firmware, logs) = unsafe { (text(directory), text(firmware), text(logs)) };
+    let path = |s: Option<String>| PathBuf::from(s.unwrap_or_default());
+    let started = (|| {
+        let vm = Vm::load(path(directory))?;
+        if !vm.wants_jit() || vm.memory > 512 {
+            return Ok(None);
+        }
+        let mode = match (recommended_width, recommended_height) {
+            (0, 0) => None,
+            (0, _) | (_, 0) => {
+                return Err("Recommended width and height must both be set or both zero".into());
+            }
+            (width, height) => Some((width, height, 16)),
+        };
+        Running::start_web(vm, path(firmware), path(logs), mode, false).map(Some)
+    })();
+    match started {
+        Ok(Some(running)) => Box::into_raw(Box::new(R86Vm(running))),
+        Ok(None) => std::ptr::null_mut(),
+        Err(err) => {
+            // SAFETY: the caller passes a writable pointer.
+            unsafe { *error = out(err) };
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The web engine's page URL, or NULL for a native VM.
+///
+/// # Safety
+/// `vm` is a live handle. Free the returned string with r86_string_free.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_web_url(vm: *const R86Vm) -> *mut c_char {
+    // SAFETY: caller contract.
+    unsafe { &*vm }
+        .0
+        .web_url()
+        .map_or(std::ptr::null_mut(), |url| out(url.into()))
+}
+
+/// 0 waiting, 1 page running, 2 unsupported device (free and start native).
+///
+/// # Safety
+/// `vm` is a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r86_vm_web_state(vm: *const R86Vm) -> u32 {
+    // SAFETY: caller contract.
+    unsafe { &*vm }.0.web_state()
+}
+
 /// Turn the VM off now (no guest shutdown), flush its disks and free it.
 ///
 /// # Safety
@@ -672,6 +740,7 @@ pub unsafe extern "C" fn r86_vm_take_message(vm: *const R86Vm) -> *mut c_char {
 /// Copy the latest frame (RGBA, `width * 4` bytes per row) into `pixels` if
 /// its serial differs from `have_serial`. Always fills `frame`; returns true
 /// only when it copied, which needs `capacity >= width * height * 4`.
+/// Web VMs report dimensions only. NULL pixels with capacity 0 is safe.
 ///
 /// # Safety
 /// `vm` is a live handle; `pixels` has `capacity` writable bytes; `frame`
@@ -721,6 +790,9 @@ pub unsafe extern "C" fn r86_vm_audio_read(
         return 0;
     };
     let count = (audio.len() / 2).min(frames);
+    if count == 0 {
+        return 0;
+    }
     // SAFETY: room for `frames * 2 >= count * 2` values.
     let out = unsafe { std::slice::from_raw_parts_mut(samples, count * 2) };
     for (slot, sample) in out.iter_mut().zip(audio.drain(..count * 2)) {
@@ -732,6 +804,114 @@ pub unsafe extern "C" fn r86_vm_audio_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_selection_and_null_pixel_size_query() {
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("r86-web-api-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let mut vm = Vm::new(&root, "VM".into(), guest_os::by_name("Windows 2000"));
+        vm.disk_mib = 1;
+        vm.memory = 16;
+        vm.cdrom = false;
+        vm.create_blank().unwrap();
+        let firmware = root.join("firmware");
+        fs::create_dir_all(firmware.join("web")).unwrap();
+        for name in [
+            "vm.html",
+            "vm.mjs",
+            "vm-worker.mjs",
+            "wasm.mjs",
+            "jit.mjs",
+            "r86-jit.wasm",
+        ] {
+            fs::write(firmware.join("web").join(name), []).unwrap();
+        }
+        for name in ["bios.bin", "vgabios-stdvga.bin"] {
+            fs::write(firmware.join(name), []).unwrap();
+        }
+        let directory = CString::new(vm.directory.to_str().unwrap()).unwrap();
+        let firmware = CString::new(firmware.to_str().unwrap()).unwrap();
+        let logs = CString::new(root.to_str().unwrap()).unwrap();
+        // SAFETY: live strings/handles and writable outputs. The web frame
+        // contract explicitly permits a NULL pixel buffer with zero capacity.
+        unsafe {
+            for (engine, memory, os) in [
+                ("interp", 16, "Windows 2000"),
+                ("jit", 513, "Windows 2000"),
+                ("auto", 16, "DOS"),
+            ] {
+                vm.engine = engine.into();
+                vm.memory = memory;
+                vm.os = os.into();
+                vm.save().unwrap();
+                let mut error = std::ptr::dangling_mut();
+                assert!(
+                    r86_vm_start_web(
+                        directory.as_ptr(),
+                        firmware.as_ptr(),
+                        logs.as_ptr(),
+                        0,
+                        0,
+                        &mut error
+                    )
+                    .is_null()
+                );
+                assert!(error.is_null());
+            }
+            vm.engine = "auto".into();
+            vm.memory = 16;
+            vm.os = "Windows 2000".into();
+            vm.save().unwrap();
+            let mut error = std::ptr::null_mut();
+            let handle = r86_vm_start_web(
+                directory.as_ptr(),
+                firmware.as_ptr(),
+                logs.as_ptr(),
+                936,
+                666,
+                &mut error,
+            );
+            assert!(error.is_null());
+            assert!(!handle.is_null());
+            let owned = Box::from_raw(handle);
+            assert_eq!(r86_vm_web_state(handle), 0);
+            let url = CString::from_raw(r86_vm_web_url(handle))
+                .into_string()
+                .unwrap();
+            assert!(url.starts_with("http://127.0.0.1:") && url.ends_with("/app/vm.html"));
+            {
+                let mut frame = runner::lock(&owned.0.shared.frame);
+                frame.width = 936;
+                frame.height = 666;
+                frame.serial = 2;
+            }
+            let mut frame = R86Frame {
+                width: 0,
+                height: 0,
+                serial: 0,
+            };
+            assert!(!r86_vm_frame(
+                handle,
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut frame
+            ));
+            assert_eq!((frame.width, frame.height, frame.serial), (936, 666, 2));
+            assert_eq!(r86_vm_audio_read(handle, std::ptr::null_mut(), 0), 0);
+            r86_vm_free(Box::into_raw(owned));
+            let _unlocked = vm_store::lock_vm(&vm.directory).unwrap();
+            let host = url
+                .strip_prefix("http://")
+                .unwrap()
+                .split('/')
+                .next()
+                .unwrap();
+            assert!(std::net::TcpStream::connect(host).is_err());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn vm_transfer_round_trips_without_overwriting_or_accepting_bad_config() {

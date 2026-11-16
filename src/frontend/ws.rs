@@ -159,6 +159,16 @@ impl WebSocket {
             )?;
             return Ok(None);
         }
+        Self::upgrade(stream, &request).map(Some)
+    }
+
+    /// Upgrade after the caller has checked its route, Host and Origin.
+    pub fn upgrade(mut stream: TcpStream, request: &str) -> Result<Self, String> {
+        if !header_value(request, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+            || header_value(request, "sec-websocket-version") != Some("13")
+        {
+            return Err("Expected WebSocket version 13".into());
+        }
         let key = header_value(&request, "sec-websocket-key")
             .ok_or_else(|| "websocket request missing Sec-WebSocket-Key".to_string())?;
         let accept = websocket_accept_value(key.trim());
@@ -173,10 +183,10 @@ impl WebSocket {
             .write_all(response.as_bytes())
             .map_err(|err| format!("failed to write websocket handshake: {err}"))?;
         stream.set_read_timeout(None).map_err(|e| e.to_string())?;
-        Ok(Some(Self {
+        Ok(Self {
             stream,
             write_lock: Arc::new(Mutex::new(())),
-        }))
+        })
     }
 
     pub fn read_message(&mut self) -> Result<Message, String> {
@@ -353,33 +363,100 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
-    let mut bytes = Vec::new();
-    let mut tmp = [0u8; 512];
-    loop {
-        let read = stream
-            .read(&mut tmp)
-            .map_err(|err| format!("failed to read websocket handshake: {err}"))?;
-        if read == 0 {
-            return Err("websocket handshake ended before headers".to_string());
-        }
-        bytes.extend_from_slice(&tmp[..read]);
-        if bytes.len() > 16 * 1024 {
-            return Err("websocket handshake exceeds 16 KiB".to_string());
-        }
-        if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    String::from_utf8(bytes).map_err(|err| format!("websocket handshake was not UTF-8: {err}"))
+pub struct HttpRequest {
+    pub headers: String,
+    #[allow(dead_code)] // The web engine accepts binary bodies; the console only accepts GET.
+    pub body: Vec<u8>,
 }
 
-fn http_reply(stream: &mut TcpStream, status: &str, mime: &str, body: &[u8]) -> Result<(), String> {
-    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len())
+impl HttpRequest {
+    /// Bounded HTTP/1.1 request, preserving binary bytes read with the headers.
+    /// Chunked transfer/pipelining is not part of these local endpoints.
+    pub fn read(stream: &mut TcpStream, max_body: usize) -> Result<Self, String> {
+        let mut bytes = Vec::new();
+        let mut tmp = [0u8; 512];
+        let end = loop {
+            let read = stream
+                .read(&mut tmp)
+                .map_err(|err| format!("failed to read websocket handshake: {err}"))?;
+            if read == 0 {
+                return Err("websocket handshake ended before headers".to_string());
+            }
+            bytes.extend_from_slice(&tmp[..read]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                break end + 4;
+            }
+            if bytes.len() > 16 * 1024 {
+                return Err("websocket handshake exceeds 16 KiB".to_string());
+            }
+        };
+        if end > 16 * 1024 {
+            return Err("HTTP headers exceed 16 KiB".into());
+        }
+        let headers =
+            String::from_utf8(bytes[..end].to_vec()).map_err(|_| "HTTP headers must be UTF-8")?;
+        if unique_header(&headers, "transfer-encoding")?.is_some() {
+            return Err("Transfer-Encoding is not supported".into());
+        }
+        let len = unique_header(&headers, "content-length")?
+            .unwrap_or("0")
+            .parse::<usize>()
+            .map_err(|_| "Invalid Content-Length")?;
+        if len > max_body || bytes.len() - end > len {
+            return Err("Invalid HTTP body length".into());
+        }
+        let mut body = bytes.split_off(end);
+        let have = body.len();
+        body.resize(len, 0);
+        stream
+            .read_exact(&mut body[have..])
+            .map_err(|e| format!("HTTP body: {e}"))?;
+        Ok(Self { headers, body })
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<String, String> {
+    HttpRequest::read(stream, 0).map(|request| request.headers)
+}
+
+pub fn http_reply(
+    stream: &mut TcpStream,
+    status: &str,
+    mime: &str,
+    body: &[u8],
+) -> Result<(), String> {
+    http_reply_headers(stream, status, mime, "", body, false)
+}
+
+pub fn http_reply_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    mime: &str,
+    headers: &str,
+    body: &[u8],
+    keep_alive: bool,
+) -> Result<(), String> {
+    let connection = if keep_alive { "keep-alive" } else { "close" };
+    write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: {connection}\r\n{headers}\r\n", body.len())
         .and_then(|_| stream.write_all(body)).map_err(|e| format!("HTTP reply: {e}"))
 }
 
-fn header_value<'a>(request: &'a str, wanted: &str) -> Option<&'a str> {
+pub fn unique_header<'a>(request: &'a str, wanted: &str) -> Result<Option<&'a str>, String> {
+    let mut found = None;
+    for line in request.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case(wanted)
+        {
+            if found.is_some() {
+                return Err(format!("Duplicate {wanted} header"));
+            }
+            found = Some(value.trim());
+        }
+    }
+    Ok(found)
+}
+
+pub fn header_value<'a>(request: &'a str, wanted: &str) -> Option<&'a str> {
     for line in request.lines().skip(1) {
         let Some((name, value)) = line.split_once(':') else {
             continue;

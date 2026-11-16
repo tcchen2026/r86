@@ -22,7 +22,8 @@ export class WasmPc {
     }
 
     async init(bytes, {memoryMiB = 128, diskSectors = 0, cdBytes = 0, cdFirst = true,
-        serial = false, deterministic = false, readOnly = true, engine = "interp", jitMiB = 128, jitThreshold = 256} = {}) {
+        serial = false, deterministic = false, readOnly = true, cdrom = true, usbTablet = false,
+        engine = "interp", jitMiB = 128, jitThreshold = 256} = {}) {
         if (!["interp", "jit"].includes(engine)) throw new Error("Invalid CPU engine");
         const imports = {browser: {
             disk_io: (...args) => this.diskImport(...args),
@@ -34,7 +35,8 @@ export class WasmPc {
         }};
         const {instance} = await WebAssembly.instantiate(bytes, imports);
         this.exports = instance.exports;
-        const flags = Number(cdFirst) | (Number(serial) << 1) | (Number(deterministic) << 2) | (Number(readOnly) << 3);
+        const flags = Number(cdFirst) | (Number(serial) << 1) | (Number(deterministic) << 2) | (Number(readOnly) << 3) |
+            (Number(!cdrom) << 4) | (Number(usbTablet) << 5);
         this.handle = this.exports.r86_create(memoryMiB, diskSectors, cdBytes, flags);
         if (!this.handle) throw new Error("Invalid machine configuration or insufficient Wasm memory");
         if (engine === "jit") {

@@ -1,9 +1,10 @@
-//! One running VM: its core thread and the state the app thread may touch.
+//! One running VM: its native core or web host, and state the app may touch.
 //! The core thread owns the Machine, disks, network, VM lock, the run's log
 //! (run_log.rs) and, while remote management is on, the web console
 //! (ws_frontend::Remote). The app queues input and commands, copies the
 //! latest frame and pulls audio. Shared by the Mac app (apple/) and the
-//! Windows app (win32/).
+//! Windows app (win32/). Web VMs keep CPU/devices in a Worker; web_host.rs
+//! owns their native disks and updates the same Shared state.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -22,6 +23,9 @@ use super::keys::{self, InputKey};
 use super::run_log;
 use super::vm_store::Vm;
 use super::ws_frontend::Remote;
+
+#[path = "vm_control.rs"]
+mod vm_control;
 
 const SLICE_STEPS: u64 = 200_000;
 const FRAME_INTERVAL: Duration = Duration::from_micros(16_667);
@@ -72,7 +76,7 @@ pub struct Frame {
 
 pub struct Status {
     pub state: State,
-    /// Guest instructions per second over the last second.
+    /// Guest instructions per second over the latest reporting interval.
     pub ips: u64,
     pub messages: VecDeque<String>,
     /// The web console's address while remote management is on.
@@ -100,11 +104,38 @@ pub struct Shared {
 pub struct Running {
     pub shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    #[cfg(feature = "apple")]
+    web: Option<super::web_host::Link>,
 }
 
 pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     // A panicking core thread reports itself; its data stays usable.
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+impl Shared {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            input: Mutex::default(),
+            wake: Condvar::new(),
+            frame: Mutex::default(),
+            audio: Mutex::default(),
+            status: Mutex::new(Status {
+                state: State::Running,
+                ips: 0,
+                messages: VecDeque::new(),
+                remote: None,
+                log: None,
+            }),
+            pointer: AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(feature = "apple")]
+    pub(super) fn take_commands(&self) -> Option<Vec<Command>> {
+        let mut input = lock(&self.input);
+        (!input.stop).then(|| std::mem::take(&mut input.commands))
+    }
 }
 
 impl Running {
@@ -118,20 +149,7 @@ impl Running {
     ) -> Result<Self, String> {
         let lock_file = super::vm_store::lock_vm(&vm.directory)?;
         let no_jit = std::env::args().any(|arg| arg == "--no-jit");
-        let shared = Arc::new(Shared {
-            input: Mutex::default(),
-            wake: Condvar::new(),
-            frame: Mutex::default(),
-            audio: Mutex::default(),
-            status: Mutex::new(Status {
-                state: State::Running,
-                ips: 0,
-                messages: VecDeque::new(),
-                remote: None,
-                log: None,
-            }),
-            pointer: AtomicBool::new(false),
-        });
+        let shared = Shared::new();
         let thread_shared = shared.clone();
         let (ready, started) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
@@ -144,8 +162,7 @@ impl Running {
                 let core = (|| -> Result<Core, String> {
                     set_core_qos()?;
                     let mut machine = config.machine(&firmware, "vgabios-stdvga.bin")?;
-                    machine.set_recommended_display_mode(recommended_mode);
-                    machine.enable_boot_splash();
+                    vm_control::prepare(&mut machine, recommended_mode);
                     let network = if vm.network {
                         machine.attach_network();
                         Some(UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
@@ -162,11 +179,9 @@ impl Running {
                         remote: None,
                         tools_iso: firmware.join(TOOLS_ISO),
                         shared: thread_shared,
-                        paused: false,
+                        input: vm_control::Input::default(),
                         boots: 0,
                         display: None,
-                        buttons: Ps2ButtonState::default(),
-                        held: Vec::new(),
                         samples: Vec::new(),
                     })
                 })();
@@ -196,18 +211,67 @@ impl Running {
         Ok(Self {
             shared,
             thread: Some(thread),
+            #[cfg(feature = "apple")]
+            web: None,
         })
+    }
+
+    #[cfg(feature = "apple")]
+    pub fn start_web(
+        vm: Vm,
+        firmware: PathBuf,
+        logs: PathBuf,
+        recommended: Option<DisplayMode>,
+        frozen: bool,
+    ) -> Result<Self, String> {
+        let shared = Shared::new();
+        let (web, thread) =
+            super::web_host::start(vm, firmware, logs, recommended, frozen, shared.clone())?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+            web: Some(web),
+        })
+    }
+
+    #[cfg(feature = "apple")]
+    pub fn web_url(&self) -> Option<&str> {
+        self.web.as_ref().map(|link| link.url.as_str())
+    }
+
+    #[cfg(feature = "apple")]
+    pub fn web_state(&self) -> u32 {
+        self.web
+            .as_ref()
+            .map_or(0, |link| link.state.load(Ordering::Acquire))
+    }
+
+    /// Last page counters, for the Linux web-host check driver.
+    #[cfg(feature = "apple")]
+    #[allow(dead_code)]
+    pub fn web_report(&self) -> String {
+        self.web
+            .as_ref()
+            .map_or_else(String::new, |link| lock(&link.report).clone())
     }
 
     pub fn send(&self, command: Command) {
         lock(&self.shared.input).commands.push(command);
         self.shared.wake.notify_one();
+        #[cfg(feature = "apple")]
+        if let Some(web) = &self.web {
+            web.wake();
+        }
     }
 
     /// Turn off now: stop the core thread, which flushes disks and unlocks.
     pub fn stop(&mut self) {
         lock(&self.shared.input).stop = true;
         self.shared.wake.notify_one();
+        #[cfg(feature = "apple")]
+        if let Some(web) = &self.web {
+            web.wake();
+        }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -296,14 +360,11 @@ struct Core {
     remote: Option<Remote>,
     tools_iso: PathBuf,
     shared: Arc<Shared>,
-    paused: bool,
+    input: vm_control::Input,
     /// The machine's reset count, to notice the guest's resets.
     boots: u64,
     /// The last display mode shown, for the run's events.
     display: Option<VgaModeInfo>,
-    buttons: Ps2ButtonState,
-    /// Keys the app holds down in the guest, released on pause and reset.
-    held: Vec<InputKey>,
     samples: Vec<i16>,
 }
 
@@ -372,19 +433,19 @@ impl Core {
                 }
                 // Its Pause and Resume are the app's.
                 let paused = !self.remote.as_ref().is_some_and(Remote::running);
-                if paused != self.paused {
+                if paused != self.input.paused {
                     self.event(if paused {
                         "paused from the web console"
                     } else {
                         "resumed from the web console"
                     });
                 }
-                if paused && !self.paused {
+                if paused && !self.input.paused {
                     self.release_input();
                 }
-                self.paused = paused;
+                self.input.paused = paused;
             }
-            if self.paused {
+            if self.input.paused {
                 self.publish_state(State::Paused, 0);
                 let wait = self.remote_wait(Duration::from_millis(200));
                 let input = lock(&self.shared.input);
@@ -448,70 +509,38 @@ impl Core {
     fn apply(&mut self, command: Command) -> Result<(), String> {
         match command {
             Command::Pause(paused) => {
-                if paused != self.paused {
+                if paused != self.input.paused {
                     self.event(if paused { "paused" } else { "resumed" });
                 }
-                self.paused = paused;
                 if let Some(remote) = &mut self.remote {
                     remote.set_running(&self.machine, !paused);
                 }
-                if paused {
-                    self.release_input();
-                }
+                self.input.control(&mut self.machine, u32::from(!paused))?;
             }
             Command::Reset => {
                 self.event("reset");
                 match &mut self.remote {
-                    Some(remote) => remote.reset(&mut self.machine)?,
-                    None => self.machine.reboot()?,
+                    Some(remote) => {
+                        remote.reset(&mut self.machine)?;
+                        self.input.clear();
+                    }
+                    None => self.input.control(&mut self.machine, 2)?,
                 }
                 self.boots = self.machine.reset_count();
-                self.held.clear();
-                self.buttons = Ps2ButtonState::default();
             }
             Command::PowerButton => {
                 self.event("power button");
-                self.machine.press_power_button();
+                self.input.control(&mut self.machine, 3)?;
             }
             Command::CtrlAltDel => {
                 self.event("Ctrl+Alt+Del");
-                for name in ["controlleft", "altleft", "delete"] {
-                    keys::inject_named_key(&mut self.machine, name, true)?;
-                }
-                for name in ["delete", "altleft", "controlleft"] {
-                    keys::inject_named_key(&mut self.machine, name, false)?;
-                }
+                self.input.control(&mut self.machine, 4)?;
             }
             Command::ReleaseInput => self.release_input(),
-            Command::Key(key, down) => {
-                let held = self.held.iter().position(|k| *k == key);
-                match (down, held) {
-                    (true, None) => self.held.push(key),
-                    (false, Some(index)) => {
-                        self.held.remove(index);
-                    }
-                    // A release the guest never saw pressed stays unsent.
-                    (false, None) => return Ok(()),
-                    (true, Some(_)) => {}
-                }
-                keys::inject_input_key(&mut self.machine, key, down);
-            }
-            Command::Mouse(mut dx, mut dy, buttons) => {
-                self.buttons = buttons;
-                // PS/2 packets carry 9-bit deltas; the device splits further.
-                loop {
-                    let (x, y) = (dx.clamp(-255, 255), dy.clamp(-255, 255));
-                    self.machine.inject_mouse(x as i16, y as i16, buttons);
-                    (dx, dy) = (dx - x, dy - y);
-                    if dx == 0 && dy == 0 {
-                        break;
-                    }
-                }
-            }
+            Command::Key(key, down) => self.input.key(&mut self.machine, key, down),
+            Command::Mouse(dx, dy, buttons) => self.input.mouse(&mut self.machine, dx, dy, buttons),
             Command::Pointer(x, y, buttons, wheel) => {
-                // The only failure, a full queue once the helper stops
-                // polling, drops this transition; the PS/2 mouse takes over.
-                let _ = self.machine.inject_pointer(x, y, buttons & 7, wheel);
+                self.input.pointer(&mut self.machine, x, y, buttons, wheel)
             }
             Command::Cd(path) => {
                 let name = path.as_deref().and_then(Path::file_name);
@@ -618,7 +647,7 @@ impl Core {
             self.tools_iso.clone(),
             access,
         )?;
-        remote.set_running(&self.machine, !self.paused);
+        remote.set_running(&self.machine, !self.input.paused);
         Ok(remote)
     }
 
@@ -638,13 +667,7 @@ impl Core {
 
     /// Release everything the app holds in the guest, as on focus loss.
     fn release_input(&mut self) {
-        for key in std::mem::take(&mut self.held) {
-            keys::inject_input_key(&mut self.machine, key, false);
-        }
-        if self.buttons != Ps2ButtonState::default() {
-            self.buttons = Ps2ButtonState::default();
-            self.machine.inject_mouse(0, 0, self.buttons);
-        }
+        self.input.release(&mut self.machine);
     }
 
     fn pump_audio(&mut self) {

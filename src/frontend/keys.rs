@@ -72,6 +72,26 @@ pub enum InputKey {
     Set2(bool, u8),
     Pause,
 }
+
+#[allow(dead_code)] // Web host/Worker wire representation; other frontends inject directly.
+impl InputKey {
+    /// Compact host/Worker key: set-2 code, bit 8 extended; 0x200 is Pause.
+    pub fn wire_code(self) -> u16 {
+        match self {
+            Self::Basic(key) => u16::from(key.set2_make()),
+            Self::Set2(extended, code) => u16::from(code) | (u16::from(extended) << 8),
+            Self::Pause => 0x200,
+        }
+    }
+
+    pub fn from_wire(code: u16) -> Option<Self> {
+        match code {
+            0x200 => Some(Self::Pause),
+            1..=0x1ff if code & 0xff != 0 => Some(Self::Set2(code & 0x100 != 0, code as u8)),
+            _ => None,
+        }
+    }
+}
 pub fn parse_named_key(name: &str) -> Result<InputKey, String> {
     if let Ok(key) = parse_ps2_key(name) {
         return Ok(InputKey::Basic(key));
