@@ -4,12 +4,27 @@ enum MachineStatus: Equatable {
     case stopped, running, paused
 }
 
+/// Saved CPU engine preference; the host resolves Auto when the VM starts.
+enum ExecutionEngine: String, CaseIterable, Identifiable, Decodable {
+    case auto, jit, interpreter
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: "Auto"
+        case .jit: "JIT"
+        case .interpreter: "Interpreter (slow)"
+        }
+    }
+}
+
 /// A VM in the library: its vm.toml settings (decoded from r86_library_list)
 /// plus the state of its running session.
 struct Machine: Identifiable, Equatable, Decodable {
     let directory: String
     var name: String
     var os: String
+    var engine: ExecutionEngine
     var memoryMiB: Int
     var disk: String
     var diskMiB: Int
@@ -50,6 +65,7 @@ struct Machine: Identifiable, Equatable, Decodable {
     var specRows: [(String, String)] {
         [
             ("System", os),
+            ("CPU engine", engine.title),
             ("Memory", memoryText),
             ("Disk", "\(diskText) · \(URL(filePath: disk).lastPathComponent)"),
             ("CD", cdrom ? (isoName ?? "Empty") : "None"),
@@ -60,7 +76,7 @@ struct Machine: Identifiable, Equatable, Decodable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case directory, name, os, memoryMiB, disk, diskMiB, iso, cdrom, bootOrder, volume, network, notes
+        case directory, name, os, engine, memoryMiB, disk, diskMiB, iso, cdrom, bootOrder, volume, network, notes
     }
 }
 

@@ -147,8 +147,8 @@ struct MoreMenu: View {
             Button("Edit \(machine.name)…", systemImage: "slider.horizontal.3") { stage.present(.edit(machine.id)) }
                 .disabled(machine.isLive)
             if WatchLink.shared.available {
-                Button("Copy to Apple Watch", systemImage: "applewatch") { WatchLink.shared.send(machine) }
-                    .disabled(machine.isLive)
+                Button("Copy to Paired Watch", systemImage: "applewatch") { WatchLink.shared.send(machine) }
+                    .disabled(machine.isLive || WatchLink.shared.copyUnavailableReason != nil)
             }
             Button("Machines…", systemImage: "list.bullet") { stage.showPicker = true }
             Button("New Machine…", systemImage: "plus") { stage.present(.newMachine) }
@@ -290,7 +290,7 @@ struct MachinePicker: View {
         } header: {
             Text("Apple Watch")
         } footer: {
-            Text("Copies of turned-off machines go between iPhone and Apple Watch under new names; nothing is replaced. Swipe a machine to copy it to the Watch.")
+            Text("Copies of turned-off machines go between iPhone and Apple Watch under new names; nothing is replaced. Open a machine's edit page to copy it to the paired Watch.")
         }
     }
 
@@ -338,8 +338,9 @@ struct MachinePicker: View {
         .listRowBackground(isCurrent ? Color.accentColor.opacity(0.14) : nil)
         .swipeActions {
             if link.available && !m.isLive {
-                Button("Copy to Apple Watch", systemImage: "applewatch") { link.send(m) }
+                Button("Copy to Paired Watch", systemImage: "applewatch") { link.send(m) }
                     .tint(.blue)
+                    .disabled(link.copyUnavailableReason != nil)
             }
         }
     }

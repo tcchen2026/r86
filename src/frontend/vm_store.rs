@@ -519,22 +519,15 @@ impl Vm {
         Ok(machine)
     }
 
-    /// Resolve the saved preference without rewriting it. A host without the
-    /// JIT runs every VM interpreted; VMs made on the handheld say "jit".
+    /// Resolve the native engine without rewriting the saved preference.
     pub fn jit_enabled(&self) -> bool {
         DEFAULT_JIT && self.wants_jit()
     }
 
-    /// Resolve preference independently of this host's native JIT capability.
+    /// Auto requests JIT for every guest OS, independently of this host's
+    /// native JIT capability.
     pub fn wants_jit(&self) -> bool {
-        match self.engine.as_str() {
-            "jit" => true,
-            "auto" => matches!(
-                super::guest_os::by_name(&self.os).id,
-                "win31" | "win95" | "win98" | "winme" | "win2000" | "winxp" | "reactos"
-            ),
-            _ => false,
-        }
+        matches!(self.engine.as_str(), "auto" | "jit")
     }
 }
 

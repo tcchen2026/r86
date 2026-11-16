@@ -13,11 +13,11 @@ struct NewMachineSheet: View {
     /// Called after the machine is created: (new machine, start it now).
     var onCreated: (Machine.ID, Bool) -> Void
 
-    private enum Source { case cd, freeDOS, disk }
+    private enum Source { case freeDOS, cd, disk }
     private enum Step { case source, os, memory, disk, summary }
 
     @State private var step = Step.source
-    @State private var source = Source.cd
+    @State private var source = Source.freeDOS
     @State private var media: URL?
     @State private var detected: String?
     @State private var preset = R86.presets.first(where: { $0.name == "Other" }) ?? R86.presets[0]
@@ -174,7 +174,10 @@ struct NewMachineSheet: View {
 
     /// A choice with its detail on the right, as the handheld's lists.
     private func choice(_ title: String, _ detail: String) -> some View {
-        LabeledContent(title) {
+        // The picker's labelsHidden also hides nested LabeledContent labels.
+        HStack {
+            Text(title)
+            Spacer()
             Text(detail).foregroundStyle(.secondary)
         }
     }
@@ -183,14 +186,14 @@ struct NewMachineSheet: View {
     private var sourceStep: some View {
         Section {
             Picker("How to start?", selection: $source) {
+                choice("Install FreeDOS", "included with this app").tag(Source.freeDOS)
                 choice("Install from a CD image", ".iso").tag(Source.cd)
-                choice("Install FreeDOS", "included").tag(Source.freeDOS)
-                choice("Use an existing disk", ".vhd .img").tag(Source.disk)
+                choice("Use an existing disk", ".vhd, .img").tag(Source.disk)
             }
             .pickerStyle(.inline)
             .labelsHidden()
         } footer: {
-            Text("Bring your own installation CD, or start with FreeDOS, which comes with r86.")
+            Text("Start with the included FreeDOS, install from a CD image, or use an existing disk.")
         }
     }
 

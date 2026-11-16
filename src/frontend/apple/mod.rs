@@ -838,8 +838,9 @@ mod tests {
         unsafe {
             for (engine, memory, os) in [
                 ("interp", 16, "Windows 2000"),
+                ("interpreter", 16, "DOS"),
                 ("jit", 513, "Windows 2000"),
-                ("auto", 16, "DOS"),
+                ("auto", 513, "DOS"),
             ] {
                 vm.engine = engine.into();
                 vm.memory = memory;
@@ -861,7 +862,7 @@ mod tests {
             }
             vm.engine = "auto".into();
             vm.memory = 16;
-            vm.os = "Windows 2000".into();
+            vm.os = "DOS".into();
             vm.save().unwrap();
             let mut error = std::ptr::null_mut();
             let handle = r86_vm_start_web(
@@ -1084,6 +1085,7 @@ mod tests {
                 );
                 let vm = Vm::load(directory.clone()).unwrap();
                 assert_eq!(vm.engine, engine);
+                assert_eq!(vm.wants_jit(), matches!(engine, "jit" | "auto"));
                 assert_eq!(
                     vm.jit_enabled(),
                     r86::machine::DEFAULT_JIT && matches!(engine, "jit" | "auto")
@@ -1125,23 +1127,16 @@ mod tests {
             assert_eq!(Vm::load(directory.clone()).unwrap().engine, "auto");
             drop(guard);
         }
-        // Exercise every current preset by its public name, including unknown OSes.
+        // Auto requests JIT regardless of the OS name; the host decides availability.
         let mut vm = Vm::load(directory).unwrap();
-        for os in [
-            "Windows 3.1",
-            "Windows 95",
-            "Windows 98",
-            "Windows ME",
-            "Windows 2000",
-            "Windows XP",
-            "ReactOS",
-        ] {
+        for os in guest_os::PRESETS
+            .iter()
+            .map(|preset| preset.name)
+            .chain(["unknown"])
+        {
             vm.os = os.into();
+            assert!(vm.wants_jit(), "{os}");
             assert_eq!(vm.jit_enabled(), r86::machine::DEFAULT_JIT, "{os}");
-        }
-        for os in ["DOS", "Linux", "Other", "unknown"] {
-            vm.os = os.into();
-            assert!(!vm.jit_enabled(), "{os}");
         }
         std::fs::remove_dir_all(root).unwrap();
     }
