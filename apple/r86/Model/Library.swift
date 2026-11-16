@@ -24,6 +24,10 @@ final class Library {
     var toast: Toast?
     /// iOS: a fatal error report to preview (Quick Look).
     var logToShow: URL?
+    /// iOS: a machine left fast mode for the compatible engine; say why.
+    var fastNotice: FastNotice?
+    /// iOS: this device failed fast mode's check; do not try again this launch.
+    @ObservationIgnored private var fastUnavailable = false
 
     /// Menu requests for the Library window.
     var requestNewMachine = false
@@ -73,7 +77,11 @@ final class Library {
     func start(_ id: Machine.ID) {
         guard let m = self[id], sessions[id] == nil else { return }
         do {
+            #if os(iOS)
+            sessions[id] = try Session(machine: m, fast: Preferences.shared.fastMode && !fastUnavailable)
+            #else
             sessions[id] = try Session(machine: m)
+            #endif
             update(id) { m in
                 m.status = .running
                 m.failure = nil
@@ -289,8 +297,36 @@ final class Library {
         reload()
     }
 
+    #if os(iOS)
+    /// This device cannot run fast mode (Lockdown Mode, or WebKit without
+    /// its compiler): start the machine again in the compatible engine. The
+    /// page had not started the guest, so nothing is lost.
+    private func leaveFastMode(_ id: Machine.ID, _ session: Session) {
+        fastUnavailable = true
+        session.close()
+        sessions[id] = nil
+        start(id)
+        if sessions[id] == nil {
+            update(id) { m in
+                m.status = .stopped
+                m.instructionsPerSecond = 0
+            }
+        }
+        if !Preferences.shared.fastNoticeHidden {
+            fastNotice = WebEngine.lockdown ? .lockdown : .unavailable
+        }
+    }
+    #endif
+
     private func poll() {
         for (id, session) in sessions {
+            #if os(iOS)
+            // Only before the page has started the guest.
+            if let web = session.web, session.webState == 2 || (web.failed && session.webState == 0) {
+                leaveFastMode(id, session)
+                continue
+            }
+            #endif
             // Status first: a stopping core thread posts its last messages with it.
             let status = session.status()
             let messages = session.takeMessages()
@@ -311,7 +347,7 @@ final class Library {
                 }
             default:
                 session.refreshThumbnail()
-                let size = session.image.map { ($0.width, $0.height) } ?? (0, 0)
+                let size = session.screenSize
                 let remote = session.remoteURL()
                 let pointer = session.pointerActive
                 update(id) { m in

@@ -22,22 +22,47 @@ final class Session {
     /// Security-scoped files (CD and disk images) open while the VM runs.
     @ObservationIgnored private var scoped: [URL] = []
     private let directory: String
+    #if os(iOS)
+    /// Fast mode: the page that runs this machine. It draws the screen
+    /// itself, so there are no frames and no thumbnail.
+    @ObservationIgnored private(set) var web: WebEngine?
+    #endif
 
-    init(machine: Machine) throws {
+    /// `fast` asks for fast mode (iOS); r86 still starts machines it does not
+    /// suit in the compatible engine.
+    init(machine: Machine, fast: Bool = false) throws {
         var scoped: [URL] = []
         for path in [machine.iso, machine.disk].compactMap({ $0 }) {
             if let url = Bookmarks.access(path, in: machine.directory) { scoped.append(url) }
         }
         var error: UnsafeMutablePointer<CChar>?
         let mode = R86.recommendedMode
-        guard let vm = r86_vm_start(machine.directory, R86.firmware, R86.logs.path,
-                                    mode.width, mode.height, &error) else {
+        var started: OpaquePointer?
+        #if os(iOS)
+        if fast {
+            // NULL without an error: this machine does not use fast mode.
+            started = r86_vm_start_web(machine.directory, R86.firmware, R86.logs.path,
+                                       mode.width, mode.height, &error)
+        }
+        #endif
+        if started == nil && error == nil {
+            started = r86_vm_start(machine.directory, R86.firmware, R86.logs.path,
+                                   mode.width, mode.height, &error)
+        }
+        guard let vm = started else {
             scoped.forEach { $0.stopAccessingSecurityScopedResource() }
             throw R86Error(message: R86.take(error) ?? "Cannot start \(machine.name)")
         }
         self.vm = vm
         self.directory = machine.directory
         self.scoped = scoped
+        #if os(iOS)
+        if let url = R86.take(r86_vm_web_url(vm)).flatMap({ URL(string: $0) }) {
+            // No sound in fast mode yet.
+            self.web = WebEngine(url: url)
+            return
+        }
+        #endif
         // The Watch plays no sound: its two cores stay with the guest and the screen.
         #if !os(watchOS)
         self.audio = AudioOutput(vm: vm)
@@ -64,6 +89,9 @@ final class Session {
 
     /// Copy the newest frame if it changed; returns it only when new.
     func newImage() -> CGImage? {
+        #if os(iOS)
+        if web != nil { return nil }
+        #endif
         var frame = R86Frame()
         let capacity = pixels.count
         let copied = pixels.withUnsafeMutableBytes { buffer in
@@ -85,6 +113,30 @@ final class Session {
                                   intent: .defaultIntent) else { return nil }
         self.image = image
         return image
+    }
+
+    #if os(iOS)
+    /// 0 waiting for the page, 1 the page runs the machine, 2 this device
+    /// cannot run fast mode.
+    var webState: UInt32 { r86_vm_web_state(vm) }
+
+    /// The guest's screen size in fast mode, zero until the page reports it.
+    func webSize() -> CGSize {
+        var frame = R86Frame()
+        _ = r86_vm_frame(vm, 0, nil, 0, &frame)
+        return CGSize(width: Int(frame.width), height: Int(frame.height))
+    }
+    #endif
+
+    /// The guest's screen size in pixels, zero before the first frame.
+    var screenSize: (Int, Int) {
+        #if os(iOS)
+        if web != nil {
+            let size = webSize()
+            return (Int(size.width), Int(size.height))
+        }
+        #endif
+        return image.map { ($0.width, $0.height) } ?? (0, 0)
     }
 
     func refreshThumbnail() {
@@ -150,6 +202,10 @@ final class Session {
     func close() {
         audio?.stop()
         audio = nil
+        #if os(iOS)
+        web?.close()
+        web = nil
+        #endif
         r86_vm_free(vm)
         scoped.forEach { $0.stopAccessingSecurityScopedResource() }
         scoped = []

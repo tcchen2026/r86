@@ -43,6 +43,14 @@ struct SettingsSheet: View {
                 }
 
                 Section {
+                    Toggle("Fast mode", isOn: $prefs.fastMode)
+                } header: {
+                    Text("Speed")
+                } footer: {
+                    Text("Experimental. Windows and ReactOS machines with up to 512 MB of memory run in a web view, where iOS lets r86 compile guest code. No sound, network or CD changes yet. It applies the next time a machine starts; Lockdown Mode turns it off.")
+                }
+
+                Section {
                     Toggle("Ask before turning off", isOn: $prefs.confirmStop)
                 } header: {
                     Text("Machines")

@@ -19,6 +19,26 @@ enum DisplayScaling: String, CaseIterable, Identifiable {
     }
 }
 
+/// Why a machine left fast mode for the compatible engine.
+enum FastNotice: String, Identifiable {
+    /// Lockdown Mode stops WebKit from compiling code (iOS).
+    case lockdown
+    case unavailable
+
+    var id: String { rawValue }
+
+    var message: String {
+        switch self {
+        case .lockdown:
+            return "Lockdown Mode is on, so this machine runs in the slower compatible mode.\n\n"
+                + "To use fast mode and keep Lockdown Mode on for everything else, open Settings › "
+                + "Privacy & Security › Lockdown Mode › Configure Web Browsing and turn off r86."
+        case .unavailable:
+            return "This device cannot run fast mode. The machine runs in the compatible mode."
+        }
+    }
+}
+
 /// App settings in UserDefaults. Each property reports reads and writes to
 /// Observation by hand, so views update when a setting changes.
 @MainActor
@@ -52,6 +72,19 @@ final class Preferences {
     var sendCommandKeys: Bool {
         get { access(keyPath: \.sendCommandKeys); return bool("sendCommandKeys", false) }
         set { withMutation(keyPath: \.sendCommandKeys) { store.set(newValue, forKey: "sendCommandKeys") } }
+    }
+
+    /// iOS: run machines that suit it in a web view, where WebKit compiles
+    /// r86's Wasm JIT (ios/Platform/WebEngine.swift).
+    var fastMode: Bool {
+        get { access(keyPath: \.fastMode); return bool("fastMode", false) }
+        set { withMutation(keyPath: \.fastMode) { store.set(newValue, forKey: "fastMode") } }
+    }
+
+    /// Do not explain again why a machine left fast mode.
+    var fastNoticeHidden: Bool {
+        get { access(keyPath: \.fastNoticeHidden); return bool("fastNoticeHidden", false) }
+        set { withMutation(keyPath: \.fastNoticeHidden) { store.set(newValue, forKey: "fastNoticeHidden") } }
     }
 
     /// Ask before shutting down from the toolbar.

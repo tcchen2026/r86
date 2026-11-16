@@ -82,6 +82,12 @@ struct RootView: View {
             }
         }
         .quickLookPreview($library.logToShow)
+        .alert("Fast Mode Is Unavailable", isPresented: fastNoticeShown, presenting: library.fastNotice) { _ in
+            Button("OK") {}
+            Button("Don't Show Again") { prefs.fastNoticeHidden = true }
+        } message: { notice in
+            Text(notice.message)
+        }
         .onChange(of: scenePhase) { _, phase in
             sceneChanged(phase)
         }
@@ -94,6 +100,11 @@ struct RootView: View {
 
     private var running: Machine.ID? {
         library.sessions.keys.first
+    }
+
+    private var fastNoticeShown: Binding<Bool> {
+        Binding(get: { library.fastNotice != nil },
+                set: { if !$0 { library.fastNotice = nil } })
     }
 
     private var switching: Binding<Bool> {

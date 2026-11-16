@@ -24,7 +24,8 @@ Contracts:
   then OS, memory (to 3 GiB), disk size and name. Windows 3.1/9x/ME CDs
   install from FreeDOS planted on the new disk.
 - Apple silicon macOS builds include the A64 JIT, using MAP_JIT and only the
-  allow-jit Hardened Runtime exception. iOS/watchOS remain interpreter-only.
+  allow-jit Hardened Runtime exception. iOS and watchOS have no native JIT
+  (iOS fast mode runs the Wasm JIT in a web view; see below).
   Native JIT/ABI tests and a deterministic ROM boot have passed on macOS CI;
   the workflow also gates the ReactOS complete language dialog. Hosted macOS
   runners have SIP off: signed boots and MAP_JIT allocation probes there are
@@ -66,7 +67,7 @@ Contracts:
   until then (src/frontend/run_log.rs). The VM window shows the error and
   Show Log.
 
-iPhone and iPad (ios/, iOS 26, interpreter only)
+iPhone and iPad (ios/, iOS 26; interpreter, or the Wasm JIT in fast mode)
 
 The iOS app shares Engine/, Model/ and the New/Edit Machine sheets with the
 Mac; its own UI is in ios/ (SwiftUI layout, UIKit for the screen, keys and
@@ -111,6 +112,19 @@ Contracts:
   address and code. Turning it on also shows the Local Network alert (a
   Bonjour browse for _r86._tcp): accepting connections needs no permission
   (TN3179), but guests on the user-mode network reaching LAN devices do.
+- Fast mode (Settings › Speed, off by default; plan and open checks in
+  PLAN_WEBJIT.md): a machine whose engine is jit, or auto with a Windows or
+  ReactOS preset, and at most 512 MiB runs in a WKWebView, where WebKit
+  compiles r86's x86-to-Wasm JIT. r86_vm_start_web serves the page
+  (<app>/web/: vm.html, the Worker, r86-jit.wasm) and the disks from
+  127.0.0.1 behind a random token (src/frontend/web_host.rs); the page runs
+  CPU, memory and devices and draws the screen on a canvas. Input, pause
+  and power use the same C calls, forwarded to the page. GuestUIView shows
+  the web view under its touches (ios/Platform/WebEngine.swift). When the
+  page's check fails (Lockdown Mode, no Wasm compiler, no page within 20 s)
+  the machine starts again in the interpreter and an alert says why, once
+  per launch. No sound, network, CD change or Library thumbnail yet. The
+  Swift side has not been compiled or run on a device.
 - Apple Watch: Machines › swipe, or More › Copy to Apple Watch, copies a
   turned-off machine to the Watch; the Machines list's Apple Watch section
   copies the Watch's machines back (watch/WatchLink.swift).

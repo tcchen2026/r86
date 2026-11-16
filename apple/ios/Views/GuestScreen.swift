@@ -51,7 +51,10 @@ struct GuestScreen: UIViewRepresentable {
 
 final class GuestUIView: UIView {
     var session: Session? {
-        didSet { trackpad.session = session }
+        didSet {
+            trackpad.session = session
+            if session !== oldValue { attachWeb() }
+        }
     }
     var keys: KeyInput?
     var scaling: DisplayScaling = .aspect { didSet { setNeedsLayout() } }
@@ -63,6 +66,14 @@ final class GuestUIView: UIView {
     let trackpad = TrackpadInterpreter()
 
     private let screen = CALayer()
+    /// Fast mode: the page draws the guest. Its web view sits where `screen`
+    /// would be, under this view's touches.
+    private weak var engine: WebEngine?
+    /// The page's view while this view shows it.
+    private var page: UIView? {
+        guard let view = engine?.view, view.superview === self else { return nil }
+        return view
+    }
     private var link: CADisplayLink?
     private var imageSize = CGSize.zero
     private let feedback = UIImpactFeedbackGenerator(style: .light)
@@ -128,12 +139,32 @@ final class GuestUIView: UIView {
         session = nil
     }
 
+    private func attachWeb() {
+        // Leaving: unless another GuestUIView already took the page (a layout
+        // change), it waits in the window, still running.
+        if let engine, engine.view.superview === self { engine.park() }
+        engine = session?.web
+        screen.isHidden = engine != nil
+        guard let engine else { return }
+        imageSize = .zero
+        insertSubview(engine.view, at: 0)
+        engine.setSmooth(smooth)
+        setNeedsLayout()
+    }
+
     override func resignFirstResponder() -> Bool {
         releaseKeys()
         return super.resignFirstResponder()
     }
 
     @objc private func step(_ link: CADisplayLink) {
+        if page != nil, let size = session?.webSize() {
+            if size != imageSize {
+                imageSize = size
+                setNeedsLayout()
+            }
+            return
+        }
         guard let image = session?.newImage() else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -157,9 +188,11 @@ final class GuestUIView: UIView {
     private func applyFilter() {
         screen.magnificationFilter = smooth ? .linear : .nearest
         screen.minificationFilter = .linear
+        session?.web?.setSmooth(smooth)
     }
 
     private func layoutScreen() {
+        defer { page?.frame = screen.frame }
         guard imageSize.width > 0, imageSize.height > 0, bounds.width > 0, bounds.height > 0 else {
             screen.frame = bounds
             return
