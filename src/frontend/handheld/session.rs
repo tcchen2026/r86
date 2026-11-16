@@ -174,6 +174,8 @@ fn run_locked(
     } else {
         r86::machine::RECOMMENDED_DESKTOP_MODE
     }));
+    // r86's logo and the engine label for 3 s, as in the apps (ESC: boot menu).
+    machine.enable_boot_splash();
     let network = if vm.network {
         machine.attach_network();
         Some(r86::network::UserNetwork::new(&[]).map_err(|e| format!("network: {e}"))?)
