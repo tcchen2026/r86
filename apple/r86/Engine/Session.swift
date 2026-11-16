@@ -12,7 +12,8 @@ final class Session {
         case pause = 0, resume, reset, powerButton, ctrlAltDel, releaseInput
     }
 
-    let vm: OpaquePointer
+    /// SwiftUI can retain this session until its stopped screen is dismantled.
+    @ObservationIgnored private var vm: OpaquePointer?
     /// Small copy of the screen for the Library, refreshed twice a second.
     private(set) var thumbnail: CGImage?
     @ObservationIgnored private(set) var image: CGImage?
@@ -70,16 +71,19 @@ final class Session {
     }
 
     func send(_ command: Command) {
+        guard let vm else { return }
         r86_vm_command(vm, command.rawValue)
     }
 
     func status() -> R86Status {
+        guard let vm else { return R86Status(state: 2, instructions_per_second: 0) }
         var status = R86Status()
         r86_vm_status(vm, &status)
         return status
     }
 
     func takeMessages() -> [String] {
+        guard let vm else { return [] }
         var messages: [String] = []
         while let message = R86.take(r86_vm_take_message(vm)) {
             messages.append(message)
@@ -89,6 +93,7 @@ final class Session {
 
     /// Copy the newest frame if it changed; returns it only when new.
     func newImage() -> CGImage? {
+        guard let vm else { return nil }
         #if os(iOS)
         if web != nil { return nil }
         #endif
@@ -118,10 +123,14 @@ final class Session {
     #if os(iOS)
     /// 0 waiting for the page, 1 the page runs the machine, 2 this device
     /// cannot run fast mode.
-    var webState: UInt32 { r86_vm_web_state(vm) }
+    var webState: UInt32 {
+        guard let vm else { return 0 }
+        return r86_vm_web_state(vm)
+    }
 
     /// The guest's screen size in fast mode, zero until the page reports it.
     func webSize() -> CGSize {
+        guard let vm else { return .zero }
         var frame = R86Frame()
         _ = r86_vm_frame(vm, 0, nil, 0, &frame)
         return CGSize(width: Int(frame.width), height: Int(frame.height))
@@ -145,6 +154,7 @@ final class Session {
     }
 
     func key(_ code: UInt16, down: Bool) {
+        guard let vm else { return }
         r86_vm_key(vm, code, down)
     }
 
@@ -152,24 +162,31 @@ final class Session {
     /// A USB HID keyboard usage (page 7, as UIKeyboardHIDUsage) pressed or
     /// released: the hardware keyboard and the on-screen keys.
     func hidKey(_ usage: UInt16, down: Bool) {
+        guard let vm else { return }
         r86_vm_hid_key(vm, usage, down)
     }
     #endif
 
     func mouse(dx: Int32, dy: Int32, buttons: UInt32) {
+        guard let vm else { return }
         r86_vm_mouse(vm, dx, dy, buttons)
     }
 
     /// The guest's r86 tools helper follows the Mac pointer: no capture.
-    var pointerActive: Bool { r86_vm_pointer_active(vm) }
+    var pointerActive: Bool {
+        guard let vm else { return false }
+        return r86_vm_pointer_active(vm)
+    }
 
     /// Absolute position, 0...65535 across the guest screen.
     func pointer(x: UInt16, y: UInt16, buttons: UInt32, wheel: Int16) {
+        guard let vm else { return }
         r86_vm_pointer(vm, x, y, buttons, wheel)
     }
 
     /// Insert a CD image picked in a file panel, or eject with nil.
     func changeCD(_ url: URL?) {
+        guard let vm else { return }
         if let url {
             let accessing = url.startAccessingSecurityScopedResource()
             Bookmarks.remember(url, in: directory)
@@ -179,27 +196,33 @@ final class Session {
     }
 
     func setVolume(_ percent: Int) {
+        guard let vm else { return }
         r86_vm_set_volume(vm, UInt32(percent))
     }
 
     /// Remote management: the web console, for this Mac only, until the VM
     /// turns off. The outcome arrives as a message.
     func setRemote(_ on: Bool) {
+        guard let vm else { return }
         r86_vm_set_remote(vm, on)
     }
 
     /// The web console's address while remote management is on.
     func remoteURL() -> URL? {
-        R86.take(r86_vm_remote_url(vm)).flatMap { URL(string: $0) }
+        guard let vm else { return nil }
+        return R86.take(r86_vm_remote_url(vm)).flatMap { URL(string: $0) }
     }
 
     /// The report of the fatal error that ended the run, once written.
     func log() -> URL? {
-        R86.take(r86_vm_log(vm)).map { URL(filePath: $0) }
+        guard let vm else { return nil }
+        return R86.take(r86_vm_log(vm)).map { URL(filePath: $0) }
     }
 
     /// Turn off now: no guest shutdown. Disks are flushed.
     func close() {
+        guard let vm else { return }
+        self.vm = nil
         audio?.stop()
         audio = nil
         #if os(iOS)

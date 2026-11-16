@@ -51,8 +51,8 @@ char *r86_library_export(const char *directory, const char *disk_out, char **con
 char *r86_library_import(const char *root, const char *config, const char *disk,
                          char **directory);
 // cpu-engine: auto|jit|interpreter (legacy interp accepted). Changes a stopped VM.
-// auto selects JIT for Windows/ReactOS presets when this build supports it;
-// other presets use the interpreter. Builds without the JIT ignore jit.
+// auto selects JIT whenever available, regardless of the OS preset.
+// Native builds without the JIT interpret auto and jit VMs.
 // New VMs default to auto. --no-jit overrides launch without changing the file.
 char *r86_library_set(const char *directory, const char *key, const char *value);
 char *r86_library_delete(const char *directory);
@@ -65,8 +65,8 @@ R86Vm *r86_vm_start(const char *directory, const char *firmware, const char *log
                     uint16_t recommended_width, uint16_t recommended_height,
                     char **error);
 // Web engine (iOS): the page owns CPU/RAM/devices/screen; this library
-// owns disks and serves them on 127.0.0.1. Selects jit, or auto for Windows/
-// ReactOS, with at most 512 MiB. NULL with *error == NULL: call r86_vm_start.
+// owns disks and serves them on 127.0.0.1. Selects auto or jit with at most
+// 512 MiB. NULL with *error == NULL: call r86_vm_start.
 R86Vm *r86_vm_start_web(const char *directory, const char *firmware, const char *logs,
                         uint16_t recommended_width, uint16_t recommended_height,
                         char **error);

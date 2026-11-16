@@ -31,14 +31,15 @@ Contracts:
   runners have SIP off: signed boots and MAP_JIT allocation probes there are
   observations, not code-signing enforcement evidence. Real-Mac checks use
   script/apple_jit_check.py --require-signing-enforcement with SIP enabled.
-- New VMs use cpu-engine="auto": Windows (win31/95/98/me/2000/xp) and ReactOS
-  select JIT when available; other presets select the interpreter. All 16-bit
-  code still uses the shared interpreter. Explicit choices are "jit" and
-  "interpreter"; existing "interp" settings remain readable. iOS/watchOS run
-  "jit" VMs (the handheld's default) interpreted. --no-jit forces
-  interpretation without saving that override.
-  The C API exposes "engine" in library JSON and accepts the "cpu-engine" key
-  in r86_library_set; the Swift engine picker is separate work.
+- New VMs use cpu-engine="auto": select JIT whenever available, regardless of
+  the OS preset; otherwise use the interpreter. All 16-bit code still uses
+  the shared interpreter. Explicit choices are "jit" and
+  "interpreter"; existing "interp" settings remain readable. watchOS always
+  interprets; iOS fast mode is described below. --no-jit forces interpretation
+  without saving that override. Edit machine offers Auto, JIT and Interpreter
+  (slow); the choice applies at the next start and appears in the VM details.
+  The C API exposes the saved preference as "engine" in library JSON and accepts
+  the "cpu-engine" key in r86_library_set.
 - Each core thread requests user-interactive QoS before constructing Machine.
   This is a scheduling request, not a guarantee of performance-core placement.
 - macOS reserves one process-wide MAP_JIT region with 16 fixed 320 MiB slots
@@ -84,6 +85,14 @@ Device builds are signed with R86_IOS_IDENTITY and R86_IOS_PROFILE (set
 R86_IOS_BUNDLE_ID to match) and packed as r86.ipa. The manual workflow
 .github/workflows/ios.yml uploads a simulator build.
 
+The build scripts bundle r86/PrivacyInfo.xcprivacy on macOS/iOS and
+watch/PrivacyInfo.xcprivacy on watchOS. They declare the linked file-metadata
+APIs (VM disks and media), statvfs (space checks before media uploads), and
+UserDefaults on macOS/iOS (Preferences and iOS Stage). Rust Instant uses
+clock_gettime in these builds, not a listed system-boot-time API. Approved
+reasons: https://developer.apple.com/documentation/bundleresources/app-privacy-configuration/nsprivacyaccessedapitypes/nsprivacyaccessedapitype
+These manifests do not replace App Store Connect's privacy questionnaire.
+
 Contracts:
 - Data: Documents/VMs and Documents/logs, shown in the Files app. Picked CD
   and disk images are bookmarked as on the Mac.
@@ -117,9 +126,9 @@ Contracts:
   Bonjour browse for _r86._tcp): accepting connections needs no permission
   (TN3179), but guests on the user-mode network reaching LAN devices do.
 - Fast mode (Settings › Speed, off by default; plan and open checks in
-  PLAN_WEBJIT.md): a machine whose engine is jit, or auto with a Windows or
-  ReactOS preset, and at most 512 MiB runs in a WKWebView, where WebKit
-  compiles r86's x86-to-Wasm JIT. r86_vm_start_web serves the page
+  PLAN_WEBJIT.md): a machine whose engine is auto or jit, with at most
+  512 MiB, runs in a WKWebView, where WebKit compiles r86's x86-to-Wasm JIT.
+  r86_vm_start_web serves the page
   (<app>/web/: vm.html, the Worker, r86-jit.wasm) and the disks from
   127.0.0.1 behind a random token (src/frontend/web_host.rs); the page runs
   CPU, memory and devices and draws the screen on a canvas. Input, pause
@@ -129,9 +138,11 @@ Contracts:
   the machine starts again in the interpreter and an alert says why, once
   per launch. No sound, network, CD change or Library thumbnail yet. The
   Swift side has not been compiled or run on a device.
-- Apple Watch: Machines › swipe, or More › Copy to Apple Watch, copies a
-  turned-off machine to the Watch; the Machines list's Apple Watch section
-  copies the Watch's machines back (watch/WatchLink.swift).
+- Apple Watch: Edit machine › Copy to Paired Watch saves the edited settings
+  and copies the turned-off machine to the Watch. More and swipe shortcuts
+  remain available; the Machines list's Apple Watch section copies the Watch's
+  machines back (watch/WatchLink.swift). Copying requires real paired devices;
+  Simulator file transfers are unsupported and the edit page explains this.
 
 Apple Watch (watch/, watchOS 26 arm64: Series 9 and later, interpreter only)
 

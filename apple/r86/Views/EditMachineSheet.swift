@@ -1,4 +1,7 @@
 import SwiftUI
+#if os(iOS)
+import WatchConnectivity
+#endif
 
 /// Settings of a stopped machine. Running machines are locked by r86.
 struct EditMachineSheet: View {
@@ -7,6 +10,7 @@ struct EditMachineSheet: View {
 
     private let original: Machine
     @State private var os: String
+    @State private var engine: ExecutionEngine
     @State private var memoryMiB: Int
     @State private var bootFromCD: Bool
     @State private var iso: String?
@@ -19,6 +23,7 @@ struct EditMachineSheet: View {
     init(machine: Machine) {
         original = machine
         _os = State(initialValue: machine.os)
+        _engine = State(initialValue: machine.engine)
         _memoryMiB = State(initialValue: machine.memoryMiB)
         _bootFromCD = State(initialValue: machine.bootOrder == "cdrom")
         _iso = State(initialValue: machine.iso)
@@ -36,10 +41,40 @@ struct EditMachineSheet: View {
                             Text(p.name).tag(p.name)
                         }
                     }
+                    Picker("CPU engine", selection: $engine) {
+                        ForEach(ExecutionEngine.allCases) { engine in
+                            Text(engine.title).tag(engine)
+                        }
+                    }
                     MemoryRow(memoryMiB: $memoryMiB)
                 } footer: {
-                    Text("The disk (\(original.diskText)) can't be resized here.")
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Auto uses JIT whenever available. 16-bit code always uses the interpreter.")
+                        #if os(iOS)
+                        Text("JIT also requires Fast mode and at most 512 MiB of memory.")
+                        #endif
+                        Text("The disk (\(original.diskText)) can't be resized here.")
+                    }
                 }
+
+                #if os(iOS)
+                if WCSession.isSupported() {
+                    Section {
+                        Button("Copy to Paired Watch", systemImage: "applewatch") {
+                            let saved = save()
+                            dismiss()
+                            if saved, let machine = library[original.id] {
+                                WatchLink.shared.send(machine)
+                            }
+                        }
+                        .disabled(watchCopyUnavailableReason != nil)
+                    } header: {
+                        Text("Apple Watch")
+                    } footer: {
+                        Text(watchCopyUnavailableReason ?? "Saves these settings and copies the machine to your paired Apple Watch.")
+                    }
+                }
+                #endif
 
                 Section("Drives") {
                     LabeledContent("CD image") {
@@ -83,7 +118,7 @@ struct EditMachineSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        save()
+                        _ = save()
                         dismiss()
                     }
                 }
@@ -100,7 +135,16 @@ struct EditMachineSheet: View {
         #endif
     }
 
-    private func save() {
+    #if os(iOS)
+    private var watchCopyUnavailableReason: String? {
+        if (library[original.id] ?? original).isLive {
+            return "Turn off this machine before copying it."
+        }
+        return WatchLink.shared.copyUnavailableReason
+    }
+    #endif
+
+    private func save() -> Bool {
         if let newISO {
             let accessing = newISO.startAccessingSecurityScopedResource()
             library.remember(newISO, for: original.id)
@@ -108,6 +152,7 @@ struct EditMachineSheet: View {
         }
         var changes: [(String, String)] = []
         if os != original.os { changes.append(("os", os)) }
+        if engine != original.engine { changes.append(("cpu-engine", engine.rawValue)) }
         if memoryMiB != original.memoryMiB { changes.append(("memory-mib", String(memoryMiB))) }
         if iso != original.iso { changes.append(("iso", iso ?? "")) }
         let bootOrder = bootFromCD ? "cdrom" : "disk"
@@ -115,6 +160,6 @@ struct EditMachineSheet: View {
         if network != original.network { changes.append(("network", String(network))) }
         if volume != original.volume { changes.append(("volume", String(volume))) }
         if notes != original.notes { changes.append(("notes", notes)) }
-        if !changes.isEmpty { library.save(original.id, changes) }
+        return changes.isEmpty || library.save(original.id, changes)
     }
 }

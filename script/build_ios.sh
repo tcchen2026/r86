@@ -10,8 +10,8 @@
 # R86_IOS_IDENTITY (a codesigning identity) and R86_IOS_PROFILE (its
 # .mobileprovision) are set; R86_IOS_BUNDLE_ID must match the profile
 # (default io.github.tcchen2026.r86). The Watch app needs its own profile,
-# R86_WATCH_PROFILE, for <bundle id>.watchkitapp; a device build without it
-# leaves the Watch app out. The iPhone Duo's laptop posture needs the iOS
+# R86_WATCH_PROFILE, for <bundle id>.watchkitapp; unsigned device builds
+# include the Watch app too. The iPhone Duo's laptop posture needs the iOS
 # 27.1 SDK; older SDKs build without it.
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -101,6 +101,7 @@ for asset in vm.html vm.mjs vm-worker.mjs wasm.mjs jit.mjs; do
 done
 cp "$root/web/dist/r86-jit.wasm" "$app/web/"
 cp "$root/tmp/freedos/share/dos.zip" "$app/"
+cp "$apple/r86/PrivacyInfo.xcprivacy" "$app/"
 if [ -f "$root/assets/r86_tools.iso" ]; then
     cp "$root/assets/r86_tools.iso" "$app/"
 else
@@ -198,7 +199,7 @@ plutil -lint "$app/Info.plist" >/dev/null
 
 # The Watch app: the engine, model, HID table and WatchLink, with the
 # firmware; machines come from the iPhone.
-if [ "$kind" = simulator ] || [ -n "${R86_WATCH_PROFILE:-}" ]; then
+if [ "$kind" = simulator ] || [ -z "${R86_IOS_IDENTITY:-}" ] || [ -n "${R86_WATCH_PROFILE:-}" ]; then
     watch="$app/Watch/r86.app"
     "$apple/build-rust.sh" "$watch_target"
     mkdir -p "$watch"
@@ -215,6 +216,7 @@ if [ "$kind" = simulator ] || [ -n "${R86_WATCH_PROFILE:-}" ]; then
         --minimum-deployment-target 26.0 --target-device watch \
         --app-icon AppIcon --output-partial-info-plist "$out/watch-assets.plist" >/dev/null
     cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" "$watch/"
+    cp "$apple/watch/PrivacyInfo.xcprivacy" "$watch/"
     "$root/ports/licenses.sh" "$watch/licenses"
     cat >"$watch/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

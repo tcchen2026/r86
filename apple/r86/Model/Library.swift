@@ -241,11 +241,12 @@ final class Library {
     }
 
     /// Save edited settings of a stopped machine: (vm.toml key, value).
-    func save(_ id: Machine.ID, _ changes: [(String, String)]) {
-        attempt {
+    func save(_ id: Machine.ID, _ changes: [(String, String)]) -> Bool {
+        let saved = attempt {
             for (key, value) in changes { try R86.set(id, key, value) }
         }
         reload()
+        return saved
     }
 
     func remember(_ url: URL, for id: Machine.ID) {

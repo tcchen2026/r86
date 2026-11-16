@@ -36,7 +36,7 @@ swiftc -O -whole-module-optimization -parse-as-library -swift-version 5 \
     -o "$app/Contents/MacOS/r86" "$@"
 
 cp "$root/firmware/seabios/bios.bin" "$root/firmware/seabios/vgabios-stdvga.bin" \
-    "$apple/r86/r86.icns" "$app/Contents/Resources/"
+    "$apple/r86/r86.icns" "$apple/r86/PrivacyInfo.xcprivacy" "$app/Contents/Resources/"
 # FreeDOS for New Machine, and the DOS that runs Windows 3.1/9x setup: the
 # DOS kit from script/build_freedos_image.py (or the pinned release), with
 # its sources, licenses and provenance inside.

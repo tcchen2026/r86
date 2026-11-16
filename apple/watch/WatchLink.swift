@@ -25,6 +25,13 @@ final class WatchLink: NSObject {
     /// The other device has r86: on the iPhone, a paired Watch with the app;
     /// on the Watch, the iPhone app.
     private(set) var available = false
+    var copyUnavailableReason: String? {
+        #if targetEnvironment(simulator)
+        return "Copying machines requires a real iPhone and Apple Watch."
+        #else
+        return available ? nil : "Pair your iPhone and Apple Watch, then open r86 on both devices."
+        #endif
+    }
     /// The Watch's machines as it last published them (iPhone).
     private(set) var watchMachines: [String] = []
     /// Copies on their way to the other device.
@@ -52,6 +59,9 @@ final class WatchLink: NSObject {
         let library = Library.shared
         guard machine.status == .stopped else {
             return library.show("Turn off \(machine.name) to copy it", systemImage: "exclamationmark.triangle")
+        }
+        if let reason = copyUnavailableReason {
+            return library.show(reason, systemImage: "exclamationmark.triangle")
         }
         let outbox = Self.outbox.appending(path: UUID().uuidString, directoryHint: .isDirectory)
         let disk = outbox.appending(path: URL(filePath: machine.disk).lastPathComponent)

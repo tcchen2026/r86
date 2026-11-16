@@ -85,7 +85,7 @@ struct AboutSection: View {
         Section {
             LabeledContent("Version",
                            value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-            LabeledContent("Guest", value: "32-bit x86 PC (interpreter)")
+            LabeledContent("Guest", value: "32-bit x86 PC")
             LabeledContent("License", value: "Apache-2.0")
         } header: {
             Text("About r86")

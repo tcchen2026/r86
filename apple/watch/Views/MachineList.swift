@@ -35,7 +35,7 @@ struct MachineList: View {
                             Button("Delete", systemImage: "trash", role: .destructive) { deleting = m }
                             Button("Copy to iPhone", systemImage: "iphone") { link.send(m) }
                                 .tint(.blue)
-                                .disabled(!link.available)
+                                .disabled(link.copyUnavailableReason != nil)
                         }
                     }
                 }
@@ -50,7 +50,7 @@ struct MachineList: View {
             .overlay {
                 if library.machines.isEmpty && link.sending.isEmpty {
                     ContentUnavailableView("No Machines", systemImage: "desktopcomputer",
-                                           description: Text("In r86 on your iPhone, turn a machine off and choose Copy to Apple Watch."))
+                                           description: Text("In r86 on your iPhone, turn a machine off, open its edit page and choose Copy to Paired Watch."))
                 }
             }
             .navigationTitle("r86")
