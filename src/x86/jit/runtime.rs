@@ -47,6 +47,8 @@ use super::{
     soft::View,
 };
 use crate::machine::HostBus;
+#[cfg(debug_assertions)]
+use crate::machine::{JitCacheCounters, JitCacheWork, JitClearCause};
 use crate::x86::cpu::{FetchCacheHit, SegmentReg, TranslationRecheck};
 use crate::x86::{
     BackingToken, BatchResult, BatchStop, Bus, Cpu, Interpreter, LinearAddr, PhysAddr,
@@ -362,6 +364,9 @@ pub struct Stats {
     #[cfg(any(test, feature = "jit-profile"))]
     pub cold_batches: u64,
     pub compiled_blocks: u64,
+    /// New admitted page records, including records recreated after a clear.
+    #[cfg(debug_assertions)]
+    pub recorded_pages: u64,
     pub content_changes: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub content_reuses: u64,
@@ -461,6 +466,10 @@ pub struct Engine {
     #[cfg(feature = "jit-profile")]
     unsupported: Box<[u64; 576]>,
     pub stats: Stats,
+    #[cfg(debug_assertions)]
+    clear_causes: [u64; 4],
+    #[cfg(debug_assertions)]
+    last_clear: JitCacheWork,
 }
 
 impl Engine {
@@ -512,6 +521,10 @@ impl Engine {
             #[cfg(feature = "jit-profile")]
             unsupported: Box::new([0; 576]),
             stats: Stats::default(),
+            #[cfg(debug_assertions)]
+            clear_causes: [0; 4],
+            #[cfg(debug_assertions)]
+            last_clear: JitCacheWork::default(),
         })
     }
 
@@ -543,10 +556,39 @@ impl Engine {
 
     pub(crate) fn clear(&mut self, bus: &mut HostBus) -> Result<(), String> {
         self.heat.fill(Heat::default());
-        self.reclaim(bus)
+        self.reclaim(
+            bus,
+            #[cfg(debug_assertions)]
+            JitClearCause::External,
+        )
     }
 
-    fn reclaim(&mut self, bus: &mut HostBus) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    pub(crate) fn cache_counters(&self) -> JitCacheCounters {
+        JitCacheCounters {
+            causes: self.clear_causes,
+            last_clear: self.last_clear,
+            current: JitCacheWork {
+                steps: self.stats.native_steps + self.stats.interpreted_steps,
+                compiled_blocks: self.stats.compiled_blocks,
+                code_bytes: self.stats.code_bytes,
+                recorded_pages: self.stats.recorded_pages,
+            },
+        }
+    }
+
+    fn reclaim(
+        &mut self,
+        bus: &mut HostBus,
+        #[cfg(debug_assertions)] cause: JitClearCause,
+    ) -> Result<(), String> {
+        // Only the rare clear path records work. Frontends poll these plain
+        // counters; no logging or host-clock work enters execution batches.
+        #[cfg(debug_assertions)]
+        {
+            self.clear_causes[cause as usize] += 1;
+            self.last_clear = self.cache_counters().current;
+        }
         self.links.fill(Link::EMPTY);
         self.global_links.fill(0);
         // Rewritten pages lose their nonzero restart identity here. Their
@@ -926,7 +968,17 @@ impl Engine {
                     && self.arena.tables_used() == self.arena.table_capacity()))
         {
             self.stats.table_clears += 1;
-            self.reclaim(bus)?;
+            #[cfg(debug_assertions)]
+            let cause = if self.pages.len() >= ENTRY_TABLES {
+                JitClearCause::PageRecords
+            } else {
+                JitClearCause::EntryTable
+            };
+            self.reclaim(
+                bus,
+                #[cfg(debug_assertions)]
+                cause,
+            )?;
             (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
         }
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
@@ -985,7 +1037,11 @@ impl Engine {
                     .is_none_or(|page| page.entries.native().is_none())
             {
                 self.stats.table_clears += 1;
-                self.reclaim(bus)?;
+                self.reclaim(
+                    bus,
+                    #[cfg(debug_assertions)]
+                    JitClearCause::EntryTable,
+                )?;
                 (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
             }
             let entry = match self.arena.publish_block(&mut code) {
@@ -994,7 +1050,11 @@ impl Engine {
                     // No active native stack exists here; reclaiming an arena
                     // invalidates all handles, lookup entries and pending edges.
                     // Emitted blocks contain no old-arena/table addresses.
-                    self.reclaim(bus)?;
+                    self.reclaim(
+                        bus,
+                        #[cfg(debug_assertions)]
+                        JitClearCause::CodeArea,
+                    )?;
                     (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
                     self.arena.publish_block(&mut code)
                 }
@@ -1009,10 +1069,13 @@ impl Engine {
                 .map_err(|error| format!("JIT linked entry: {error:?}"))?;
             (Some(NativeBlock { body }), code.faults, code.edges)
         };
-        let page = self
-            .pages
-            .entry(key)
-            .or_insert_with(|| CompiledPage::new(version, version_ptr, &mut self.arena));
+        let page = self.pages.entry(key).or_insert_with(|| {
+            #[cfg(debug_assertions)]
+            {
+                self.stats.recorded_pages += 1;
+            }
+            CompiledPage::new(version, version_ptr, &mut self.arena)
+        });
         page.version = version;
         {
             let content = &mut page.content;

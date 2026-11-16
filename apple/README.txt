@@ -68,10 +68,13 @@ Contracts:
   (ws_frontend::Remote) on the first free port of 127.0.0.1:8086-8095. Only
   this Mac can connect; it ends when the VM turns off, and the console's
   Power off turns the VM off. Listening needs the network.server entitlement.
-- Logs: only a fatal error writes one, $HOME/r86/logs/<VM folder>.log, with
-  the machine's state, the run's events and serial output kept in memory
-  until then (src/frontend/run_log.rs). The VM window shows the error and
-  Show Log.
+- Logs: fatal errors write $HOME/r86/logs/<VM folder>.log and retain Show Log.
+  Every build records undefined opcodes and saves those runs on clean exit.
+  Debug builds (cfg(debug_assertions)) also record native-JIT clears and write
+  a summary on clean exit; normal Release builds have no added JIT logging.
+  Xcode Debug uses Cargo's dev profile through apple/build-rust.sh. For an
+  optimized diagnostic build, set CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true
+  with --release. See design/CONFIGURATION.md, Native VM run logs.
 
 iPhone and iPad (ios/, iOS 26; interpreter, or the Wasm JIT in fast mode)
 

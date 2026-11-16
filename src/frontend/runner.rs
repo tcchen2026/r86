@@ -389,6 +389,7 @@ impl Core {
                 (State::Failed, Some(format!("r86 internal error: {text}")))
             }
         };
+        run_log::poll(&self.machine);
         let flushed =
             (self.machine.flush_disks().err()).map(|err| format!("Disk flush failed: {err}"));
         // A stop or panic already wrote the run's report.
@@ -469,6 +470,7 @@ impl Core {
                 Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
                 None => self.machine.run_steps(SLICE_STEPS)?,
             };
+            run_log::poll(&self.machine);
             self.pump_audio();
             if self.machine.reset_count() != self.boots {
                 self.boots = self.machine.reset_count();

@@ -11,6 +11,39 @@ mod sound_tests;
 mod undefined_opcode_tests;
 #[cfg(test)]
 mod usb_tests;
+/// Reasons for discarding an ARM64 whole-code cache. Dispatch invalidations in
+/// other backends are different events, not these four causes.
+#[derive(Clone, Copy)]
+#[cfg(debug_assertions)]
+pub enum JitClearCause {
+    CodeArea,
+    PageRecords,
+    EntryTable,
+    External,
+}
+
+/// Cumulative work. Steps count executed/attempted instructions, excluding
+/// deterministic halted-time skips; code bytes exclude the shared entry stub.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(debug_assertions)]
+pub struct JitCacheWork {
+    pub steps: u64,
+    pub compiled_blocks: u64,
+    pub code_bytes: u64,
+    pub recorded_pages: u64,
+}
+
+/// No formatting, callback or host clock in the core. The last-clear snapshot
+/// gives exact work through that clear; several clears between frontend polls
+/// are reported together, with exact cumulative causes and combined work.
+#[derive(Clone, Copy, Debug, Default)]
+#[cfg(debug_assertions)]
+pub struct JitCacheCounters {
+    pub causes: [u64; 4],
+    pub last_clear: JitCacheWork,
+    pub current: JitCacheWork,
+}
+
 use bus_diagnostics::BusDiagnostics;
 pub use bus_diagnostics::{
     BUS_PAGE_LOG_LIMIT, BusCounter, BusSpace, BusWarning, UNDEFINED_OPCODE_LIMIT, UndefinedOpcode,
@@ -1178,6 +1211,17 @@ impl Machine {
     #[cfg(all(feature = "r86chip", target_arch = "riscv32"))]
     pub fn chip_jit_stats(&self) -> Option<&crate::chipjit::runtime::Stats> {
         self.chip_jit.as_ref().map(|engine| &engine.stats)
+    }
+
+    /// Plain snapshots for frontend run logs, read once per slice/frame. Other
+    /// JITs do not expose these whole-cache causes and are left unchanged.
+    #[cfg(debug_assertions)]
+    pub fn jit_cache_counters(&self) -> Option<JitCacheCounters> {
+        #[cfg(a64_jit)]
+        if let Some(jit) = &self.jit {
+            return Some(jit.cache_counters());
+        }
+        None
     }
 
     pub fn jit_report(&self) -> String {

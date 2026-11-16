@@ -9,7 +9,8 @@
 //! and the panel shows the address instead of returning to the library.
 //!
 //! A fatal error ends the session with a report in the run's log
-//! (run_log.rs); the run's events are kept for it in memory.
+//! (run_log.rs); clean runs also save events after an undefined opcode, or in
+//! debug builds after native-JIT execution.
 use std::cell::RefCell;
 use std::fs::File;
 use std::net::TcpListener;
@@ -235,6 +236,7 @@ fn run_locked(
         session.notify(&format!("{}: r86 menu", device.menu_keys()));
     }
     let result = session.run(device, canvas);
+    run_log::poll(&session.machine);
     let display_closed = device.set_hdmi(false, &session.vm.name);
     let flushed = session.machine.flush_disks();
     let failed = [
@@ -331,6 +333,7 @@ impl Session<'_> {
                 Some(remote) => remote.run_slice(&mut self.machine, SLICE_STEPS)?,
                 None => self.machine.run_steps(SLICE_STEPS)?,
             };
+            run_log::poll(&self.machine);
             self.audio.pump(&mut self.machine)?;
             let mut idle = None;
             match report.stop {
