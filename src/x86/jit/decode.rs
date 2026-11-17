@@ -626,7 +626,7 @@ impl Reader<'_> {
         if repeat && !matches!(opcode, 0xa4..=0xa6 | 0xaa..=0xaf) {
             return None;
         }
-        // PM16 strings keep their shared interpreter boundary in this pilot.
+        // PM16 strings keep their shared interpreter boundary.
         if self.code16 && matches!(opcode, 0x6c..=0x6f | 0xa4..=0xa7 | 0xaa..=0xaf) {
             return None;
         }

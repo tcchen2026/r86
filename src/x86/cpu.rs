@@ -1546,7 +1546,7 @@ impl Cpu {
     #[inline(always)]
     pub fn set_seg_cache(&mut self, seg: SegmentReg, cache: SegmentCache) {
         #[cfg(any(
-            feature = "jit",
+            all(feature = "jit", not(a64_jit)),
             all(feature = "r86chip-native", target_arch = "riscv32")
         ))]
         let previous = self.segments[seg as usize];
@@ -1567,21 +1567,13 @@ impl Cpu {
             if was_user != (self.cached_cpl == 3) {
                 self.invalidate_fetch_translations();
             }
-            #[cfg(feature = "jit")]
-            if previous != cache {
-                // A64 context ids qualify CS base and D. CODE16 bodies check
-                // the live CS limit; 32-bit entry requires the full limit.
-                // No other CS attribute specializes generated code: paging
-                // privilege has its own plane, POPF/CLI use the entry mask,
-                // and CS data reads check the refreshed readable-code grant.
-                // Descriptor loads already validate presence/type/privilege.
-                let same_code = cfg!(a64_jit)
-                    || (previous.base == cache.base
-                        && previous.limit == cache.limit
-                        && (previous.flags ^ cache.flags) & !0x60 == 0);
-                if !same_code {
-                    self.invalidate_jit_fetch_context();
-                }
+            // A64 context ids qualify CS base/D; entry checks the live limit.
+            #[cfg(all(feature = "jit", not(a64_jit)))]
+            if previous.base != cache.base
+                || previous.limit != cache.limit
+                || (previous.flags ^ cache.flags) & !0x60 != 0
+            {
+                self.invalidate_jit_fetch_context();
             }
             self.fetch_cursor.invalidate();
             self.translation_cache

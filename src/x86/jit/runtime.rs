@@ -390,8 +390,6 @@ pub struct Stats {
     #[cfg(any(test, feature = "jit-profile"))]
     pub global_link_retags: u64,
     #[cfg(any(test, feature = "jit-profile"))]
-    pub interned_contexts: u64,
-    #[cfg(any(test, feature = "jit-profile"))]
     pub context_clears: u64,
     #[cfg(feature = "jit-profile")]
     pub native_pm16_steps: u64,
@@ -401,12 +399,6 @@ pub struct Stats {
     /// memory, other (including dispatch/admission and budget/attention).
     #[cfg(feature = "jit-profile")]
     pub exit_reasons: [u64; 6],
-    #[cfg(feature = "jit-profile")]
-    pub link_single_retirements: u64,
-    #[cfg(feature = "jit-profile")]
-    pub link_scan_fallbacks: u64,
-    #[cfg(feature = "jit-profile")]
-    pub write_alias_scans: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub native_memory_reads: u64,
     #[cfg(any(test, feature = "jit-profile"))]
@@ -557,11 +549,7 @@ impl Engine {
             link_epoch: 1,
             #[cfg(feature = "jit-profile")]
             unsupported: Box::new([0; 576]),
-            stats: Stats {
-                #[cfg(any(test, feature = "jit-profile"))]
-                interned_contexts: 1,
-                ..Stats::default()
-            },
+            stats: Stats::default(),
             #[cfg(debug_assertions)]
             clear_causes: [0; 4],
             #[cfg(debug_assertions)]
@@ -729,10 +717,6 @@ impl Engine {
         }
         let id = (self.contexts.len() + 1) as u16;
         self.contexts.insert(context, id);
-        #[cfg(any(test, feature = "jit-profile"))]
-        {
-            self.stats.interned_contexts += 1;
-        }
         id
     }
 
@@ -908,10 +892,6 @@ impl Engine {
             self.retire_code_page(ram_page, version_ptr);
             return;
         }
-        #[cfg(feature = "jit-profile")]
-        {
-            self.stats.link_scan_fallbacks += 1;
-        }
         for (link, stamp) in self.links.iter_mut().zip(self.stamps.iter()) {
             if link.tag != 0 {
                 // SAFETY: a published nonzero tag owns a stable CodePages cell.
@@ -937,10 +917,6 @@ impl Engine {
             .map(core::mem::take)
             .unwrap_or_default();
         if let Some(slot) = aliases.single() {
-            #[cfg(feature = "jit-profile")]
-            {
-                self.stats.link_single_retirements += 1;
-            }
             if let Some(slot) = slot {
                 let stamp = &self.stamps[slot];
                 if stamp.version_ptr == version_ptr && stamp.version != version {
@@ -948,10 +924,6 @@ impl Engine {
                 }
             }
             return;
-        }
-        #[cfg(feature = "jit-profile")]
-        {
-            self.stats.link_scan_fallbacks += 1;
         }
         for (link, stamp) in self.links.iter_mut().zip(self.stamps.iter()) {
             if stamp.version_ptr == version_ptr && stamp.version != version {
@@ -1066,10 +1038,6 @@ impl Engine {
                 // compared again on a later count-only lookup: ordinary writes
                 // to an unwatched page do not change that version cell.
                 let (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-                #[cfg(feature = "jit-profile")]
-                {
-                    self.stats.write_alias_scans = bus.jit_write_alias_scans();
-                }
                 page.version = version;
                 #[cfg(feature = "jit-profile")]
                 if entry == INTERPRET {
@@ -1113,10 +1081,6 @@ impl Engine {
             self.stats.admissions += 1;
         }
         let (_, mut version, mut version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-        #[cfg(feature = "jit-profile")]
-        {
-            self.stats.write_alias_scans = bus.jit_write_alias_scans();
-        }
         // Counted-only pages consume no entry table or CompiledPage. Bound the
         // admitted page metadata as before, outside any active native stack.
         let new_page = !self.pages.contains_key(&key);
@@ -1138,10 +1102,6 @@ impl Engine {
                 cause,
             )?;
             (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-            #[cfg(feature = "jit-profile")]
-            {
-                self.stats.write_alias_scans = bus.jit_write_alias_scans();
-            }
         }
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
         let compilation_start = std::time::Instant::now();
@@ -1210,10 +1170,6 @@ impl Engine {
                     JitClearCause::EntryTable,
                 )?;
                 (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-                #[cfg(feature = "jit-profile")]
-                {
-                    self.stats.write_alias_scans = bus.jit_write_alias_scans();
-                }
             }
             let entry = match self.arena.publish_block(&mut code) {
                 Err(CodeError::Capacity) => {
@@ -1227,10 +1183,6 @@ impl Engine {
                         JitClearCause::CodeArea,
                     )?;
                     (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
-                    #[cfg(feature = "jit-profile")]
-                    {
-                        self.stats.write_alias_scans = bus.jit_write_alias_scans();
-                    }
                     self.arena.publish_block(&mut code)
                 }
                 result => result,

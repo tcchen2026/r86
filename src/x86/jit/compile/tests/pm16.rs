@@ -739,7 +739,7 @@ fn native_pm16_segment_loads_keep_the_chain_and_refresh_based_access() {
             same(&cpu, &expected);
             assert_eq!(cpu.seg(seg), expected.seg(seg));
             assert_eq!(cpu.regs[0] & 0xffff, 0xbeef);
-            assert_eq!(soft::View::block_facts(&cpu), soft::CODE16 | soft::STACK16);
+            assert_eq!(soft::View::block_facts(&cpu), soft::CODE16);
             assert_eq!(
                 memory
                     .0

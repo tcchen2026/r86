@@ -54,17 +54,14 @@ fn expand_down_fact(segment: u8) -> u32 {
 }
 
 pub const CODE16: u32 = 1 << 30;
-pub const STACK16: u32 = 1 << 31;
 
 #[repr(C)]
 pub struct View {
     entries: *mut LinearTranslationCacheEntry,
     // Native X16: low data-context bits plus the fixed CS base in the high half.
     state: u64,
-    // Four six-bit segment masks, SS.B at bit 6 and ES/SS/DS kind facts.
-    // A flat stack fact also
-    // proves this bit; a non-flat stack checks it before the based access.
-    // W7 mirrors this; a segment helper refreshes it before native continuation.
+    // W7: four segment masks, SS.B at bit 6, ES/SS/DS kind facts.
+    // Segment helpers refresh it; a flat stack fact also proves SS.B.
     permissions: u32,
     bases: [u32; 6],
     limits: [u32; 6],
@@ -158,15 +155,7 @@ impl View {
     /// The adapter qualifies each link with these facts and the CS base.
     pub fn block_facts(cpu: &Cpu) -> u32 {
         if cpu.code_default16() {
-            return CODE16
-                | if cpu.seg(crate::x86::cpu::SegmentReg::Ss).flags
-                    & crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG
-                    == 0
-                {
-                    STACK16
-                } else {
-                    0
-                };
+            return CODE16; // Eligibility requires SS.B=0; native helpers cannot load SS.
         }
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
         ((flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS)
@@ -390,14 +379,14 @@ impl Guard<'_> {
 }
 
 pub fn stack_guard(a: &mut Assembler, guard: Guard<'_>) {
-    if guard.segments.get() & STACK16 == 0 {
+    if guard.segments.get() & CODE16 == 0 {
         guard.require(a, 6, guard.miss);
     }
 }
 
 pub fn stack_address(guard: Guard<'_>) -> Address {
     Address {
-        bits: if guard.segments.get() & STACK16 != 0 {
+        bits: if guard.segments.get() & CODE16 != 0 {
             16
         } else {
             32
@@ -425,7 +414,7 @@ pub fn stack_range(a: &mut Assembler, bytes: u8, write: bool, guard: Guard<'_>) 
         address.displacement = 0u32.wrapping_sub(u32::from(bytes));
     }
     let based = based_segment(guard.segments.get(), address.segment, write);
-    if guard.segments.get() & STACK16 != 0 {
+    if guard.segments.get() & CODE16 != 0 {
         // Multi-slot proofs cannot cross SP's wrap point, even with a larger
         // segment limit. The interpreter handles those partial-frame cases.
         let offset = emit_address(a, ADDRESS, address);

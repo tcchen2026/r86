@@ -131,8 +131,6 @@ pub struct CodePages {
     versions: Vec<Cell<u64>>,
     #[cfg(a64_jit)]
     write_aliases: Vec<Cell<AliasSlot>>,
-    #[cfg(all(a64_jit, feature = "jit-profile"))]
-    pub(crate) write_alias_scans: u64,
 }
 
 impl CodePages {
@@ -145,8 +143,6 @@ impl CodePages {
             // The first promotion scans; later grants are tracked at fill.
             #[cfg(a64_jit)]
             write_aliases: alloc::vec![Cell::new(AliasSlot::MANY); bytes.div_ceil(4096)],
-            #[cfg(all(a64_jit, feature = "jit-profile"))]
-            write_alias_scans: 0,
         }
     }
 
@@ -198,12 +194,7 @@ impl CodePages {
 
     #[cfg(a64_jit)]
     pub(crate) fn take_write_alias(&mut self, page: usize) -> AliasSlot {
-        let aliases = self.write_aliases[page].replace(AliasSlot::default());
-        #[cfg(feature = "jit-profile")]
-        {
-            self.write_alias_scans += u64::from(aliases.single().is_none());
-        }
-        aliases
+        self.write_aliases[page].replace(AliasSlot::default())
     }
 
     fn retire_epoch(&mut self) {

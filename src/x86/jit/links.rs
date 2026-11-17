@@ -6,7 +6,7 @@
 //! such a write itself. Its second level holds one native
 //! entry per byte offset. After a mapping-epoch change, validating the page restores
 //! all its compiled entries at once. Supervisor/user planes qualify privilege;
-//! Stable context ids qualify CS base and flat DS/ES/SS facts; a different
+//! Stable context ids qualify CS base and compiled facts; a different
 //! context cannot pass even an execute-walk recheck. Returning to a context
 //! can reuse its links. Exhausting the ids clears both planes before reuse.
 //! Relevant control changes expire mappings independently of these ids.

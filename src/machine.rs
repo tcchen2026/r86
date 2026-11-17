@@ -3015,13 +3015,6 @@ impl HostBus {
         Some((page, pages.version_ptr(page)))
     }
 
-    #[cfg(all(a64_jit, feature = "jit-profile"))]
-    pub(crate) fn jit_write_alias_scans(&self) -> u64 {
-        self.jit_code_pages
-            .as_ref()
-            .map_or(0, |pages| pages.write_alias_scans)
-    }
-
     #[cfg(any(
         all(feature = "wasm-jit", target_arch = "wasm32"),
         a64_jit,

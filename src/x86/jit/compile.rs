@@ -899,7 +899,7 @@ fn push(
         a,
         guest_reg(4),
         -i32::from(stack_bytes),
-        site.segments.get() & soft::STACK16 != 0,
+        site.segments.get() & soft::CODE16 != 0,
     );
 }
 
@@ -1447,11 +1447,9 @@ pub fn entry() -> Result<CompiledEntry, EmitError> {
 #[cfg(a64_jit)]
 pub(super) const ONE_INSTRUCTION_ENTRY: u32 = 0xf100_077b;
 
-/// `block_facts` (flat segment qualifications) are
-/// proven by the adapter for every entry into this
-/// code, including linked edges. They remain constant throughout a native
-/// invocation: a segment load exits if these qualifications change. Pass zero
-/// when the adapter supplies no such specialization.
+/// The adapter proves `block_facts` on every entry, including linked edges.
+/// A segment load exits if these compiled qualifications change. Pass zero
+/// when the adapter supplies no specialization.
 pub fn block(
     block: &Block,
     page: Option<super::links::Page>,
@@ -1460,7 +1458,6 @@ pub fn block(
     assert!(!block.instructions.is_empty() && block.instructions.len() < 4096);
     let count = block.instructions.len() as u16;
     let code16 = block_facts & soft::CODE16 != 0;
-    let stack16 = block_facts & soft::STACK16 != 0;
     let needed = flag_requirements(block);
     // These cached biases are for flat offsets; a based access also needs its
     // live segment addition. Keep the existing ranges for every proven flat op.
@@ -1474,8 +1471,7 @@ pub fn block(
             *range = None;
         }
     }
-    let stack_based = soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, true)
-        || soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, false);
+    let stack_based = soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, true);
     let memory_count = block
         .instructions
         .iter()
@@ -1613,7 +1609,7 @@ pub fn block(
                 // and any accessed-bit write precede the ESP commit.
                 read_stack(&mut a, LHS, 16, site, &mut faults, false);
                 soft::load_segment(&mut a, segment, site.miss);
-                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), stack16);
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), code16);
             }
             Op::PushSegment { segment, bits } => {
                 a.load_store(
@@ -1806,7 +1802,7 @@ pub fn block(
                 a.logical(0, RESULT, RESULT, FLAGS, false); // Bits that became set.
                 a.load_store(false, FLAGS, FRAME, offset_of!(Frame, eflags) as u32, 2);
                 unpack_flags(&mut a);
-                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), stack16);
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), code16);
                 // An enabled IRQ must be observed immediately after POPF,
                 // even when CLI earlier in this chain disabled it only briefly.
                 let attention = a.label();
@@ -2281,7 +2277,7 @@ pub fn block(
                 );
                 // Use the old frame pointer for ESP before replacing BP/EBP.
                 // A fault above leaves both registers and all flags untouched.
-                stack_adjust(&mut a, guest_reg(5), i32::from(bits / 8), stack16);
+                stack_adjust(&mut a, guest_reg(5), i32::from(bits / 8), code16);
                 write_register(
                     &mut a,
                     Register {
@@ -2688,7 +2684,7 @@ pub fn block(
                 // POP ESP replaces the increment with its loaded value. For
                 // POP SP, increment first, then merge the low half as usual.
                 if dst.bits != 32 || dst.index != 4 {
-                    stack_adjust(&mut a, guest_reg(4), i32::from(dst.bits / 8), stack16);
+                    stack_adjust(&mut a, guest_reg(4), i32::from(dst.bits / 8), code16);
                 }
                 if dst.bits != 32 {
                     write_register(&mut a, dst, RESULT);
@@ -2713,7 +2709,7 @@ pub fn block(
                         true,
                     ));
                 }
-                stack_adjust(&mut a, guest_reg(4), -i32::from(bits), stack16);
+                stack_adjust(&mut a, guest_reg(4), -i32::from(bits), code16);
             }
             Op::PopAll { bits } => {
                 debug_assert!(stack_cached);
@@ -2758,7 +2754,7 @@ pub fn block(
                         );
                     }
                 }
-                stack_adjust(&mut a, guest_reg(4), i32::from(bits), stack16);
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits), code16);
             }
             Op::Push { src, bits } => {
                 let value = match src {
@@ -2815,7 +2811,7 @@ pub fn block(
                     soft::code_limit(&mut a, LHS, fail);
                 }
                 let adjust = u32::from(pop) + u32::from(bits / 8);
-                stack_adjust(&mut a, guest_reg(4), adjust as i32, stack16);
+                stack_adjust(&mut a, guest_reg(4), adjust as i32, code16);
             }
             Op::IndirectJump { src } => {
                 read_value(&mut a, LHS, src, site.as_ref(), &mut faults);
@@ -2878,8 +2874,7 @@ pub fn block(
             a.b(done);
         }
         Op::LoadSegment { .. } | Op::PopSegment { .. } => {
-            // Dynamic segment state is refreshed; a changed specialization
-            // must retire old links in the adapter before another block runs.
+            // Changed compiled facts require selecting a context before linking.
             a.mov_imm(PC, last.next_eip.into(), false);
             a.tbz(Reg::new(4), 1, true, done);
             emit_edge(&mut a, page, Some(last.next_eip), false, done, &mut edges);
