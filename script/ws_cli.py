@@ -34,6 +34,9 @@ Transport
 The same port serves the embedded browser console at http://HOST:PORT/ and
 plain RFC 6455 WebSocket at /ws (legacy / also works). This client
 uses ``websockets.sync.client`` and does not use TLS or protocol extensions.
+A browser must connect from the console's own origin (Origin equal to
+http://Host or https://Host, ignoring ASCII case) or the upgrade gets
+HTTP 403; clients that send no Origin, like this one, are accepted.
 
 The iOS app's LAN console requires a six-digit access code, regenerated each
 time remote management starts. Its page URL includes ``?code=NNNNNN``; the

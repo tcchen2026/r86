@@ -7,12 +7,6 @@ or review and not yet re-checked against this commit.
 
 Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
-## P0: a guest or the network can hang or kill the emulator
-
-- host: one WebSocket text frame with a `\u` escape followed by a
-  multi-byte character panics `parse_json_string`
-  (src/frontend/protocol.rs); release builds abort on panic.
-
 ## P1: large speed cost, or ordinary guests hit it
 
 - device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
@@ -35,8 +29,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   rounding control ignored, tag word and deferred exceptions not modelled,
   transcendental functions approximated. [?]
 - cpu: TF single-step traps and DR0-DR3 breakpoints are not delivered. [?]
-- host: the console WebSocket accepts any Origin; a web page open in a
-  LAN browser can drive the VM (`WebSocket::accept`, src/frontend/ws.rs).
 
 ## P2: specific guests or drivers; smaller or unmeasured cost; bad input
 
@@ -66,6 +58,9 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   interrupt; ATAPI lacks READ SUB-CHANNEL and reports medium type 0 with
   an empty drive. [?]
 - device: the ACPI tables declare an MPU-401 at 330h that does not exist.
+- host: the console checks a browser's Origin only against the Host
+  header; a DNS-rebinding page can still connect (`WebSocket::accept`,
+  src/frontend/ws.rs).
 - host: `files-get` reads a whole guest file into memory; an interrupted
   `files-put` overwrite loses the original; a disc built from uploaded
   files is staged in RAM with no entry limit. [?]

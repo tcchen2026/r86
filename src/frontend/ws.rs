@@ -148,6 +148,27 @@ impl WebSocket {
             )?;
             return Ok(None);
         }
+        // Scripts omit Origin; browsers must name this exact host and port.
+        let origin_matches = match (
+            unique_header(&request, "origin"),
+            unique_header(&request, "host"),
+        ) {
+            (Ok(None), Ok(_)) => true,
+            (Ok(Some(origin)), Ok(Some(host))) => {
+                origin.eq_ignore_ascii_case(&format!("http://{host}"))
+                    || origin.eq_ignore_ascii_case(&format!("https://{host}"))
+            }
+            _ => false,
+        };
+        if !origin_matches {
+            http_reply(
+                &mut stream,
+                "403 Forbidden",
+                "text/plain",
+                b"Origin denied\n",
+            )?;
+            return Ok(None);
+        }
         if let Some(access) = access
             && !access.accepts(query)?
         {
@@ -725,39 +746,46 @@ fn sha256_digest(input: &[u8]) -> [u8; 32] {
 mod tests {
     use super::*;
 
+    fn accept_request(
+        access: Option<Arc<AccessCode>>,
+        path: &str,
+        upgrade: bool,
+        headers: &str,
+    ) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            WebSocket::accept(listener.accept().unwrap().0, access.as_deref())
+                .unwrap()
+                .is_some()
+        });
+        let upgrade_headers = if upgrade {
+            "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        } else {
+            ""
+        };
+        write!(
+            client,
+            "GET {path} HTTP/1.1\r\n{headers}{upgrade_headers}\r\n"
+        )
+        .unwrap();
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).unwrap();
+        let response = String::from_utf8_lossy(&bytes).into_owned();
+        assert_eq!(
+            server.join().unwrap(),
+            response.starts_with("HTTP/1.1 101 ")
+        );
+        response
+    }
+
     #[test]
     fn websocket_upgrade_access_code_and_cooldown() {
-        fn request(access: Option<Arc<AccessCode>>, path: &str, upgrade: bool) -> String {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-            client
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
-            let server = std::thread::spawn(move || {
-                WebSocket::accept(listener.accept().unwrap().0, access.as_deref())
-                    .unwrap()
-                    .is_some()
-            });
-            let headers = if upgrade {
-                "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
-            } else {
-                ""
-            };
-            write!(
-                client,
-                "GET {path} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n"
-            )
-            .unwrap();
-            let mut bytes = Vec::new();
-            client.read_to_end(&mut bytes).unwrap();
-            let response = String::from_utf8_lossy(&bytes).into_owned();
-            assert_eq!(
-                server.join().unwrap(),
-                response.starts_with("HTTP/1.1 101 ")
-            );
-            response
-        }
-
+        let request =
+            |access, path, upgrade| accept_request(access, path, upgrade, "Host: localhost\r\n");
         let access = Arc::new(AccessCode {
             code: "012345".into(),
             blocked_until: Mutex::new(None),
@@ -789,6 +817,76 @@ mod tests {
         upgraded(request(None, "/ws", true));
         upgraded(request(None, "/", true));
         assert!(request(None, "/access", false).ends_with("\r\n\r\nopen"));
+    }
+
+    #[test]
+    fn websocket_upgrade_checks_origin() {
+        for headers in [
+            "Host: localhost\r\n",
+            "Host: localhost\r\nOrigin: http://localhost\r\n",
+            "Host: localhost\r\nOrigin: https://localhost\r\n",
+            "hOsT: LocalHost:8765\r\noRiGiN: HTTP://LOCALHOST:8765\r\n",
+            "Host: [::1]:8765\r\nOrigin: http://[::1]:8765\r\n",
+        ] {
+            for path in ["/ws", "/"] {
+                let response = accept_request(None, path, true, headers);
+                assert!(
+                    response.starts_with("HTTP/1.1 101 "),
+                    "{headers}: {response}"
+                );
+            }
+        }
+        for headers in [
+            "Host: localhost\r\nOrigin: http://foreign.example\r\n",
+            "Host: localhost\r\nOrigin: null\r\n",
+            "Host: localhost\r\nOrigin: \r\n",
+            "Host: localhost\r\nOrigin: ws://localhost\r\n",
+            "Host: localhost\r\nOrigin: http://localhost/\r\n",
+            "Host: localhost\r\nOrigin: http://localhost.evil\r\n",
+            "Host: localhost:8765\r\nOrigin: http://localhost:8766\r\n",
+            "Host: localhost:8765\r\nOrigin: http://localhost\r\n",
+            "Origin: http://localhost\r\n",
+            "Host: localhost\r\nHost: localhost\r\n",
+            "Host: localhost\r\nHost: foreign.example\r\nOrigin: http://localhost\r\n",
+            "Host: localhost\r\nOrigin: http://localhost\r\nOrigin: http://foreign.example\r\n",
+        ] {
+            for path in ["/ws", "/"] {
+                let response = accept_request(None, path, true, headers);
+                assert!(
+                    response.starts_with("HTTP/1.1 403 "),
+                    "{headers}: {response}"
+                );
+            }
+        }
+        let page = accept_request(
+            None,
+            "/",
+            false,
+            "Host: localhost\r\nOrigin: http://foreign.example\r\n",
+        );
+        assert!(page.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn websocket_rejected_origin_does_not_start_access_code_cooldown() {
+        let access = Arc::new(AccessCode {
+            code: "012345".into(),
+            blocked_until: Mutex::new(None),
+        });
+        let denied = accept_request(
+            Some(access.clone()),
+            "/ws?code=999999",
+            true,
+            "Host: localhost\r\nOrigin: http://foreign.example\r\n",
+        );
+        assert!(denied.starts_with("HTTP/1.1 403 Forbidden\r\n"));
+        let accepted = accept_request(
+            Some(access),
+            "/ws?code=012345",
+            true,
+            "Host: localhost\r\nOrigin: http://localhost\r\n",
+        );
+        assert!(accepted.starts_with("HTTP/1.1 101 Switching Protocols\r\n"));
     }
 
     #[test]

@@ -399,6 +399,19 @@ pub fn number_token(value: &str) -> &str {
 }
 
 pub fn parse_json_string(value: &str) -> Result<String, String> {
+    fn code_unit(bytes: &[u8], index: &mut usize) -> Result<u32, String> {
+        let digits = bytes
+            .get(*index + 1..*index + 5)
+            .ok_or("short JSON unicode escape")?;
+        let mut unit = 0;
+        for &digit in digits {
+            // Exactly four ASCII hex digits: no sign, no byte of a multi-byte character.
+            unit = unit * 16 + u32::from(hex_nibble(digit).ok_or("invalid JSON unicode escape")?);
+        }
+        *index += 4;
+        Ok(unit)
+    }
+
     let bytes = value.as_bytes();
     if bytes.first() != Some(&b'"') {
         return Err("JSON string does not start with quote".to_string());
@@ -423,17 +436,21 @@ pub fn parse_json_string(value: &str) -> Result<String, String> {
                     b'r' => out.push('\r'),
                     b't' => out.push('\t'),
                     b'u' => {
-                        let end = index + 5;
-                        if end > bytes.len() {
-                            return Err("short JSON unicode escape".to_string());
+                        let mut scalar = code_unit(bytes, &mut index)?;
+                        if (0xd800..=0xdbff).contains(&scalar) {
+                            if bytes.get(index + 1..index + 3) != Some(b"\\u") {
+                                return Err("missing JSON low surrogate".to_string());
+                            }
+                            index += 2;
+                            let low = code_unit(bytes, &mut index)?;
+                            if !(0xdc00..=0xdfff).contains(&low) {
+                                return Err("invalid JSON low surrogate".to_string());
+                            }
+                            scalar = 0x10000 + ((scalar - 0xd800) << 10) + (low - 0xdc00);
                         }
-                        let digits = &value[index + 1..end];
-                        let scalar = u32::from_str_radix(digits, 16)
-                            .map_err(|_| "invalid JSON unicode escape".to_string())?;
                         let ch = char::from_u32(scalar)
                             .ok_or_else(|| "invalid JSON unicode scalar".to_string())?;
                         out.push(ch);
-                        index = end - 1;
                     }
                     other => return Err(format!("unsupported JSON escape {other:#x}")),
                 }
@@ -544,4 +561,70 @@ pub fn parse_usb_tablet(json: &str) -> Result<(u16, u16, u8, i8), String> {
         return Err("usb-tablet buttons must be 0..7 and wheel -127..127".into());
     }
     Ok((x, y, buttons as u8, wheel as i8))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_unicode_escapes_require_four_ascii_hex_digits() {
+        for value in [
+            r#""\u123é""#,
+            r#""\u12€""#,
+            r#""\u1😀""#,
+            r#""\ué00""#,
+            r#""\u+123""#,
+            r#""\u12x4""#,
+            r#""\u12""#,
+            r#""\u"#,
+        ] {
+            assert!(parse_json_string(value).is_err(), "{value}");
+        }
+        assert_eq!(
+            parse_json_string(r#""\u0000\u0041\u00e9\uFFFF""#).unwrap(),
+            "\0Aé\u{ffff}"
+        );
+    }
+
+    #[test]
+    fn json_unicode_surrogates_decode_only_in_pairs() {
+        assert_eq!(
+            json_string(
+                r#"{"text":"é\uD83D\uDE00!\ud800\udc00\udbff\udfff"}"#,
+                "text"
+            )
+            .unwrap(),
+            Some("é😀!\u{10000}\u{10ffff}".into())
+        );
+        for value in [
+            r#""\uD800""#,
+            r#""\uDBFF""#,
+            r#""\uDC00""#,
+            r#""\uDFFF""#,
+            r#""\uD800x\uDC00""#,
+            r#""\uD800\u0041""#,
+            r#""\uD800\uD800""#,
+            r#""\uD800\u12é""#,
+            r#""\uD800\uDC""#,
+        ] {
+            assert!(parse_json_string(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn json_helpers_keep_utf8_slice_boundaries() {
+        assert_eq!(
+            json_string(r#"{"é":"😀\n漢"}"#, "é").unwrap(),
+            Some("😀\n漢".into())
+        );
+        assert!(json_value(r#"{"é"😀}"#, "é").is_err());
+        assert_eq!(number_token("123é"), "123");
+        assert_eq!(number_token("-12😀"), "-12");
+        assert_eq!(number_token("é"), "");
+        assert!(json_u64(r#"{"n":é}"#, "n").is_err());
+        assert!(json_i64(r#"{"n":-é}"#, "n").is_err());
+        assert!(memory_integer(r#"{"n":12é}"#, "n").is_err());
+        assert!(parse_hex_bytes("é").is_err());
+    }
 }
