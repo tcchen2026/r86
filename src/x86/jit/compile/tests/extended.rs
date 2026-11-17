@@ -239,7 +239,7 @@ fn native_extended_stack_faults_preserve_uncommitted_state() {
 }
 
 #[test]
-fn native_extended_stack_qualification_exits_before_any_effect() {
+fn native_extended_based_stack_runs_and_word_stack_exits_before_any_effect() {
     for opcode in [0x60, 0x61] {
         let bytes = [opcode];
         let code = fixture(&bytes, 0x100);
@@ -259,13 +259,19 @@ fn native_extended_stack_qualification_exits_before_any_effect() {
             let mut actual_bus = Memory(expected_bus.0.clone());
             let before = actual.clone();
             let frame = invoke(&code, &mut actual, &mut actual_bus, 1);
-            assert_eq!((frame.exit_kind, frame.completed), (1, 0));
-            same(&actual, &before);
-            assert_eq!(actual_bus.0, expected_bus.0);
+            if word_stack {
+                assert_eq!((frame.exit_kind, frame.completed), (1, 0));
+                same(&actual, &before);
+                assert_eq!(actual_bus.0, expected_bus.0);
+            } else {
+                assert_eq!((frame.exit_kind, frame.completed), (0, 1));
+            }
             let reference = Interpreter::run_batch(&mut expected, &mut expected_bus, 0, 1);
-            let resumed = Interpreter::run_batch(&mut actual, &mut actual_bus, 0, 1);
             assert_eq!(reference.stop, BatchStop::Budget);
-            assert_eq!(resumed.stop, reference.stop);
+            if word_stack {
+                let resumed = Interpreter::run_batch(&mut actual, &mut actual_bus, 0, 1);
+                assert_eq!(resumed.stop, reference.stop);
+            }
             same(&actual, &expected);
             assert_eq!(actual_bus.0, expected_bus.0);
         }

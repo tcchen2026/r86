@@ -84,13 +84,14 @@ Read r86chip/README.md if you are working on it.
   This includes kernel and user execution, normal paging, and the code those
   operating systems and their applications actually run. Judge additions by
   correctness and measured benefit on these workloads, not by native ISA coverage.
-- Rule: 16-bit code is interpreter-only. No code generator (A64, ARMv6K,
-  Wasm, r86chip) compiles real mode, virtual-8086 mode or a 16-bit code
-  segment (CS default size 16); make those paths faster in the shared
-  interpreter instead. The test is the code segment's default size, not the
-  operand size: 32-bit code using 16-bit operands or 66h/67h prefixes still
-  compiles. Reopen only with a measurement showing 16-bit code dominating a
-  priority workload (for example Windows 98's 16-bit USER/GDI paths).
+- Rule: real mode and virtual-8086 mode are interpreter-only for every code
+  generator. A 16-bit protected-mode code segment (CS default size 16)
+  compiles only on A64, and only with a 16-bit stack (SS.B=0); ARMv6K, Wasm
+  and r86chip leave it to the interpreter. The test is the code segment's
+  default size, not the operand size: 32-bit code using 16-bit operands or
+  66h/67h prefixes compiles everywhere. A64's exception rests on Windows 95
+  apps after boot running 10.5% faster on the Pi 5 (task J16, 2026-11-17);
+  extend it to another generator only with a measurement on that target.
 - BIOS/setup paths, mode transitions, cold code and uncommon/complex
   instructions may also stay in the shared interpreter. Native coverage for
   every x86 mode is not a requirement for either JIT or the FPGA extensions.

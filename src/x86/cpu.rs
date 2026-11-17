@@ -320,6 +320,9 @@ pub struct Cpu {
     /// Diagnostic-only interpreted attempts satisfying the ARM64 entry mode guard.
     #[cfg(all(a64_jit, feature = "jit-profile"))]
     pub(crate) jit_eligible_interpreted: u64,
+    /// Real, V86, PM16, eligible PM32, other PM32 attempted instructions.
+    #[cfg(all(a64_jit, feature = "jit-profile"))]
+    pub(crate) jit_interpreted_modes: [u64; 5],
     pub regs: [u32; 8],
     pub eip: u32,
     pub eflags: u32,
@@ -649,6 +652,20 @@ impl LinearTranslationCache {
         }
     }
 
+    /// A reverse hint may name a reused row. Revoke only the original backing.
+    #[cfg(a64_jit)]
+    pub(crate) fn revoke_writable_row(&mut self, slot: usize, backing_page: u64) {
+        let entry = &mut self.entries[slot];
+        if entry
+            .bias
+            .wrapping_add(u64::from(entry.tag) & u64::from(LINEAR_TRANSLATION_PAGE_MASK))
+            == backing_page
+        {
+            self.write_permissions[slot >> 6] &= !(1u64 << (slot & 63));
+            entry.write_tag = 0;
+        }
+    }
+
     pub const fn new() -> Self {
         Self {
             state: LINEAR_TRANSLATION_GENERATION_STEP,
@@ -755,7 +772,7 @@ impl LinearTranslationCache {
     }
 
     #[inline(always)]
-    fn slot(linear: LinearAddr) -> usize {
+    pub(crate) fn slot(linear: LinearAddr) -> usize {
         ((linear.0 >> 12) as usize) & (LINEAR_TRANSLATION_CACHE_SLOTS - 1)
     }
 
@@ -1195,6 +1212,8 @@ impl Cpu {
         Self {
             #[cfg(all(a64_jit, feature = "jit-profile"))]
             jit_eligible_interpreted: 0,
+            #[cfg(all(a64_jit, feature = "jit-profile"))]
+            jit_interpreted_modes: [0; 5],
             regs: [0; 8],
             eip: 0,
             eflags: 0x0000_0002,
@@ -1542,14 +1561,17 @@ impl Cpu {
             }
             #[cfg(feature = "jit")]
             if previous != cache {
-                let same_code = (cfg!(a64_jit) || previous.base == cache.base)
-                    && previous.limit == cache.limit
-                    && (previous.flags ^ cache.flags) & !0x60 == 0;
+                // A64 context ids qualify CS base and D. CODE16 bodies check
+                // the live CS limit; 32-bit entry requires the full limit.
+                // No other CS attribute specializes generated code: paging
+                // privilege has its own plane, POPF/CLI use the entry mask,
+                // and CS data reads check the refreshed readable-code grant.
+                // Descriptor loads already validate presence/type/privilege.
+                let same_code = cfg!(a64_jit)
+                    || (previous.base == cache.base
+                        && previous.limit == cache.limit
+                        && (previous.flags ^ cache.flags) & !0x60 == 0);
                 if !same_code {
-                    // A64 tags qualify CS base separately, so rebasing alone
-                    // preserves linear execute proofs. Other backends still
-                    // expire those links here. CS attributes expire all;
-                    // user/supervisor execute tables qualify paging privilege.
                     self.invalidate_jit_fetch_context();
                 }
             }
@@ -1562,6 +1584,37 @@ impl Cpu {
     #[inline(always)]
     pub(crate) fn code_default16(&self) -> bool {
         self.code_default16
+    }
+
+    #[cfg(a64_jit)]
+    #[inline(always)]
+    pub(crate) fn jit_code_eligible(&self) -> bool {
+        !self.halted
+            && self.cr0 & CR0_PE != 0
+            && self.eflags & ((1 << 8) | (1 << 17)) == 0
+            && if self.code_default16 {
+                self.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0
+            } else {
+                self.seg(SegmentReg::Cs).limit == u32::MAX
+            }
+    }
+
+    #[cfg(all(a64_jit, feature = "jit-profile"))]
+    pub(crate) fn jit_profile_interpreted(&mut self) {
+        let eligible = self.jit_code_eligible();
+        self.jit_eligible_interpreted += u64::from(eligible);
+        let mode = if self.cr0 & CR0_PE == 0 {
+            0
+        } else if self.eflags & (1 << 17) != 0 {
+            1
+        } else if self.code_default16 {
+            2
+        } else if eligible {
+            3
+        } else {
+            4
+        };
+        self.jit_interpreted_modes[mode] += 1;
     }
 
     #[inline(always)]
@@ -1650,7 +1703,7 @@ impl Cpu {
         }
         let cache = self.segments[seg as usize];
         #[cfg(feature = "jit")]
-        if matches!(seg, SegmentReg::Fs | SegmentReg::Gs) {
+        if cfg!(a64_jit) || matches!(seg, SegmentReg::Fs | SegmentReg::Gs) {
             // Segment loads own qualification, just as for the flat masks.
             // Rechecking descriptors at each native entry duplicates work;
             // emitted scalar accesses still check offset+width before base.
@@ -1658,7 +1711,7 @@ impl Cpu {
             self.jit_based_write_mask &= !bit;
             let mut based = cache;
             based.base = 0;
-            // The native FS/GS access checks its actual limit before paging.
+            // Native based access checks its actual limit before paging.
             // Reuse the normal-data qualification, including null/read-only
             // and expand-down rejection, independently of the segment range.
             based.limit = u32::MAX;
@@ -1667,6 +1720,13 @@ impl Cpu {
                 if flat_data_segment(based, true) {
                     self.jit_based_write_mask |= bit;
                 }
+            } else if cfg!(a64_jit)
+                && seg == SegmentReg::Cs
+                && cache.selector & !3 != 0
+                && cache.flags & 0x1a == 0x1a
+            {
+                // A readable code override is never writable.
+                self.jit_based_read_mask |= bit;
             }
         }
         if flat_data_segment(cache, false) {

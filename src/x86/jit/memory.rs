@@ -53,12 +53,25 @@ use super::decode::{Address, Alu, Block, Op, Value};
 use super::frame::guest_reg;
 use alloc::vec::Vec;
 
-/// Form the x86 offset, wrapping at 32 bits before adding a segment base.
+/// Form the x86 offset, wrapping at the decoded address width before the base.
 /// Shared by LEA and both MMU access lowerings. The caller chooses
 /// and validates segment semantics before turning this offset into an address.
 /// A bare base/index is already resident and needs no copy. The returned
 /// register is read-only; `dst` is the scratch for actual address arithmetic.
 pub fn emit_address(a: &mut Assembler, dst: Reg, address: Address) -> Reg {
+    if address.bits == 16 {
+        let offset = emit_address(
+            a,
+            dst,
+            Address {
+                bits: 32,
+                ..address
+            },
+        );
+        // Even a bare SI/DI/BX/BP needs truncation; its upper half is unrelated.
+        a.bitfield(dst, offset, 0, 15, false, false);
+        return dst;
+    }
     let base = address.base.map(|reg| guest_reg(reg as usize));
     let index = address.index.map(|reg| guest_reg(reg as usize));
     if address.displacement == 0 {

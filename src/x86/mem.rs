@@ -668,6 +668,10 @@ pub trait Bus {
         true
     }
 
+    /// A64 reverse-alias bookkeeping at a write grant, never on a cache hit.
+    #[cfg(a64_jit)]
+    fn cached_write_translation_granted(&self, _linear: LinearAddr, _backing: BackingToken) {}
+
     /// Cache notification after a successful walk. As with native-read hooks,
     /// `eflags` supplies control bits; lazy arithmetic status is not evaluated.
     fn after_linear_translate(

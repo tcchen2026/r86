@@ -6,9 +6,10 @@
 //! The interpreter handles that boundary with its ordinary fetch/fault ordering.
 //! A decoded branch ends the block. No speculative target fetch is performed.
 //!
-//! Integer operations use 32-bit addressing with byte/high-byte and operand-size
-//! overrides. Memory operands carry x86 effective addresses and segments, never
-//! software-TLB entries or native pointers. The memory adapter decides whether a
+//! The A64 code16 entry selects 16-bit defaults and accepts 66h/67h overrides.
+//! Other entries retain 32-bit addressing. Memory operands carry x86 effective
+//! addresses and segments, never software-TLB entries or native pointers.
+//! The memory adapter decides whether a
 //! store can commit natively or must leave before the attempted instruction.
 
 use crate::x86::cpu::SegmentReg;
@@ -16,6 +17,7 @@ use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Address {
+    pub bits: u8,
     pub base: Option<u8>,
     pub index: Option<u8>,
     pub scale: u8,
@@ -26,6 +28,7 @@ pub struct Address {
 impl Address {
     pub const fn stack() -> Self {
         Self {
+            bits: 32,
             base: Some(4),
             index: None,
             scale: 0,
@@ -119,7 +122,7 @@ pub enum ExchangeOp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BranchCondition {
     Flags(u8),
-    EcxZero,
+    EcxZero { bits: u8 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -317,11 +320,12 @@ pub enum Op {
         condition: Option<BranchCondition>,
         target: u32,
     },
-    /// Decrement ECX without changing flags, then branch while nonzero and,
+    /// Decrement CX/ECX by address size without changing flags, then branch while nonzero and,
     /// for LOOP(E/NE), while ZF has the requested value. AArch64/Thumb-2 only.
     Loop {
         target: u32,
         zero: Option<bool>,
+        counter_bits: u8,
     },
 }
 
@@ -457,6 +461,8 @@ struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
     extended: bool,
+    code16: bool,
+    address16: bool,
 }
 
 impl Reader<'_> {
@@ -503,6 +509,47 @@ impl Reader<'_> {
             ));
         }
         let mode = byte >> 6;
+        if self.address16 {
+            let (mut base, index) = match byte & 7 {
+                0 => (Some(3), Some(6)),
+                1 => (Some(3), Some(7)),
+                2 => (Some(5), Some(6)),
+                3 => (Some(5), Some(7)),
+                4 => (Some(6), None),
+                5 => (Some(7), None),
+                6 => (Some(5), None),
+                _ => (Some(3), None),
+            };
+            let displacement = if mode == 0 && byte & 7 == 6 {
+                base = None;
+                self.immediate(16)?
+            } else if mode == 1 {
+                self.byte()? as i8 as i32 as u32
+            } else if mode == 2 {
+                self.immediate(16)?
+            } else {
+                0
+            };
+            return Some((
+                Value::Memory {
+                    address: Address {
+                        bits: 16,
+                        base,
+                        index,
+                        scale: 0,
+                        displacement,
+                        segment: segment.unwrap_or(if base == Some(5) {
+                            SegmentReg::Ss
+                        } else {
+                            SegmentReg::Ds
+                        }),
+                    },
+                    bits,
+                },
+                reg,
+                group,
+            ));
+        }
         let mut base = Some(byte & 7);
         let mut index = None;
         let mut scale = 0;
@@ -532,6 +579,7 @@ impl Reader<'_> {
         Some((
             Value::Memory {
                 address: Address {
+                    bits: 32,
                     base,
                     index,
                     scale,
@@ -547,7 +595,8 @@ impl Reader<'_> {
 
     fn instruction(&mut self, eip: u32) -> Option<Instruction> {
         let start = self.at;
-        let mut bits = 32;
+        let mut bits = if self.code16 { 16 } else { 32 };
+        self.address16 = self.code16;
         let mut segment = None;
         let mut repeat = false;
         let mut repeat_equal = true;
@@ -558,7 +607,8 @@ impl Reader<'_> {
                 return None;
             }
             match self.byte()? {
-                0x66 if bits == 32 => bits = 16,
+                0x66 if self.code16 || bits == 32 => bits = if self.code16 { 32 } else { 16 },
+                0x67 if self.code16 => self.address16 = false,
                 0x26 => segment = Some(SegmentReg::Es),
                 0x2e => segment = Some(SegmentReg::Cs),
                 0x36 => segment = Some(SegmentReg::Ss),
@@ -574,6 +624,10 @@ impl Reader<'_> {
             }
         };
         if repeat && !matches!(opcode, 0xa4..=0xa6 | 0xaa..=0xaf) {
+            return None;
+        }
+        // PM16 strings keep their shared interpreter boundary in this pilot.
+        if self.code16 && matches!(opcode, 0x6c..=0x6f | 0xa4..=0xa7 | 0xaa..=0xaf) {
             return None;
         }
         let op = match opcode {
@@ -666,10 +720,11 @@ impl Reader<'_> {
             0xa2 | 0xa3 => {
                 let bits = if opcode == 0xa2 { 8 } else { bits };
                 let address = Address {
+                    bits: if self.address16 { 16 } else { 32 },
                     base: None,
                     index: None,
                     scale: 0,
-                    displacement: self.immediate(32)?,
+                    displacement: self.immediate(if self.address16 { 16 } else { 32 })?,
                     segment: segment.unwrap_or(SegmentReg::Ds),
                 };
                 Op::Store {
@@ -681,10 +736,11 @@ impl Reader<'_> {
             0xa0 | 0xa1 => {
                 let bits = if opcode == 0xa0 { 8 } else { bits };
                 let address = Address {
+                    bits: if self.address16 { 16 } else { 32 },
                     base: None,
                     index: None,
                     scale: 0,
-                    displacement: self.immediate(32)?,
+                    displacement: self.immediate(if self.address16 { 16 } else { 32 })?,
                     segment: segment.unwrap_or(SegmentReg::Ds),
                 };
                 Op::Mov {
@@ -979,12 +1035,13 @@ impl Reader<'_> {
                     target,
                 }
             }
-            // Address-size prefixes are rejected by the prefix reader.
-            opcode @ 0xe0..=0xe2 if self.extended && bits == 32 => {
+            opcode @ 0xe0..=0xe2 if self.extended && (bits == 32 || self.code16) => {
                 let relative = self.byte()? as i8 as i32;
                 let next = eip.wrapping_add((self.at - start) as u32);
                 Op::Loop {
-                    target: next.wrapping_add_signed(relative),
+                    target: next.wrapping_add_signed(relative)
+                        & if bits == 16 { 0xffff } else { u32::MAX },
+                    counter_bits: if self.address16 { 16 } else { 32 },
                     zero: match opcode {
                         0xe0 => Some(false),
                         0xe1 => Some(true),
@@ -992,12 +1049,15 @@ impl Reader<'_> {
                     },
                 }
             }
-            0xe3 if bits == 32 => {
+            0xe3 if bits == 32 || self.code16 => {
                 let relative = self.byte()? as i8 as i32;
                 let next = eip.wrapping_add((self.at - start) as u32);
                 Op::Branch {
-                    condition: Some(BranchCondition::EcxZero),
-                    target: next.wrapping_add_signed(relative),
+                    condition: Some(BranchCondition::EcxZero {
+                        bits: if self.address16 { 16 } else { 32 },
+                    }),
+                    target: next.wrapping_add_signed(relative)
+                        & if bits == 16 { 0xffff } else { u32::MAX },
                 }
             }
             0x0f => match self.byte()? {
@@ -1191,6 +1251,11 @@ impl Reader<'_> {
         if self.at - start > 15 {
             return None;
         }
+        if self.code16
+            && (u64::from(eip) + (self.at - start) as u64 > 0x10000 || matches!(op, Op::Mmx { .. }))
+        {
+            return None;
+        }
         // A single vCPU exclusively owns RAM through the native invocation.
         // No device event or helper can interleave a guarded RMW. LOCK adds no
         // host atomic operation in this machine, but still has x86 restrictions.
@@ -1222,19 +1287,26 @@ impl Reader<'_> {
 }
 
 pub fn block(bytes: &[u8], eip: u32, limit: usize) -> Block {
-    read_block(bytes, eip, limit, false)
+    read_block(bytes, eip, limit, false, false)
 }
 
 /// As `block`, plus the operations lowered by AArch64 and Thumb-2.
 pub fn block_extended(bytes: &[u8], eip: u32, limit: usize) -> Block {
-    read_block(bytes, eip, limit, true)
+    read_block(bytes, eip, limit, true, false)
 }
 
-fn read_block(bytes: &[u8], eip: u32, limit: usize, extended: bool) -> Block {
+/// A64 protected-mode entry. Other generators keep calling the 32-bit entry.
+pub fn block_code16(bytes: &[u8], eip: u32, limit: usize) -> Block {
+    read_block(bytes, eip, limit, true, true)
+}
+
+fn read_block(bytes: &[u8], eip: u32, limit: usize, extended: bool, code16: bool) -> Block {
     let mut reader = Reader {
         bytes,
         at: 0,
         extended,
+        code16,
+        address16: code16,
     };
     let mut result = Block {
         instructions: Vec::new(),

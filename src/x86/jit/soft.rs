@@ -3,8 +3,10 @@
 //! The x86 decoder/ALU and precise exits do not choose a memory backend.
 //!
 //! A complete access requires current privilege, paging and segment permission.
-//! DS/ES/SS remain flat-only; FS/GS allow normal data segments with any base and
-//! limit. Offset+width is validated before wrapping base addition, without
+//! PM32 keeps proven flat accesses and uses based checks for other DS/ES/SS
+//! and FS/GS. PM16 uses based normal data
+//! segments and readable CS, with explicit permissions and inclusive limits.
+//! Offset+width is validated before wrapping base addition, without
 //! extra work on ordinary flat accesses (v86 cpu.rs get_seg checks no bounds).
 //!
 //! RAM hits use address-biased tokens. Cold paths can revalidate exact PDE/PTE
@@ -39,16 +41,20 @@ const FLAT_SEGMENT_PROOFS: u32 = {
     segments | (segments << 8) | (1 << 6)
 };
 
+pub const CODE16: u32 = 1 << 30;
+pub const STACK16: u32 = 1 << 31;
+
 #[repr(C)]
 pub struct View {
     entries: *mut LinearTranslationCacheEntry,
     // Native X16: low data-context bits plus the fixed CS base in the high half.
     state: u64,
-    // Four six-bit segment masks, plus the flat SS.B qualification at bit 6.
+    // Four six-bit segment masks, plus SS.B at bit 6. A flat stack fact also
+    // proves this bit; a non-flat stack checks it before the based access.
     // W7 mirrors this; a segment helper refreshes it before native continuation.
     permissions: u32,
-    bases: [u32; 2],
-    limits: [u32; 2],
+    bases: [u32; 6],
+    limits: [u32; 6],
     rechecks: *const TranslationRecheck,
     recheck_context: u64,
     walk_root: u64,
@@ -129,11 +135,23 @@ pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
 }
 
 impl View {
-    /// Only ordinary flat data/stack qualifications specialize code. FS/GS
+    /// PM16 specializes only code/stack size and uses dynamic based segments.
+    /// PM32 retains its ordinary flat data/stack qualifications. FS/GS
     /// are often replaced for TLS; including them would split otherwise
     /// identical code and consume context ids for ordinary TLS changes.
     /// The adapter qualifies each link with these facts and the CS base.
     pub fn block_facts(cpu: &Cpu) -> u32 {
+        if cpu.code_default16() {
+            return CODE16
+                | if cpu.seg(crate::x86::cpu::SegmentReg::Ss).flags
+                    & crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG
+                    == 0
+                {
+                    STACK16
+                } else {
+                    0
+                };
+        }
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
         (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS
     }
@@ -144,8 +162,8 @@ impl View {
             entries,
             state: state | (u64::from(cpu.seg(crate::x86::cpu::SegmentReg::Cs).base) << 32),
             permissions: 0,
-            bases: [0; 2],
-            limits: [0; 2],
+            bases: [0; 6],
+            limits: [u32::MAX; 6],
             rechecks: cpu.translation_cache.rechecks.as_ptr(),
             recheck_context: cpu.translation_cache.recheck_context,
             walk_root: if rechecks {
@@ -179,16 +197,42 @@ impl View {
         }
     }
 
-    /// Refresh dynamic segment state. Compiled DS/ES/SS assumptions must be
-    /// identical to continue linking; FS/GS always use these current fields.
+    /// Refresh dynamic segment state. PM32's flat facts must remain identical
+    /// to continue linking. PM16 data loads never change its size-only facts.
     pub fn refresh_segments(&mut self, cpu: &Cpu) -> bool {
         let (flat, flat_write) = cpu.jit_segment_masks();
         let (bases, limits, based, based_write) = cpu.jit_based_segments();
-        let permissions = flat | (flat_write << 8) | (based << 16) | (based_write << 24);
-        let unchanged = (permissions ^ self.permissions) & FLAT_SEGMENT_PROOFS == 0;
+        let mut permissions = flat | (flat_write << 8) | (based << 16) | (based_write << 24);
+        let code16 = cpu.code_default16();
+        if code16 {
+            for index in 0..6 {
+                let cache = cpu.seg(crate::x86::cpu::SegmentReg::from_modrm_reg(index as u8));
+                self.bases[index] = cache.base;
+                self.limits[index] = cache.limit;
+            }
+        } else {
+            self.bases[4..].copy_from_slice(&bases);
+            self.limits[4..].copy_from_slice(&limits);
+            // Common flat contexts copy no additional descriptor state.
+            let data = FLAT_SEGMENT_PROOFS & !(1 << 6);
+            if permissions & data != data {
+                use crate::x86::cpu::{SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
+                for segment in [SegmentReg::Es, SegmentReg::Ss, SegmentReg::Ds] {
+                    let bit = 1 << segment as u8;
+                    if permissions & (bit | (bit << 8)) != (bit | (bit << 8)) {
+                        let cache = cpu.seg(segment);
+                        self.bases[segment as usize] = cache.base;
+                        self.limits[segment as usize] = cache.limit;
+                        if segment == SegmentReg::Ss && cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0
+                        {
+                            permissions |= 1 << 6;
+                        }
+                    }
+                }
+            }
+        }
+        let unchanged = code16 || (permissions ^ self.permissions) & FLAT_SEGMENT_PROOFS == 0;
         self.permissions = permissions;
-        self.bases = bases;
-        self.limits = limits;
         unchanged
     }
 }
@@ -315,7 +359,28 @@ impl Guard<'_> {
 }
 
 pub fn stack_guard(a: &mut Assembler, guard: Guard<'_>) {
-    guard.require(a, 6, guard.miss);
+    if guard.segments.get() & STACK16 == 0 {
+        guard.require(a, 6, guard.miss);
+    }
+}
+
+pub fn stack_address(guard: Guard<'_>) -> Address {
+    Address {
+        bits: if guard.segments.get() & STACK16 != 0 {
+            16
+        } else {
+            32
+        },
+        ..Address::stack()
+    }
+}
+
+/// The body guard also runs on direct edges and cached-return continuations.
+/// A miss leaves before this block has retired any instruction.
+pub fn code_limit(a: &mut Assembler, last: Reg, fail: Label) {
+    view_load(a, TEMP, (offset_of!(View, limits) + 4) as u32, 2);
+    a.add_sub(ZR, last, TEMP, false, true, true);
+    a.b_cond(Cond::Hi, fail);
 }
 
 /// Consecutive register/immediate PUSHes or POPs may reuse one data translation
@@ -324,12 +389,21 @@ pub fn stack_guard(a: &mut Assembler, guard: Guard<'_>) {
 /// Each store/load still has its own architectural commit and fault location.
 pub fn stack_range(a: &mut Assembler, bytes: u8, write: bool, guard: Guard<'_>) {
     stack_guard(a, guard);
-    let mut address = Address::stack();
+    let mut address = stack_address(guard);
     if write {
         address.displacement = 0u32.wrapping_sub(u32::from(bytes));
     }
-    let access = prepare_access(a, address, u16::from(bytes), write, guard, false, None);
-    if write {
+    let based = based_segment(guard.segments.get(), address.segment, write);
+    if guard.segments.get() & STACK16 != 0 {
+        // Multi-slot proofs cannot cross SP's wrap point, even with a larger
+        // segment limit. The interpreter handles those partial-frame cases.
+        let offset = emit_address(a, ADDRESS, address);
+        a.add_sub_imm(TEMP, offset, u16::from(bytes - 1), false, false, false);
+        a.bitfield(TEMP, TEMP, 16, 31, false, false);
+        a.cbz(TEMP, false, true, guard.miss);
+    }
+    let access = prepare_access(a, address, u16::from(bytes), write, guard, based, None);
+    if write || based {
         // Retain the checked interval's lowest host address. Using that guest
         // address also handles a PUSH run beginning with ESP=0 correctly.
         a.add_shifted(ENTRY, ENTRY, access.linear, 0, true);
@@ -346,8 +420,12 @@ pub fn stack_load(a: &mut Assembler, value: Reg, bits: u8) -> u32 {
 
 /// Materialize the base of an already qualified read window. POPA/POPAD use
 /// fixed slot offsets so ESP remains unchanged until every load completes.
-pub fn stack_read_pointer(a: &mut Assembler, dst: Reg) {
-    a.add_sub(dst, ENTRY, super::frame::guest_reg(4), true, false, false);
+pub fn stack_read_pointer(a: &mut Assembler, dst: Reg, based: bool) {
+    if based {
+        a.mov(dst, ENTRY, true);
+    } else {
+        a.add_sub(dst, ENTRY, super::frame::guest_reg(4), true, false, false);
+    }
 }
 
 /// X11 names the minimum address of the dominating PUSH interval. The compiler
@@ -408,10 +486,7 @@ pub fn prepare(
     write: bool,
     guard: Guard<'_>,
 ) -> Access {
-    let based = matches!(
-        address.segment,
-        crate::x86::cpu::SegmentReg::Fs | crate::x86::cpu::SegmentReg::Gs
-    );
+    let based = based_segment(guard.segments.get(), address.segment, write);
     prepare_access(a, address, u16::from(bits / 8), write, guard, based, None)
 }
 
@@ -425,10 +500,7 @@ pub fn prepare_offset(
     guard: Guard<'_>,
     displacement: Reg,
 ) -> Access {
-    let based = matches!(
-        address.segment,
-        crate::x86::cpu::SegmentReg::Fs | crate::x86::cpu::SegmentReg::Gs
-    );
+    let based = based_segment(guard.segments.get(), address.segment, write);
     prepare_access(
         a,
         address,
@@ -438,6 +510,14 @@ pub fn prepare_offset(
         based,
         Some(displacement),
     )
+}
+
+pub fn based_segment(facts: u32, segment: crate::x86::cpu::SegmentReg, write: bool) -> bool {
+    use crate::x86::cpu::SegmentReg;
+    facts & CODE16 != 0
+        || matches!(segment, SegmentReg::Fs | SegmentReg::Gs)
+        || (matches!(segment, SegmentReg::Es | SegmentReg::Ss | SegmentReg::Ds)
+            && facts & (1 << (segment as u8 + if write { 8 } else { 0 })) == 0)
 }
 
 /// String chunks need a flat offset: checking their entire linear-page range
@@ -511,6 +591,9 @@ fn prepare_access(
     let mut offset = emit_address(a, ADDRESS, address);
     if let Some(displacement) = displacement {
         a.add_sub(ADDRESS, offset, displacement, false, false, false);
+        if address.bits == 16 {
+            a.bitfield(ADDRESS, ADDRESS, 0, 15, false, false);
+        }
         offset = ADDRESS;
     }
     let linear = if based {
@@ -527,7 +610,7 @@ fn prepare_access(
         view_load(
             a,
             VIEW,
-            (offset_of!(View, limits) + usize::from(segment - 4) * 4) as u32,
+            (offset_of!(View, limits) + usize::from(segment) * 4) as u32,
             2,
         );
         a.add_sub(ZR, end, VIEW, true, true, true);
@@ -535,7 +618,7 @@ fn prepare_access(
         view_load(
             a,
             TEMP,
-            (offset_of!(View, bases) + usize::from(segment - 4) * 4) as u32,
+            (offset_of!(View, bases) + usize::from(segment) * 4) as u32,
             2,
         );
         a.add_sub(ADDRESS, offset, TEMP, false, false, false);

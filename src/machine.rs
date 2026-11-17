@@ -2998,11 +2998,28 @@ impl HostBus {
             .map_or(0, |pages| pages.epoch())
     }
 
-    #[cfg(any(all(feature = "jit", target_arch = "arm"), a64_jit))]
+    #[cfg(all(feature = "jit", target_arch = "arm"))]
     pub(crate) fn jit_single_retired_version(&self, previous_epoch: u64) -> Option<*const u64> {
         self.jit_code_pages
             .as_ref()
             .and_then(|pages| pages.single_retired_version(previous_epoch))
+    }
+
+    #[cfg(a64_jit)]
+    pub(crate) fn jit_single_retired_page(
+        &self,
+        previous_epoch: u64,
+    ) -> Option<(usize, *const u64)> {
+        let pages = self.jit_code_pages.as_ref()?;
+        let page = pages.single_retired_page(previous_epoch)?;
+        Some((page, pages.version_ptr(page)))
+    }
+
+    #[cfg(all(a64_jit, feature = "jit-profile"))]
+    pub(crate) fn jit_write_alias_scans(&self) -> u64 {
+        self.jit_code_pages
+            .as_ref()
+            .map_or(0, |pages| pages.write_alias_scans)
     }
 
     #[cfg(any(
@@ -3034,6 +3051,17 @@ impl HostBus {
             .get_or_insert_with(|| crate::x86::jit::validity::CodePages::new(self.ram.len()));
         let (version, promoted) = pages.watch(offset >> 12);
         if promoted {
+            #[cfg(a64_jit)]
+            match pages.take_write_alias(offset >> 12).single() {
+                Some(Some(slot)) => cpu
+                    .translation_cache
+                    .revoke_writable_row(slot, self.ram.as_ptr() as u64 + (offset & !4095) as u64),
+                Some(None) => {}
+                None => cpu
+                    .translation_cache
+                    .revoke_writable_aliases(self.ram.as_ptr() as u64 + (offset & !4095) as u64),
+            }
+            #[cfg(not(a64_jit))]
             cpu.translation_cache
                 .revoke_writable_aliases(self.ram.as_ptr() as u64 + (offset & !4095) as u64);
         }
@@ -4497,6 +4525,19 @@ impl Bus for HostBus {
         index < self.frame_roles.len()
     }
 
+    #[cfg(a64_jit)]
+    #[inline]
+    fn cached_write_translation_granted(&self, linear: LinearAddr, backing: BackingToken) {
+        if let Some(pages) = &self.jit_code_pages {
+            let offset = backing.0.wrapping_sub(self.ram.as_ptr() as u64);
+            // Device grants may point outside RAM. Only RAM can own code.
+            if offset < self.ram.len() as u64 {
+                let row = crate::x86::cpu::LinearTranslationCache::slot(linear);
+                pages.record_write_alias(offset as usize >> 12, row);
+            }
+        }
+    }
+
     fn io_read_u8(&mut self, port: u16) -> Result<u8, MemError> {
         if let Some(value) = self.usb_read(port, 1) {
             return Ok(value as u8);
@@ -5894,6 +5935,66 @@ mod host_bus_tests {
                 }
             }
             assert!(engine.stats.native_steps > 4000);
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_write_alias_hints_revoke_both_aliases_and_preserve_reused_rows() {
+        for two in [false, true] {
+            for reused in [false, true] {
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1000, 0);
+                cpu.cr0 |= CR0_PG;
+                cpu.cr3 = 0x4000;
+                let mut bus = HostBus::new(0x10000);
+                write_ram_u32(&mut bus, 0x4000, 0x5067);
+                write_ram_u32(&mut bus, 0x5004, 0x9067);
+                write_ram_u32(&mut bus, 0x5008, 0x9067);
+                let token = bus.cached_backing_token(PhysAddr(0x9000));
+                bus.jit_code_stamp(&mut cpu, token); // First promotion handles pre-JIT grants.
+                // First write retires the watch; the second grants the first row.
+                for value in [1, 2] {
+                    mmu::write_linear_u32(&mut cpu, &mut bus, LinearAddr(0x1000), value).unwrap();
+                }
+                if two {
+                    // A dirty writable read also grants a write row and must be recorded.
+                    mmu::read_linear_u32(&mut cpu, &mut bus, LinearAddr(0x2000), AccessKind::Read)
+                        .unwrap();
+                    assert!(
+                        cpu.cached_current_write_translation(LinearAddr(0x2000))
+                            .is_some()
+                    );
+                }
+                if reused {
+                    write_ram_u32(&mut bus, 0x5004, 0xa067);
+                    cpu.invalidate_translation_page(LinearAddr(0x1000));
+                    mmu::read_linear_u32(&mut cpu, &mut bus, LinearAddr(0x1000), AccessKind::Read)
+                        .unwrap();
+                }
+                bus.jit_code_stamp(&mut cpu, token);
+                assert_eq!(
+                    cpu.cached_current_write_translation(LinearAddr(0x1000))
+                        .is_some(),
+                    reused
+                );
+                if reused {
+                    assert_eq!(
+                        cpu.cached_current_write_translation(LinearAddr(0x1000)),
+                        Some(bus.cached_backing_token(PhysAddr(0xa000)))
+                    );
+                }
+                if two {
+                    assert!(
+                        cpu.cached_current_write_translation(LinearAddr(0x2000))
+                            .is_none()
+                    );
+                    assert!(
+                        cpu.cached_current_read_translation(LinearAddr(0x2000))
+                            .is_some()
+                    );
+                }
+            }
         }
     }
 

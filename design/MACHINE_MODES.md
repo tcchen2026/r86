@@ -22,8 +22,8 @@ A mode is data, not a second implementation.
   branch in the existing PAE page walker. The APIC is an optional device
   beside the 8259 pair.
 - Everything else is shared and behaves identically in both modes: real
-  mode, V86 and 16-bit code in the interpreter only, the JITs for 32-bit
-  code segments, SoftMMU, SeaBIOS, IDE, VGA/VBE, sound, network, USB, guest
+  mode and V86 in the interpreter only, the JITs for 32-bit code segments
+  (the A64 JIT also for 16-bit protected-mode code), SoftMMU, SeaBIOS, IDE, VGA/VBE, sound, network, USB, guest
   time.
 - Retro must not pay for Modern. A Retro guest executes the paths it
   executes today; the plan's performance gate (host instructions per guest

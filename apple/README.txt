@@ -32,8 +32,9 @@ Contracts:
   observations, not code-signing enforcement evidence. Real-Mac checks use
   script/apple_jit_check.py --require-signing-enforcement with SIP enabled.
 - New VMs use cpu-engine="auto": select JIT whenever available, regardless of
-  the OS preset; otherwise use the interpreter. All 16-bit code still uses
-  the shared interpreter. Explicit choices are "jit" and
+  the OS preset; otherwise use the interpreter. Real-mode and V86 code
+  still use the shared interpreter; the arm64 JIT also compiles 16-bit
+  protected-mode code. Explicit choices are "jit" and
   "interpreter"; legacy "interp", the old automatic default, reads as "auto".
   watchOS always interprets; iOS fast mode is described below. --no-jit forces
   interpretation without saving that override. Edit machine offers Auto, JIT

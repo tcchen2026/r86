@@ -11,6 +11,7 @@ use crate::x86::{BatchStop, Bus, Cpu, Interpreter, MemError, PhysAddr};
 
 mod extended;
 mod mmx;
+mod pm16;
 
 struct Bytes(Vec<u8>);
 impl Bus for Bytes {
@@ -135,10 +136,14 @@ fn native_bit_modifications_preserve_register_aliases_and_other_flags() {
 
 impl Fixture {
     fn new(decoded: &decode::Block) -> Self {
+        Self::with_facts(decoded, 0)
+    }
+
+    fn with_facts(decoded: &decode::Block, facts: u32) -> Self {
         let mut arena = CodeArena::new(64 * 1024).unwrap();
         let stubs = entry().unwrap();
         let entry = arena.publish(&stubs.words).unwrap();
-        let mut code = block(decoded, None, 0).unwrap();
+        let mut code = block(decoded, None, facts).unwrap();
         let body_handle = arena.publish_block(&mut code).unwrap();
         let body = arena.address(body_handle, 0).unwrap();
         let finish = arena.address(entry, stubs.return_offset).unwrap();

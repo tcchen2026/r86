@@ -10,16 +10,17 @@
 //! BSWAP, CMOVcc, LAHF/SAHF, CLC/STC/CMC, RCL/RCR and JECXZ also use this
 //! resident state. tiny386 i386.c was consulted; v86 instructions_0f.rs confirms
 //! CMOV's unconditional memory read. Carry rotates include CF in a 9/17/33-bit
-//! ring and retain old flags until a memory store commits. JECXZ tests ECX,
-//! independently of arithmetic flags; address-size overrides remain interpreted.
+//! ring and retain old flags until a memory store commits. JCXZ/JECXZ select
+//! CX/ECX by address size, independently of arithmetic flags.
 //!
 //! Dead flag writes are eliminated between register operations. Every exit and
 //! faultable memory instruction makes its incoming flags live, before selecting
 //! the access lowering. SoftMMU misses return before the attempted instruction.
 //! All state is committed before returning to Rust; no lazy-flag ABI leaks out.
 //!
-//! Entry requires 32-bit code, valid instruction bytes and branch destinations
-//! inside CS, no debug step, and a budget ending at or before the next machine
+//! Entry requires protected mode without VM/debug step. PM32 requires a full
+//! CS limit. PM16 requires SS.B=0 and checks all segments, block fetch limits
+//! and near targets before their commits. The budget ends by the next machine
 //! event. During an interrupt shadow the adapter may invoke only a recognized
 //! one-instruction entry with budget one, retaining the shadow/attention boundary.
 //! An insufficient budget returns without executing any instruction. The runtime
@@ -52,7 +53,7 @@
 //!   flags. v86 arith.rs agrees on the destination but clears CF and recomputes
 //!   the other flags.
 //! - NEG subtracts from zero; LEAVE commits ESP and BP/EBP only after its stack
-//!   read (v86 agrees). Native LEAVE requires a flat 32-bit stack.
+//!   read (v86 agrees). SS.B selects SP/ESP independently of operand size.
 //! - XADD/CMPXCHG/XCHG memory forms require write permission even when CMPXCHG
 //!   fails (v86 cpu.rs agrees). They store before committing GPRs or flags; XADD
 //!   writes its source before its register destination so aliases receive the
@@ -122,6 +123,7 @@ struct InstructionExit<'a> {
     steps_before: u16,
     repeat: Option<(u32, u32)>, // Continuation control and next EIP.
     division: bool,
+    code_miss: Option<Label>,
 }
 
 impl InstructionExit<'_> {
@@ -859,7 +861,7 @@ fn read_stack(
             a,
             dst,
             Value::Memory {
-                address: Address::stack(),
+                address: soft::stack_address(site.guard()),
                 bits,
             },
             Some(site),
@@ -881,7 +883,7 @@ fn push(
         soft::stack_store(a, value, bits, displacement)
     } else {
         soft::stack_guard(a, site.guard());
-        let mut address = Address::stack();
+        let mut address = soft::stack_address(site.guard());
         address.displacement = 0u32.wrapping_sub(u32::from(stack_bytes));
         soft::prepare(a, address, bits, true, site.guard()).access(a, value, true)
     };
@@ -893,7 +895,34 @@ fn push(
         true,
     ));
     // ESP remains architecturally old if the recorded store faults.
-    a.add_sub_imm(guest_reg(4), guest_reg(4), stack_bytes, false, true, false);
+    stack_adjust(
+        a,
+        guest_reg(4),
+        -i32::from(stack_bytes),
+        site.segments.get() & soft::STACK16 != 0,
+    );
+}
+
+/// SS.B selects the pointer width independently of the pushed/popped value.
+/// Commit after the last faultable operation, preserving ESP's upper half.
+fn stack_adjust(a: &mut Assembler, source: Reg, delta: i32, stack16: bool) {
+    let dst = if stack16 { TMP } else { guest_reg(4) };
+    if delta.unsigned_abs() < 4096 {
+        a.add_sub_imm(
+            dst,
+            source,
+            delta.unsigned_abs() as u16,
+            false,
+            delta < 0,
+            false,
+        );
+    } else {
+        a.mov_imm(TMP, u64::from(delta as u32), false);
+        a.add_sub(dst, source, TMP, false, false, false);
+    }
+    if stack16 {
+        a.bfi32(guest_reg(4), dst, 0, 16);
+    }
 }
 
 fn condition_value(a: &mut Assembler, condition: u8) {
@@ -939,6 +968,7 @@ fn movs(
     a.load_store(true, TMP, FRAME, offset_of!(Frame, eflags) as u32, 2);
     a.tbz(TMP, 10, true, site.miss);
     let address = Address {
+        bits: 32,
         base: Some(6),
         index: None,
         scale: 0,
@@ -1134,6 +1164,7 @@ fn repeat_string(
     let page = a.label();
     a.bind(page);
     let address = Address {
+        bits: 32,
         base: Some(if kind == 0 || kind == 2 || compare {
             6
         } else {
@@ -1428,8 +1459,23 @@ pub fn block(
 ) -> Result<CompiledBlock, EmitError> {
     assert!(!block.instructions.is_empty() && block.instructions.len() < 4096);
     let count = block.instructions.len() as u16;
+    let code16 = block_facts & soft::CODE16 != 0;
+    let stack16 = block_facts & soft::STACK16 != 0;
     let needed = flag_requirements(block);
-    let ranges = super::memory::access_ranges(block, frame::PAGE_BIAS_SLOTS);
+    // These cached biases are for flat offsets; a based access also needs its
+    // live segment addition. Keep the existing ranges for every proven flat op.
+    let mut ranges = if code16 {
+        alloc::vec![None; usize::from(count)]
+    } else {
+        super::memory::access_ranges(block, frame::PAGE_BIAS_SLOTS)
+    };
+    for range in &mut ranges {
+        if range.is_some_and(|r| soft::based_segment(block_facts, r.address.segment, r.write)) {
+            *range = None;
+        }
+    }
+    let stack_based = soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, true)
+        || soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, false);
     let memory_count = block
         .instructions
         .iter()
@@ -1442,13 +1488,43 @@ pub fn block(
     let mut attention_exits = Vec::new();
     let done = a.label();
     let budget_exit = a.label();
+    let code_exit = code16.then(|| a.label());
     a.add_sub_imm(BUDGET, BUDGET, count, true, true, true);
     a.b_cond(Cond::Cc, budget_exit);
+    if let Some(fail) = code_exit {
+        let mut last_ip = block.instructions.last().unwrap().next_eip - 1;
+        for instruction in &block.instructions {
+            if let Op::Branch { target, .. }
+            | Op::Loop { target, .. }
+            | Op::Call {
+                target: Value::Immediate(target),
+                ..
+            } = instruction.op
+            {
+                last_ip = last_ip.max(target);
+            }
+        }
+        // Folding direct targets into this one compare preserves CALL/LOOP
+        // commits and the branch's fault IP. An untaken out-of-range target
+        // merely leaves the block to the interpreter before any instruction.
+        a.mov_imm(TMP, u64::from(last_ip), false);
+        soft::code_limit(&mut a, TMP, fail);
+    }
     let segments = core::cell::Cell::new(block_facts);
     let mut stack_end = 0;
     let mut stack_remaining = 0;
     for (index, instruction) in block.instructions.iter().enumerate() {
-        let site = instruction.op.can_exit().then(|| InstructionExit {
+        let indirect16 = code16
+            && matches!(
+                instruction.op,
+                Op::Return { .. }
+                    | Op::IndirectJump { .. }
+                    | Op::Call {
+                        target: Value::Register(_) | Value::Memory { .. },
+                        ..
+                    }
+            );
+        let site = (instruction.op.can_exit() || indirect16).then(|| InstructionExit {
             segments: &segments,
             range: ranges[index],
             miss: a.label(),
@@ -1456,11 +1532,14 @@ pub fn block(
             steps_before: index as u16,
             repeat: repeat_control(instruction.op).map(|control| (control, instruction.next_eip)),
             division: matches!(instruction.op, Op::Divide { .. }),
+            code_miss: indirect16.then(|| a.label()),
         });
         if matches!(instruction.op, Op::Movs { .. } | Op::String { .. }) {
             segments.set(block_facts);
         }
-        if index >= stack_end {
+        if index >= stack_end
+            && (!stack_based || matches!(instruction.op, Op::PushAll { .. } | Op::PopAll { .. }))
+        {
             if let Some(range) = super::memory::stack_range(block, index) {
                 soft::stack_range(
                     &mut a,
@@ -1534,14 +1613,7 @@ pub fn block(
                 // and any accessed-bit write precede the ESP commit.
                 read_stack(&mut a, LHS, 16, site, &mut faults, false);
                 soft::load_segment(&mut a, segment, site.miss);
-                a.add_sub_imm(
-                    guest_reg(4),
-                    guest_reg(4),
-                    u16::from(bits / 8),
-                    false,
-                    false,
-                    false,
-                );
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), stack16);
             }
             Op::PushSegment { segment, bits } => {
                 a.load_store(
@@ -1707,13 +1779,7 @@ pub fn block(
                     &mut a,
                     RHS,
                     Value::Memory {
-                        address: Address {
-                            base: Some(4),
-                            index: None,
-                            scale: 0,
-                            displacement: 0,
-                            segment: crate::x86::cpu::SegmentReg::Ss,
-                        },
+                        address: soft::stack_address(site.guard()),
                         bits,
                     },
                     Some(site),
@@ -1740,14 +1806,7 @@ pub fn block(
                 a.logical(0, RESULT, RESULT, FLAGS, false); // Bits that became set.
                 a.load_store(false, FLAGS, FRAME, offset_of!(Frame, eflags) as u32, 2);
                 unpack_flags(&mut a);
-                a.add_sub_imm(
-                    guest_reg(4),
-                    guest_reg(4),
-                    u16::from(bits / 8),
-                    false,
-                    false,
-                    false,
-                );
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), stack16);
                 // An enabled IRQ must be observed immediately after POPF,
                 // even when CLI earlier in this chain disabled it only briefly.
                 let attention = a.label();
@@ -1804,6 +1863,7 @@ pub fn block(
                     7
                 };
                 let address = Address {
+                    bits: 32,
                     base: Some(index_reg),
                     index: None,
                     scale: 0,
@@ -2212,7 +2272,7 @@ pub fn block(
                     Value::Memory {
                         address: Address {
                             base: Some(5),
-                            ..Address::stack()
+                            ..soft::stack_address(site.guard())
                         },
                         bits,
                     },
@@ -2221,14 +2281,7 @@ pub fn block(
                 );
                 // Use the old frame pointer for ESP before replacing BP/EBP.
                 // A fault above leaves both registers and all flags untouched.
-                a.add_sub_imm(
-                    guest_reg(4),
-                    guest_reg(5),
-                    u16::from(bits / 8),
-                    false,
-                    false,
-                    false,
-                );
+                stack_adjust(&mut a, guest_reg(5), i32::from(bits / 8), stack16);
                 write_register(
                     &mut a,
                     Register {
@@ -2635,14 +2688,7 @@ pub fn block(
                 // POP ESP replaces the increment with its loaded value. For
                 // POP SP, increment first, then merge the low half as usual.
                 if dst.bits != 32 || dst.index != 4 {
-                    a.add_sub_imm(
-                        guest_reg(4),
-                        guest_reg(4),
-                        u16::from(dst.bits / 8),
-                        false,
-                        false,
-                        false,
-                    );
+                    stack_adjust(&mut a, guest_reg(4), i32::from(dst.bits / 8), stack16);
                 }
                 if dst.bits != 32 {
                     write_register(&mut a, dst, RESULT);
@@ -2667,11 +2713,15 @@ pub fn block(
                         true,
                     ));
                 }
-                a.add_sub_imm(guest_reg(4), guest_reg(4), bits.into(), false, true, false);
+                stack_adjust(&mut a, guest_reg(4), -i32::from(bits), stack16);
             }
             Op::PopAll { bits } => {
                 debug_assert!(stack_cached);
-                soft::stack_read_pointer(&mut a, LHS);
+                soft::stack_read_pointer(
+                    &mut a,
+                    LHS,
+                    soft::based_segment(block_facts, crate::x86::cpu::SegmentReg::Ss, false),
+                );
                 for (slot, register) in [7, 6, 5, 4, 3, 2, 1, 0].into_iter().enumerate() {
                     if register == 4 {
                         continue;
@@ -2708,7 +2758,7 @@ pub fn block(
                         );
                     }
                 }
-                a.add_sub_imm(guest_reg(4), guest_reg(4), bits.into(), false, false, false);
+                stack_adjust(&mut a, guest_reg(4), i32::from(bits), stack16);
             }
             Op::Push { src, bits } => {
                 let value = match src {
@@ -2734,6 +2784,9 @@ pub fn block(
                 let target_reg = Reg::new(14);
                 if !matches!(target, Value::Immediate(_)) {
                     read_value(&mut a, target_reg, target, site.as_ref(), &mut faults);
+                    if let Some(fail) = site.as_ref().unwrap().code_miss {
+                        soft::code_limit(&mut a, target_reg, fail);
+                    }
                 }
                 a.mov_imm(RESULT, instruction.next_eip.into(), false);
                 push(
@@ -2758,25 +2811,26 @@ pub fn block(
                     &mut faults,
                     stack_cached,
                 );
+                if let Some(fail) = site.as_ref().unwrap().code_miss {
+                    soft::code_limit(&mut a, LHS, fail);
+                }
                 let adjust = u32::from(pop) + u32::from(bits / 8);
-                if adjust < 4096 {
-                    a.add_sub_imm(
-                        guest_reg(4),
-                        guest_reg(4),
-                        adjust as u16,
-                        false,
-                        false,
-                        false,
-                    );
-                } else {
-                    a.mov_imm(TMP, adjust.into(), false);
-                    a.add_sub(guest_reg(4), guest_reg(4), TMP, false, false, false);
+                stack_adjust(&mut a, guest_reg(4), adjust as i32, stack16);
+            }
+            Op::IndirectJump { src } => {
+                read_value(&mut a, LHS, src, site.as_ref(), &mut faults);
+                if indirect16 {
+                    soft::code_limit(&mut a, LHS, site.as_ref().unwrap().code_miss.unwrap());
                 }
             }
-            Op::IndirectJump { src } => read_value(&mut a, LHS, src, site.as_ref(), &mut faults),
             Op::Branch { .. } => {}
-            Op::Loop { .. } => {
-                a.add_sub_imm(guest_reg(1), guest_reg(1), 1, false, true, false);
+            Op::Loop { counter_bits, .. } => {
+                if counter_bits == 16 {
+                    a.add_sub_imm(TMP, guest_reg(1), 1, false, true, false);
+                    a.bfi32(guest_reg(1), TMP, 0, 16);
+                } else {
+                    a.add_sub_imm(guest_reg(1), guest_reg(1), 1, false, true, false);
+                }
             }
         }
         if matches!(instruction.op, Op::Movs { .. } | Op::String { .. }) {
@@ -2837,21 +2891,37 @@ pub fn block(
         | Op::Loop { target, .. } => {
             let taken = a.label();
             match last.op {
-                Op::Loop { zero, .. } => {
+                Op::Loop {
+                    zero, counter_bits, ..
+                } => {
+                    let counter = if counter_bits == 16 {
+                        a.bitfield(TMP, guest_reg(1), 0, 15, false, false);
+                        TMP
+                    } else {
+                        guest_reg(1)
+                    };
                     if let Some(equal) = zero {
                         let fallthrough = a.label();
-                        a.cbz(guest_reg(1), false, false, fallthrough);
+                        a.cbz(counter, false, false, fallthrough);
                         a.tbz(FLAGS, 30, equal, taken);
                         a.bind(fallthrough);
                     } else {
-                        a.cbz(guest_reg(1), false, true, taken);
+                        a.cbz(counter, false, true, taken);
                     }
                 }
                 Op::Branch {
                     condition: Some(condition),
                     ..
                 } => match condition {
-                    BranchCondition::EcxZero => a.cbz(guest_reg(1), false, false, taken),
+                    BranchCondition::EcxZero { bits } => {
+                        let counter = if bits == 16 {
+                            a.bitfield(TMP, guest_reg(1), 0, 15, false, false);
+                            TMP
+                        } else {
+                            guest_reg(1)
+                        };
+                        a.cbz(counter, false, false, taken);
+                    }
                     BranchCondition::Flags(condition) => {
                         let native = block.instructions.len().checked_sub(2).and_then(|i| {
                             comparison_condition(block.instructions[i].op, condition)
@@ -2935,6 +3005,14 @@ pub fn block(
     a.mov_imm(LHS, 2, false);
     a.load_store(false, LHS, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
     a.b(done);
+    if let Some(fail) = code_exit {
+        a.bind(fail);
+        a.add_sub_imm(BUDGET, BUDGET, count, true, false, false);
+        a.mov_imm(PC, block.instructions[0].eip.into(), false);
+        a.mov_imm(LHS, 7, false);
+        a.load_store(false, LHS, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
+        a.b(done);
+    }
     for (label, next_eip, completed) in attention_exits {
         a.bind(label);
         a.mov_imm(PC, next_eip.into(), false);
@@ -2948,6 +3026,14 @@ pub fn block(
     // checking references. Native fault records above remain independent.
     a.flush_tails();
     for site in &exits {
+        if let Some(fail) = site.code_miss {
+            a.bind(fail);
+            a.mov_imm(PC, site.eip.into(), false);
+            emit_progress(&mut a, block, site.steps_before);
+            a.mov_imm(LHS, 7, false);
+            a.load_store(false, LHS, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
+            a.b(done);
+        }
         if !a.is_referenced(site.miss) {
             continue;
         }

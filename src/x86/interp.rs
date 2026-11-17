@@ -861,11 +861,7 @@ impl Interpreter {
             {
                 // Diagnostic only: classify every interpreted attempt, even
                 // when a batch changes guest mode before returning to the JIT.
-                cpu.jit_eligible_interpreted += u64::from(
-                    !cpu.code_default16()
-                        && cpu.seg(SegmentReg::Cs).limit == u32::MAX
-                        && cpu.eflags & ((1 << 8) | (1 << 17)) == 0,
-                );
+                cpu.jit_profile_interpreted();
             }
             // Every operation still uses its existing Result-returning helper.
             // Errors leave the batch at this instruction; a successful handler

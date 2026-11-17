@@ -114,9 +114,10 @@ SIMD floating-point exceptions return masked results regardless of masks.
 PE is not raised, and tininess at the smallest-normal rounding boundary is
 not modeled. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
 Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
-HID tablet. The JITs compile only 32-bit code segments outside
-virtual-8086 mode: real-mode, V86 and 16-bit protected-mode code always
-runs in the interpreter, including Windows 9x's 16-bit USER/GDI paths.
+HID tablet. Real-mode and V86 code always runs in the interpreter. The A64
+JIT also compiles 16-bit protected-mode code with a 16-bit stack; the other
+JITs compile only 32-bit code segments. Far transfers, string instructions,
+LES/LDS and SS loads in 16-bit code still run in the interpreter.
 
 ## Unexplained
 

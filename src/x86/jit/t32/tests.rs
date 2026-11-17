@@ -319,6 +319,7 @@ fn arm_jit_extended_loop_decode_is_isolated() {
         assert_eq!(
             block.instructions[0].op,
             decode::Op::Loop {
+                counter_bits: 32,
                 target: 0x100,
                 zero: match opcode {
                     0xe0 => Some(false),

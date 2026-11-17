@@ -14,6 +14,9 @@
 //! Link tags also qualify CS base and compiled segment facts with a stable
 //! 12-bit context id. Context changes retain links; exhausting the 4095 ids
 //! clears both privilege planes before any id is reused.
+//! Protected 16-bit code requires a 16-bit stack and uses dynamic based segment
+//! checks. Real mode, V86 and debug stepping remain interpreted. PM32 keeps its
+//! full CS limit requirement and flat segment specializations.
 //! Execute revalidation is per page: the previous per-PC tags caused about
 //! 88 million context-related exits in the firmware workload. Restoring all
 //! entries of a revalidated page reduced a development cold boot from 48.1 to
@@ -42,7 +45,7 @@
 //! boot alone is not JIT validation.
 
 use super::code::{CodeArena, CodeError, CodeHandle, ENTRY_TABLES, TableIndex, cache_limits};
-use super::validity::CodeContent;
+use super::validity::{AliasSlot, CodeContent};
 use super::{
     compile, decode,
     frame::Frame,
@@ -303,7 +306,11 @@ unsafe extern "C" fn refill_data_translation(view: *mut View, page_tag: u32, wri
 /// Change a data segment without reading resident GPRs/flags/time or performing
 /// a faultable access. Refresh its explicit native view; changed compiled
 /// qualifications force exit before another block can run.
-unsafe extern "C" fn load_cached_segment(frame: *mut Frame, segment: u32, selector: u32) -> u32 {
+pub(super) unsafe extern "C" fn load_cached_segment<B: Bus>(
+    frame: *mut Frame,
+    segment: u32,
+    selector: u32,
+) -> u32 {
     let segment = crate::x86::cpu::SegmentReg::from_modrm_reg(segment as u8);
     // SAFETY: the invocation owns the frame, view, CPU and bus exclusively.
     // Generated callers end their block, preserve the fixed mapping state and
@@ -314,7 +321,7 @@ unsafe extern "C" fn load_cached_segment(frame: *mut Frame, segment: u32, select
         let cpu = &mut *view.cpu;
         if !crate::x86::interp::try_load_cached_segment(
             cpu,
-            &mut *view.bus.cast::<HostBus>(),
+            &mut *view.bus.cast::<B>(),
             segment,
             selector as u16,
         ) {
@@ -386,6 +393,20 @@ pub struct Stats {
     pub interned_contexts: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub context_clears: u64,
+    #[cfg(feature = "jit-profile")]
+    pub native_pm16_steps: u64,
+    #[cfg(feature = "jit-profile")]
+    pub interpreted_modes: [u64; 5],
+    /// Native returns: far transfer, string, segment boundary, CS limit,
+    /// memory, other (including dispatch/admission and budget/attention).
+    #[cfg(feature = "jit-profile")]
+    pub exit_reasons: [u64; 6],
+    #[cfg(feature = "jit-profile")]
+    pub link_single_retirements: u64,
+    #[cfg(feature = "jit-profile")]
+    pub link_scan_fallbacks: u64,
+    #[cfg(feature = "jit-profile")]
+    pub write_alias_scans: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub native_memory_reads: u64,
     #[cfg(any(test, feature = "jit-profile"))]
@@ -455,6 +476,9 @@ pub struct Engine {
     // Both privilege planes have fixed bounds. Keep that ownership invariant
     // in the types so a masked page index needs no dynamic slice-length check.
     links: Box<[Link; 2 * SLOTS]>,
+    // Reverse RAM-page hint; stale slots are checked against their live stamp.
+    // Multiple linear/privilege aliases use the existing full scan.
+    link_aliases: Vec<AliasSlot>,
     user_links: bool,
     // Content stamps are read only after a code write, outside native execution.
     // Keeping them out of Link halves the generated dispatch table's footprint.
@@ -507,6 +531,7 @@ impl Engine {
                 .try_into()
                 .ok()
                 .expect("fixed link count"),
+            link_aliases: Vec::new(),
             user_links: false,
             stamps: vec![CodeStamp::default(); 2 * SLOTS]
                 .into_boxed_slice()
@@ -606,6 +631,7 @@ impl Engine {
             self.last_clear = self.cache_counters().current;
         }
         self.links.fill(Link::EMPTY);
+        self.link_aliases.fill(AliasSlot::default());
         self.global_links.fill(0);
         // Rewritten pages lose their nonzero restart identity here. Their
         // next visit replaces the old half-count; unchanged pages retain it.
@@ -693,6 +719,7 @@ impl Engine {
             // Native execution has returned. No live link may name a reused
             // id, including a global link in the other privilege plane.
             self.links.fill(Link::EMPTY);
+            self.link_aliases.fill(AliasSlot::default());
             self.global_links.fill(0);
             self.contexts.clear();
             #[cfg(any(test, feature = "jit-profile"))]
@@ -711,6 +738,52 @@ impl Engine {
 
     fn link_context(&self) -> u64 {
         (u64::from(self.link_epoch) << 32) | u64::from(self.context_id)
+    }
+
+    #[cfg(feature = "jit-profile")]
+    fn profile_exit(cpu: &mut Cpu, bus: &HostBus, kind: u32) -> usize {
+        match kind {
+            7 => return 3,
+            1 | 3 => return 4,
+            0 => {}
+            _ => return 5,
+        }
+        // Observe only already resident bytes. No page walk, A/D update or
+        // device read is allowed for an exit classifier; unknown stays other.
+        let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip));
+        let Some(hit) = cpu.fetch_cache_lookup(linear) else {
+            return 5;
+        };
+        let bytes = bus.jit_code_bytes(
+            bus.jit_ram_offset(hit.backing),
+            (4096 - (linear.0 & 4095) as usize).min(15),
+        );
+        let Some(at) = bytes.iter().position(|b| {
+            !matches!(
+                b,
+                0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 | 0x66 | 0x67 | 0xf0 | 0xf2 | 0xf3
+            )
+        }) else {
+            return 5;
+        };
+        match bytes[at] {
+            0x9a | 0xea | 0xca | 0xcb => 0,
+            0xff if bytes
+                .get(at + 1)
+                .is_some_and(|b| matches!((b >> 3) & 7, 3 | 5)) =>
+            {
+                0
+            }
+            0x6c..=0x6f | 0xa4..=0xa7 | 0xaa..=0xaf => 1,
+            0x07 | 0x17 | 0x1f | 0x8e | 0xc4 | 0xc5 => 2,
+            0x0f if bytes
+                .get(at + 1)
+                .is_some_and(|b| matches!(b, 0xa1 | 0xa9 | 0xb2 | 0xb4 | 0xb5)) =>
+            {
+                2
+            }
+            _ => 5,
+        }
     }
 
     fn sync_mapping(&mut self, cpu: &mut Cpu) {
@@ -763,6 +836,7 @@ impl Engine {
         self.link_epoch = self.link_epoch.wrapping_add(1);
         if self.link_epoch == 0 {
             self.links.fill(Link::EMPTY);
+            self.link_aliases.fill(AliasSlot::default());
             self.link_epoch = 1;
         }
         let global_epoch = cpu.jit_global_epoch();
@@ -795,6 +869,7 @@ impl Engine {
     fn link(
         &mut self,
         linear: u32,
+        ram_page: usize,
         version: u64,
         version_ptr: *const u64,
         entries: *const u32,
@@ -803,6 +878,10 @@ impl Engine {
         fetch: FetchCacheHit,
     ) {
         let slot = usize::from(self.user_links) * SLOTS + links::slot(linear);
+        if self.link_aliases.len() <= ram_page {
+            self.link_aliases.resize(ram_page + 1, AliasSlot::default());
+        }
+        self.link_aliases[ram_page].record(slot);
         self.links[slot] = Link {
             tag: self.link_context() | u64::from(linear & !4095),
             entries,
@@ -823,20 +902,15 @@ impl Engine {
         if self.code_epoch == epoch {
             return;
         }
-        let single = bus.jit_single_retired_version(self.code_epoch);
+        let single = bus.jit_single_retired_page(self.code_epoch);
         self.code_epoch = epoch;
-        if let Some(version_ptr) = single {
-            // SAFETY: CodePages just supplied its stable, live version cell.
-            // One retirement since our last scan touched only this backing
-            // page. All linear/privilege aliases share that cell; compare its
-            // current version once instead of loading every published version.
-            let version = unsafe { *version_ptr };
-            for (link, stamp) in self.links.iter_mut().zip(self.stamps.iter()) {
-                if stamp.version_ptr == version_ptr && stamp.version != version {
-                    *link = Link::EMPTY;
-                }
-            }
+        if let Some((ram_page, version_ptr)) = single {
+            self.retire_code_page(ram_page, version_ptr);
             return;
+        }
+        #[cfg(feature = "jit-profile")]
+        {
+            self.stats.link_scan_fallbacks += 1;
         }
         for (link, stamp) in self.links.iter_mut().zip(self.stamps.iter()) {
             if link.tag != 0 {
@@ -847,6 +921,41 @@ impl Engine {
                 if unsafe { *stamp.version_ptr } != stamp.version {
                     *link = Link::EMPTY;
                 }
+            }
+        }
+    }
+
+    fn retire_code_page(&mut self, ram_page: usize, version_ptr: *const u64) {
+        // SAFETY: CodePages just supplied its stable, live version cell.
+        // One retirement since our last scan touched only this backing
+        // page. All linear/privilege aliases share that cell; compare its
+        // current version once instead of loading every published version.
+        let version = unsafe { *version_ptr };
+        let aliases = self
+            .link_aliases
+            .get_mut(ram_page)
+            .map(core::mem::take)
+            .unwrap_or_default();
+        if let Some(slot) = aliases.single() {
+            #[cfg(feature = "jit-profile")]
+            {
+                self.stats.link_single_retirements += 1;
+            }
+            if let Some(slot) = slot {
+                let stamp = &self.stamps[slot];
+                if stamp.version_ptr == version_ptr && stamp.version != version {
+                    self.links[slot] = Link::EMPTY;
+                }
+            }
+            return;
+        }
+        #[cfg(feature = "jit-profile")]
+        {
+            self.stats.link_scan_fallbacks += 1;
+        }
+        for (link, stamp) in self.links.iter_mut().zip(self.stamps.iter()) {
+            if stamp.version_ptr == version_ptr && stamp.version != version {
+                *link = Link::EMPTY;
             }
         }
     }
@@ -879,7 +988,10 @@ impl Engine {
                 self.rechecks[slot],
             );
         }
-        let window = (PAGE_BYTES as u64 - offset).min(u64::from(u32::MAX - cpu.eip) + 1);
+        let Some(remaining) = cpu.seg(SegmentReg::Cs).limit.checked_sub(cpu.eip) else {
+            return;
+        };
+        let window = (PAGE_BYTES as u64 - offset).min(u64::from(remaining) + 1);
         cpu.fill_fetch_cursor_after(cpu.eip, backing, 1, window as u32);
     }
 
@@ -954,6 +1066,10 @@ impl Engine {
                 // compared again on a later count-only lookup: ordinary writes
                 // to an unwatched page do not change that version cell.
                 let (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.stats.write_alias_scans = bus.jit_write_alias_scans();
+                }
                 page.version = version;
                 #[cfg(feature = "jit-profile")]
                 if entry == INTERPRET {
@@ -963,6 +1079,7 @@ impl Engine {
                     let entries = self.arena.entries_pointer(table);
                     self.link(
                         linear.0,
+                        (key.1 >> 12) as usize,
                         version,
                         version_ptr,
                         entries,
@@ -996,6 +1113,10 @@ impl Engine {
             self.stats.admissions += 1;
         }
         let (_, mut version, mut version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+        #[cfg(feature = "jit-profile")]
+        {
+            self.stats.write_alias_scans = bus.jit_write_alias_scans();
+        }
         // Counted-only pages consume no entry table or CompiledPage. Bound the
         // admitted page metadata as before, outside any active native stack.
         let new_page = !self.pages.contains_key(&key);
@@ -1017,6 +1138,10 @@ impl Engine {
                 cause,
             )?;
             (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+            #[cfg(feature = "jit-profile")]
+            {
+                self.stats.write_alias_scans = bus.jit_write_alias_scans();
+            }
         }
         #[cfg(all(feature = "jit-profile", target_os = "linux"))]
         let compilation_start = std::time::Instant::now();
@@ -1055,7 +1180,12 @@ impl Engine {
         // boundary. Compile that entry with the existing one-instruction ABI;
         // otherwise a longer block would be rejected on every shadowed visit.
         let count = if cpu.interrupt_shadow() { 1 } else { 32 };
-        let decoded = decode::block_extended(bus.jit_code_bytes(backing, window), cpu.eip, count);
+        let bytes = bus.jit_code_bytes(backing, window);
+        let decoded = if cpu.code_default16() {
+            decode::block_code16(bytes, cpu.eip, count)
+        } else {
+            decode::block_extended(bytes, cpu.eip, count)
+        };
         let (native, _faults, edges) = if decoded.instructions.is_empty() {
             (None, Vec::new(), Vec::new())
         } else {
@@ -1080,6 +1210,10 @@ impl Engine {
                     JitClearCause::EntryTable,
                 )?;
                 (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+                #[cfg(feature = "jit-profile")]
+                {
+                    self.stats.write_alias_scans = bus.jit_write_alias_scans();
+                }
             }
             let entry = match self.arena.publish_block(&mut code) {
                 Err(CodeError::Capacity) => {
@@ -1093,6 +1227,10 @@ impl Engine {
                         JitClearCause::CodeArea,
                     )?;
                     (_, version, version_ptr) = bus.jit_code_stamp(cpu, hit.backing);
+                    #[cfg(feature = "jit-profile")]
+                    {
+                        self.stats.write_alias_scans = bus.jit_write_alias_scans();
+                    }
                     self.arena.publish_block(&mut code)
                 }
                 result => result,
@@ -1178,6 +1316,7 @@ impl Engine {
             let entries = self.arena.entries_pointer(table);
             self.link(
                 linear.0,
+                (key.1 >> 12) as usize,
                 version,
                 version_ptr,
                 entries,
@@ -1204,16 +1343,13 @@ impl Engine {
             let mut repeat = None;
             #[cfg(feature = "jit-profile")]
             let mut write_token_miss = false;
-            // 16-bit code segments and V86 are interpreter-only by design
-            // (KNOWN_ISSUES.md, Limits by design); TF has no native lowering.
+            // Real mode, V86 and TF remain interpreted. PM16 requires SS.B=0;
+            // PM32 retains its full CS limit rule and flat specializations.
             // Taking the normal interpreter batch also avoids a slow
             // per-instruction real-mode path during BIOS startup. The next
             // machine boundary retries JIT.
             let shadowed = cpu.interrupt_shadow();
-            let eligible = !cpu.halted
-                && !cpu.code_default16()
-                && cpu.seg(SegmentReg::Cs).limit == u32::MAX
-                && cpu.eflags & ((1 << 8) | (1 << 17)) == 0;
+            let eligible = cpu.jit_code_eligible();
             let plan = bus.batch_attention_limit(start.wrapping_add(ran), budget - ran);
             let (limit, attention) = plan.unwrap_or((1, false));
             let native_limit = if shadowed { 1 } else { limit };
@@ -1244,7 +1380,7 @@ impl Engine {
                     let mut memory = View::new(cpu, bus.jit_rechecks_enabled());
                     memory.bus = (bus as *mut HostBus).cast();
                     memory.refill = refill_data_translation as *const () as usize;
-                    memory.load_segment = load_cached_segment as *const () as usize;
+                    memory.load_segment = load_cached_segment::<HostBus> as *const () as usize;
                     memory.mmx = execute_mmx as *const () as usize;
                     frame.memory = (&mut memory as *mut View).cast();
                     // SAFETY: entry was emitted from these validated bytes;
@@ -1278,6 +1414,10 @@ impl Engine {
                     self.stats.native_invocations += 1;
                     #[cfg(feature = "jit-profile")]
                     {
+                        if cpu.code_default16() {
+                            self.stats.native_pm16_steps += frame.completed;
+                        }
+                        self.stats.exit_reasons[Self::profile_exit(cpu, bus, frame.exit_kind)] += 1;
                         self.stats.empty_invocations += u64::from(frame.completed == 0);
                         self.stats.budget_exits += u64::from(frame.exit_kind == 2);
                         if frame.exit_kind == 0 {
@@ -1364,7 +1504,10 @@ impl Engine {
                         #[cfg(feature = "jit-profile")]
                         self.lookup(cpu, bus)?; // Opcode counts.
                     }
-                    assert!(matches!(frame.exit_kind, 0..=4), "unknown JIT exit kind");
+                    assert!(
+                        matches!(frame.exit_kind, 0..=4 | 7),
+                        "unknown JIT exit kind"
+                    );
                     #[cfg(any(test, feature = "jit-profile"))]
                     {
                         self.stats.division_exits += u64::from(frame.exit_kind == 4);
@@ -1424,10 +1567,12 @@ impl Engine {
             let epoch_before = cpu.jit_mapping_epoch();
             #[cfg(feature = "jit-profile")]
             let eligible_before = cpu.jit_eligible_interpreted;
+            #[cfg(feature = "jit-profile")]
+            let modes_before = cpu.jit_interpreted_modes;
             let mut batch = if let Some(repeat) = repeat {
                 #[cfg(feature = "jit-profile")]
                 {
-                    cpu.jit_eligible_interpreted += u64::from(eligible);
+                    cpu.jit_profile_interpreted();
                 }
                 Interpreter::resume_repeat(cpu, bus, start.wrapping_add(ran), &repeat)
             } else if eligible {
@@ -1473,6 +1618,10 @@ impl Engine {
             {
                 self.stats.eligible_interpreted_steps +=
                     cpu.jit_eligible_interpreted.wrapping_sub(eligible_before);
+                for (index, before) in modes_before.into_iter().enumerate() {
+                    self.stats.interpreted_modes[index] +=
+                        cpu.jit_interpreted_modes[index].wrapping_sub(before);
+                }
             }
             if !matches!(batch.stop, BatchStop::Budget) {
                 return Ok(BatchResult {
@@ -1492,14 +1641,72 @@ impl Engine {
 mod tests {
     use super::*;
 
+    #[test]
+    fn jit_link_alias_hints_retire_both_planes_and_preserve_reused_slots() {
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut pages = super::super::validity::CodePages::new(8192);
+        let (version, _) = pages.watch(0);
+        let (other_version, _) = pages.watch(1);
+        let ptr = pages.version_ptr(0);
+        let other = pages.version_ptr(1);
+        let entries = [0u32; PAGE_BYTES];
+        let publish = |engine: &mut Engine, page, ptr, version| {
+            engine.link(
+                0x1000,
+                page,
+                version,
+                ptr,
+                entries.as_ptr(),
+                false,
+                TranslationRecheck::EMPTY,
+                FetchCacheHit {
+                    phys: PhysAddr((page * PAGE_BYTES) as u64),
+                    backing: BackingToken((page * PAGE_BYTES) as u64),
+                },
+            );
+        };
+        publish(&mut engine, 0, ptr, version);
+        engine.user_links = true;
+        publish(&mut engine, 0, ptr, version);
+        pages.write(0, 1);
+        engine.retire_code_page(0, ptr);
+        assert_eq!(engine.links[1].tag, 0);
+        assert_eq!(engine.links[1 + SLOTS].tag, 0);
+
+        let (version, _) = pages.watch(0);
+        publish(&mut engine, 0, ptr, version);
+        publish(&mut engine, 1, other, other_version); // Same slot now owns another page.
+        let retained = engine.links[1 + SLOTS].tag;
+        pages.write(0, 1);
+        engine.retire_code_page(0, ptr);
+        assert_eq!(engine.links[1 + SLOTS].tag, retained);
+        assert_ne!(retained, 0);
+        assert_eq!(engine.stamps[1 + SLOTS].version_ptr, other);
+    }
+
     fn context_probe() -> (Engine, Cpu, *const u32) {
+        context_probe_mode(false)
+    }
+
+    fn context_probe_mode(code16: bool) -> (Engine, Cpu, *const u32) {
         let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
         let mut cpu = Cpu::new();
         cpu.enter_protected_flat(0x100, 0);
+        if code16 {
+            for seg in [SegmentReg::Cs, SegmentReg::Ss] {
+                let mut cache = cpu.seg(seg);
+                cache.flags &= !crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
+                cpu.set_seg_cache(seg, cache);
+            }
+        }
         engine.sync_mapping(&mut cpu);
         let table = engine.arena.allocate_entries();
         let entries = engine.arena.entries_pointer(table);
-        let decoded = decode::block_extended(&[0x40], 0x100, 1); // INC EAX
+        let decoded = if code16 {
+            decode::block_code16(&[0x40], 0x100, 1)
+        } else {
+            decode::block_extended(&[0x40], 0x100, 1)
+        }; // INC AX/EAX
         let mut code = compile::block(&decoded, None, View::block_facts(&cpu)).unwrap();
         let handle = engine.arena.publish_block(&mut code).unwrap();
         let body = engine.arena.address(handle, 0).unwrap();
@@ -1533,6 +1740,38 @@ mod tests {
                 .unwrap()
         };
         frame
+    }
+
+    #[test]
+    fn native_pm16_linked_body_checks_changed_cs_limit_and_mode_eligibility() {
+        let (mut engine, mut cpu, _) = context_probe_mode(true);
+        let epoch = cpu.jit_mapping_epoch();
+        let tag = engine.links[0].tag;
+        assert!(cpu.jit_code_eligible());
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+        let mut cs = cpu.seg(SegmentReg::Cs);
+        cs.limit = 0xff;
+        cpu.set_seg_cache(SegmentReg::Cs, cs);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(cpu.jit_mapping_epoch(), epoch);
+        assert_eq!(engine.links[0].tag, tag);
+        let frame = dispatch_probe(&mut engine, &mut cpu);
+        assert_eq!((frame.completed, frame.eip, frame.exit_kind), (0, 0x100, 7));
+        cs.limit = 0x100;
+        cpu.set_seg_cache(SegmentReg::Cs, cs);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+        let mut ss = cpu.seg(SegmentReg::Ss);
+        ss.flags |= crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
+        cpu.set_seg_cache(SegmentReg::Ss, ss);
+        assert!(!cpu.jit_code_eligible());
+        ss.flags &= !crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
+        cpu.set_seg_cache(SegmentReg::Ss, ss);
+        cpu.cr0 &= !crate::x86::cpu::CR0_PE;
+        assert!(!cpu.jit_code_eligible());
+        cpu.cr0 |= crate::x86::cpu::CR0_PE;
+        cpu.replace_eflags(1 << 17);
+        assert!(!cpu.jit_code_eligible());
     }
 
     #[test]
@@ -1580,16 +1819,23 @@ mod tests {
         assert_eq!(engine.link_context(), tag);
         assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
 
-        // Only a base change is exempted. Limit/default-size changes still
-        // retire execute proofs even when the base and data facts match.
+        // CS limits stay dynamic; changing D selects another context. Neither
+        // load expires the mapping epoch or discards the retained old link.
         let mut changed_cs = cs;
         changed_cs.limit = 0xffff;
         cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
-        assert_ne!(cpu.jit_mapping_epoch(), epoch);
-        let limit_epoch = cpu.jit_mapping_epoch();
+        assert_eq!(cpu.jit_mapping_epoch(), epoch);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.links[0].tag, tag);
+        assert!(!cpu.jit_code_eligible()); // A limited PM32 CS cannot enter.
         changed_cs.flags ^= crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
         cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
-        assert_ne!(cpu.jit_mapping_epoch(), limit_epoch);
+        assert_eq!(cpu.jit_mapping_epoch(), epoch);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.links[0].tag, tag);
+        assert_ne!(engine.link_context(), tag);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 0);
+        assert!(!cpu.jit_code_eligible()); // PM16 on SS.B=1 is deferred.
     }
 
     #[test]

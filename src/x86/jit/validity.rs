@@ -23,6 +23,35 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::cell::Cell;
 
+/// Conservative reverse ownership: no slot, one slot, or multiple slots.
+/// Reuse need not unlink the old page; consumers check the remembered identity.
+#[cfg(a64_jit)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct AliasSlot(u16);
+
+#[cfg(a64_jit)]
+impl AliasSlot {
+    pub const MANY: Self = Self(u16::MAX);
+
+    pub fn record(&mut self, slot: usize) {
+        let next = slot as u16 + 1;
+        self.0 = if self.0 == 0 || self.0 == next {
+            next
+        } else {
+            u16::MAX
+        };
+    }
+
+    /// None is the full-scan case; Some(None) has no remaining aliases.
+    pub fn single(self) -> Option<Option<usize>> {
+        match self.0 {
+            0 => Some(None),
+            u16::MAX => None,
+            slot => Some(Some(usize::from(slot - 1))),
+        }
+    }
+}
+
 /// Only bytes used by translated instructions or negative-cache decisions are
 /// dependencies. Other bytes can become data or code later. Record new spans
 /// from the current qualified backing bytes, never from an earlier page image.
@@ -100,6 +129,10 @@ pub struct CodePages {
     // Cell keeps published raw version pointers valid across notifications.
     // The allocation never moves or grows; execution and mutation are exclusive.
     versions: Vec<Cell<u64>>,
+    #[cfg(a64_jit)]
+    write_aliases: Vec<Cell<AliasSlot>>,
+    #[cfg(all(a64_jit, feature = "jit-profile"))]
+    pub(crate) write_alias_scans: u64,
 }
 
 impl CodePages {
@@ -108,6 +141,12 @@ impl CodePages {
             epoch: 0,
             retired_page: usize::MAX,
             versions: alloc::vec![Cell::new(0); bytes.div_ceil(4096)],
+            // Translations granted before JIT activation are not recorded.
+            // The first promotion scans; later grants are tracked at fill.
+            #[cfg(a64_jit)]
+            write_aliases: alloc::vec![Cell::new(AliasSlot::MANY); bytes.div_ceil(4096)],
+            #[cfg(all(a64_jit, feature = "jit-profile"))]
+            write_alias_scans: 0,
         }
     }
 
@@ -141,8 +180,30 @@ impl CodePages {
     /// epoch retired exactly one page. Older observers and bulk retirement
     /// must inspect all their published versions. This does not consume state.
     pub fn single_retired_version(&self, previous_epoch: u64) -> Option<*const u64> {
+        self.single_retired_page(previous_epoch)
+            .map(|page| self.version_ptr(page))
+    }
+
+    pub(crate) fn single_retired_page(&self, previous_epoch: u64) -> Option<usize> {
         (previous_epoch.checked_add(1) == Some(self.epoch) && self.retired_page != usize::MAX)
-            .then(|| self.version_ptr(self.retired_page))
+            .then_some(self.retired_page)
+    }
+
+    #[cfg(a64_jit)]
+    pub(crate) fn record_write_alias(&self, page: usize, slot: usize) {
+        let mut aliases = self.write_aliases[page].get();
+        aliases.record(slot);
+        self.write_aliases[page].set(aliases);
+    }
+
+    #[cfg(a64_jit)]
+    pub(crate) fn take_write_alias(&mut self, page: usize) -> AliasSlot {
+        let aliases = self.write_aliases[page].replace(AliasSlot::default());
+        #[cfg(feature = "jit-profile")]
+        {
+            self.write_alias_scans += u64::from(aliases.single().is_none());
+        }
+        aliases
     }
 
     fn retire_epoch(&mut self) {
@@ -153,6 +214,7 @@ impl CodePages {
     /// A page reused as data can then regain a writable translation. The next
     /// promotion must revoke its aliases again. Keep the allocation stable so
     /// reclamation does not replace the version owner or its published pointers.
+    /// Write-row hints survive: releasing watches does not evict translations.
     pub fn clear(&mut self) {
         self.retired_page = usize::MAX;
         self.retire_epoch();

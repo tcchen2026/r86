@@ -69,6 +69,7 @@ pub struct Frame {
     pub completed: u64,
     /// Kind 5 requests attention; kind 6 also requires the adapter to install
     /// STI's interrupt shadow before handing control back to the machine.
+    /// Kind 7 leaves before a CODE16 fetch/target limit violation.
     pub exit_kind: u32,
     /// Exit kind 3 resumes the unfinished REP instruction after native memory
     /// elements. While running, completed temporarily stores its starting ECX.

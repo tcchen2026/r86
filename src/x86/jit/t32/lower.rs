@@ -1475,6 +1475,7 @@ impl Lower {
                 self.clobber();
                 let miss = self.miss(index);
                 let string = |base, segment| Address {
+                    bits: 32,
                     base: Some(base),
                     index: None,
                     scale: 0,
@@ -1504,6 +1505,7 @@ impl Lower {
                 let write = kind == StringOp::Store;
                 let pointer = if write { 7 } else { 6 };
                 let address = Address {
+                    bits: 32,
                     base: Some(pointer),
                     index: None,
                     scale: 0,
@@ -1699,7 +1701,11 @@ impl Lower {
                 }
                 self.a.dp(Dp::Add, false, ESP, ESP, Operand::Imm(32));
             }
-            Op::Loop { target, zero } => {
+            Op::Loop {
+                target,
+                zero,
+                counter_bits: _,
+            } => {
                 self.clobber();
                 let ecx = guest(1);
                 self.a.dp(Dp::Sub, false, ecx, ecx, Operand::Imm(1));
@@ -1731,7 +1737,7 @@ impl Lower {
                 self.spill();
                 let cond = match condition {
                     BranchCondition::Flags(cc) => self.condition(cc),
-                    BranchCondition::EcxZero => {
+                    BranchCondition::EcxZero { bits: _ } => {
                         self.clobber();
                         self.a.cmp(guest(1), Operand::Imm(0));
                         Cond::Eq

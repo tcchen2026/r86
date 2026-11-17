@@ -69,7 +69,7 @@ impl Bus for Memory {
     }
 }
 
-unsafe extern "C" fn refill(view: *mut soft::View, tag: u32, write: u32) -> u64 {
+pub(super) unsafe extern "C" fn refill(view: *mut soft::View, tag: u32, write: u32) -> u64 {
     // SAFETY: invoke supplies exclusive, live fixture owners.
     let view = unsafe { &mut *view };
     let linear = LinearAddr(tag & !4095);

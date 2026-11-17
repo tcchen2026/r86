@@ -1702,7 +1702,7 @@ impl Compiler<'_> {
     fn branch_condition(&mut self, condition: BranchCondition, invert: bool) {
         match condition {
             BranchCondition::Flags(condition) => self.condition(condition ^ u8::from(invert)),
-            BranchCondition::EcxZero => {
+            BranchCondition::EcxZero { bits: _ } => {
                 self.code.get(REG + 1);
                 self.code.byte(0x45);
                 if invert {

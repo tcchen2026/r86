@@ -1147,6 +1147,7 @@ impl Lower {
                 self.clobber();
                 let miss = self.miss(index);
                 let string = |base, segment| Address {
+                    bits: 32,
                     base: Some(base),
                     index: None,
                     scale: 0,
@@ -1238,7 +1239,7 @@ impl Lower {
                 self.spill();
                 let cond = match condition {
                     BranchCondition::Flags(cc) => self.condition(cc),
-                    BranchCondition::EcxZero => {
+                    BranchCondition::EcxZero { bits: _ } => {
                         self.clobber();
                         self.a.cmp(guest(1), Operand::Imm(0));
                         Cond::Eq

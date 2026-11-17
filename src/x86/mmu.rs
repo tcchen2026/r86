@@ -433,6 +433,22 @@ fn cache_native_read<B: Bus>(cpu: &mut Cpu, bus: &mut B, linear: LinearAddr, pri
     }
 }
 
+// Publish the reverse write-row hint at the grant, never on RAM hits.
+#[inline(always)]
+fn fill_cached_write_translation<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &B,
+    linear: LinearAddr,
+    backing: BackingToken,
+    user: bool,
+) {
+    cpu.fill_cached_write_translation(linear, backing, user);
+    #[cfg(a64_jit)]
+    bus.cached_write_translation_granted(linear, backing);
+    #[cfg(not(a64_jit))]
+    let _ = bus;
+}
+
 fn cached_write_backing<B: Bus>(
     cpu: &mut Cpu,
     bus: &B,
@@ -488,7 +504,7 @@ pub(crate) fn try_resident_data_translation<B: Bus>(
             return None;
         }
         if writable {
-            cpu.fill_cached_write_translation(linear, token, cpu.cpl() == 3);
+            fill_cached_write_translation(cpu, bus, linear, token, cpu.cpl() == 3);
         } else {
             cpu.fill_cached_read_translation(linear, token, cpu.cpl() == 3);
         }
@@ -515,7 +531,7 @@ pub(crate) fn try_resident_data_translation<B: Bus>(
         return None;
     }
     if writable {
-        cpu.fill_cached_write_translation(linear, token, priv_.is_user());
+        fill_cached_write_translation(cpu, bus, linear, token, priv_.is_user());
     } else {
         cpu.fill_cached_read_translation(linear, token, priv_.is_user());
     }
@@ -673,7 +689,7 @@ pub(crate) fn fill_linear_translation_cache<B: Bus>(
                 // The successful read already observed A/D and permissions for
                 // a write. Granting the token changes no paging bits or RAM;
                 // watched code remains excluded by the bus's ordinary policy.
-                cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+                fill_cached_write_translation(cpu, bus, linear, backing, priv_.is_user());
             } else {
                 cpu.fill_cached_read_translation(linear, backing, priv_.is_user());
             }
@@ -687,7 +703,9 @@ pub(crate) fn fill_linear_translation_cache<B: Bus>(
             | TranslationPageSize::Size4M,
         ) => {
             if bus.cached_write_translation_allowed(translation.phys) {
-                cpu.fill_cached_write_translation(
+                fill_cached_write_translation(
+                    cpu,
+                    bus,
                     linear,
                     bus.cached_backing_token(translation.phys),
                     priv_.is_user(),
@@ -715,14 +733,15 @@ fn cache_ioram_translation<B: Bus>(
     let phys = translation.phys;
     let page = bus.ioram_page(PhysAddr(phys.0 & !4095), write)?;
     let backing = BackingToken(page.0 + (phys.0 & 4095));
-    publish_ioram_translation(cpu, linear, priv_, translation.global, write, backing);
+    publish_ioram_translation(cpu, bus, linear, priv_, translation.global, write, backing);
     Some(backing)
 }
 
 // Keep device publication and ownership bookkeeping out of RAM hit frames.
 #[inline(never)]
-fn publish_ioram_translation(
+fn publish_ioram_translation<B: Bus>(
     cpu: &mut Cpu,
+    bus: &B,
     linear: LinearAddr,
     priv_: AccessPriv,
     global: bool,
@@ -730,7 +749,7 @@ fn publish_ioram_translation(
     backing: BackingToken,
 ) {
     if write {
-        cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+        fill_cached_write_translation(cpu, bus, linear, backing, priv_.is_user());
     } else {
         cpu.fill_cached_read_translation(linear, backing, priv_.is_user());
     }
@@ -1417,7 +1436,7 @@ fn write_linear_u8_miss<B: Bus>(
     bus.probe_phys_write_u8(phys)?;
     if translation_cache_target_is_ram(bus, phys) && bus.cached_write_translation_allowed(phys) {
         let backing = bus.cached_backing_token(phys);
-        cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+        fill_cached_write_translation(cpu, bus, linear, backing, priv_.is_user());
         finish_cached_translation(cpu, bus, linear, &translation);
         return write_probed_cached_ram_u8(cpu, bus, backing, value);
     }
@@ -1508,7 +1527,7 @@ fn write_linear_u16_slow<B: Bus>(
         if contiguous_ram_commit(bus, phys, 2) {
             if bus.cached_write_translation_allowed(phys) {
                 let backing = bus.cached_backing_token(phys);
-                cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+                fill_cached_write_translation(cpu, bus, linear, backing, priv_.is_user());
                 finish_cached_translation(cpu, bus, linear, &translation);
                 return write_probed_cached_ram_u16(cpu, bus, backing, value);
             }
@@ -1607,7 +1626,7 @@ fn write_linear_u32_slow<B: Bus>(
         if contiguous_ram_commit(bus, phys, 4) {
             if bus.cached_write_translation_allowed(phys) {
                 let backing = bus.cached_backing_token(phys);
-                cpu.fill_cached_write_translation(linear, backing, priv_.is_user());
+                fill_cached_write_translation(cpu, bus, linear, backing, priv_.is_user());
                 finish_cached_translation(cpu, bus, linear, &translation);
                 return write_probed_cached_ram_u32(cpu, bus, backing, value);
             }
