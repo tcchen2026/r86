@@ -52,6 +52,7 @@ __pycache__/
 *.md
 !/README.md
 !/KNOWN_ISSUES.md
+!/THIRD_PARTY_NOTICES.md
 !/assets/README.md
 !/r86-tools/README.md
 !/vendor/README.md

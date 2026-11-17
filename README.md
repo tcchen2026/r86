@@ -38,22 +38,40 @@ cargo run --release --features sdl2-frontend --bin r86-run -- \
 
 ## License
 
-r86 is licensed under the [Apache License 2.0](LICENSE). The bundled SeaBIOS
-([source](vendor/seabios), [firmware](firmware/seabios)) is LGPLv3, and
-[the tiny386 patch](patches/tiny386-reactos-compat.patch) is BSD-3-Clause. The
-r86 tools disc's Windows 95/98/Me display driver,
-[VMDisp9x](r86-tools/disc/VMDISP9X), is MIT; see [r86-tools](r86-tools).
+r86 is licensed under the [Apache License 2.0](LICENSE). Included and adapted
+third-party material retains its own terms; see
+[Third-party notices](THIRD_PARTY_NOTICES.md) for copyright notices and full
+licence texts. The separate FreeDOS kit retains its packages' notices and
+sources; [its manifest](assets/freedos.json) identifies their licences.
 
 ## Credits
 
-**Projects r86 builds on.** r86's design started from
+**Included or adapted components.**
+
+- [QEMU](https://www.qemu.org/): MIT-licensed UHCI, USB control and HID code
+  adapted in [the USB controller and tablet](src/devices/usb/README.txt).
+- [ymfm](https://github.com/aaronsgiles/ymfm): BSD-3-Clause OPL2 synthesis
+  adapted in [the audio device](src/devices/audio/README.txt).
+- [fatfs](https://github.com/rafalh/rust-fatfs): MIT FAT filesystem library,
+  [vendored with local changes](vendor/fatfs/provenance.txt).
+- [SeaBIOS](https://www.seabios.org/): LGPLv3 PC and VGA BIOS, with separately
+  licensed components and build tools documented in the notices. Both the
+  [source](vendor/seabios) and [firmware](firmware/seabios) are bundled.
+- [VMDisp9x](https://github.com/JHRobotics/vmdisp9x): MIT Windows 95/98/Me
+  display-driver package on [the public tools disc](r86-tools/README.md).
+- Joseph Gil's fntcol16 collection: public-domain IBM VGA font data used by
+  SeaBIOS and [the handheld frontend](src/frontend/handheld/vgafont.rs).
+- [The tiny386 compatibility patch](patches/tiny386-reactos-compat.patch):
+  BSD-3-Clause; distributed as a patch, not linked into r86.
+- [VibeOffice](https://github.com/tcchen2026/VibeOffice): Apache-2.0 desktop
+  helper adapted for [the CardputerZero launcher](ports/cardputerzero/packaging/helpers.sh).
+- [FreeDOS](https://www.freedos.org/): the separate DOS kit contains the
+  kernel, shell, utilities and games under the licences in its manifest.
+
+**Design and compatibility references.** r86's design started from
 [tiny386](https://github.com/hchunhui/tiny386) (BSD-3-Clause),
 which remains its performance baseline. [v86](https://github.com/copy/v86)
 (BSD-2-Clause) is used as a reference for operating-system compatibility.
-[SeaBIOS](https://www.seabios.org/) (LGPLv3) is bundled as the PC BIOS and VGA
-BIOS; its source is in [vendor/seabios](vendor/seabios).
-[VMDisp9x](https://github.com/JHRobotics/vmdisp9x) (MIT) is the Windows
-95/98/Me display driver on the r86 tools disc. We thank their authors.
 
 **How x86 behavior was checked.** r86 follows Intel's published architecture
 manuals. Where details are ambiguous or undocumented, such as fault ordering,
@@ -61,7 +79,8 @@ paging and device edge cases, [QEMU](https://www.qemu.org/),
 [Bochs](https://bochs.sourceforge.io/) and [86Box](https://86box.net/) were
 consulted as references: their source code was read to understand their
 behavior, and Bochs and QEMU are run in testing, as installed programs, to
-compare results. r86 does not include code from these projects.
+compare results. The QEMU adaptations listed above use those files' MIT
+licence. Bochs and 86Box are behavior references, not included emulator code.
 
 **How the code is reviewed.** r86 is written with the help of AI coding
 assistants. Such tools are trained on large amounts of public code, which may
