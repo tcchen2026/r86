@@ -1542,12 +1542,14 @@ impl Cpu {
             }
             #[cfg(feature = "jit")]
             if previous != cache {
-                let same_code = previous.base == cache.base
+                let same_code = (cfg!(a64_jit) || previous.base == cache.base)
                     && previous.limit == cache.limit
                     && (previous.flags ^ cache.flags) & !0x60 == 0;
                 if !same_code {
-                    // Native links embed guest PCs and CS attributes. Their
-                    // user/supervisor execute tables remain privilege-tagged.
+                    // A64 tags qualify CS base separately, so rebasing alone
+                    // preserves linear execute proofs. Other backends still
+                    // expire those links here. CS attributes expire all;
+                    // user/supervisor execute tables qualify paging privilege.
                     self.invalidate_jit_fetch_context();
                 }
             }

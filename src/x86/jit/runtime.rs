@@ -11,6 +11,9 @@
 //! whole page together: a same-page direct branch can reach any of those bodies.
 //! Compare under exclusive CPU/bus ownership after execute revalidation. Renew
 //! the watch and revoke writable aliases before republishing any retained link.
+//! Link tags also qualify CS base and compiled segment facts with a stable
+//! 12-bit context id. Context changes retain links; exhausting the 4095 ids
+//! clears both privilege planes before any id is reused.
 //! Execute revalidation is per page: the previous per-PC tags caused about
 //! 88 million context-related exits in the firmware workload. Restoring all
 //! entries of a revalidated page reduced a development cold boot from 48.1 to
@@ -87,6 +90,7 @@ impl Hasher for PageHasher {
 pub(crate) const HOT: u8 = 8;
 const HEAT_SLOTS: usize = 131072;
 const COLD_BATCH: u64 = 32;
+const MAX_CONTEXTS: usize = PAGE_BYTES - 1;
 
 // A scheduling hint, never a native-code identity. The upper 56 bits hold a
 // tag; the low byte holds a saturating count. Exactly 1 MiB on every ARM64 host.
@@ -379,6 +383,10 @@ pub struct Stats {
     #[cfg(any(test, feature = "jit-profile"))]
     pub global_link_retags: u64,
     #[cfg(any(test, feature = "jit-profile"))]
+    pub interned_contexts: u64,
+    #[cfg(any(test, feature = "jit-profile"))]
+    pub context_clears: u64,
+    #[cfg(any(test, feature = "jit-profile"))]
     pub native_memory_reads: u64,
     #[cfg(any(test, feature = "jit-profile"))]
     pub native_memory_writes: u64,
@@ -453,8 +461,11 @@ pub struct Engine {
     stamps: Box<[CodeStamp; 2 * SLOTS]>,
     rechecks: Box<[TranslationRecheck; 2 * SLOTS]>,
     returns: Box<links::ReturnStack>,
-    cs_base: u32,
-    block_facts: u32,
+    // Low word: CS base; high word: compiled segment facts. Compare once on
+    // the usual unchanged path; hash the full pair only on a context switch.
+    context: u64,
+    context_id: u16,
+    contexts: HashMap<u64, u16, BuildHasherDefault<PageHasher>>,
     heat: Box<[Heat]>,
     code_epoch: u64,
     mapping_epoch: Option<u64>,
@@ -462,7 +473,7 @@ pub struct Engine {
     previous_cr3: u32,
     global_epoch: u64,
     global_links: [u64; 2 * SLOTS / 64],
-    link_context: u32,
+    link_epoch: u32,
     #[cfg(feature = "jit-profile")]
     unsupported: Box<[u64; 576]>,
     pub stats: Stats,
@@ -508,8 +519,9 @@ impl Engine {
                 .ok()
                 .expect("fixed recheck count"),
             returns: Box::new(links::ReturnStack::new()),
-            cs_base: 0,
-            block_facts: 0,
+            context: 0,
+            context_id: 1,
+            contexts: HashMap::from_iter([(0, 1)]),
             heat: vec![Heat::default(); HEAT_SLOTS].into_boxed_slice(),
             code_epoch: 0,
             mapping_epoch: None,
@@ -517,10 +529,14 @@ impl Engine {
             previous_cr3: 0,
             global_epoch: 0,
             global_links: [0; 2 * SLOTS / 64],
-            link_context: 1,
+            link_epoch: 1,
             #[cfg(feature = "jit-profile")]
             unsupported: Box::new([0; 576]),
-            stats: Stats::default(),
+            stats: Stats {
+                #[cfg(any(test, feature = "jit-profile"))]
+                interned_contexts: 1,
+                ..Stats::default()
+            },
             #[cfg(debug_assertions)]
             clear_causes: [0; 4],
             #[cfg(debug_assertions)]
@@ -669,21 +685,42 @@ impl Engine {
         result
     }
 
-    fn sync_mapping(&mut self, cpu: &mut Cpu) {
-        // Every linked block was compiled for these segment and memory-mode facts.
-        // Clear both privilege planes: an execute-walk recheck cannot certify
-        // compiled assumptions. Bases/limits not covered by flat qualification
-        // are still loaded and checked from each invocation's memory view.
-        let permissions = View::block_facts(cpu);
-        if self.block_facts != permissions {
-            self.links.fill(Link::EMPTY);
-            self.block_facts = permissions;
+    fn intern_context(&mut self, context: u64) -> u16 {
+        if let Some(&id) = self.contexts.get(&context) {
+            return id;
         }
-        // Native absolute branch PCs are CS-relative. Paging rechecks alone
-        // cannot certify code compiled with another CS base.
-        if self.cs_base != cpu.seg(SegmentReg::Cs).base {
+        if self.contexts.len() == MAX_CONTEXTS {
+            // Native execution has returned. No live link may name a reused
+            // id, including a global link in the other privilege plane.
             self.links.fill(Link::EMPTY);
-            self.cs_base = cpu.seg(SegmentReg::Cs).base;
+            self.global_links.fill(0);
+            self.contexts.clear();
+            #[cfg(any(test, feature = "jit-profile"))]
+            {
+                self.stats.context_clears += 1;
+            }
+        }
+        let id = (self.contexts.len() + 1) as u16;
+        self.contexts.insert(context, id);
+        #[cfg(any(test, feature = "jit-profile"))]
+        {
+            self.stats.interned_contexts += 1;
+        }
+        id
+    }
+
+    fn link_context(&self) -> u64 {
+        (u64::from(self.link_epoch) << 32) | u64::from(self.context_id)
+    }
+
+    fn sync_mapping(&mut self, cpu: &mut Cpu) {
+        // Execute rechecks certify mappings, not compiled assumptions. Keep
+        // both in the tag so returning to an old context can reuse its links.
+        let context =
+            u64::from(cpu.seg(SegmentReg::Cs).base) | (u64::from(View::block_facts(cpu)) << 32);
+        if self.context != context {
+            self.context = context;
+            self.context_id = self.intern_context(context);
         }
         // Paging distinguishes CPL 3 from supervisor access. Retain both
         // certified execute translations across calls/interrupts; a kernel
@@ -722,11 +759,11 @@ impl Engine {
             self.stats.same_cr3_mapping_changes += u64::from(cpu.cr3 == self.previous_cr3);
             self.previous_cr3 = cpu.cr3;
         }
-        let old_context = self.link_context;
-        self.link_context = self.link_context.wrapping_add(1);
-        if self.link_context == 0 {
+        let old_epoch = self.link_epoch;
+        self.link_epoch = self.link_epoch.wrapping_add(1);
+        if self.link_epoch == 0 {
             self.links.fill(Link::EMPTY);
-            self.link_context = 1;
+            self.link_epoch = 1;
         }
         let global_epoch = cpu.jit_global_epoch();
         if self.global_epoch == global_epoch {
@@ -737,8 +774,10 @@ impl Engine {
                     let bit = old_bits.trailing_zeros() as usize;
                     old_bits &= old_bits - 1;
                     let link = &mut self.links[word * 64 + bit];
-                    if link.tag >> 32 == u64::from(old_context) {
-                        link.tag = (u64::from(self.link_context) << 32) | (link.tag & 0xffff_ffff);
+                    if link.tag >> 32 == u64::from(old_epoch) {
+                        // Preserve the linear page and its context id, even
+                        // when that context is not the current one.
+                        link.tag = (u64::from(self.link_epoch) << 32) | (link.tag & 0xffff_ffff);
                         *bits |= 1 << bit;
                         #[cfg(any(test, feature = "jit-profile"))]
                         {
@@ -765,7 +804,7 @@ impl Engine {
     ) {
         let slot = usize::from(self.user_links) * SLOTS + links::slot(linear);
         self.links[slot] = Link {
-            tag: (u64::from(self.link_context) << 32) | u64::from(linear & !4095),
+            tag: self.link_context() | u64::from(linear & !4095),
             entries,
         };
         self.stamps[slot] = CodeStamp {
@@ -816,11 +855,9 @@ impl Engine {
         if cpu.fetch_cursor_backing_u8(cpu.eip).is_some() {
             return;
         }
-        let linear = LinearAddr(self.cs_base.wrapping_add(cpu.eip));
+        let linear = LinearAddr((self.context as u32).wrapping_add(cpu.eip));
         let slot = usize::from(self.user_links) * SLOTS + links::slot(linear.0);
-        if self.links[slot].tag
-            != (u64::from(self.link_context) << 32) | u64::from(linear.0 & !4095)
-        {
+        if self.links[slot].tag != self.link_context() | u64::from(linear.0 & !4095) {
             return;
         }
         // lookup retired invalid mappings/content before entering this chain;
@@ -852,7 +889,7 @@ impl Engine {
         let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip));
         let offset = (linear.0 & 4095) as usize;
         let link = self.links[usize::from(self.user_links) * SLOTS + links::slot(linear.0)];
-        if link.tag == (u64::from(self.link_context) << 32) | u64::from(linear.0 & !4095) {
+        if link.tag == self.link_context() | u64::from(linear.0 & !4095) {
             // SAFETY: matching page tag owns a PAGE_BYTES-entry allocation;
             // sync_code retired any changed contents before this lookup.
             // clear drops the allocation only after invalidating all links.
@@ -887,7 +924,7 @@ impl Engine {
         // Lookup hashes and compares two u64s instead of three scalar fields;
         // no qualification bits are discarded, including unaligned CS bases.
         let key = (
-            u64::from(cpu.eip.wrapping_sub(offset as u32)) | (u64::from(self.block_facts) << 32),
+            u64::from(cpu.eip.wrapping_sub(offset as u32)) | (self.context & !0xffff_ffff),
             backing - offset as u64,
         );
         let mut restart = 0;
@@ -1027,7 +1064,7 @@ impl Engine {
                 Some(links::Page {
                     eip_start: key.0 as u32,
                 }),
-                self.block_facts,
+                (self.context >> 32) as u32,
             )
             .map_err(|error| format!("JIT compiler at {:#x}: {error:?}", cpu.eip))?;
             if self.arena.tables_used() == self.arena.table_capacity()
@@ -1202,7 +1239,7 @@ impl Engine {
                     let link_base = usize::from(self.user_links) * SLOTS;
                     frame.links = self.links[link_base..].as_mut_ptr();
                     frame.link_rechecks = self.rechecks[link_base..].as_ptr();
-                    frame.link_context = u64::from(self.link_context) << 32;
+                    frame.link_context = self.link_context();
                     frame.call_base = &mut *self.returns;
                     let mut memory = View::new(cpu, bus.jit_rechecks_enabled());
                     memory.bus = (bus as *mut HostBus).cast();
@@ -1244,12 +1281,12 @@ impl Engine {
                         self.stats.empty_invocations += u64::from(frame.completed == 0);
                         self.stats.budget_exits += u64::from(frame.exit_kind == 2);
                         if frame.exit_kind == 0 {
-                            let linear = self.cs_base.wrapping_add(cpu.eip);
+                            let linear = (self.context as u32).wrapping_add(cpu.eip);
                             let link = self.links
                                 [usize::from(self.user_links) * SLOTS + links::slot(linear)];
                             if link.tag != frame.link_context | u64::from(linear & !4095) {
                                 self.stats.dispatch_misses += 1;
-                                if link.tag >> 32 == frame.link_context >> 32 {
+                                if link.tag & !0xffff_f000_u64 == frame.link_context {
                                     self.stats.dispatch_collisions += 1;
                                 } else if link.tag != 0 {
                                     self.stats.dispatch_context_changes += 1;
@@ -1310,7 +1347,7 @@ impl Engine {
                     }
                     if frame.exit_kind == 0 {
                         assert!(frame.completed != 0, "JIT normal exit lost progress");
-                        let linear = self.cs_base.wrapping_add(cpu.eip);
+                        let linear = (self.context as u32).wrapping_add(cpu.eip);
                         let link =
                             self.links[usize::from(self.user_links) * SLOTS + links::slot(linear)];
                         // Native code cannot change mappings or watched code.
@@ -1454,6 +1491,200 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn context_probe() -> (Engine, Cpu, *const u32) {
+        let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x100, 0);
+        engine.sync_mapping(&mut cpu);
+        let table = engine.arena.allocate_entries();
+        let entries = engine.arena.entries_pointer(table);
+        let decoded = decode::block_extended(&[0x40], 0x100, 1); // INC EAX
+        let mut code = compile::block(&decoded, None, View::block_facts(&cpu)).unwrap();
+        let handle = engine.arena.publish_block(&mut code).unwrap();
+        let body = engine.arena.address(handle, 0).unwrap();
+        engine.arena.entries_mut(table)[0x100] = (body as isize - entries as isize) as i32 as u32;
+        engine.links[0] = Link {
+            tag: engine.link_context(),
+            entries,
+        };
+        (engine, cpu, entries)
+    }
+
+    // Enter the generated dispatcher directly: a hit here cannot be rescued
+    // by Rust lookup, admission or interpretation. One INC then returns.
+    fn dispatch_probe(engine: &mut Engine, cpu: &mut Cpu) -> Frame {
+        let mut view = View::new(cpu, false);
+        let mut frame = Frame::from_cpu(cpu, 1);
+        frame.memory = core::ptr::from_mut(&mut view).cast();
+        frame.native_entry = engine.entry.dispatch;
+        frame.dispatch_entry = engine.entry.finish;
+        frame.return_entry = engine.entry.finish;
+        frame.recheck_entry = engine.entry.recheck;
+        frame.links = engine.links.as_mut_ptr();
+        frame.link_rechecks = engine.rechecks.as_ptr();
+        frame.link_context = engine.link_context();
+        // SAFETY: the frame, view, links and native table stay live throughout
+        // this invocation; the only published body is the one-step probe.
+        unsafe {
+            engine
+                .arena
+                .invoke(engine.entry.handle, &mut frame)
+                .unwrap()
+        };
+        frame
+    }
+
+    #[test]
+    fn context_links_reject_changed_base_or_facts_and_reenter_without_lookup() {
+        let (mut engine, mut cpu, _) = context_probe();
+        let cs = cpu.seg(SegmentReg::Cs);
+        let ds = cpu.seg(SegmentReg::Ds);
+        let tag = engine.links[0].tag;
+        let epoch = cpu.jit_mapping_epoch();
+        let hit = dispatch_probe(&mut engine, &mut cpu);
+        assert_eq!((hit.completed, hit.eip, hit.regs[0]), (1, 0x101, 1));
+
+        // Same linear page and byte, different CS-relative instruction.
+        let mut based_cs = cs;
+        based_cs.base = 0x80;
+        cpu.set_seg_cache(SegmentReg::Cs, based_cs);
+        cpu.eip = 0x80;
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(cpu.jit_mapping_epoch(), epoch);
+        assert_eq!(engine.links[0].tag, tag);
+        let miss = dispatch_probe(&mut engine, &mut cpu);
+        assert_eq!(
+            (miss.completed, miss.eip, miss.regs),
+            (0, cpu.eip, cpu.regs)
+        );
+        cpu.set_seg_cache(SegmentReg::Cs, cs);
+        cpu.eip = 0x100;
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.link_context(), tag);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+
+        let mut limited_ds = ds;
+        limited_ds.limit = 0x7fff;
+        cpu.set_seg_cache(SegmentReg::Ds, limited_ds);
+        engine.sync_mapping(&mut cpu);
+        assert_ne!(engine.link_context(), tag);
+        assert_eq!(engine.links[0].tag, tag);
+        let miss = dispatch_probe(&mut engine, &mut cpu);
+        assert_eq!(
+            (miss.completed, miss.eip, miss.regs),
+            (0, cpu.eip, cpu.regs)
+        );
+        cpu.set_seg_cache(SegmentReg::Ds, ds);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.link_context(), tag);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+
+        // Only a base change is exempted. Limit/default-size changes still
+        // retire execute proofs even when the base and data facts match.
+        let mut changed_cs = cs;
+        changed_cs.limit = 0xffff;
+        cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
+        assert_ne!(cpu.jit_mapping_epoch(), epoch);
+        let limit_epoch = cpu.jit_mapping_epoch();
+        changed_cs.flags ^= crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
+        cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
+        assert_ne!(cpu.jit_mapping_epoch(), limit_epoch);
+    }
+
+    #[test]
+    fn context_overflow_clears_both_planes_before_reusing_an_id() {
+        let (mut engine, mut cpu, entries) = context_probe();
+        let cs = cpu.seg(SegmentReg::Cs);
+        let original_tag = engine.links[0].tag;
+        engine.links[SLOTS] = engine.links[0];
+        engine.global_links[0] = 1;
+        engine.global_links[SLOTS / 64] = 1;
+        // The initial (0, 0) context and this flat context already occupy ids.
+        for base in 1..(MAX_CONTEXTS - 1) as u32 {
+            let mut changed = cs;
+            changed.base = base;
+            cpu.set_seg_cache(SegmentReg::Cs, changed);
+            engine.sync_mapping(&mut cpu);
+        }
+        assert_eq!(engine.contexts.len(), MAX_CONTEXTS);
+        assert_eq!(engine.links[0].tag, original_tag);
+        assert_eq!(engine.stats.context_clears, 0);
+        let mut changed = cs;
+        changed.base = MAX_CONTEXTS as u32;
+        cpu.set_seg_cache(SegmentReg::Cs, changed);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.context_id, 1);
+        assert_eq!(engine.stats.context_clears, 1);
+        assert!(
+            engine
+                .links
+                .iter()
+                .all(|link| link.tag == 0 && link.entries.is_null())
+        );
+        assert!(engine.global_links.iter().all(|bits| *bits == 0));
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 0);
+
+        // Returning now reuses the old numerical id, but cannot reach the
+        // former link until the retained page table is explicitly published.
+        cpu.set_seg_cache(SegmentReg::Cs, cs);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.link_context(), original_tag);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 0);
+        engine.links[0] = Link {
+            tag: engine.link_context(),
+            entries,
+        };
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+    }
+
+    #[test]
+    fn global_retag_keeps_each_context_id_and_epoch_wrap_expires_all_links() {
+        let (mut engine, mut cpu, entries) = context_probe();
+        let ds = cpu.seg(SegmentReg::Ds);
+        cpu.cr4 |= crate::x86::cpu::CR4_PGE;
+        let old_tag = engine.links[0].tag;
+        let mut changed_ds = ds;
+        changed_ds.base = 0x1000;
+        cpu.set_seg_cache(SegmentReg::Ds, changed_ds);
+        engine.sync_mapping(&mut cpu);
+        let other_tag = engine.link_context() | 0x1000;
+        assert_ne!(other_tag & 4095, old_tag & 4095);
+        engine.links[SLOTS + 1] = Link {
+            tag: other_tag,
+            entries,
+        };
+        engine.links[2] = Link {
+            tag: engine.link_context() | 0x2000,
+            entries,
+        };
+        let nonglobal = engine.links[2].tag;
+        engine.global_links[0] = 1;
+        engine.global_links[SLOTS / 64] = 2;
+
+        cpu.invalidate_non_global_translations();
+        engine.sync_mapping(&mut cpu);
+        let epoch = u64::from(engine.link_epoch) << 32;
+        assert_eq!(engine.links[0].tag, epoch | (old_tag & 0xffff_ffff));
+        assert_eq!(
+            engine.links[SLOTS + 1].tag,
+            epoch | (other_tag & 0xffff_ffff)
+        );
+        assert_eq!(engine.links[2].tag, nonglobal);
+        assert_eq!(engine.stats.global_link_retags, 2);
+        cpu.set_seg_cache(SegmentReg::Ds, ds);
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+
+        let id = engine.context_id;
+        engine.link_epoch = u32::MAX;
+        cpu.invalidate_non_global_translations();
+        engine.sync_mapping(&mut cpu);
+        assert_eq!(engine.link_epoch, 1);
+        assert_eq!(engine.context_id, id);
+        assert!(engine.links.iter().all(|link| link.tag == 0));
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 0);
+    }
 
     #[test]
     fn heat_word_admits_at_threshold_and_restarts_on_tag_replacement() {

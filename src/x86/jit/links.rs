@@ -4,11 +4,12 @@
 //! epoch and one backing-page content version. Rust retires stale links after a
 //! watched code write and before entering native code; the chain cannot perform
 //! such a write itself. Its second level holds one native
-//! entry per byte offset. After a context change, validating the page restores
+//! entry per byte offset. After a mapping-epoch change, validating the page restores
 //! all its compiled entries at once. Supervisor/user planes qualify privilege;
-//! CS base changes discard links and relevant control changes expire mappings.
-//! Flat DS/ES/SS qualifications are part of the compiled-page key; a
-//! change discards both link planes before any execute-walk recheck can run.
+//! Stable context ids qualify CS base and flat DS/ES/SS facts; a different
+//! context cannot pass even an execute-walk recheck. Returning to a context
+//! can reuse its links. Exhausting the ids clears both planes before reuse.
+//! Relevant control changes expire mappings independently of these ids.
 //! CR3 preserves qualified global pages. INVLPG expires its addressed range,
 //! even with an empty ordinary fetch cache. Collisions use the full Rust lookup.
 //!
@@ -44,6 +45,7 @@ pub const fn slot(linear: u32) -> usize {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct Link {
+    // Bits 63..32: mapping epoch; 31..12: linear page; 11..0: context id.
     pub tag: u64,
     // Signed byte displacements from this table. The adapter keeps code and
     // tables within i32 reach; native entries never overlap 0..=COLD sentinels.

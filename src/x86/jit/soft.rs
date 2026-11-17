@@ -131,8 +131,8 @@ pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
 impl View {
     /// Only ordinary flat data/stack qualifications specialize code. FS/GS
     /// are often replaced for TLS; including them would split otherwise
-    /// identical code and repeatedly discard links during task switches.
-    /// The adapter retires links whenever one of these compiled facts changes.
+    /// identical code and consume context ids for ordinary TLS changes.
+    /// The adapter qualifies each link with these facts and the CS base.
     pub fn block_facts(cpu: &Cpu) -> u32 {
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
         (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS

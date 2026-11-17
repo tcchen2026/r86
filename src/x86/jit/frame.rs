@@ -81,6 +81,7 @@ pub struct Frame {
     /// Live SLOTS-entry table when dispatch_entry uses the shared dispatcher.
     pub links: *mut super::links::Link,
     pub link_rechecks: *const crate::x86::cpu::TranslationRecheck,
+    /// Mapping epoch in bits 63..32, context id in 11..0; page bits are zero.
     pub link_context: u64,
     pub popf_mask: u32,
     pub selectors: [u16; 6],
