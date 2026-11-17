@@ -9,10 +9,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 
 ## P1: large speed cost, or ordinary guests hit it
 
-- device: the FreeDOS kit's JEMMEX profile (S=DA00-EFFF) gets 3 KiB of
-  upper memory instead of 59 KiB: the bundled SeaBIOS write-protects
-  DA000-E7FFF through PAM, which r86 now enforces
-  (firmware/seabios/bios.config lacks `CONFIG_WRITABLE_UPPERMEMORY=y`).
 - device: a Windows 98 installed under the old SeaBIOS (PnP BIOS stub,
   Code 24) has no PCI bus, so VMDisp9x and the PCI NE2000 are not found;
   the current BIOS does not repair it. Add New Hardware's automatic
