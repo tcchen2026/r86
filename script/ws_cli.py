@@ -181,6 +181,21 @@ there is no OS-specific crash detector. Host process aborts, SIGKILL and host
 failure terminate WebSocket too; in-memory evidence cannot survive those events.
 Save diagnostics/logs on a separate client when durable capture is needed.
 
+Debug-assertion builds advertise ``hello.profiling: true`` and execution state
+``profile_active``. ``profile-start`` begins one VM-wide counter interval;
+``profile-stop`` ends it and returns ``markdown`` (the CLI prints that text).
+Both replies have ``type: "profile"``, ``ok``, ``step`` and ``active``. Starting
+twice or stopping without a start is an error. Any client may stop the session;
+disconnect does not cancel it. Closing the console server or replacing the VM
+or engine cancels it; guest resets retain cumulative counters. No server file
+is written. The guest's running/paused state is unchanged. Reports include
+idle-corrected work and wall time, A64 fallback causes, exact native-return
+reasons, compilation, cache clears and up to 20 retained return sites (4096-key
+cap; sites sample every eighth return, with unscaled sample counts and exact
+reason totals). A64-only sections say not applicable on other engines. Ordinary release
+builds omit this feature. In debug-assertion builds, ``--measure-from-step``
+also prints this report to stderr after the phase timer stops.
+
 ``memory`` reads RAM (default 256 bytes, maximum 64 KiB). ``linear: true``
 walks the current CR0/CR3/CR4 RAM page tables, including PAE and large pages,
 without using cached translations or latched PDPTEs. It ignores R/W and U/S,
@@ -677,7 +692,7 @@ def build_parser():
     sub.add_parser("status")
     sub.add_parser("power-button")
     for name in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes",
-                 "media", "media-tools", "media-eject"):
+                 "media", "media-tools", "media-eject", "profile-start", "profile-stop"):
         sub.add_parser(name)
     remote = sub.add_parser("media-remote", help="serve a local ISO on demand until interrupted")
     remote.add_argument("path")
@@ -777,7 +792,7 @@ def command_object(args):
     """Translate parsed CLI arguments into one protocol JSON command object."""
 
     if args.command in ("resume", "pause", "reset", "release-input", "diagnostics", "guest-bytes",
-                        "media", "media-tools", "media-eject"):
+                        "media", "media-tools", "media-eject", "profile-start", "profile-stop"):
         return {"cmd": args.command}
     if args.command == "logs":
         return {"cmd": "logs", "serial_from": args.serial_from, "event_from": args.event_from}
@@ -977,7 +992,10 @@ def main(argv):
             write_ppm(args.path, frame)
             response["path"] = args.path
             response["bytes"] = len(payload)
-        print_json(response)
+        if args.command == "profile-stop" and response.get("ok"):
+            print(response["markdown"], end="")
+        else:
+            print_json(response)
         return 0 if response.get("ok", False) else 1
     finally:
         client.close()

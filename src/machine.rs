@@ -1102,6 +1102,10 @@ impl Machine {
         let elapsed = wake.saturating_sub(self.step);
         self.step += elapsed;
         self.cpu.advance_tsc(elapsed);
+        #[cfg(debug_assertions)]
+        {
+            self.bus.profile_idle_steps += elapsed;
+        }
         true
     }
 
@@ -1310,6 +1314,28 @@ impl Machine {
             return Some(jit.cache_counters());
         }
         None
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn profile_idle_steps(&self) -> u64 {
+        self.bus.profile_idle_steps
+    }
+
+    #[cfg(all(debug_assertions, a64_jit))]
+    pub fn profile_jit_stats(&self) -> Option<&crate::x86::jit::runtime::Stats> {
+        self.jit.as_ref().map(|jit| &jit.stats)
+    }
+
+    /// Start with an empty map, or take the completed map. Cache clears and
+    /// guest resets preserve the active session and cumulative counters.
+    #[cfg(all(debug_assertions, a64_jit))]
+    pub fn set_jit_profiling(
+        &mut self,
+        active: bool,
+    ) -> Option<crate::x86::jit::runtime::ExitSites> {
+        self.jit
+            .as_mut()
+            .and_then(|jit| core::mem::replace(&mut jit.profile, active.then(Default::default)))
     }
 
     pub fn jit_report(&self) -> String {
@@ -1664,6 +1690,10 @@ fn run_steps_no_trace_no_perf<const YIELD_SERIAL: bool>(
             // The interpreter executes no instruction while halted; the
             // machine's deterministic clock still advances during this tick.
             cpu.advance_tsc(batch.ran);
+            #[cfg(debug_assertions)]
+            {
+                bus.profile_idle_steps += batch.ran;
+            }
         }
         *step = (*step).wrapping_add(batch.ran);
         ran = ran.wrapping_add(batch.ran);
@@ -1784,7 +1814,7 @@ pub enum GuestStepStatus {
 
 fn fast_forward_halted(
     cpu: &mut Cpu,
-    bus: &HostBus,
+    bus: &mut HostBus,
     step: &mut u64,
     ran: &mut u64,
     budget: u64,
@@ -1805,6 +1835,10 @@ fn fast_forward_halted(
     *step += elapsed;
     *ran += elapsed;
     cpu.advance_tsc(elapsed);
+    #[cfg(debug_assertions)]
+    {
+        bus.profile_idle_steps += elapsed;
+    }
     true
 }
 
@@ -1903,6 +1937,10 @@ fn step_guest_once<T: TraceSink, P: PerfSink>(
     let was_interruptible = cpu.maskable_interrupts_enabled();
     if cpu.halted {
         cpu.advance_tsc(1);
+        #[cfg(debug_assertions)]
+        {
+            bus.profile_idle_steps += 1;
+        }
     }
     trace.push(step, cpu, &bus.ram, perf);
     let result = Interpreter::step(cpu, bus);
@@ -2219,6 +2257,8 @@ pub(crate) struct HostBus {
     #[cfg_attr(not(test), allow(dead_code))]
     tracked_writes: TrackedWriteStats,
     diagnostics: BusDiagnostics,
+    #[cfg(debug_assertions)]
+    profile_idle_steps: u64,
     firmware_mode: bool,
     acpi: Acpi,
     boot_order: BootOrder,
@@ -2447,6 +2487,8 @@ impl HostBus {
             frame_roles,
             tracked_writes: TrackedWriteStats::default(),
             diagnostics: BusDiagnostics::default(),
+            #[cfg(debug_assertions)]
+            profile_idle_steps: 0,
             firmware_mode,
             acpi: Acpi::new(firmware_mode),
             boot_order: BootOrder::DiskFirst,
@@ -2542,6 +2584,10 @@ impl HostBus {
         fresh.serial = core::mem::take(&mut self.serial);
         fresh.serial_dropped = self.serial_dropped;
         fresh.diagnostics = core::mem::take(&mut self.diagnostics);
+        #[cfg(debug_assertions)]
+        {
+            fresh.profile_idle_steps = self.profile_idle_steps;
+        }
         fresh.last_cpu_shutdown = self.last_cpu_shutdown.take();
         fresh.current_step = step;
         fresh.boot_order = self.boot_order;
@@ -4932,6 +4978,36 @@ mod host_bus_tests {
 
     use super::*;
     use crate::x86::cpu::{CR0_PE, CR0_PG};
+
+    #[cfg(all(a64_jit, debug_assertions))]
+    #[test]
+    fn session_profile_native_return_hook_counts_each_invocation() {
+        let mut machine = Machine::new(0x10000);
+        machine.cpu.enter_protected_flat(0x1000, 0);
+        machine.bus.ram[0x1000..0x1003].copy_from_slice(&[0x40, 0xeb, 0xfd]);
+        machine.set_jit_enabled(true).unwrap();
+        machine.set_jit_profiling(true);
+        for _ in 0..10 {
+            machine.run_steps(1000).unwrap();
+            machine.clear_jit_code().unwrap();
+        }
+        let stats = machine.profile_jit_stats().unwrap().clone();
+        let exits = machine.set_jit_profiling(false).unwrap();
+        assert!(stats.native_steps > 0);
+        assert!(stats.native_invocations >= 10);
+        assert_eq!(exits.reasons.iter().sum::<u64>(), stats.native_invocations);
+        assert_eq!(
+            exits.sites.values().sum::<u64>(),
+            stats.native_invocations / 8
+        );
+        assert_eq!(
+            stats.interpreted_causes.iter().sum::<u64>(),
+            stats.interpreted_steps
+        );
+        assert_eq!(stats.native_steps + stats.interpreted_steps, 10000);
+        machine.run_steps(1000).unwrap();
+        assert!(machine.set_jit_profiling(false).is_none());
+    }
 
     const PTE_PRESENT: u32 = 1 << 0;
     const PTE_WRITE: u32 = 1 << 1;
@@ -13292,7 +13368,9 @@ mod host_bus_tests {
         let mut step = 10;
         let mut ran = 10;
 
-        assert!(fast_forward_halted(&mut cpu, &bus, &mut step, &mut ran, 50));
+        assert!(fast_forward_halted(
+            &mut cpu, &mut bus, &mut step, &mut ran, 50
+        ));
         assert_eq!(step, 50);
         assert_eq!(ran, 50);
         assert_eq!(cpu.tsc(), 0x1234 + 40);

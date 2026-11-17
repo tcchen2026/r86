@@ -360,10 +360,14 @@ struct CodeStamp {
     backing_page: u64,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Stats {
     pub native_steps: u64,
     pub interpreted_steps: u64,
+    /// Batch-entry causes: ineligible, cold, after native exit, other fallback.
+    /// Already-halted polls are excluded.
+    #[cfg(debug_assertions)]
+    pub interpreted_causes: [u64; 4],
     #[cfg(feature = "jit-profile")]
     pub eligible_interpreted_steps: u64,
     #[cfg(feature = "jit-profile")]
@@ -379,7 +383,7 @@ pub struct Stats {
     #[cfg(debug_assertions)]
     pub recorded_pages: u64,
     pub content_changes: u64,
-    #[cfg(any(test, feature = "jit-profile"))]
+    #[cfg(any(test, debug_assertions, feature = "jit-profile"))]
     pub content_reuses: u64,
     /// All clears, including external resets; the two causes below are subsets.
     pub arena_clears: u64,
@@ -458,6 +462,79 @@ pub struct Stats {
     pub write_misses_flushing_context: u64,
 }
 
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ExitReason {
+    MemoryGuard,
+    Division,
+    CsLimit,
+    Attention,
+    Budget,
+    DispatchMiss,
+    FarTransfer,
+    String,
+    SegmentBoundary,
+    Other,
+}
+
+#[cfg(debug_assertions)]
+impl ExitReason {
+    pub const NAMES: [&'static str; 10] = [
+        "memory/guard",
+        "division",
+        "CS limit",
+        "attention/shadow boundary",
+        "budget",
+        "dispatch miss",
+        "far transfer",
+        "string",
+        "segment boundary",
+        "other",
+    ];
+
+    fn boundary(kind: u32, at_limit: bool, attention: bool) -> Option<Self> {
+        match kind {
+            1 | 3 => Some(Self::MemoryGuard),
+            4 => Some(Self::Division),
+            7 => Some(Self::CsLimit),
+            5 | 6 => Some(Self::Attention),
+            _ if at_limit && attention => Some(Self::Attention),
+            2 => Some(Self::Budget),
+            _ if at_limit => Some(Self::Budget),
+            _ => None,
+        }
+    }
+}
+
+/// One active session; exact reason totals and at most 4096 retained sites.
+/// Sites identify the committed return/resume CS:EIP, not code identities.
+#[cfg(debug_assertions)]
+#[derive(Default)]
+pub struct ExitSites {
+    pub reasons: [u64; 10],
+    pub sites: HashMap<(u16, u32, ExitReason), u64>,
+}
+
+#[cfg(debug_assertions)]
+impl ExitSites {
+    /// W95A full site counting exceeded the debug-session overhead budget.
+    /// Reason totals remain exact; site counts are unscaled 1-in-8 samples.
+    pub const SAMPLE_INTERVAL: u64 = 8;
+
+    fn record(&mut self, cs: u16, eip: u32, reason: ExitReason, invocation: u64) {
+        self.reasons[reason as usize] += 1;
+        if invocation % Self::SAMPLE_INTERVAL != 0 {
+            return;
+        }
+        let key = (cs, eip, reason);
+        if let Some(count) = self.sites.get_mut(&key) {
+            *count += 1;
+        } else if self.sites.len() < 4096 {
+            self.sites.insert(key, 1);
+        }
+    }
+}
+
 pub struct Engine {
     arena: CodeArena,
     entry: Entry,
@@ -493,6 +570,8 @@ pub struct Engine {
     #[cfg(feature = "jit-profile")]
     unsupported: Box<[u64; 576]>,
     pub stats: Stats,
+    #[cfg(debug_assertions)]
+    pub(crate) profile: Option<ExitSites>,
     #[cfg(debug_assertions)]
     clear_causes: [u64; 4],
     #[cfg(debug_assertions)]
@@ -550,6 +629,8 @@ impl Engine {
             #[cfg(feature = "jit-profile")]
             unsupported: Box::new([0; 576]),
             stats: Stats::default(),
+            #[cfg(debug_assertions)]
+            profile: None,
             #[cfg(debug_assertions)]
             clear_causes: [0; 4],
             #[cfg(debug_assertions)]
@@ -724,7 +805,7 @@ impl Engine {
         (u64::from(self.link_epoch) << 32) | u64::from(self.context_id)
     }
 
-    #[cfg(feature = "jit-profile")]
+    #[cfg(any(debug_assertions, feature = "jit-profile"))]
     fn profile_exit(cpu: &mut Cpu, bus: &HostBus, kind: u32) -> usize {
         match kind {
             7 => return 3,
@@ -1022,7 +1103,7 @@ impl Engine {
                     .matches(bus.jit_code_bytes(key.1, page.content.end))
                 {
                     page.version = observed;
-                    #[cfg(any(test, feature = "jit-profile"))]
+                    #[cfg(any(test, debug_assertions, feature = "jit-profile"))]
                     {
                         self.stats.content_reuses += 1;
                     }
@@ -1280,6 +1361,40 @@ impl Engine {
         Ok(native.map_or(Lookup::Interpret, Lookup::Native))
     }
 
+    #[cfg(debug_assertions)]
+    fn session_exit_reason(
+        &self,
+        cpu: &mut Cpu,
+        bus: &HostBus,
+        frame: &Frame,
+        limit: u64,
+        attention: bool,
+    ) -> ExitReason {
+        if let Some(reason) =
+            ExitReason::boundary(frame.exit_kind, frame.completed == limit, attention)
+        {
+            return reason;
+        }
+        if frame.exit_kind == 0 {
+            let linear = (self.context as u32).wrapping_add(cpu.eip);
+            let link = self.links[usize::from(self.user_links) * SLOTS + links::slot(linear)];
+            // SAFETY: the matching tag certifies a live entry table; native
+            // execution cannot change its mapping or watched code.
+            if link.tag != frame.link_context | u64::from(linear & !4095)
+                || unsafe { *link.entries.add((linear & 4095) as usize) } != INTERPRET
+            {
+                return ExitReason::DispatchMiss;
+            }
+            return match Self::profile_exit(cpu, bus, 0) {
+                0 => ExitReason::FarTransfer,
+                1 => ExitReason::String,
+                2 => ExitReason::SegmentBoundary,
+                _ => ExitReason::Other,
+            };
+        }
+        ExitReason::Other
+    }
+
     pub(crate) fn run_batch(
         &mut self,
         cpu: &mut Cpu,
@@ -1293,6 +1408,10 @@ impl Engine {
         while ran < budget {
             let mut cold = false;
             let mut repeat = None;
+            #[cfg(debug_assertions)]
+            let was_halted = cpu.halted;
+            #[cfg(debug_assertions)]
+            let mut after_native = false;
             #[cfg(feature = "jit-profile")]
             let mut write_token_miss = false;
             // Real mode, V86 and TF remain interpreted. PM16 requires SS.B=0;
@@ -1364,6 +1483,22 @@ impl Engine {
                         self.stats.native_segment_loads += frame.loaded_segments;
                     }
                     self.stats.native_invocations += 1;
+                    #[cfg(debug_assertions)]
+                    if self.profile.is_some() {
+                        let reason = self.session_exit_reason(
+                            cpu,
+                            bus,
+                            &frame,
+                            native_limit,
+                            native_attention,
+                        );
+                        self.profile.as_mut().unwrap().record(
+                            cpu.seg(SegmentReg::Cs).selector,
+                            cpu.eip,
+                            reason,
+                            self.stats.native_invocations,
+                        );
+                    }
                     #[cfg(feature = "jit-profile")]
                     {
                         if cpu.code_default16() {
@@ -1460,6 +1595,10 @@ impl Engine {
                         matches!(frame.exit_kind, 0..=4 | 7),
                         "unknown JIT exit kind"
                     );
+                    #[cfg(debug_assertions)]
+                    {
+                        after_native = true;
+                    }
                     #[cfg(any(test, feature = "jit-profile"))]
                     {
                         self.stats.division_exits += u64::from(frame.exit_kind == 4);
@@ -1566,6 +1705,19 @@ impl Engine {
                     u64::from(write_token_miss && cpu.jit_mapping_epoch() != epoch_before);
             }
             self.stats.interpreted_steps += batch.ran;
+            #[cfg(debug_assertions)]
+            if !was_halted {
+                let cause = if !eligible {
+                    0
+                } else if after_native {
+                    2
+                } else if cold {
+                    1
+                } else {
+                    3
+                };
+                self.stats.interpreted_causes[cause] += batch.ran;
+            }
             #[cfg(feature = "jit-profile")]
             {
                 self.stats.eligible_interpreted_steps +=
@@ -1592,6 +1744,56 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn session_profile_map_cap_preserves_totals_and_existing_sites() {
+        let mut profile = ExitSites::default();
+        for event in 1..=4100 * 8 {
+            profile.record(
+                0x13f,
+                ((event - 1) / 8) as u32,
+                ExitReason::MemoryGuard,
+                event,
+            );
+        }
+        for event in 4100 * 8 + 1..=4101 * 8 {
+            profile.record(0x13f, 0, ExitReason::MemoryGuard, event);
+        }
+        for event in 4101 * 8 + 1..=4102 * 8 {
+            profile.record(0x13f, 0, ExitReason::Budget, event); // Different key, beyond cap.
+        }
+        assert_eq!(profile.sites.len(), 4096);
+        assert_eq!(profile.sites[&(0x13f, 0, ExitReason::MemoryGuard)], 2);
+        assert_eq!(profile.reasons[ExitReason::MemoryGuard as usize], 4101 * 8);
+        assert_eq!(profile.reasons[ExitReason::Budget as usize], 8);
+        assert_eq!(
+            profile.reasons.iter().sum::<u64>() - profile.sites.values().sum::<u64>(),
+            4102 * 8 - 4097
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn session_profile_reason_priority() {
+        use ExitReason::*;
+        for (kind, reason) in [
+            (1, MemoryGuard),
+            (3, MemoryGuard),
+            (4, Division),
+            (7, CsLimit),
+            (5, Attention),
+            (6, Attention),
+        ] {
+            assert_eq!(ExitReason::boundary(kind, true, true), Some(reason));
+            assert_eq!(ExitReason::boundary(kind, false, false), Some(reason));
+        }
+        assert_eq!(ExitReason::boundary(2, true, true), Some(Attention));
+        assert_eq!(ExitReason::boundary(0, true, true), Some(Attention));
+        assert_eq!(ExitReason::boundary(2, false, false), Some(Budget));
+        assert_eq!(ExitReason::boundary(0, true, false), Some(Budget));
+        assert_eq!(ExitReason::boundary(0, false, false), None);
+    }
 
     #[test]
     fn jit_link_alias_hints_retire_both_planes_and_preserve_reused_slots() {

@@ -314,6 +314,8 @@ fn run_machine_output(
 
     let mut replay = ReplaySchedule::load(args.replay.as_deref())?;
     let mut measurement = None;
+    #[cfg(debug_assertions)]
+    let mut profile = None;
     let mut completed_budget = true;
     let mut matched_serial_expectation = args.expect_serial.is_none();
     let mut serial_observed = 0u64;
@@ -339,6 +341,10 @@ fn run_machine_output(
                 println!("measurement begin step={}", machine.step_count());
                 print!("{}", machine.jit_report());
                 std::io::stdout().flush().map_err(|e| e.to_string())?;
+                #[cfg(debug_assertions)]
+                {
+                    profile = Some(protocol::Profile::start(machine));
+                }
                 measurement = Some(measure::Measurement::start()?);
             }
             replay.apply_due(machine)?;
@@ -413,6 +419,10 @@ fn run_machine_output(
         measurement.finish(machine.step_count())?;
     } else if args.measure_from_step.is_some() {
         return Err("run stopped before the measurement boundary".into());
+    }
+    #[cfg(debug_assertions)]
+    if let Some(profile) = profile {
+        eprintln!("{}", profile.finish(machine));
     }
     replay.apply_due(machine)?;
     if completed_budget && args.steps != 0 {

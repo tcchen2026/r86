@@ -10,6 +10,137 @@ use r86::x86::cpu::SegmentReg;
 
 use super::ws;
 
+/// A VM-wide interval. Guest resets retain counters; the owner cancels before
+/// replacing the Machine or its engine. No host clock enters the core.
+#[cfg(debug_assertions)]
+pub struct Profile {
+    wall: std::time::Instant,
+    step: u64,
+    idle: u64,
+    engine: &'static str,
+    #[cfg(a64_jit)]
+    jit: Option<r86::x86::jit::runtime::Stats>,
+    #[cfg(a64_jit)]
+    clears: Option<r86::machine::JitCacheCounters>,
+}
+
+#[cfg(debug_assertions)]
+impl Profile {
+    pub fn start(machine: &mut Machine) -> Self {
+        #[cfg(a64_jit)]
+        machine.set_jit_profiling(true);
+        Self {
+            step: machine.step_count(),
+            idle: machine.profile_idle_steps(),
+            engine: machine.engine_label(),
+            #[cfg(a64_jit)]
+            jit: machine.profile_jit_stats().cloned(),
+            #[cfg(a64_jit)]
+            clears: machine.jit_cache_counters(),
+            wall: std::time::Instant::now(),
+        }
+    }
+
+    pub fn cancel(self, _machine: &mut Machine) {
+        #[cfg(a64_jit)]
+        _machine.set_jit_profiling(false);
+    }
+
+    pub fn finish(self, machine: &mut Machine) -> String {
+        use std::fmt::Write;
+        let seconds = self.wall.elapsed().as_secs_f64();
+        #[cfg(a64_jit)]
+        let exits = machine.set_jit_profiling(false);
+        let steps = machine.step_count() - self.step;
+        let idle = machine.profile_idle_steps() - self.idle;
+        let work = steps - idle;
+        let mut out = format!(
+            "# Session profile\n\nEngine: {}. Steps {} to {}.\n\n## 1. Work and time\n\nScheduled steps: {steps}\n\nIdle steps: {idle}\n\nExecuted/attempted steps: {work}\n\nWall seconds: {seconds:.6}\n\n",
+            self.engine,
+            self.step,
+            machine.step_count(),
+        );
+        if seconds > 0.0 {
+            writeln!(out, "Guest MIPS: {:.3}\n", work as f64 / seconds / 1e6).unwrap();
+        } else {
+            out.push_str("Guest MIPS: unavailable (zero elapsed time)\n\n");
+        }
+        out.push_str("Wall time includes pauses and frontend work. Work counts attempted instructions; halted polls and deterministic idle advances are excluded.\n\n");
+        #[cfg(a64_jit)]
+        if let Some(before) = self.jit {
+            use r86::x86::jit::runtime::{ExitReason, ExitSites};
+            let after = machine
+                .profile_jit_stats()
+                .expect("profile owner replaced engine");
+            let native = after.native_steps - before.native_steps;
+            let interpreted = work - native;
+            let causes: [u64; 4] = core::array::from_fn(|i| {
+                after.interpreted_causes[i] - before.interpreted_causes[i]
+            });
+            writeln!(out, "## 2. Native and interpreted work\n\nNative steps: {native}\n\nInterpreted steps: {interpreted}\n\nRaw JIT-adapter interpreted steps (includes halted polls): {}\n\n| Interpreted cause | Steps |\n| --- | ---: |", after.interpreted_steps - before.interpreted_steps).unwrap();
+            for (name, count) in [
+                "ineligible entry",
+                "cold",
+                "after native exit",
+                "other fallback",
+            ]
+            .iter()
+            .zip(causes)
+            {
+                writeln!(out, "| {name} | {count} |").unwrap();
+            }
+            writeln!(
+                out,
+                "| outside JIT adapter | {} |\n",
+                interpreted - causes.iter().sum::<u64>()
+            )
+            .unwrap();
+            out.push_str("Causes describe batch entry, not each instruction's mode. Other fallback includes unsupported instructions, unavailable fetch proofs and shadows.\n\n");
+            let exits = exits.expect("profile owner disabled exit collection");
+            let total: u64 = exits.reasons.iter().sum();
+            let mapped: u64 = exits.sites.values().sum();
+            writeln!(out, "## 3. Native returns\n\nNative returns: {}\n\n| Reason | Returns |\n| --- | ---: |", after.native_invocations - before.native_invocations).unwrap();
+            for (name, count) in ExitReason::NAMES.iter().zip(exits.reasons) {
+                writeln!(out, "| {name} | {count} |").unwrap();
+            }
+            out.push_str("\nReasons cover every native return, including continuations inside the JIT. Memory/guard does not imply a guest page fault; attention includes shadow boundaries.\n\n");
+            writeln!(out, "## 4. Compilation and retained code\n\nBlocks compiled: {}\n\nCode bytes compiled: {}\n\nCode-change invalidations (compiled page records): {}\n\nUnchanged-content validations retaining entries: {}\n\nThese are cumulative publication bytes and invalidated records, not live occupancy or exact blocks recompiled. Validations do not always install a new watch.\n", after.compiled_blocks - before.compiled_blocks, after.code_bytes - before.code_bytes, after.content_changes - before.content_changes, after.content_reuses - before.content_reuses).unwrap();
+            let clears = machine.jit_cache_counters().unwrap();
+            let initial = self.clears.unwrap();
+            out.push_str("## 5. Cache clears\n\n| Cause | Clears |\n| --- | ---: |\n");
+            for (i, name) in [
+                "code area full",
+                "page-record limit",
+                "no free entry table",
+                "external reset",
+            ]
+            .iter()
+            .enumerate()
+            {
+                writeln!(out, "| {name} | {} |", clears.causes[i] - initial.causes[i]).unwrap();
+            }
+            writeln!(out, "\n## 6. Top 20 retained exit sites\n\nRetained keys: {} / 4096. Total returns: {total}. Mapped returns: {mapped}. Overflow returns: {}.\n\nSites sample every {}th cumulative native return; counts are unscaled samples. Reason totals above are exact. Overflow is total minus mapped: it includes unsampled returns and samples omitted by the cap.\n\nCS:EIP is the committed return/resume site. Equal selectors and offsets across address spaces are merged. After the cap, existing keys keep counting samples; unseen keys are omitted. This is not necessarily the global top 20; periodic sampling can miss sites.\n\n| CS:EIP | Reason | Sampled returns |\n| --- | --- | ---: |", exits.sites.len(), total - mapped, ExitSites::SAMPLE_INTERVAL).unwrap();
+            let mut sites: Vec<_> = exits.sites.into_iter().collect();
+            sites.sort_unstable_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then(ka.cmp(kb)));
+            for ((cs, eip, reason), count) in sites.into_iter().take(20) {
+                writeln!(
+                    out,
+                    "| {cs:04x}:{eip:08x} | {} | {count} |",
+                    ExitReason::NAMES[reason as usize]
+                )
+                .unwrap();
+            }
+            return out;
+        }
+        out.push_str("## 2. Native and interpreted work\n\n");
+        if self.engine == "[Interpreter (slow!)]" {
+            writeln!(out, "Interpreted steps (interpreter selected): {work}\n").unwrap();
+        }
+        out.push_str("A64 native and fallback counters: not applicable.\n\n## 3. Native returns\n\nNot applicable: A64 JIT is not selected.\n\n## 4. Compilation and retained code\n\nNot applicable: A64 JIT is not selected.\n\n## 5. Cache clears\n\nNot applicable: A64 JIT is not selected.\n\n## 6. Top 20 retained exit sites\n\nNot applicable: A64 JIT is not selected.\n");
+        out
+    }
+}
+
 pub struct ByteMatcher {
     needle: Vec<u8>,
     fallback: Vec<usize>,
@@ -566,6 +697,40 @@ pub fn parse_usb_tablet(json: &str) -> Result<(u16, u16, u8, i8), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn session_profile_subtracts_snapshots_and_idle() {
+        let mut machine = Machine::new(0x10000);
+        let mut boot = [0u8; 512];
+        boot[..3].copy_from_slice(&[0x90, 0xfa, 0xf4]); // NOP; CLI; HLT
+        boot[510..].copy_from_slice(&[0x55, 0xaa]);
+        machine.load_bootsector(&boot).unwrap();
+        machine.enter_bootsector();
+        machine.step_once().unwrap(); // Work before the profile is excluded.
+        let profile = Profile::start(&mut machine);
+        machine.step_once().unwrap();
+        machine.step_once().unwrap();
+        machine.step_once().unwrap(); // Already halted: idle, not work.
+        assert!(machine.advance_halted(17));
+        assert_eq!(machine.profile_idle_steps(), 18);
+        let report = profile.finish(&mut machine);
+        for line in [
+            "Steps 1 to 21.",
+            "Scheduled steps: 20",
+            "Idle steps: 18",
+            "Executed/attempted steps: 2",
+            "Interpreted steps (interpreter selected): 2",
+            "Not applicable: A64 JIT is not selected.",
+        ] {
+            assert!(report.contains(line), "{report}");
+        }
+        // A new interval excludes prior idle; a reboot preserves counters.
+        let profile = Profile::start(&mut machine);
+        machine.reboot().unwrap();
+        assert_eq!(machine.profile_idle_steps(), 18);
+        assert!(profile.finish(&mut machine).contains("Idle steps: 0"));
+    }
 
     #[test]
     fn json_unicode_escapes_require_four_ascii_hex_digits() {

@@ -62,6 +62,13 @@ impl WsSession {
             machine.step_count(),
             self.slice_steps
         );
+        #[cfg(debug_assertions)]
+        let response = {
+            let mut response = response;
+            response.pop();
+            response.push_str(",\"profiling\":true}");
+            response
+        };
         response
     }
 
@@ -193,6 +200,8 @@ struct Service {
     tablet_position: (u16, u16),
     running: bool,
     job: Option<Job>,
+    #[cfg(debug_assertions)]
+    profile: Option<Profile>,
     last_stop: String,
     failures: VecDeque<String>,
     last_shutdown_step: Option<u64>,
@@ -289,6 +298,8 @@ impl Service {
             tablet_position: (0, 0),
             running: false,
             job: None,
+            #[cfg(debug_assertions)]
+            profile: None,
             last_stop: "null".into(),
             failures: VecDeque::new(),
             last_shutdown_step: None,
@@ -458,8 +469,12 @@ impl Service {
         }
     }
     fn state(&self, machine: &Machine) -> String {
+        #[cfg(debug_assertions)]
+        let profile = format!(",\"profile_active\":{}", self.profile.is_some());
+        #[cfg(not(debug_assertions))]
+        let profile = "";
         format!(
-            "{{\"type\":\"execution\",\"ok\":true,\"step\":{},\"running\":{},\"busy\":{},\"stop\":{},\"pending_text_bytes\":{}}}",
+            "{{\"type\":\"execution\",\"ok\":true,\"step\":{},\"running\":{},\"busy\":{},\"stop\":{},\"pending_text_bytes\":{}{profile}}}",
             machine.step_count(),
             self.running,
             self.job.is_some(),
@@ -888,6 +903,27 @@ impl Service {
                     "{{\"type\":\"display-mode\",\"ok\":true,\"step\":{},{}}}",
                     machine.step_count(),
                     Self::display_json(machine, true)
+                )
+            }
+            #[cfg(debug_assertions)]
+            "profile-start" => {
+                if self.profile.is_some() {
+                    return Err("profiling is already active".into());
+                }
+                self.profile = Some(Profile::start(machine));
+                format!(
+                    "{{\"type\":\"profile\",\"ok\":true,\"step\":{},\"active\":true}}",
+                    machine.step_count()
+                )
+            }
+            #[cfg(debug_assertions)]
+            "profile-stop" => {
+                let profile = self.profile.take().ok_or("profiling is not active")?;
+                let markdown = profile.finish(machine);
+                format!(
+                    "{{\"type\":\"profile\",\"ok\":true,\"step\":{},\"active\":false,\"markdown\":\"{}\"}}",
+                    machine.step_count(),
+                    json_escape(&markdown)
                 )
             }
             "diagnostics" => {
@@ -1720,6 +1756,10 @@ impl Remote {
     /// Stops serving, first releasing keys and buttons browsers still hold.
     #[allow(dead_code)]
     pub fn close(mut self, machine: &mut Machine) {
+        #[cfg(debug_assertions)]
+        if let Some(profile) = self.service.profile.take() {
+            profile.cancel(machine);
+        }
         if let Some(remote) = &self.service.remote {
             remote.disconnect("Remote console closed");
         }
@@ -2297,6 +2337,87 @@ mod import_tests {
     use std::io::Read;
     use std::net::TcpStream;
     use std::time::Duration;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn session_profile_commands_errors_disconnect_and_close() {
+        let mut service = Service::new();
+        for id in [1, 2] {
+            service.clients.insert(
+                id,
+                Client {
+                    session: WsSession::new(1000, None),
+                    reply: Arc::new(mpsc::sync_channel(2).0),
+                    remote: Arc::new(Mutex::new(RemoteSlot::default())),
+                },
+            );
+        }
+        let mut machine = Machine::new(0x10000);
+        #[cfg(a64_jit)]
+        machine.set_jit_enabled(true).unwrap();
+        let hello = service
+            .command(&mut machine, 1, r#"{"cmd":"hello"}"#)
+            .unwrap()
+            .unwrap()
+            .text;
+        assert_eq!(json_bool(&hello, "profiling").unwrap(), Some(true));
+        assert_eq!(
+            json_bool(&service.state(&machine), "profile_active").unwrap(),
+            Some(false)
+        );
+        assert!(
+            service
+                .command(&mut machine, 1, r#"{"cmd":"profile-stop"}"#)
+                .is_err()
+        );
+        service.running = true;
+        let start = service
+            .command(&mut machine, 1, r#"{"cmd":"profile-start"}"#)
+            .unwrap()
+            .unwrap()
+            .text;
+        assert_eq!(json_bool(&start, "active").unwrap(), Some(true));
+        assert!(service.running);
+        assert!(
+            service
+                .command(&mut machine, 1, r#"{"cmd":"profile-start"}"#)
+                .is_err()
+        );
+        let mut remote = Remote {
+            rx: mpsc::channel().1,
+            service,
+            slice_steps: 1000,
+            record: None,
+            port: 0,
+            local: true,
+            access: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        remote.handle(&mut machine, Request::Disconnect(1));
+        assert_eq!(
+            json_bool(&remote.service.state(&machine), "profile_active").unwrap(),
+            Some(true)
+        );
+        let stop = remote
+            .service
+            .command(&mut machine, 2, r#"{"cmd":"profile-stop"}"#)
+            .unwrap()
+            .unwrap()
+            .text;
+        assert_eq!(json_bool(&stop, "active").unwrap(), Some(false));
+        let markdown = json_string(&stop, "markdown").unwrap().unwrap();
+        assert!(markdown.starts_with("# Session profile\n"));
+        assert!(markdown.contains("Scheduled steps: 0"));
+        assert!(!stop.contains("\"path\""));
+        assert!(remote.service.running);
+        remote
+            .service
+            .command(&mut machine, 2, r#"{"cmd":"profile-start"}"#)
+            .unwrap();
+        remote.close(&mut machine);
+        #[cfg(a64_jit)]
+        assert!(machine.set_jit_profiling(false).is_none());
+    }
 
     #[test]
     fn debug_memory_commands_validate_and_record_committed_writes() {
