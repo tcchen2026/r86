@@ -3506,8 +3506,10 @@ fn execute_fpu_d9<B: Bus>(
         match group {
             0 => {
                 let value = cpu.fpu.get(index);
+                let integer = cpu.fpu.integer_image(index);
                 fpu_clear_c1(cpu);
                 cpu.fpu.push(value);
+                cpu.fpu.set_integer_image(0, integer);
             }
             1 => fpu_fxch(cpu, index),
             2 if index == 0 => {}
@@ -3647,13 +3649,14 @@ fn execute_fpu_db<B: Bus>(
             cpu.fpu.pop();
         }
         5 => {
-            let value = read_fpu_m80(cpu, bus, dst)?;
+            let (value, integer) = read_fpu_m80(cpu, bus, dst)?;
             fpu_clear_c1(cpu);
             cpu.fpu.push(value);
+            cpu.fpu.set_integer_image(0, integer);
         }
         7 => {
             fpu_clear_c1(cpu);
-            write_fpu_m80(cpu, bus, dst, cpu.fpu.get(0))?;
+            write_fpu_m80(cpu, bus, dst)?;
             cpu.fpu.pop();
         }
         // FISTTP requires SSE3.
@@ -3712,16 +3715,10 @@ fn execute_fpu_dd<B: Bus>(
         let index = modrm & 7;
         match group {
             2 => {
-                let value = cpu.fpu.get(0);
                 fpu_clear_c1(cpu);
-                cpu.fpu.set(index, value);
+                cpu.fpu.copy(index, 0);
             }
-            3 => {
-                let value = cpu.fpu.get(0);
-                fpu_clear_c1(cpu);
-                cpu.fpu.set(index, value);
-                cpu.fpu.pop();
-            }
+            3 => fpu_fstp_sti(cpu, index),
             4 => fpu_compare(cpu, cpu.fpu.get(0), cpu.fpu.get(index)),
             5 => {
                 fpu_compare(cpu, cpu.fpu.get(0), cpu.fpu.get(index));
@@ -3851,9 +3848,10 @@ fn execute_fpu_df<B: Bus>(
                 cpu.fpu.push(value);
             }
             5 => {
-                let value = read_fpu_i64(cpu, bus, dst)? as f64;
+                let value = read_fpu_i64(cpu, bus, dst)?;
                 fpu_clear_c1(cpu);
-                cpu.fpu.push(value);
+                cpu.fpu.push(value as f64);
+                cpu.fpu.set_integer_image(0, Some(value));
             }
             6 => {
                 fpu_clear_c1(cpu);
@@ -3861,7 +3859,10 @@ fn execute_fpu_df<B: Bus>(
                 cpu.fpu.pop();
             }
             7 => {
-                let value = fpu_round_i64_indefinite(cpu.fpu.get(0), cpu.fpu.control);
+                let value = cpu.fpu.integer_image(0).map_or_else(
+                    || fpu_round_i64_indefinite(cpu.fpu.get(0), cpu.fpu.control),
+                    |value| value as u64,
+                );
                 fpu_clear_c1(cpu);
                 write_fpu_i64(cpu, bus, dst, value)?;
                 cpu.fpu.pop();
@@ -12569,6 +12570,8 @@ fn fpu_restore_state<B: Bus>(
         cpu.fpu.mm[index] = image_read_u64(&image, offset);
         restored_mmx &= fpu_m80_looks_mmx(&image, offset);
         cpu.fpu.set(index as u8, fpu_m80_to_f64(&image, offset));
+        cpu.fpu
+            .set_integer_image(index as u8, fpu_m80_integer(&image, offset));
         offset += FPU_REG_IMAGE_LEN;
         index += 1;
     }
@@ -12594,7 +12597,7 @@ fn fpu_save_state<B: Bus>(
         if cpu.fpu.mmx_active {
             fpu_mmx_to_m80(cpu.fpu.mmx(index as u8), &mut image, offset);
         } else {
-            f64_to_fpu_m80(cpu.fpu.get(index as u8), &mut image, offset);
+            fpu_reg_to_m80(cpu, index as u8, &mut image, offset);
         }
         offset += FPU_REG_IMAGE_LEN;
         index += 1;
@@ -12617,7 +12620,7 @@ fn fxsave<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Result
         if cpu.fpu.mmx_active {
             fpu_mmx_to_m80(cpu.fpu.mmx(index as u8), &mut image, offset);
         } else {
-            f64_to_fpu_m80(cpu.fpu.get(index as u8), &mut image, offset);
+            fpu_reg_to_m80(cpu, index as u8, &mut image, offset);
         }
         index += 1;
     }
@@ -12662,6 +12665,8 @@ fn fxrstor<B: Bus>(cpu: &mut Cpu, bus: &mut B, addr: MemAddr, eip: u32) -> Resul
         cpu.fpu.mm[index] = image_read_u64(&image, offset);
         restored_mmx &= fpu_m80_looks_mmx(&image, offset);
         cpu.fpu.set(index as u8, fpu_m80_to_f64(&image, offset));
+        cpu.fpu
+            .set_integer_image(index as u8, fpu_m80_integer(&image, offset));
         index += 1;
     }
     cpu.fpu.mmx_active = restored_mmx;
@@ -12737,26 +12742,58 @@ fn write_fpu_m64<B: Bus>(
     Ok(())
 }
 
-fn read_fpu_m80<B: Bus>(cpu: &mut Cpu, bus: &mut B, rm: Rm32) -> Result<f64, StepError> {
-    let Rm32::Mem(addr) = rm else {
-        return Ok(0.0);
-    };
-    let image = read_mem_image(cpu, bus, addr, FPU_REG_IMAGE_LEN)?;
-    Ok(fpu_m80_to_f64(&image, 0))
-}
-
-fn write_fpu_m80<B: Bus>(
+fn read_fpu_m80<B: Bus>(
     cpu: &mut Cpu,
     bus: &mut B,
     rm: Rm32,
-    value: f64,
-) -> Result<(), StepError> {
+) -> Result<(f64, Option<i64>), StepError> {
+    let Rm32::Mem(addr) = rm else {
+        return Ok((0.0, None));
+    };
+    let image = read_mem_image(cpu, bus, addr, FPU_REG_IMAGE_LEN)?;
+    Ok((fpu_m80_to_f64(&image, 0), fpu_m80_integer(&image, 0)))
+}
+
+fn write_fpu_m80<B: Bus>(cpu: &mut Cpu, bus: &mut B, rm: Rm32) -> Result<(), StepError> {
     let Rm32::Mem(addr) = rm else {
         return Ok(());
     };
     let mut image = [0u8; FPU_SAVE_IMAGE_MAX];
-    f64_to_fpu_m80(value, &mut image, 0);
+    fpu_reg_to_m80(cpu, 0, &mut image, 0);
     write_mem_image(cpu, bus, addr, &image, FPU_REG_IMAGE_LEN)
+}
+
+/// Only normal, nonzero, integral encodings in the signed 64-bit range.
+fn fpu_m80_integer(image: &[u8], offset: usize) -> Option<i64> {
+    let significand = image_read_u64(image, offset);
+    let sign_exp = image_read_u16(image, offset + 8);
+    let exponent = sign_exp & 0x7fff;
+    if significand >> 63 == 0 || !(0x3fff..=0x403e).contains(&exponent) {
+        return None;
+    }
+    let shift = 0x403e - exponent;
+    if significand & ((1u64 << shift) - 1) != 0 {
+        return None;
+    }
+    let magnitude = significand >> shift;
+    let negative = sign_exp & 0x8000 != 0;
+    if negative && magnitude == 1u64 << 63 {
+        return Some(i64::MIN);
+    }
+    let value = i64::try_from(magnitude).ok()?;
+    Some(if negative { -value } else { value })
+}
+
+fn fpu_reg_to_m80(cpu: &Cpu, index: u8, image: &mut [u8], offset: usize) {
+    if let Some(value) = cpu.fpu.integer_image(index) {
+        let magnitude = value.unsigned_abs();
+        let shift = magnitude.leading_zeros(); // Images never contain zero.
+        image_write_u64(image, offset, magnitude << shift);
+        let sign_exp = (u16::from(value < 0) << 15) | (0x403e - shift as u16);
+        image_write_u16(image, offset + 8, sign_exp);
+    } else {
+        f64_to_fpu_m80(cpu.fpu.get(index), image, offset);
+    }
 }
 
 fn fpu_m80_to_f64(image: &[u8], offset: usize) -> f64 {
@@ -12968,13 +13005,17 @@ fn fpu_fxch(cpu: &mut Cpu, index: u8) {
     fpu_clear_c1(cpu);
     let st0 = cpu.fpu.get(0);
     let sti = cpu.fpu.get(index);
+    let integer0 = cpu.fpu.integer_image(0);
+    let integer_i = cpu.fpu.integer_image(index);
     cpu.fpu.set(0, sti);
     cpu.fpu.set(index, st0);
+    cpu.fpu.set_integer_image(0, integer_i);
+    cpu.fpu.set_integer_image(index, integer0);
 }
 
 fn fpu_fstp_sti(cpu: &mut Cpu, index: u8) {
     fpu_clear_c1(cpu);
-    cpu.fpu.set(index, cpu.fpu.get(0));
+    cpu.fpu.copy(index, 0);
     cpu.fpu.pop();
 }
 
@@ -13485,7 +13526,7 @@ fn fpu_comi(cpu: &mut Cpu, index: u8, pop_stack: bool) {
 
 fn fpu_cmov(cpu: &mut Cpu, index: u8, condition: bool) {
     if condition {
-        cpu.fpu.set(0, cpu.fpu.get(index));
+        cpu.fpu.copy(0, index);
     }
 }
 
@@ -21203,24 +21244,23 @@ mod tests {
 
     #[test]
     fn legacy_x87_controls_preserve_state_and_check_ts() {
-        let state = crate::x86::cpu::FpuState {
-            control: 0x027e,
-            status: 0x82c1,
-            top: 5,
-            mxcsr: 0x0000_5f80,
-            st: [
-                0.0,
-                -0.0,
-                1.5,
-                -3.0,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                f64::from_bits(0x7ff8_1234_5678_9abc),
-                f64::from_bits(1),
-            ],
-            mm: [1, 2, 3, 4, 5, 6, 7, u64::MAX],
-            mmx_active: true,
-        };
+        let mut state = crate::x86::cpu::FpuState::new();
+        state.control = 0x027e;
+        state.status = 0x82c1;
+        state.top = 5;
+        state.mxcsr = 0x0000_5f80;
+        state.st = [
+            0.0,
+            -0.0,
+            1.5,
+            -3.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(0x7ff8_1234_5678_9abc),
+            f64::from_bits(1),
+        ];
+        state.mm = [1, 2, 3, 4, 5, 6, 7, u64::MAX];
+        state.mmx_active = true;
         let snapshot = |fpu: &crate::x86::cpu::FpuState| {
             (
                 fpu.control,
@@ -25089,6 +25129,192 @@ mod tests {
             (-6_i32) as u32
         );
         assert_eq!(read_reg16(&cpu, Reg32::Eax as u8) & 0x4500, 0x4000);
+    }
+
+    const X87_INTEGER_IMAGES: [(i64, [u8; 10]); 6] = [
+        (
+            i64::from_le_bytes(*b"TPF0\x11\x22\x33\x44"),
+            [0xa8, 0xa0, 0x8c, 0x60, 0x22, 0x44, 0x66, 0x88, 0x3d, 0x40],
+        ),
+        ((1 << 53) + 1, [0, 4, 0, 0, 0, 0, 0, 0x80, 0x34, 0x40]),
+        (
+            i64::MAX,
+            [0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x3d, 0x40],
+        ),
+        (i64::MIN, [0, 0, 0, 0, 0, 0, 0, 0x80, 0x3e, 0xc0]),
+        (-1, [0, 0, 0, 0, 0, 0, 0, 0x80, 0xff, 0xbf]),
+        (
+            0x0123_4567_89ab_cdef,
+            [0x80, 0xf7, 0xe6, 0xd5, 0xc4, 0xb3, 0xa2, 0x91, 0x37, 0x40],
+        ),
+    ];
+
+    #[test]
+    fn x87_exact_integer_load_store_and_register_moves() {
+        for (value, _) in X87_INTEGER_IMAGES {
+            // Each sequence starts with FILD value, FILD !value, and leaves
+            // the original value on top for the final FISTP qword.
+            for moves in [
+                &[0xd9, 0xc9][..],                     // FXCH ST(1)
+                &[0xd9, 0xc1],                         // FLD ST(1)
+                &[0xd9, 0xc9, 0xdd, 0xd9],             // FXCH; FSTP ST(1)
+                &[0xd9, 0xc9, 0xdd, 0xd1, 0xd9, 0xc9], // FXCH; FST ST(1); FXCH
+                &[0xda, 0xc1],                         // FCMOVB ST(0), ST(1), CF set below
+            ] {
+                let mut ram = Ram::new();
+                let mut code = Vec::from([
+                    0xdf, 0x2d, 0x00, 0x03, 0x00, 0x00, // FILD qword [0x300]
+                    0xdf, 0x3d, 0x00, 0x04, 0x00, 0x00, // FISTP qword [0x400]: direct
+                    0xdf, 0x2d, 0x00, 0x03, 0x00, 0x00, 0xdf, 0x2d, 0x08, 0x03, 0x00, 0x00,
+                ]);
+                code.extend_from_slice(moves);
+                code.extend_from_slice(&[0xdf, 0x3d, 0x08, 0x04, 0x00, 0x00]);
+                ram.data[..code.len()].copy_from_slice(&code);
+                ram.data[0x300..0x308].copy_from_slice(&value.to_le_bytes());
+                ram.data[0x308..0x310].copy_from_slice(&(!value).to_le_bytes());
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0, 0);
+                cpu.set_flag(EFLAGS_CF, true);
+                while (cpu.eip as usize) < code.len() {
+                    step_running(&mut cpu, &mut ram);
+                }
+                assert_eq!(&ram.data[0x400..0x408], &value.to_le_bytes());
+                assert_eq!(
+                    &ram.data[0x408..0x410],
+                    &value.to_le_bytes(),
+                    "{value:x} {moves:x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x87_exact_integer_save_restore_images() {
+        for (value, expected) in X87_INTEGER_IMAGES {
+            for (save, restore, offset) in [
+                (
+                    &[0xdd, 0x35, 0, 6, 0, 0][..],
+                    &[0xdd, 0x25, 0, 6, 0, 0][..],
+                    28,
+                ),
+                (
+                    &[0x66, 0xdd, 0x35, 0, 6, 0, 0],
+                    &[0x66, 0xdd, 0x25, 0, 6, 0, 0],
+                    14,
+                ),
+                (
+                    &[0x0f, 0xae, 0x05, 0, 6, 0, 0],
+                    &[0x0f, 0xae, 0x0d, 0, 6, 0, 0],
+                    32,
+                ),
+            ] {
+                let mut ram = Ram::new();
+                let mut code = Vec::from([0xdf, 0x2d, 0, 3, 0, 0]); // FILD
+                code.extend_from_slice(save);
+                code.extend_from_slice(&[0xdb, 0xe3]); // FNINIT before restore
+                code.extend_from_slice(restore);
+                code.extend_from_slice(&[0xdf, 0x3d, 0, 4, 0, 0]); // FISTP
+                ram.data[..code.len()].copy_from_slice(&code);
+                ram.data[0x300..0x308].copy_from_slice(&value.to_le_bytes());
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0, 0);
+                while (cpu.eip as usize) < code.len() {
+                    step_running(&mut cpu, &mut ram);
+                }
+                assert_eq!(&ram.data[0x400..0x408], &value.to_le_bytes());
+                assert_eq!(
+                    ram.data[0x600 + offset..0x600 + offset + 10],
+                    expected,
+                    "{value:x} {save:x?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn x87_exact_integer_extended_load_store() {
+        for (value, image) in X87_INTEGER_IMAGES {
+            let mut ram = Ram::new();
+            let code = [
+                0xdb, 0x2d, 0, 3, 0, 0, // FLD tbyte
+                0xd9, 0xc0, // FLD ST(0)
+                0xdb, 0x3d, 0, 4, 0, 0, // FSTP tbyte
+                0xdf, 0x3d, 0x10, 4, 0, 0, // FISTP qword
+            ];
+            ram.data[..code.len()].copy_from_slice(&code);
+            ram.data[0x300..0x30a].copy_from_slice(&image);
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0, 0);
+            for _ in 0..4 {
+                step_running(&mut cpu, &mut ram);
+            }
+            assert_eq!(ram.data[0x400..0x40a], image);
+            assert_eq!(&ram.data[0x410..0x418], &value.to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn x87_exact_integer_other_writes_discard_image() {
+        for (operation, expected) in [
+            (&[0xd8, 0xc0][..], 1i64 << 54), // FADD ST(0), ST(0): f64 arithmetic
+            (&[0xd9, 0xe0], -(1i64 << 53)),  // FCHS
+            (&[0xd9, 0xe1], 1i64 << 53),     // FABS
+            (&[0xdf, 0xc0, 0xd9, 0xee], 0),  // FFREEP; FLDZ reuses physical slot
+            (&[0xdb, 0xe3, 0xd9, 0xe8], 1),  // FNINIT; FLD1
+        ] {
+            let mut ram = Ram::new();
+            let mut code = Vec::from([0xdf, 0x2d, 0, 3, 0, 0]);
+            code.extend_from_slice(operation);
+            code.extend_from_slice(&[0xdf, 0x3d, 0, 4, 0, 0]);
+            ram.data[..code.len()].copy_from_slice(&code);
+            ram.data[0x300..0x308].copy_from_slice(&((1i64 << 53) + 1).to_le_bytes());
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0, 0);
+            while (cpu.eip as usize) < code.len() {
+                step_running(&mut cpu, &mut ram);
+            }
+            assert_eq!(
+                &ram.data[0x400..0x408],
+                &expected.to_le_bytes(),
+                "{operation:x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn x87_extended_noninteger_and_out_of_range_loads_keep_f64_behavior() {
+        for (input, expected) in [
+            ([0; 10], [0; 10]),
+            (
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80],
+                [0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80],
+            ), // -0
+            (
+                [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0x3f],
+                [0, 0, 0, 0, 0, 0, 0, 0xc0, 0xff, 0x3f],
+            ), // 1.5
+            (
+                [0, 0, 0, 0, 0, 0, 0, 0x80, 0x3e, 0x40],
+                [0, 0, 0, 0, 0, 0, 0, 0x80, 0x3e, 0x40],
+            ), // +2^63
+            (
+                [1, 0, 0, 0, 0, 0, 0, 0x80, 0x3e, 0xc0],
+                [0, 0, 0, 0, 0, 0, 0, 0x80, 0x3e, 0xc0],
+            ), // below i64::MIN
+            (
+                [0, 4, 0, 0, 0, 0, 0, 0x40, 0x34, 0x40],
+                [0, 0, 0, 0, 0, 0, 0, 0xc0, 0x34, 0x40],
+            ), // no explicit integer bit
+        ] {
+            let mut ram = Ram::new();
+            ram.data[..12].copy_from_slice(&[0xdb, 0x2d, 0, 3, 0, 0, 0xdb, 0x3d, 0, 4, 0, 0]);
+            ram.data[0x300..0x30a].copy_from_slice(&input);
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0, 0);
+            step_running(&mut cpu, &mut ram);
+            step_running(&mut cpu, &mut ram);
+            assert_eq!(ram.data[0x400..0x40a], expected, "{input:x?}");
+        }
     }
 
     #[test]

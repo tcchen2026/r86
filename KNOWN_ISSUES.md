@@ -25,9 +25,13 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: on Windows window switches the interpreter runs 0.34% of guest
   instructions for 11.5% of cycles (INT/IRET, short budgets, page-split
   instructions); JIT dispatch takes another 21%.
-- cpu: x87 registers are `f64`: no 80-bit precision, precision and
-  rounding control ignored, tag word and deferred exceptions not modelled,
-  transcendental functions approximated. [?]
+- cpu: x87 registers are `f64` (`FpuState`, src/x86/cpu.rs). Integers
+  loaded by FILD m64 or an integral 80-bit load stay exact only through
+  moves, saves and integer or 80-bit stores; arithmetic, FCHS/FABS,
+  compares and FBLD/FBSTP round them to 53 bits. Precision control and
+  arithmetic rounding control are ignored, the tag word and deferred
+  exceptions are not modelled, transcendental functions are
+  approximated. [?]
 - cpu: TF single-step traps and DR0-DR3 breakpoints are not delivered. [?]
 
 ## P2: specific guests or drivers; smaller or unmeasured cost; bad input

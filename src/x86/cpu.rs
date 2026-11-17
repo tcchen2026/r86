@@ -96,6 +96,13 @@ impl TableReg {
     }
 }
 
+/// x87 registers hold f64, not 80-bit extended values. A register loaded
+/// from a 64-bit integer (FILD m64, or an integral 80-bit load or restore)
+/// also keeps that integer exactly, because Delphi's RTL Move copies memory
+/// with FILD/FISTP m64 and must not change any bit. Register moves carry the
+/// integer; FISTP m64, 80-bit stores and FSAVE/FXSAVE write it; any other write
+/// drops it. Write registers only through these methods, or a stale integer
+/// could be stored. Zero needs no image and retains its sign in f64.
 #[derive(Clone, Copy, Debug)]
 pub struct FpuState {
     pub control: u16,
@@ -103,6 +110,8 @@ pub struct FpuState {
     pub top: u8,
     pub mxcsr: u32,
     pub st: [f64; 8],
+    exact: [i64; 8],
+    exact_valid: u8,
     pub mm: [u64; 8],
     pub mmx_active: bool,
 }
@@ -115,6 +124,8 @@ impl FpuState {
             top: 0,
             mxcsr: 0x0000_1f80,
             st: [0.0; 8],
+            exact: [0; 8],
+            exact_valid: 0,
             mm: [0; 8],
             mmx_active: false,
         }
@@ -150,8 +161,31 @@ impl FpuState {
     }
 
     pub fn set(&mut self, index: u8, value: f64) {
-        self.st[((self.top.wrapping_add(index)) & 7) as usize] = value;
+        let physical = (self.top.wrapping_add(index)) & 7;
+        self.st[physical as usize] = value;
+        self.exact_valid &= !(1 << physical);
         self.mmx_active = false;
+    }
+
+    pub fn integer_image(&self, index: u8) -> Option<i64> {
+        let physical = (self.top.wrapping_add(index)) & 7;
+        (self.exact_valid & (1 << physical) != 0).then_some(self.exact[physical as usize])
+    }
+
+    /// Attach an integer image after writing the f64 value with set/push.
+    pub fn set_integer_image(&mut self, index: u8, value: Option<i64>) {
+        let physical = (self.top.wrapping_add(index)) & 7;
+        self.exact_valid &= !(1 << physical);
+        if let Some(value) = value.filter(|value| *value != 0) {
+            self.exact[physical as usize] = value;
+            self.exact_valid |= 1 << physical;
+        }
+    }
+
+    pub fn copy(&mut self, dst: u8, src: u8) {
+        let image = self.integer_image(src);
+        self.set(dst, self.get(src));
+        self.set_integer_image(dst, image);
     }
 
     pub fn mmx(&self, index: u8) -> u64 {
