@@ -2225,10 +2225,9 @@ impl Cpu {
         }
     }
 
-    /// Native blocks may commit POPF/CLI/STI but never change VM. An IF 0->1
-    /// transition exits with attention; STI's exit handler then installs its
-    /// shadow before the machine can observe interruptibility. No subsequent
-    /// guest instruction runs in the same native chain.
+    /// Native blocks may commit POPF/CLI/STI but never change VM. A64's quiet
+    /// invocation may continue after IF rises; other cases exit for attention.
+    /// The adapter consumes any STI shadow exit before the machine observes IF.
     #[cfg(feature = "jit")]
     #[inline]
     pub(crate) fn jit_commit_flags(&mut self, value: u32) {

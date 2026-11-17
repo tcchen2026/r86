@@ -1455,6 +1455,7 @@ impl Engine {
                     cpu.begin_instruction();
                     cpu.segment_override = None;
                     let mut frame = Frame::from_cpu(cpu, native_limit);
+                    frame.quiet = u32::from(bus.batch_interrupts_quiet());
                     frame.native_entry = body;
                     frame.dispatch_entry = self.entry.dispatch;
                     frame.call_dispatch_entry = self.entry.call_dispatch;
@@ -1561,13 +1562,6 @@ impl Engine {
                         // inhibition before Machine can inspect pending IRQs.
                         if frame.exit_kind == 6 {
                             cpu.inhibit_maskable_interrupts();
-                            if crate::x86::interp::continue_after_interrupt_shadow(
-                                cpu,
-                                bus,
-                                frame.completed < native_limit,
-                            ) {
-                                continue;
-                            }
                         }
                         return Ok(BatchResult {
                             ran,

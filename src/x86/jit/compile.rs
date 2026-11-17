@@ -42,8 +42,8 @@
 //!   element semantics). Scalar LODS/STOS/SCAS complete the memory operation
 //!   before changing the accumulator, flags or index (v86 string.rs agrees).
 //! - CLD/STD update the frame's DF. CLI/POPF share privilege rules with the
-//!   interpreter; enabling IF exits for attention; the adapter owns VM changes
-//!   and shadow boundaries (v86 instructions.rs agrees on CPL/IOPL gating).
+//!   interpreter. Frame.quiet governs native continuation after IF rises; the
+//!   adapter owns VM changes and shadow exits (v86 agrees on CPL/IOPL gating).
 //! - PUSHFD clears RF/VM only in its stack image; CWD/CDQ sign-extend (v86
 //!   instructions.rs agrees).
 //! - MUL/IMUL produce full-width products, signed truncation and CF/OF overflow;
@@ -1377,8 +1377,8 @@ fn emit_progress(a: &mut Assembler, _block: &Block, count: u16) {
 
 fn prologue(a: &mut Assembler) {
     frame::emit_entry(a);
-    // Only exits write a nonzero kind, and each immediately returns to Rust.
-    // Linked blocks need no repeated clearing of this invocation-wide field.
+    // Exits write a nonzero kind; STI clears its tentative kind before linking.
+    // Other linked blocks need no repeated clearing of this invocation field.
     a.load_store(false, ZR, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
     soft::emit_entry(a);
     a.load_store(true, FLAGS, FRAME, offset_of!(Frame, eflags) as u32, 2);
@@ -1803,10 +1803,15 @@ pub fn block(
                 a.load_store(false, FLAGS, FRAME, offset_of!(Frame, eflags) as u32, 2);
                 unpack_flags(&mut a);
                 stack_adjust(&mut a, guest_reg(4), i32::from(bits / 8), code16);
-                // An enabled IRQ must be observed immediately after POPF,
-                // even when CLI earlier in this chain disabled it only briefly.
+                // A pending IRQ must be observed immediately after POPF, even
+                // when CLI in this chain disabled it only briefly. The quiet
+                // invocation contract excludes such a request until its end.
                 let attention = a.label();
-                a.tbz(RESULT, 9, true, attention);
+                let no_attention = a.label();
+                a.tbz(RESULT, 9, false, no_attention);
+                a.load_store(true, TMP, FRAME, offset_of!(Frame, quiet) as u32, 2);
+                a.cbz(TMP, false, false, attention);
+                a.bind(no_attention);
                 attention_exits.push((attention, instruction.next_eip, index as u16 + 1));
             }
             Op::ClearInterrupt => {
@@ -1831,7 +1836,7 @@ pub fn block(
                 a.bfi32(TMP, LHS, 9, 1);
                 a.load_store(false, TMP, FRAME, offset_of!(Frame, eflags) as u32, 2);
                 // Kind 5 is attention with IF already set; kind 6 also installs
-                // the shadow. Neither permits another native instruction.
+                // the shadow. The quiet next-EIP edge below clears this tag.
                 a.mov_imm(LHS, 6, false);
                 a.add_sub(LHS, LHS, TMP2, false, true, false);
                 a.load_store(false, LHS, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
@@ -2870,6 +2875,13 @@ pub fn block(
     }
     match last.op {
         Op::SetInterrupt => {
+            let attention = a.label();
+            a.load_store(true, TMP, FRAME, offset_of!(Frame, quiet) as u32, 2);
+            a.cbz(TMP, false, false, attention);
+            a.cbz(BUDGET, true, false, attention);
+            a.load_store(false, ZR, FRAME, offset_of!(Frame, exit_kind) as u32, 2);
+            emit_edge(&mut a, page, Some(last.next_eip), false, done, &mut edges);
+            a.bind(attention);
             a.mov_imm(PC, last.next_eip.into(), false);
             a.b(done);
         }

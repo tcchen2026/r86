@@ -12051,6 +12051,12 @@ pub(crate) fn try_load_cached_segment<B: Bus>(
     let Some(token) = cpu.cached_read_translation(linear, false) else {
         return false;
     };
+    // Native helpers must not observe device memory during a quiet invocation.
+    // A cached translation may name framebuffer backing as well as RAM.
+    if bus.classify_phys(bus.cached_backing_phys(token), 8) != crate::x86::mem::PhysRegionKind::Ram
+    {
+        return false;
+    }
     let desc = DescriptorRaw {
         selector,
         low: bus.read_backing_token_u32(token),

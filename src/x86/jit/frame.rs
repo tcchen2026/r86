@@ -16,9 +16,9 @@
 //! W15 carries N/Z/C/V in bits 31/30/29/28, with C meaning x86 carry/borrow.
 //! W17 carries a byte whose parity gives PF; bit 4 of W8 XOR W17 gives AF. Non-status
 //! EFLAGS remain in Frame.eflags; CLD/STD, CLI/STI and POPF update their permitted
-//! bits. POPF enabling IF and STI exit for machine interrupt attention. The
-//! adapter handles STI's IF 0->1 exit by installing the shadow before a machine
-//! interrupt check.
+//! bits. With Frame.quiet, POPF enabling IF and STI can continue natively;
+//! otherwise they exit for machine attention. The adapter installs the shadow
+//! for STI's IF 0->1 exit before a machine interrupt check.
 //! These registers survive
 //! links and memory guards. Only
 //! the exit materializes both into Frame.eflags.
@@ -71,6 +71,17 @@ pub struct Frame {
     /// STI's interrupt shadow before handing control back to the machine.
     /// Kind 7 leaves before a CODE16 fetch/target limit violation.
     pub exit_kind: u32,
+    /// No deliverable PIC request or bus attention at entry, independent of IF.
+    /// Constant for this invocation: generated code accesses only RAM or plain
+    /// framebuffer backing, never device registers. `refill_data_translation`
+    /// reads resident RAM page tables and updates translation/dirty metadata;
+    /// `load_cached_segment` reads only RAM descriptors (other backing exits);
+    /// `execute_mmx` touches only CPU/FPU state. None advances devices or time.
+    /// The native budget cannot cross the next device-service boundary. Masked
+    /// PIC requests need I/O or another machine boundary to become deliverable.
+    /// Thus IF may rise without leaving; STI may link only with budget for its
+    /// following instruction. Any future helper must preserve this contract.
+    pub quiet: u32,
     /// Exit kind 3 resumes the unfinished REP instruction after native memory
     /// elements. While running, completed temporarily stores its starting ECX.
     pub repeat: crate::x86::interp::RepeatContinuation,
@@ -126,6 +137,7 @@ impl Frame {
             remaining: budget,
             completed: 0,
             exit_kind: 0,
+            quiet: 0,
             repeat: Default::default(),
             memory: core::ptr::null_mut(),
             native_entry: 0,

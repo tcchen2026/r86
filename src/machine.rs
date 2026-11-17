@@ -6764,6 +6764,42 @@ mod host_bus_tests {
 
     #[cfg(a64_jit)]
     #[test]
+    fn jit_cached_segment_helper_leaves_device_backing_to_interpretation() {
+        let mut bus = HostBus::new_firmware(2 << 20).unwrap();
+        enable_test_vbe(&mut bus);
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x1000, 0);
+        cpu.gdtr = crate::x86::cpu::TableReg {
+            base: 0xa2000,
+            limit: 0x17,
+        };
+        bus.sync_ioram(&mut cpu);
+        bus.write_phys_u32(PhysAddr(0xa2010), 0x1234_ffff).unwrap();
+        bus.write_phys_u32(PhysAddr(0xa2014), 0x00cf_9300).unwrap();
+        mmu::read_linear_u32(&mut cpu, &mut bus, LinearAddr(0xa2010), AccessKind::Read).unwrap();
+        assert!(
+            cpu.cached_read_translation(LinearAddr(0xa2010), false)
+                .is_some()
+        );
+        let old = cpu.seg(SegmentReg::Ds);
+        assert!(!crate::x86::interp::try_load_cached_segment(
+            &mut cpu,
+            &mut bus,
+            SegmentReg::Ds,
+            0x10
+        ));
+        assert_eq!(cpu.seg(SegmentReg::Ds), old);
+        cpu.regs[0] = 0x10;
+        bus.ram[0x1000..0x1002].copy_from_slice(&[0x8e, 0xd8]); // MOV DS,AX.
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        let result = Interpreter::run_one(&mut cpu, &mut bus, 0);
+        assert_eq!(result.stop, BatchStop::Budget);
+        assert_eq!(cpu.seg(SegmentReg::Ds).base, 0x1234);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
     fn jit_data_segment_loads_preserve_descriptors_and_fault_order() {
         for (segment, prefix) in [
             (SegmentReg::Es, 0x26),
@@ -13736,6 +13772,195 @@ mod host_bus_tests {
         let sp = m.cpu.reg(Reg32::Esp) as usize;
         assert_eq!(&m.bus.ram[sp..sp + 2], &[0x02, 0x10]);
         assert_eq!(m.cpu.tsc(), start + 3);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_quiet_sti_and_popflags_share_one_native_invocation() {
+        for code16 in [false, true] {
+            let mut bus = HostBus::new(0x10000);
+            // STI; CLI; POPF[D]; JMP next; INC [E]BX; JMP back to INC.
+            bus.ram[0x1000..0x1008].copy_from_slice(&[0xfb, 0xfa, 0x9d, 0xeb, 0, 0x43, 0xeb, 0xfd]);
+            bus.ram[0x1800] = 0x90;
+            write_ram_u32(&mut bus, 0x8000, 0x202);
+            let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+            for round in 0..=crate::x86::jit::runtime::HOT * 4 {
+                let mut cpu = Cpu::new();
+                cpu.enter_protected_flat(0x1800, 0);
+                cpu.regs[4] = 0x8000;
+                if code16 {
+                    cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(8, 0, 0xffff, 0x9b));
+                    cpu.set_seg_cache(SegmentReg::Ss, SegmentCache::new(16, 0, 0xffff, 0x93));
+                    cpu.regs[4] |= 0xface_0000;
+                }
+                bus.attention = false;
+                bus.next_attention_step = u64::MAX;
+                Interpreter::run_one(&mut cpu, &mut bus, 0);
+                mmu::read_linear_u32(&mut cpu, &mut bus, LinearAddr(0x8000), AccessKind::Read)
+                    .unwrap();
+                cpu.eip = 0x1000;
+                cpu.set_tsc(0);
+                let invocations = engine.stats.native_invocations;
+                let interpreted = engine.stats.interpreted_steps;
+                let mut ran = 0;
+                while ran < 6 {
+                    let batch = engine.run_batch(&mut cpu, &mut bus, ran, 6 - ran).unwrap();
+                    assert!(matches!(
+                        batch.stop,
+                        BatchStop::Budget | BatchStop::Attention { .. }
+                    ));
+                    ran += batch.ran;
+                }
+                assert_eq!(cpu.eip, 0x1005);
+                assert_eq!(cpu.regs[3], 1);
+                assert_eq!(cpu.regs[4], if code16 { 0xface_8002 } else { 0x8004 });
+                assert_ne!(cpu.effective_eflags() & EFLAGS_IF, 0);
+                assert!(!cpu.interrupt_shadow());
+                assert_eq!(cpu.tsc(), 6);
+                if round == crate::x86::jit::runtime::HOT * 4 {
+                    assert_eq!(
+                        engine.stats.native_invocations - invocations,
+                        1,
+                        "code16={code16}"
+                    );
+                    assert_eq!(engine.stats.interpreted_steps, interpreted);
+                }
+            }
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_if_transitions_deliver_pending_and_due_irqs_at_exact_boundaries() {
+        for code16 in [false, true] {
+            for opcode in [0xfb, 0x9d] {
+                // Pending PIC, timer at IF change, timer after the following
+                // instruction. Check large caller budgets and one-step calls.
+                for timing in 0..3 {
+                    for single in [false, true] {
+                        let mut bus = HostBus::new(0x10000);
+                        let code: &[u8] = if opcode == 0xfb {
+                            &[0xfb, 0x43, 0x41, 0xeb, 0xfe]
+                        } else {
+                            // End POPF's block after one following instruction,
+                            // so a pending IRQ and a two-step caller budget
+                            // exercise the native IF-rise exit, not a cold miss.
+                            &[0x9d, 0xeb, 0, 0x43, 0x41, 0xeb, 0xfe]
+                        };
+                        bus.ram[0x1000..0x1000 + code.len()].copy_from_slice(code);
+                        bus.ram[0x1800] = 0x90;
+                        bus.ram[0x2000] = 0xf4;
+                        write_ram_u32(&mut bus, 0x3008, 0xffff);
+                        write_ram_u32(
+                            &mut bus,
+                            0x300c,
+                            if code16 { 0x0000_9b00 } else { 0x00cf_9b00 },
+                        );
+                        write_ram_u32(&mut bus, 0x4100, 0x0008_2000); // IRQ0 -> CS:2000.
+                        write_ram_u32(&mut bus, 0x4104, if code16 { 0x8600 } else { 0x8e00 });
+                        write_ram_u32(&mut bus, 0x8000, 0x202);
+                        let make_cpu = || {
+                            let mut cpu = Cpu::new();
+                            cpu.enter_protected_flat(0x1800, 0);
+                            cpu.regs[4] = 0x8000;
+                            if code16 {
+                                cpu.set_seg_cache(
+                                    SegmentReg::Cs,
+                                    SegmentCache::new(8, 0, 0xffff, 0x9b),
+                                );
+                                cpu.set_seg_cache(
+                                    SegmentReg::Ss,
+                                    SegmentCache::new(16, 0, 0xffff, 0x93),
+                                );
+                            }
+                            cpu.gdtr = crate::x86::cpu::TableReg {
+                                base: 0x3000,
+                                limit: 0x17,
+                            };
+                            cpu.idtr = crate::x86::cpu::TableReg {
+                                base: 0x4000,
+                                limit: 0x1ff,
+                            };
+                            cpu
+                        };
+                        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+                        let mut cpu = make_cpu();
+                        for _ in 0..crate::x86::jit::runtime::HOT * 4 {
+                            cpu = make_cpu();
+                            bus.attention = false;
+                            bus.next_attention_step = u64::MAX;
+                            Interpreter::run_one(&mut cpu, &mut bus, 0);
+                            cpu.eip = 0x1000;
+                            let mut ran = 0;
+                            while ran < 8 {
+                                ran += engine
+                                    .run_batch(&mut cpu, &mut bus, ran, 8 - ran)
+                                    .unwrap()
+                                    .ran;
+                            }
+                        }
+                        // Reuse the warm translation/context; restore only
+                        // architectural state, not the compiled code or bus.
+                        cpu.eip = 0x1000;
+                        cpu.regs = [0; 8];
+                        cpu.regs[4] = 0x8000;
+                        cpu.replace_eflags(2);
+                        cpu.restore_interrupt_shadow(false);
+                        bus.io_write_u8(0x21, 0xfe).unwrap();
+                        let start = if timing == 0 {
+                            bus.pic.pulse(0);
+                            bus.refresh_interrupt_attention(0);
+                            0
+                        } else {
+                            bus.io_write_u8(0x43, 0x10).unwrap();
+                            bus.io_write_u8(0x40, 3).unwrap();
+                            bus.refresh_interrupt_attention(0);
+                            assert!(bus.batch_interrupts_quiet());
+                            bus.next_attention_step - u64::from(timing == 2)
+                        };
+                        cpu.set_tsc(start);
+                        let native_before = engine.stats.native_steps;
+                        let mut machine =
+                            Machine::from_parts(cpu, bus, TraceMode::Off, PerfMode::Disabled);
+                        machine.jit = Some(engine);
+                        machine.step = start;
+                        let following = opcode == 0xfb || timing == 2;
+                        let steps = if following { 3 } else { 2 };
+                        if single {
+                            for _ in 0..steps {
+                                assert_eq!(machine.run_steps(1).unwrap().ran, 1);
+                            }
+                        } else {
+                            assert_eq!(machine.run_steps(steps).unwrap().ran, steps);
+                        }
+                        assert!(
+                            machine.cpu.halted,
+                            "code16={code16} opcode={opcode:x} timing={timing} single={single}"
+                        );
+                        assert_eq!(machine.cpu.eip, 0x2001);
+                        assert_eq!(machine.cpu.regs[3], u32::from(opcode == 0xfb));
+                        assert_eq!(machine.cpu.regs[1], 0);
+                        assert_eq!(machine.cpu.tsc(), start + steps);
+                        let sp = machine.cpu.regs[4] as usize;
+                        assert_eq!(
+                            u16::from_le_bytes(machine.bus.ram[sp..sp + 2].try_into().unwrap()),
+                            if opcode == 0xfb {
+                                0x1002
+                            } else if following {
+                                0x1003
+                            } else {
+                                0x1001
+                            }
+                        );
+                        if opcode == 0xfb || (!single && timing != 1) {
+                            assert!(
+                                machine.jit.as_ref().unwrap().stats.native_steps > native_before
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(a64_jit)]
