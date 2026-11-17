@@ -63,6 +63,8 @@ def main():
         manifest["asyncify_command"] = opt
         manifest["binaryen"] = subprocess.check_output([args.wasm_opt, "--version"], text=True).strip()
         files.append(transformed)
+    # A deployed directory carries the same licence material as the apps.
+    subprocess.run(["sh", str(ROOT / "ports/licenses.sh"), str(args.output / "licenses")], check=True)
     manifest["artifacts"] = {f.name: {"bytes": f.stat().st_size, "sha256": hashlib.sha256(f.read_bytes()).hexdigest()} for f in files}
     (args.output / "build.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest["artifacts"], indent=2))

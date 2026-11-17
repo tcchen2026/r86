@@ -80,11 +80,10 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - build: no CI builds or tests the emulator (only the Mac app); the
   no-JIT translation-cache layout used by the Apple build is not in the
   default test run.
-- build: binary packages using `ports/licenses.sh` omit the aggregate
-  `THIRD_PARTY_NOTICES.md`, including SeaBIOS's separate permissive notices;
-  linked registry-crate notices are also absent. The standalone web build
-  has no notice-copy step. Existing QEMU USB, ymfm, fatfs and SeaBIOS
-  GPL/LGPL texts are already copied by the shared helper.
+- build: the FreeDOS kit ships SHSUCDX 3.09, whose files say only
+  "Freeware", and UDVD2, which has sources but no explicit redistribution
+  grant (`assets/freedos.json`). Windows packages' MinGW-w64 runtime
+  notices are not inventoried.
 
 ## P3: rare paths, model honesty, structure
 

@@ -3,15 +3,16 @@
 r86's own code is under the [Apache License 2.0](LICENSE). The components
 below retain their own licences. This file collects notices for adapted
 code, vendored source, firmware and the display-driver package; it does
-not replace their original source headers. Rust registry dependencies
-require their own notices and are not covered by this file yet.
+not replace their original source headers. The licences of the Rust
+crates r86 may link are written at packaging time by
+[script/crate_licenses.py](script/crate_licenses.py).
 
 The separate FreeDOS kit carries its package notices and corresponding
 source archives inside `dos.zip`; see [Guest software](#guest-software).
 The public tools ISO carries the VMDisp9x licence inside `VMDISP9X/`.
-Distribution scripts must include the applicable notices alongside the
-material they distribute; the existence of this file in the source tree
-does not by itself put it into an app or archive.
+[ports/licenses.sh](ports/licenses.sh) installs r86's licence, this file,
+the crates' licences (`crates.txt`) and SeaBIOS's build configs into the
+`licenses` directory of every app, archive and web build the scripts make.
 
 ## QEMU USB adaptations — MIT
 
