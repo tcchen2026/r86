@@ -215,6 +215,7 @@
       <div class="items" role="menu">
         <button id="shot">Screenshot</button>
         <button id="diag" disabled title="Download a diagnostics snapshot">Diagnostics</button>
+        <button id="profile" hidden disabled title="Debug builds: count native and interpreted work, JIT exits, recompiles and cache clears between Start and Stop; Stop downloads the report">Start profiling</button>
         <button id="tools" hidden title="Display driver and mouse helper. Windows opens the installer; otherwise run R86-TOOL.EXE on the CD.">Install r86 Tools…</button>
         <hr>
         <button data-panel="serial">Serial console</button>
@@ -492,6 +493,8 @@ function online(id, hello) {
   retry = 0;
   $("engine").textContent = hello.engine ?? "";
   if (hello.import) { showImport(hello.import); return; }
+  $("profile").hidden = !hello.profiling;
+  showProfile(hello.execution?.profile_active);
   serialPre.textContent = ""; eventsPre.textContent = "";
   frameGen = undefined; serialNext = 0; eventNext = 0;
   decoder = new TextDecoder();
@@ -577,6 +580,7 @@ async function pollStatus() {
   }
   lastStep = json.step; lastTime = now;
   running = json.execution.running;
+  showProfile(json.execution.profile_active);
   $("engine").textContent = json.engine ?? "";
   showPower(json.powered_off);
   showMouse(json);
@@ -584,7 +588,7 @@ async function pollStatus() {
   showMedia((await request({ cmd: "media" })).json);
   const mode = `${json.vga.mode} ${json.vga.width}x${json.vga.height}`;
   const run = json.powered_off ? "powered off" : json.execution.busy ? "busy" : running ? "running" : "paused";
-  $("state").textContent = `${run} · step ${json.step.toLocaleString("en-US")}${rate} · ${mode}`;
+  $("state").textContent = `${run} · step ${json.step.toLocaleString("en-US")}${rate} · ${mode}${profiling ? " · profiling" : ""}`;
   setUi(true);
 }
 
@@ -645,7 +649,7 @@ function setUi(on) {
     item.disabled = !on || poweredOff;
   }
   for (const item of document.querySelectorAll("[data-mode]")) item.disabled = !on;
-  $("diag").disabled = !on;
+  $("diag").disabled = $("profile").disabled = !on;
   if (!on) { showMedia(null); $("display-open").disabled = true; }
 }
 
@@ -762,6 +766,20 @@ $("shot").onclick = () => canvas.toBlob(blob => {
 $("diag").onclick = async () => {
   const json = await command({ cmd: "diagnostics" });
   if (json) download(new Blob([JSON.stringify(json, null, 2)]), `r86-diagnostics-${json.step}.json`);
+};
+
+// Debug builds only (hello.profiling). The session is VM-wide: another
+// client may start or stop it, so the status poll keeps the label current.
+let profiling = false;
+function showProfile(active) {
+  profiling = !!active;
+  $("profile").textContent = profiling ? "Stop profiling" : "Start profiling";
+}
+$("profile").onclick = async () => {
+  const json = await command({ cmd: profiling ? "profile-stop" : "profile-start" });
+  if (!json) return;
+  showProfile(json.active);
+  if (json.markdown) download(new Blob([json.markdown], { type: "text/markdown" }), `r86-profile-${json.step}.md`);
 };
 
 function download(blob, name) {
