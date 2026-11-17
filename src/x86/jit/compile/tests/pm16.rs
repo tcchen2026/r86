@@ -751,3 +751,209 @@ fn native_pm16_segment_loads_keep_the_chain_and_refresh_based_access() {
         }
     }
 }
+
+#[test]
+fn native_pm32_expand_down_access_bounds_match_interpreter() {
+    for (prefix, segment) in [
+        (0x26, SegmentReg::Es),
+        (0x36, SegmentReg::Ss),
+        (0x3e, SegmentReg::Ds),
+    ] {
+        for big in [false, true] {
+            let upper = if big { u32::MAX } else { 0xffff };
+            for width in [2, 4] {
+                for opcode in [0x8b, 0x89, 0x01] {
+                    for (offset, valid) in [
+                        (0x400, false),
+                        (0x401, true),
+                        (upper - width + 1, true),
+                        (upper - width + 2, false),
+                    ] {
+                        let mut bytes = vec![prefix];
+                        if width == 2 {
+                            bytes.push(0x66);
+                        }
+                        bytes.extend([opcode, 5]);
+                        bytes.extend(offset.to_le_bytes());
+                        let (frame, stop) = check_mode(
+                            &bytes,
+                            |cpu, _| {
+                                let mut cache = cpu.seg(segment);
+                                cache.flags = 0xf7 | if big { 0x4000 } else { 0 };
+                                cache.limit = 0x400;
+                                // Valid upper-end operands fit the small test RAM only
+                                // after wrapping base addition. Bounds precede that add.
+                                cache.base = 0x40000u32.wrapping_sub(offset);
+                                cpu.set_seg_cache(segment, cache);
+                            },
+                            valid,
+                            false,
+                        );
+                        assert_eq!(frame.completed, u64::from(valid));
+                        if !valid {
+                            fault(stop, segment == SegmentReg::Ss);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_pm32_expand_down_push_checks_before_stack_effects() {
+    for width in [2, 4] {
+        for start in [0x3ffu32, 0x400, 0x401] {
+            let bytes = if width == 2 {
+                &[0x66, 0x50][..]
+            } else {
+                &[0x50][..]
+            };
+            let valid = start > 0x400;
+            let (frame, stop) = check_mode(
+                bytes,
+                |cpu, _| {
+                    let mut ss = cpu.seg(SegmentReg::Ss);
+                    ss.flags = 0x40f7;
+                    ss.limit = 0x400;
+                    cpu.set_seg_cache(SegmentReg::Ss, ss);
+                    cpu.regs[4] = start + width;
+                },
+                valid,
+                false,
+            );
+            assert_eq!(frame.completed, u64::from(valid));
+            assert_eq!(frame.regs[4], if valid { start } else { start + width });
+            if !valid {
+                fault(stop, true);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_expand_down_permissions_and_pm16_boundary() {
+    // Read-only expand-down is readable in PM32; writes and RMW still leave.
+    for opcode in [0x8b, 0x89, 0x01] {
+        let (frame, stop) = check_mode(
+            &[opcode, 5, 0x20, 4, 0, 0],
+            |cpu, _| {
+                let mut ds = cpu.seg(SegmentReg::Ds);
+                ds.flags = 0x40f5;
+                ds.limit = 0x400;
+                cpu.set_seg_cache(SegmentReg::Ds, ds);
+            },
+            opcode == 0x8b,
+            false,
+        );
+        assert_eq!(frame.completed, u64::from(opcode == 0x8b));
+        if opcode != 0x8b {
+            fault(stop, false);
+        }
+    }
+    for big in [false, true] {
+        let (frame, stop) = check_mode(
+            &[0xa1, 0x20, 4],
+            |cpu, _| {
+                let mut ds = cpu.seg(SegmentReg::Ds);
+                ds.flags = 0xf7 | if big { 0x4000 } else { 0 };
+                ds.limit = 0x400;
+                cpu.set_seg_cache(SegmentReg::Ds, ds);
+            },
+            false,
+            true,
+        );
+        assert_eq!(frame.completed, 0);
+        assert_eq!(stop, BatchStop::Budget);
+        // A limit at the upper end describes an empty range, not flat memory.
+        let (frame, stop) = check_mode(
+            &[0xa1, 0x20, 4, 0, 0],
+            |cpu, _| {
+                let mut ds = cpu.seg(SegmentReg::Ds);
+                ds.flags = 0xf7 | if big { 0x4000 } else { 0 };
+                ds.limit = if big { u32::MAX } else { 0xffff };
+                ds.base = 0;
+                cpu.set_seg_cache(SegmentReg::Ds, ds);
+            },
+            false,
+            false,
+        );
+        assert_eq!(frame.completed, 0);
+        fault(stop, false);
+    }
+}
+
+#[test]
+fn native_pm32_segment_kind_load_forces_exit_and_refreshes_bounds() {
+    use crate::x86::jit::runtime;
+    use crate::x86::{LinearAddr, mmu};
+    // SS loads already leave for their interrupt shadow; the native helper
+    // only continues ES/DS loads.
+    for seg in [SegmentReg::Es, SegmentReg::Ds] {
+        for old_down in [false, true] {
+            for new_down in [false, true] {
+                let (mut cpu, mut memory) = setup();
+                let mut cs = cpu.seg(SegmentReg::Cs);
+                cs.flags |= 0x4000;
+                cs.limit = u32::MAX;
+                cpu.set_seg_cache(SegmentReg::Cs, cs);
+                let mut cache = cpu.seg(seg);
+                cache.flags = 0x40f3 | if old_down { 4 } else { 0 };
+                cache.limit = 0x3ff;
+                cpu.set_seg_cache(seg, cache);
+                let old_facts = soft::View::block_facts(&cpu);
+                cpu.gdtr.base = 0x2000;
+                cpu.gdtr.limit = 0xff;
+                let base = 0x50000;
+                let flags = 0x40f3 | if new_down { 4 } else { 0 };
+                memory.word(0x2038, (base << 16) | 0x4ff);
+                memory.word(
+                    0x203c,
+                    ((base >> 16) & 255) | ((flags & 255) << 8) | ((flags & 0xf000) << 8),
+                );
+                mmu::read_linear_u32_at_priv(
+                    &mut cpu,
+                    &mut memory,
+                    LinearAddr(0x2038),
+                    mmu::AccessKind::Read,
+                    mmu::AccessPriv::ImplicitSupervisor,
+                )
+                .unwrap();
+                let mut view = soft::View::new(&mut cpu, true);
+                view.bus = (&mut memory as *mut Memory).cast();
+                let mut frame = Frame::from_cpu(&cpu, 1);
+                frame.memory = (&mut view as *mut soft::View).cast();
+                // SAFETY: the production segment helper owns live test CPU,
+                // view and bus; its descriptor is resident and already accessed.
+                let result =
+                    unsafe { runtime::load_cached_segment::<Memory>(&mut frame, seg as u32, 0x3b) };
+                assert_eq!(result, if old_down == new_down { 1 } else { 2 });
+                assert_eq!(
+                    old_facts == soft::View::block_facts(&cpu),
+                    old_down == new_down
+                );
+                assert_eq!(
+                    cpu.seg(seg),
+                    SegmentCache::new(0x3b, base, 0x4ff, flags as u16)
+                );
+                // A same-kind load continues with the new base/limit, including
+                // both bounds when the segment grows down. Use the refreshed view.
+                let offset: u32 = if new_down { 0x500 } else { 0x4fc };
+                let mut bytes = vec![[0x26, 0x2e, 0x36, 0x3e][seg as usize], 0xa1];
+                bytes.extend(offset.to_le_bytes());
+                let decoded = decode::block_extended(&bytes, cpu.eip, 1);
+                let fixture = Fixture::with_facts(&decoded, soft::View::block_facts(&cpu));
+                let expected = u32::from_le_bytes(
+                    memory.0[(base + offset) as usize..(base + offset + 4) as usize]
+                        .try_into()
+                        .unwrap(),
+                );
+                view.refill = super::mmx::refill as *const () as usize;
+                fixture.invoke(&mut frame);
+                frame.commit(&mut cpu);
+                assert_eq!(frame.completed, 1);
+                assert_eq!(cpu.regs[0], expected);
+            }
+        }
+    }
+}

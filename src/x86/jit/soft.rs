@@ -4,8 +4,8 @@
 //!
 //! A complete access requires current privilege, paging and segment permission.
 //! PM32 keeps proven flat accesses and uses based checks for other DS/ES/SS
-//! and FS/GS. PM16 uses based normal data
-//! segments and readable CS, with explicit permissions and inclusive limits.
+//! and FS/GS. PM32 ES/SS/DS also check expand-down data. PM16 uses based
+//! normal data segments and readable CS, with explicit permissions and limits.
 //! Offset+width is validated before wrapping base addition, without
 //! extra work on ordinary flat accesses (v86 cpu.rs get_seg checks no bounds).
 //!
@@ -41,6 +41,18 @@ const FLAT_SEGMENT_PROOFS: u32 = {
     segments | (segments << 8) | (1 << 6)
 };
 
+// Unused bits between the four six-bit permission masks. These kind facts
+// never double as an access proof and exclude FS/GS and PM16.
+const EXPAND_DOWN_PROOFS: u32 = (1 << 7) | (1 << 14) | (1 << 15);
+
+fn expand_down_facts(segments: u32) -> u32 {
+    ((segments & 1) << 7) | ((segments & 0xc) << 12)
+}
+
+fn expand_down_fact(segment: u8) -> u32 {
+    expand_down_facts(1 << segment)
+}
+
 pub const CODE16: u32 = 1 << 30;
 pub const STACK16: u32 = 1 << 31;
 
@@ -49,7 +61,8 @@ pub struct View {
     entries: *mut LinearTranslationCacheEntry,
     // Native X16: low data-context bits plus the fixed CS base in the high half.
     state: u64,
-    // Four six-bit segment masks, plus SS.B at bit 6. A flat stack fact also
+    // Four six-bit segment masks, SS.B at bit 6 and ES/SS/DS kind facts.
+    // A flat stack fact also
     // proves this bit; a non-flat stack checks it before the based access.
     // W7 mirrors this; a segment helper refreshes it before native continuation.
     permissions: u32,
@@ -71,6 +84,9 @@ pub struct View {
     // admits framebuffer pointers, which must never enter the CPU's RAM cache.
     refill_bias: u64,
     refill_tags: u64,
+    // Appended to preserve every existing native View offset. Entry 1 (CS)
+    // is unused. Expand-down accesses require offset > this inclusive limit.
+    expand_down_limits: [u32; 4],
 }
 
 /// Cold dispatch path. All arguments are scratch registers, distinct from X5,
@@ -136,7 +152,7 @@ pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
 
 impl View {
     /// PM16 specializes only code/stack size and uses dynamic based segments.
-    /// PM32 retains its ordinary flat data/stack qualifications. FS/GS
+    /// PM32 specializes flat data/stack proofs and ES/SS/DS kinds. FS/GS
     /// are often replaced for TLS; including them would split otherwise
     /// identical code and consume context ids for ordinary TLS changes.
     /// The adapter qualifies each link with these facts and the CS base.
@@ -153,7 +169,8 @@ impl View {
                 };
         }
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
-        (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS
+        ((flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS)
+            | expand_down_facts(cpu.jit_expand_down_segments())
     }
 
     pub fn new(cpu: &mut Cpu, rechecks: bool) -> Self {
@@ -180,6 +197,7 @@ impl View {
             mmx_disabled: cpu.cr0 & (crate::x86::cpu::CR0_EM | crate::x86::cpu::CR0_TS),
             refill_bias: 0,
             refill_tags: 0,
+            expand_down_limits: [0; 4],
         };
         view.refresh_segments(cpu);
         view
@@ -197,20 +215,23 @@ impl View {
         }
     }
 
-    /// Refresh dynamic segment state. PM32's flat facts must remain identical
+    /// Refresh dynamic segments. PM32's flat and kind facts must stay identical
     /// to continue linking. PM16 data loads never change its size-only facts.
     pub fn refresh_segments(&mut self, cpu: &Cpu) -> bool {
         let (flat, flat_write) = cpu.jit_segment_masks();
         let (bases, limits, based, based_write) = cpu.jit_based_segments();
         let mut permissions = flat | (flat_write << 8) | (based << 16) | (based_write << 24);
         let code16 = cpu.code_default16();
+        let down = cpu.jit_expand_down_segments();
         if code16 {
+            permissions &= !((down << 16) | (down << 24));
             for index in 0..6 {
                 let cache = cpu.seg(crate::x86::cpu::SegmentReg::from_modrm_reg(index as u8));
                 self.bases[index] = cache.base;
                 self.limits[index] = cache.limit;
             }
         } else {
+            permissions |= expand_down_facts(down);
             self.bases[4..].copy_from_slice(&bases);
             self.limits[4..].copy_from_slice(&limits);
             // Common flat contexts copy no additional descriptor state.
@@ -222,7 +243,16 @@ impl View {
                     if permissions & (bit | (bit << 8)) != (bit | (bit << 8)) {
                         let cache = cpu.seg(segment);
                         self.bases[segment as usize] = cache.base;
-                        self.limits[segment as usize] = cache.limit;
+                        self.limits[segment as usize] = if down & bit != 0 {
+                            self.expand_down_limits[segment as usize] = cache.limit;
+                            if cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
+                                u32::MAX
+                            } else {
+                                0xffff
+                            }
+                        } else {
+                            cache.limit
+                        };
                         if segment == SegmentReg::Ss && cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0
                         {
                             permissions |= 1 << 6;
@@ -231,7 +261,8 @@ impl View {
                 }
             }
         }
-        let unchanged = code16 || (permissions ^ self.permissions) & FLAT_SEGMENT_PROOFS == 0;
+        let unchanged = code16
+            || (permissions ^ self.permissions) & (FLAT_SEGMENT_PROOFS | EXPAND_DOWN_PROOFS) == 0;
         self.permissions = permissions;
         unchanged
     }
@@ -277,8 +308,8 @@ pub fn emit_entry(a: &mut Assembler) {
 /// Block-ending helper: preserve packed flags and the fixed mapping registers.
 /// AAPCS64 preserves the guest registers, budget and frame. X6 is spilled here.
 /// Return 1 continues with refreshed segments, 2 must exit after commit because
-/// a compiled flat-segment qualification changed. No local access proof crosses
-/// this block boundary; a failed probe returns before the instruction.
+/// a compiled flat-segment qualification or kind changed. No local access
+/// proof crosses this block boundary; a failed probe leaves before the instruction.
 pub fn load_segment(a: &mut Assembler, segment: crate::x86::cpu::SegmentReg, miss: Label) {
     a.add_sub_imm(SP, SP, 48, true, true, false);
     a.pair(false, FLAGS, PARITY, SP, 0, true);
@@ -597,6 +628,16 @@ fn prepare_access(
         offset = ADDRESS;
     }
     let linear = if based {
+        if guard.segments.get() & expand_down_fact(segment) != 0 {
+            view_load(
+                a,
+                VIEW,
+                (offset_of!(View, expand_down_limits) + usize::from(segment) * 4) as u32,
+                2,
+            );
+            a.add_sub(ZR, offset, VIEW, false, true, true);
+            a.b_cond(Cond::Ls, reasons[0]);
+        }
         // Native guest offsets have zeroed high halves. A 64-bit end offset
         // detects both a limited-segment overrun and 32-bit offset wrap in one
         // comparison, before base addition or any paging effect. The linear
