@@ -1,12 +1,19 @@
 # The r86 iOS app for the simulator on Apple silicon: a compile check, and an
 # app to install with `xcrun simctl install booted r86.app`. It embeds the
 # Watch app (r86.app/Watch/r86.app); rust-src lets apple/build-rust.sh build
-# std for the tier 3 watchOS targets. Unsigned; device builds need a signing
-# identity and profiles (script/build_ios.sh device).
+# std for the tier 3 watchOS targets. With "device", also the iPhone/iPad
+# app with its Watch app as an unsigned IPA, to sign with your own identity
+# and profiles (script/build_ios.sh device documents signed builds).
+# Artifacts carry the version, v2026.11.18-b0dd54 (script/current-tree-version.sh).
 name: iOS app
 
 on:
   workflow_dispatch:
+    inputs:
+      device:
+        description: Also build the unsigned device app (iPhone, iPad, Apple Watch)
+        type: boolean
+        default: false
 
 jobs:
   simulator:
@@ -45,12 +52,31 @@ jobs:
           rustup toolchain install stable --profile minimal --component rust-src --target aarch64-apple-ios-sim
           rustc -V
 
+      - name: Version
+        run: echo "R86_VERSION=$(script/current-tree-version.sh)" >> "$GITHUB_ENV"
+
       - name: Build
         run: |
           script/build_ios.sh simulator
-          cd apple/build/ios-simulator && zip -qry r86-ios-simulator.zip r86.app
+          cd apple/build/ios-simulator && zip -qry "r86-ios-simulator-$R86_VERSION.zip" r86.app
 
       - uses: actions/upload-artifact@v4
         with:
-          name: r86-ios-simulator
-          path: apple/build/ios-simulator/r86-ios-simulator.zip
+          name: r86-ios-simulator-${{ env.R86_VERSION }}
+          path: apple/build/ios-simulator/r86-ios-simulator-${{ env.R86_VERSION }}.zip
+
+      - name: Build for devices (unsigned)
+        if: inputs.device
+        run: |
+          rustup target add aarch64-apple-ios
+          script/build_ios.sh device
+          cd apple/build/ios-device
+          rm -rf Payload && mkdir Payload && cp -R r86.app Payload/
+          zip -qry "r86-ios-$R86_VERSION-unsigned.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.device
+        with:
+          name: r86-ios-${{ env.R86_VERSION }}-unsigned
+          path: apple/build/ios-device/r86-ios-${{ env.R86_VERSION }}-unsigned.ipa
+          if-no-files-found: error

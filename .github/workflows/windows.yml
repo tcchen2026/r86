@@ -1,7 +1,9 @@
 # The Windows app (src/frontend/win32/): r86-win.exe with SeaBIOS, the DOS
 # kit (the release assets/freedos-kit.sha256 pins), the r86 tools disc and
 # licenses, built on Linux by script/build_windows.sh and
-# uploaded as artifacts (r86-windows-x64, optionally r86-windows-arm64).
+# uploaded as artifacts (r86-windows-x64-<version>, optionally
+# r86-windows-arm64-<version>; version v2026.11.18-b0dd54 from
+# script/current-tree-version.sh).
 # Run by hand: Actions > Windows app > Run workflow, picking the branch.
 name: Windows app
 
@@ -59,6 +61,10 @@ jobs:
             tmp/target-windows
           key: windows-${{ inputs.arm64 }}-${{ hashFiles('Cargo.lock') }}
 
+      # v2026.11.18-b0dd54 (script/current-tree-version.sh), as on every platform.
+      - name: Version
+        run: echo "R86_VERSION=$(script/current-tree-version.sh)" >> "$GITHUB_ENV"
+
       - name: Build
         run: |
           PYTHONPATH=tmp/iso-tools python3 script/build_tools_iso.py
@@ -67,13 +73,13 @@ jobs:
       # GitHub zips each artifact itself, so the folders are uploaded.
       - uses: actions/upload-artifact@v4
         with:
-          name: r86-windows-x64
+          name: r86-windows-x64-${{ env.R86_VERSION }}
           path: tmp/windows/r86-windows-x64
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4
         if: inputs.arm64
         with:
-          name: r86-windows-arm64
+          name: r86-windows-arm64-${{ env.R86_VERSION }}
           path: tmp/windows/r86-windows-arm64
           if-no-files-found: error

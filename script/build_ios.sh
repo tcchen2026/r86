@@ -17,8 +17,12 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 apple="$root/apple"
 kind=${1:-simulator}
-version=0.1
-build=1
+# v2026.11.18-b0dd54 (script/current-tree-version.sh) unless R86_VERSION is
+# set; the Rust libraries embed it, both apps' bundle versions take its date.
+R86_VERSION=${R86_VERSION:-$("$root/script/current-tree-version.sh")}
+export R86_VERSION
+version=$(echo "$R86_VERSION" | sed 's/^v\([0-9]*\)\.0*\([0-9][0-9]*\)\.0*\([0-9][0-9]*\)-.*/\1.\2.\3/')
+build=$version
 bundle_id=${R86_IOS_BUNDLE_ID:-io.github.tcchen2026.r86}
 case $kind in
     simulator)
@@ -138,6 +142,8 @@ cat >"$app/Info.plist" <<PLIST
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$build</string>
+	<key>R86Version</key>
+	<string>$R86_VERSION</string>
 	<key>DTPlatformName</key>
 	<string>$sdk</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
@@ -245,6 +251,8 @@ if [ "$kind" = simulator ] || [ -z "${R86_IOS_IDENTITY:-}" ] || [ -n "${R86_WATC
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$build</string>
+	<key>R86Version</key>
+	<string>$R86_VERSION</string>
 	<key>DTPlatformName</key>
 	<string>$watch_sdk</string>
 	<key>ITSAppUsesNonExemptEncryption</key>

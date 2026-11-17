@@ -4,10 +4,16 @@ use std::process::Command;
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    // Packaging scripts set R86_VERSION (script/current-tree-version.sh,
+    // v2026.11.18-b0dd54); other builds report Cargo's version.
+    println!("cargo::rerun-if-env-changed=R86_VERSION");
+    let version = env::var("R86_VERSION")
+        .unwrap_or_else(|_| format!("v{}-dev", env::var("CARGO_PKG_VERSION").unwrap()));
+    println!("cargo::rustc-env=R86_VERSION={version}");
     if env::var_os("CARGO_FEATURE_WIN32_FRONTEND").is_some()
         && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
     {
-        windows_resources();
+        windows_resources(&version);
     }
     println!("cargo::rustc-check-cfg=cfg(a64_jit)");
     if env::var_os("CARGO_FEATURE_HOST").is_some()
@@ -24,7 +30,7 @@ fn main() {
 
 /// Compiles r86-win.exe's icon, manifest, dialogs and version
 /// (src/frontend/win32/r86-win.rc) with the target's MinGW windres, or $WINDRES.
-fn windows_resources() {
+fn windows_resources(version: &str) {
     let dir = PathBuf::from("src/frontend/win32");
     for file in ["r86-win.rc", "r86-win.manifest", "r86.ico"] {
         println!("cargo::rerun-if-changed={}", dir.join(file).display());
@@ -32,8 +38,14 @@ fn windows_resources() {
     println!("cargo::rerun-if-env-changed=WINDRES");
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let windres = env::var("WINDRES").unwrap_or_else(|_| format!("{arch}-w64-mingw32-windres"));
-    let version = env::var("CARGO_PKG_VERSION").unwrap();
-    let numbers: Vec<&str> = version.split(['.', '-']).take(3).collect();
+    // FILEVERSION takes the date: v2026.11.08-... is 2026,11,8,0 (a leading
+    // zero would make the resource compiler read octal).
+    let numbers: Vec<String> = version
+        .trim_start_matches('v')
+        .split(['.', '-'])
+        .take(3)
+        .map(|n| n.parse::<u16>().expect("R86_VERSION starts with three numbers").to_string())
+        .collect();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("r86-win-res.o");
     let status = Command::new(&windres)
         .current_dir(&dir)

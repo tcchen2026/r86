@@ -1,5 +1,7 @@
 # The r86 Mac app (Apple silicon, macOS 26): ad-hoc signed and sandboxed,
-# uploaded as a dmg artifact. Notarization needs Developer ID secrets (later).
+# uploaded as a dmg artifact named with the version, v2026.11.18-b0dd54
+# (script/current-tree-version.sh). Notarization needs Developer ID secrets
+# (later).
 name: Mac app
 
 on:
@@ -95,15 +97,20 @@ jobs:
           swiftc --version
           rustc -V
 
+      # v2026.11.18-b0dd54 (script/current-tree-version.sh), as on every platform.
+      - name: Version
+        run: echo "R86_VERSION=$(script/current-tree-version.sh)" >> "$GITHUB_ENV"
+
       - name: Build
         run: |
           script/build_macos.sh
           codesign -d --entitlements - apple/build/r86.app
+          mv apple/build/r86.dmg "apple/build/r86-$R86_VERSION.dmg"
 
       - name: Swift session lifecycle
         run: sh script/apple_session_check.sh
 
       - uses: actions/upload-artifact@v4
         with:
-          name: r86-mac
-          path: apple/build/r86.dmg
+          name: r86-mac-${{ env.R86_VERSION }}
+          path: apple/build/r86-${{ env.R86_VERSION }}.dmg

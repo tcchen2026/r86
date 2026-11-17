@@ -26,6 +26,12 @@ enum AboutPanel {
         centered.alignment = .center
         credits.addAttribute(.paragraphStyle, value: centered,
                              range: NSRange(location: 0, length: credits.length))
-        NSApp.orderFrontStandardAboutPanel(options: [.credits: credits])
+        var options: [NSApplication.AboutPanelOptionKey: Any] = [.credits: credits]
+        // In parentheses after "Version 2026.11.18": the full build version,
+        // v2026.11.18-b0dd54 (script/build_macos.sh writes R86Version).
+        if let version = Bundle.main.object(forInfoDictionaryKey: "R86Version") as? String {
+            options[.version] = version
+        }
+        NSApp.orderFrontStandardAboutPanel(options: options)
     }
 }

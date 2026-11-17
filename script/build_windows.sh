@@ -16,6 +16,10 @@ set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 out=$root/tmp/windows
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/tmp/target-windows}"
+# v2026.11.18-b0dd54 (script/current-tree-version.sh) unless R86_VERSION is
+# set: the run log and r86-win.exe's version resource (build.rs) carry it.
+R86_VERSION=${R86_VERSION:-$("$root/script/current-tree-version.sh")}
+export R86_VERSION
 
 archs=${*:-x64 arm64}
 for arch in $archs; do

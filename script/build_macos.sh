@@ -10,8 +10,12 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 apple="$root/apple"
 out="$apple/build"
 app="$out/r86.app"
-version=0.1
-build=1
+# v2026.11.18-b0dd54 (script/current-tree-version.sh) unless R86_VERSION is
+# set; the Rust library embeds it, the bundle versions take its date.
+R86_VERSION=${R86_VERSION:-$("$root/script/current-tree-version.sh")}
+export R86_VERSION
+version=$(echo "$R86_VERSION" | sed 's/^v\([0-9]*\)\.0*\([0-9][0-9]*\)\.0*\([0-9][0-9]*\)-.*/\1.\2.\3/')
+build=$version
 
 [ "$(uname -s)-$(uname -m)" = Darwin-arm64 ] || { echo "build_macos.sh: needs an Apple silicon Mac" >&2; exit 1; }
 for tool in swiftc cargo codesign hdiutil plutil; do
@@ -91,6 +95,8 @@ cat >"$app/Contents/Info.plist" <<PLIST
 	<string>Apache-2.0; see the bundled licenses</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>R86Version</key>
+	<string>$R86_VERSION</string>
 </dict>
 </plist>
 PLIST

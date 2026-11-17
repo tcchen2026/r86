@@ -69,7 +69,7 @@ pub fn start(logs: &Path, vm: &Vm) {
         "r86 {} ({exe}, {} {})\n\
          VM {}: {}, {} MiB, engine {} ({}), disk {}, CD {}, network {}\n\
          Started {}\n",
-        env!("CARGO_PKG_VERSION"),
+        env!("R86_VERSION"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         vm.name,
