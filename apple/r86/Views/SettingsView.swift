@@ -14,9 +14,6 @@ struct SettingsView: View {
             Form { InputSettingsSection() }
                 .formStyle(.grouped)
                 .tabItem { Label("Input", systemImage: "keyboard") }
-            Form { AboutSection() }
-                .formStyle(.grouped)
-                .tabItem { Label("About", systemImage: "info.circle") }
         }
         .frame(width: 500, height: 340)
     }
@@ -76,19 +73,6 @@ struct InputSettingsSection: View {
             Text("Input")
         } footer: {
             Text("When off, ⌘ shortcuts such as ⌘Q and ⌘W stay with r86 and the guest never sees ⌘.")
-        }
-    }
-}
-
-struct AboutSection: View {
-    var body: some View {
-        Section {
-            LabeledContent("Version",
-                           value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
-            LabeledContent("Guest", value: "32-bit x86 PC")
-            LabeledContent("License", value: "Apache-2.0")
-        } header: {
-            Text("About r86")
         }
     }
 }

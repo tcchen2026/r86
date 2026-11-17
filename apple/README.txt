@@ -70,6 +70,9 @@ Contracts:
   this Mac can connect; it ends when the VM turns off, and the console's
   Power off turns the VM off. Listening needs the network.server entitlement.
 - Logs: fatal errors write $HOME/r86/logs/<VM folder>.log and retain Show Log.
+- About r86 (app menu, AboutPanel.swift): the standard panel with the
+  GitHub link and a link to Contents/Resources/licenses (ports/licenses.sh).
+  Settings has General, Display and Input only.
   Every build records undefined opcodes and saves those runs on clean exit.
   Debug builds (cfg(debug_assertions)) also record native-JIT clears and write
   a summary on clean exit; normal Release builds have no added JIT logging.

@@ -12,7 +12,8 @@ extension FocusedValues {
     }
 }
 
-/// File › New Machine, a Machine menu that acts on the front window, and View options.
+/// r86 › About, File › New Machine, a Machine menu that acts on the front
+/// window, and View options.
 struct MachineCommands: Commands {
     let library: Library
     @Bindable var prefs: Preferences
@@ -21,6 +22,10 @@ struct MachineCommands: Commands {
     @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
+        CommandGroup(replacing: .appInfo) {
+            Button("About r86") { AboutPanel.show() }
+        }
+
         CommandGroup(replacing: .newItem) {
             Button("New Machine…") {
                 openWindow(id: "library")
