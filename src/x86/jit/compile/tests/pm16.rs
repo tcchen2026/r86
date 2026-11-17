@@ -100,7 +100,14 @@ fn check_mode(
     let count = decoded.instructions.len() as u64;
     let fixture = Fixture::with_facts(&decoded, soft::View::block_facts(&actual));
     let reference = Interpreter::run_batch(&mut expected, &mut expected_memory, 0, count);
+    let before_native = actual_memory.0.clone();
     let frame = invoke_pm16(&fixture, &mut actual, &mut actual_memory, count);
+    if frame.completed == 0 {
+        assert!(
+            actual_memory.0 == before_native,
+            "native wrote before a zero-step exit {bytes:02x?}"
+        );
+    }
     if native {
         assert_eq!(
             frame.completed, count,
@@ -420,7 +427,7 @@ fn native_pm16_segment_limits_permissions_and_restartable_stack_faults() {
     assert_eq!((frame.completed, frame.exit_kind), (0, 7));
     for (seg, prefix, flags) in [
         (SegmentReg::Cs, 0x2e, 0xf9), // execute-only code
-        (SegmentReg::Ds, 0x3e, 0xf5), // expand-down: interpreter boundary
+        (SegmentReg::Ds, 0x3e, 0xf5), // empty expand-down range
     ] {
         let frame = compare(
             &[prefix, 0x8b, 0x06, 0x20, 0x04],
@@ -832,7 +839,7 @@ fn native_pm32_expand_down_push_checks_before_stack_effects() {
 }
 
 #[test]
-fn native_expand_down_permissions_and_pm16_boundary() {
+fn native_expand_down_permissions_and_empty_ranges() {
     // Read-only expand-down is readable in PM32; writes and RMW still leave.
     for opcode in [0x8b, 0x89, 0x01] {
         let (frame, stop) = check_mode(
@@ -860,10 +867,10 @@ fn native_expand_down_permissions_and_pm16_boundary() {
                 ds.limit = 0x400;
                 cpu.set_seg_cache(SegmentReg::Ds, ds);
             },
-            false,
+            true,
             true,
         );
-        assert_eq!(frame.completed, 0);
+        assert_eq!(frame.completed, 1);
         assert_eq!(stop, BatchStop::Budget);
         // A limit at the upper end describes an empty range, not flat memory.
         let (frame, stop) = check_mode(
@@ -884,7 +891,7 @@ fn native_expand_down_permissions_and_pm16_boundary() {
 }
 
 #[test]
-fn native_pm32_segment_kind_load_forces_exit_and_refreshes_bounds() {
+fn native_pm32_segment_kind_load_continues_with_refreshed_bounds() {
     use crate::x86::jit::runtime;
     use crate::x86::{LinearAddr, mmu};
     // SS loads already leave for their interrupt shadow; the native helper
@@ -927,22 +934,18 @@ fn native_pm32_segment_kind_load_forces_exit_and_refreshes_bounds() {
                 // view and bus; its descriptor is resident and already accessed.
                 let result =
                     unsafe { runtime::load_cached_segment::<Memory>(&mut frame, seg as u32, 0x3b) };
-                assert_eq!(result, if old_down == new_down { 1 } else { 2 });
-                assert_eq!(
-                    old_facts == soft::View::block_facts(&cpu),
-                    old_down == new_down
-                );
+                assert_eq!(result, 1);
+                assert_eq!(old_facts, soft::View::block_facts(&cpu));
                 assert_eq!(
                     cpu.seg(seg),
                     SegmentCache::new(0x3b, base, 0x4ff, flags as u16)
                 );
-                // A same-kind load continues with the new base/limit, including
-                // both bounds when the segment grows down. Use the refreshed view.
+                // The same compiled facts use the new bounds for either kind.
                 let offset: u32 = if new_down { 0x500 } else { 0x4fc };
                 let mut bytes = vec![[0x26, 0x2e, 0x36, 0x3e][seg as usize], 0xa1];
                 bytes.extend(offset.to_le_bytes());
                 let decoded = decode::block_extended(&bytes, cpu.eip, 1);
-                let fixture = Fixture::with_facts(&decoded, soft::View::block_facts(&cpu));
+                let fixture = Fixture::with_facts(&decoded, old_facts);
                 let expected = u32::from_le_bytes(
                     memory.0[(base + offset) as usize..(base + offset + 4) as usize]
                         .try_into()
@@ -953,6 +956,183 @@ fn native_pm32_segment_kind_load_forces_exit_and_refreshes_bounds() {
                 frame.commit(&mut cpu);
                 assert_eq!(frame.completed, 1);
                 assert_eq!(cpu.regs[0], expected);
+            }
+        }
+    }
+}
+
+fn based_access_bytes(
+    code16: bool,
+    segment: SegmentReg,
+    width: u32,
+    write: bool,
+    offset: u32,
+) -> Vec<u8> {
+    let mut bytes = vec![[0x26, 0x2e, 0x36, 0x3e, 0x64, 0x65][segment as usize]];
+    if code16 {
+        bytes.push(0x67); // Also reach B=1 bounds above the 16-bit address space.
+    }
+    if width == 8 {
+        bytes.extend([0x0f, 0xc7, 0x0d]); // CMPXCHG8B [disp32]
+    } else {
+        if width > 1 && (width == 2) != code16 {
+            bytes.push(0x66);
+        }
+        bytes.extend([if write { 0x88 } else { 0x8a } + u8::from(width > 1), 5]);
+    }
+    bytes.extend(offset.to_le_bytes());
+    bytes
+}
+
+#[test]
+fn native_pm16_and_fs_gs_expand_down_accesses_check_both_bounds() {
+    for code16 in [false, true] {
+        for segment in [SegmentReg::Ds, SegmentReg::Fs, SegmentReg::Gs] {
+            if !code16 && segment == SegmentReg::Ds {
+                continue; // Existing PM32 ES/SS/DS matrix covers this path.
+            }
+            for big in [false, true] {
+                let upper = if big { u32::MAX } else { 0xffff };
+                for width in [1, 2, 4, 8] {
+                    let mut cases = vec![(0x400, false), (0x401, true), (upper - width + 1, true)];
+                    if let Some(past) = (upper - width + 1).checked_add(1) {
+                        cases.push((past, false));
+                    }
+                    for (offset, valid) in cases {
+                        for write in [false, true] {
+                            if width == 8 && !write {
+                                continue;
+                            }
+                            let bytes = based_access_bytes(code16, segment, width, write, offset);
+                            let (frame, stop) = check_mode(
+                                &bytes,
+                                |cpu, memory| {
+                                    let mut cache = cpu.seg(segment);
+                                    cache.flags = 0xf7 | if big { 0x4000 } else { 0 };
+                                    cache.limit = 0x400;
+                                    cache.base = 0x40000u32.wrapping_sub(offset);
+                                    cpu.set_seg_cache(segment, cache);
+                                    // Force the wide compare to store a different value.
+                                    memory.word(0x40000, cpu.regs[0]);
+                                    memory.word(0x40004, cpu.regs[2]);
+                                },
+                                valid,
+                                code16,
+                            );
+                            assert_eq!(frame.completed, u64::from(valid));
+                            if !valid {
+                                fault(stop, false);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_based_narrow_and_empty_ranges_never_underflow() {
+    for code16 in [false, true] {
+        for down in [false, true] {
+            for length in 1..=4 {
+                for width in [1, 2, 4, 8] {
+                    let offset = if down { 0x10000 - length } else { 0 };
+                    let bytes = based_access_bytes(code16, SegmentReg::Fs, width, true, offset);
+                    let valid = width <= length;
+                    let (frame, stop) = check_mode(
+                        &bytes,
+                        |cpu, memory| {
+                            let mut cache = cpu.seg(SegmentReg::Fs);
+                            cache.flags = 0xf3 | if down { 4 } else { 0 };
+                            cache.limit = if down { offset - 1 } else { length - 1 };
+                            cache.base = 0x40000u32.wrapping_sub(offset);
+                            cpu.set_seg_cache(SegmentReg::Fs, cache);
+                            memory.word(0x40000, cpu.regs[0]);
+                            memory.word(0x40004, cpu.regs[2]);
+                        },
+                        valid,
+                        code16,
+                    );
+                    assert_eq!(frame.completed, u64::from(valid));
+                    if !valid {
+                        fault(stop, false);
+                    }
+                }
+            }
+        }
+        for segment in [SegmentReg::Ds, SegmentReg::Fs, SegmentReg::Gs] {
+            for (big, limit) in [
+                (false, 0xffff),
+                (false, 0x10000),
+                (false, u32::MAX),
+                (true, u32::MAX),
+            ] {
+                let (frame, stop) = check_mode(
+                    &based_access_bytes(code16, segment, 8, true, 0),
+                    |cpu, _| {
+                        let mut cache = cpu.seg(segment);
+                        cache.flags = 0xf7 | if big { 0x4000 } else { 0 };
+                        cache.limit = limit;
+                        cpu.set_seg_cache(segment, cache);
+                    },
+                    false,
+                    code16,
+                );
+                assert_eq!(frame.completed, 0);
+                fault(stop, false);
+            }
+        }
+    }
+}
+
+#[test]
+fn native_expand_down_pusha_popa_windows_check_before_any_commit() {
+    for code16 in [false, true] {
+        let upper = if code16 { 0xffff } else { u32::MAX };
+        for width in [2, 4] {
+            let window = width * 8;
+            for push in [false, true] {
+                let mut bytes = vec![];
+                if (width == 2) != code16 {
+                    bytes.push(0x66);
+                }
+                bytes.push(if push { 0x60 } else { 0x61 });
+                let cases = if push {
+                    vec![
+                        (0x400 + window, false),
+                        (0x401 + window, true),
+                        (0, true),
+                        (1, false),
+                    ]
+                } else {
+                    vec![
+                        (0x400, false),
+                        (0x401, true),
+                        (upper - window + 1, true),
+                        (upper - window + 2, false),
+                    ]
+                };
+                for (sp, valid) in cases {
+                    let esp = sp | if code16 { 0xa5a5_0000 } else { 0 };
+                    let (frame, stop) = check_mode(
+                        &bytes,
+                        |cpu, _| {
+                            let mut ss = cpu.seg(SegmentReg::Ss);
+                            ss.flags = 0xf7 | if code16 { 0 } else { 0x4000 };
+                            ss.limit = 0x400;
+                            cpu.set_seg_cache(SegmentReg::Ss, ss);
+                            cpu.regs[4] = esp;
+                        },
+                        valid,
+                        code16,
+                    );
+                    assert_eq!(frame.completed, u64::from(valid));
+                    if !valid {
+                        assert_eq!(frame.regs[4], esp);
+                        fault(stop, true);
+                    }
+                }
             }
         }
     }

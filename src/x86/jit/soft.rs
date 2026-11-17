@@ -3,10 +3,9 @@
 //! The x86 decoder/ALU and precise exits do not choose a memory backend.
 //!
 //! A complete access requires current privilege, paging and segment permission.
-//! PM32 keeps proven flat accesses and uses based checks for other DS/ES/SS
-//! and FS/GS. PM32 ES/SS/DS also check expand-down data. PM16 uses based
-//! normal data segments and readable CS, with explicit permissions and limits.
-//! Offset+width is validated before wrapping base addition, without
+//! PM32 keeps proven flat accesses; other DS/ES/SS and FS/GS use based checks.
+//! PM16 uses based data segments and readable CS. All based accesses check
+//! inclusive low/high offsets before wrapping base addition, without
 //! extra work on ordinary flat accesses (v86 cpu.rs get_seg checks no bounds).
 //!
 //! RAM hits use address-biased tokens. Cold paths can revalidate exact PDE/PTE
@@ -30,7 +29,8 @@ use super::decode::Address;
 use super::frame::{AUXILIARY, FLAGS, FRAME, Frame, PARITY, RETURN_TOP};
 use super::memory::{AccessRange, emit_address};
 use crate::x86::cpu::{
-    Cpu, LINEAR_TRANSLATION_CACHE_BITS, LinearTranslationCacheEntry, TranslationRecheck,
+    Cpu, LINEAR_TRANSLATION_CACHE_BITS, LinearTranslationCacheEntry, SEGMENT_FLAG_DEFAULT_BIG,
+    SegmentCache, SegmentReg, TranslationRecheck,
 };
 use core::mem::{offset_of, size_of};
 
@@ -41,18 +41,6 @@ const FLAT_SEGMENT_PROOFS: u32 = {
     segments | (segments << 8) | (1 << 6)
 };
 
-// Unused bits between the four six-bit permission masks. These kind facts
-// never double as an access proof and exclude FS/GS and PM16.
-const EXPAND_DOWN_PROOFS: u32 = (1 << 7) | (1 << 14) | (1 << 15);
-
-fn expand_down_facts(segments: u32) -> u32 {
-    ((segments & 1) << 7) | ((segments & 0xc) << 12)
-}
-
-fn expand_down_fact(segment: u8) -> u32 {
-    expand_down_facts(1 << segment)
-}
-
 pub const CODE16: u32 = 1 << 30;
 
 #[repr(C)]
@@ -60,11 +48,11 @@ pub struct View {
     entries: *mut LinearTranslationCacheEntry,
     // Native X16: low data-context bits plus the fixed CS base in the high half.
     state: u64,
-    // W7: four segment masks, SS.B at bit 6, ES/SS/DS kind facts.
+    // W7: four segment masks and SS.B at bit 6.
     // Segment helpers refresh it; a flat stack fact also proves SS.B.
     permissions: u32,
     bases: [u32; 6],
-    limits: [u32; 6],
+    bounds: [[u32; 2]; 6],
     rechecks: *const TranslationRecheck,
     recheck_context: u64,
     walk_root: u64,
@@ -81,9 +69,6 @@ pub struct View {
     // admits framebuffer pointers, which must never enter the CPU's RAM cache.
     refill_bias: u64,
     refill_tags: u64,
-    // Appended to preserve every existing native View offset. Entry 1 (CS)
-    // is unused. Expand-down accesses require offset > this inclusive limit.
-    expand_down_limits: [u32; 4],
 }
 
 /// Cold dispatch path. All arguments are scratch registers, distinct from X5,
@@ -149,7 +134,7 @@ pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
 
 impl View {
     /// PM16 specializes only code/stack size and uses dynamic based segments.
-    /// PM32 specializes flat data/stack proofs and ES/SS/DS kinds. FS/GS
+    /// PM32 specializes flat data/stack proofs. FS/GS
     /// are often replaced for TLS; including them would split otherwise
     /// identical code and consume context ids for ordinary TLS changes.
     /// The adapter qualifies each link with these facts and the CS base.
@@ -158,8 +143,7 @@ impl View {
             return CODE16; // Eligibility requires SS.B=0; native helpers cannot load SS.
         }
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
-        ((flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS)
-            | expand_down_facts(cpu.jit_expand_down_segments())
+        (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS
     }
 
     pub fn new(cpu: &mut Cpu, rechecks: bool) -> Self {
@@ -169,7 +153,7 @@ impl View {
             state: state | (u64::from(cpu.seg(crate::x86::cpu::SegmentReg::Cs).base) << 32),
             permissions: 0,
             bases: [0; 6],
-            limits: [u32::MAX; 6],
+            bounds: [[0, u32::MAX]; 6],
             rechecks: cpu.translation_cache.rechecks.as_ptr(),
             recheck_context: cpu.translation_cache.recheck_context,
             walk_root: if rechecks {
@@ -186,7 +170,6 @@ impl View {
             mmx_disabled: cpu.cr0 & (crate::x86::cpu::CR0_EM | crate::x86::cpu::CR0_TS),
             refill_bias: 0,
             refill_tags: 0,
-            expand_down_limits: [0; 4],
         };
         view.refresh_segments(cpu);
         view
@@ -204,44 +187,29 @@ impl View {
         }
     }
 
-    /// Refresh dynamic segments. PM32's flat and kind facts must stay identical
+    /// Refresh dynamic segments. PM32's flat facts must stay identical
     /// to continue linking. PM16 data loads never change its size-only facts.
     pub fn refresh_segments(&mut self, cpu: &Cpu) -> bool {
         let (flat, flat_write) = cpu.jit_segment_masks();
-        let (bases, limits, based, based_write) = cpu.jit_based_segments();
+        let (_, _, based, based_write) = cpu.jit_based_segments();
         let mut permissions = flat | (flat_write << 8) | (based << 16) | (based_write << 24);
         let code16 = cpu.code_default16();
-        let down = cpu.jit_expand_down_segments();
         if code16 {
-            permissions &= !((down << 16) | (down << 24));
             for index in 0..6 {
-                let cache = cpu.seg(crate::x86::cpu::SegmentReg::from_modrm_reg(index as u8));
-                self.bases[index] = cache.base;
-                self.limits[index] = cache.limit;
+                let segment = SegmentReg::from_modrm_reg(index);
+                self.refresh_segment(segment, cpu.seg(segment));
             }
         } else {
-            permissions |= expand_down_facts(down);
-            self.bases[4..].copy_from_slice(&bases);
-            self.limits[4..].copy_from_slice(&limits);
+            self.refresh_segment(SegmentReg::Fs, cpu.seg(SegmentReg::Fs));
+            self.refresh_segment(SegmentReg::Gs, cpu.seg(SegmentReg::Gs));
             // Common flat contexts copy no additional descriptor state.
             let data = FLAT_SEGMENT_PROOFS & !(1 << 6);
             if permissions & data != data {
-                use crate::x86::cpu::{SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
                 for segment in [SegmentReg::Es, SegmentReg::Ss, SegmentReg::Ds] {
                     let bit = 1 << segment as u8;
                     if permissions & (bit | (bit << 8)) != (bit | (bit << 8)) {
                         let cache = cpu.seg(segment);
-                        self.bases[segment as usize] = cache.base;
-                        self.limits[segment as usize] = if down & bit != 0 {
-                            self.expand_down_limits[segment as usize] = cache.limit;
-                            if cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
-                                u32::MAX
-                            } else {
-                                0xffff
-                            }
-                        } else {
-                            cache.limit
-                        };
+                        self.refresh_segment(segment, cache);
                         if segment == SegmentReg::Ss && cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0
                         {
                             permissions |= 1 << 6;
@@ -250,10 +218,27 @@ impl View {
                 }
             }
         }
-        let unchanged = code16
-            || (permissions ^ self.permissions) & (FLAT_SEGMENT_PROOFS | EXPAND_DOWN_PROOFS) == 0;
+        let unchanged = code16 || (permissions ^ self.permissions) & FLAT_SEGMENT_PROOFS == 0;
         self.permissions = permissions;
         unchanged
+    }
+
+    fn refresh_segment(&mut self, segment: SegmentReg, cache: SegmentCache) {
+        self.bases[segment as usize] = cache.base;
+        self.bounds[segment as usize] = if cache.flags & 0x1c == 0x14 {
+            let high = if cache.flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
+                u32::MAX
+            } else {
+                0xffff
+            };
+            if cache.limit >= high {
+                [1, 0] // Empty, including limit+1 overflow.
+            } else {
+                [cache.limit + 1, high]
+            }
+        } else {
+            [0, cache.limit]
+        };
     }
 }
 
@@ -398,7 +383,7 @@ pub fn stack_address(guard: Guard<'_>) -> Address {
 /// The body guard also runs on direct edges and cached-return continuations.
 /// A miss leaves before this block has retired any instruction.
 pub fn code_limit(a: &mut Assembler, last: Reg, fail: Label) {
-    view_load(a, TEMP, (offset_of!(View, limits) + 4) as u32, 2);
+    view_load(a, TEMP, (offset_of!(View, bounds) + 12) as u32, 2);
     a.add_sub(ZR, last, TEMP, false, true, true);
     a.b_cond(Cond::Hi, fail);
 }
@@ -617,37 +602,31 @@ fn prepare_access(
         offset = ADDRESS;
     }
     let linear = if based {
-        if guard.segments.get() & expand_down_fact(segment) != 0 {
-            view_load(
-                a,
-                VIEW,
-                (offset_of!(View, expand_down_limits) + usize::from(segment) * 4) as u32,
-                2,
-            );
-            a.add_sub(ZR, offset, VIEW, false, true, true);
-            a.b_cond(Cond::Ls, reasons[0]);
-        }
-        // Native guest offsets have zeroed high halves. A 64-bit end offset
-        // detects both a limited-segment overrun and 32-bit offset wrap in one
-        // comparison, before base addition or any paging effect. The linear
-        // base+offset addition below intentionally wraps at 32 bits.
+        a.load_store(true, ENTRY, FRAME, offset_of!(Frame, memory) as u32, 3);
+        a.pair(
+            true,
+            VIEW,
+            TEMP,
+            ENTRY,
+            (offset_of!(View, bounds) + usize::from(segment) * 8) as i16,
+            false,
+        );
+        a.add_sub(ZR, offset, VIEW, false, true, true);
+        a.b_cond(Cond::Cc, reasons[0]);
+        // Zero-extended guest offsets cannot wrap this 64-bit end. Both
+        // bounds precede paging; only the final linear addition wraps at 32 bits.
         let end = if bytes > 1 {
-            a.add_sub_imm(TEMP, offset, u16::from(bytes - 1), true, false, false);
-            TEMP
+            a.add_sub_imm(VIEW, offset, bytes - 1, true, false, false);
+            VIEW
         } else {
             offset
         };
-        view_load(
-            a,
-            VIEW,
-            (offset_of!(View, limits) + usize::from(segment) * 4) as u32,
-            2,
-        );
-        a.add_sub(ZR, end, VIEW, true, true, true);
+        a.add_sub(ZR, end, TEMP, true, true, true);
         a.b_cond(Cond::Hi, reasons[0]);
-        view_load(
-            a,
+        a.load_store(
+            true,
             TEMP,
+            ENTRY,
             (offset_of!(View, bases) + usize::from(segment) * 4) as u32,
             2,
         );

@@ -50,12 +50,6 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   real-mode DOS game (far CALL/JMP 12K, IRET 6K), 32K in Floppy Bird (port
   I/O 22K, IRET 5K); at about 27 ns each, about 3% of RPi 5 interpreter
   CPU (`run_batch_inner`).
-- perf: the A64 JIT's expand-down segment support makes the Windows 2000
-  boot about 1.1% slower on the Pi 5, although that boot loads no
-  expand-down segment: each lookup and native entry repacks the segment-kind
-  facts and copies a larger View, and each segment load updates an extra
-  mask, about 308 M host instructions in the boot (soft.rs `block_facts`,
-  `refresh_segments`; cpu.rs `update_flat_segment_mask`).
 - cpu: an instruction longer than 15 bytes with fewer than 15 prefixes
   executes instead of raising #GP(0).
 - cpu: INT3 and INTO in virtual-8086 mode with IOPL < 3 raise #GP. [?]

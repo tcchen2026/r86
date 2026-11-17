@@ -339,8 +339,6 @@ pub struct Cpu {
     jit_based_read_mask: u8,
     #[cfg(feature = "jit")]
     jit_based_write_mask: u8,
-    #[cfg(a64_jit)]
-    jit_expand_down_mask: u8,
     code_default16: bool,
     cached_cpl: u8,
     pub halted: bool,
@@ -1268,8 +1266,6 @@ impl Cpu {
             jit_based_read_mask: 0,
             #[cfg(feature = "jit")]
             jit_based_write_mask: 0,
-            #[cfg(a64_jit)]
-            jit_expand_down_mask: 0,
             code_default16: true,
             cached_cpl: 0,
             halted: false,
@@ -1350,10 +1346,6 @@ impl Cpu {
         {
             self.jit_based_read_mask = 0;
             self.jit_based_write_mask = 0;
-        }
-        #[cfg(a64_jit)]
-        {
-            self.jit_expand_down_mask = 0;
         }
         self.set_seg_cache(
             SegmentReg::Cs,
@@ -1666,13 +1658,6 @@ impl Cpu {
         )
     }
 
-    /// ES/SS/DS kinds, cached when their descriptors change. PM16 excludes
-    /// these segments from its based permissions; PM32 specializes the check.
-    #[cfg(a64_jit)]
-    pub(crate) fn jit_expand_down_segments(&self) -> u32 {
-        u32::from(self.jit_expand_down_mask)
-    }
-
     /// Checked JIT data access: read/write permission, base, inclusive bounds.
     /// Empty expand-down ranges and unsupported descriptors get no permission.
     #[cfg(feature = "jit-t32")]
@@ -1718,19 +1703,11 @@ impl Cpu {
             self.jit_based_write_mask &= !bit;
             let mut based = cache;
             based.base = 0;
-            // Native based access checks its actual limit before paging.
-            // Range and type are separate: PM32 ES/SS/DS also qualify
-            // expand-down data, with both bounds checked by generated code.
+            // Native based accesses check their actual bounds before paging.
             based.limit = u32::MAX;
             #[cfg(a64_jit)]
             {
-                self.jit_expand_down_mask &= !bit;
-                if matches!(seg, SegmentReg::Es | SegmentReg::Ss | SegmentReg::Ds)
-                    && cache.flags & 0x1c == 0x14
-                {
-                    self.jit_expand_down_mask |= bit;
-                    based.flags &= !4;
-                }
+                based.flags &= !4;
             }
             if flat_data_segment(based, false) {
                 self.jit_based_read_mask |= bit;
