@@ -5405,6 +5405,68 @@ mod host_bus_tests {
 
     #[cfg(all(feature = "jit", target_arch = "arm"))]
     #[test]
+    fn arm_jit_cs_reloads_recheck_base_mode_and_limit() {
+        let make = || {
+            let mut cpu = Cpu::new();
+            cpu.enter_protected_flat(0x1000, 0);
+            cpu.regs[0] = 0x1234_0000;
+            let mut bus = HostBus::new(0x20000);
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            bus.ram[0x1000..0x1003].copy_from_slice(&[0x40, 0xeb, 0xfd]); // inc eax; loop
+            bus.ram[0x11000..0x11003].copy_from_slice(&[0x43, 0xeb, 0xfd]); // inc ebx; loop
+            (cpu, bus)
+        };
+        let (mut expected, mut reference_bus) = make();
+        let (mut actual, mut native_bus) = make();
+        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+        let mut steps = 0;
+        for (base, limit, flags) in [
+            (0, u32::MAX, 0xc09b),
+            (0x10000, u32::MAX, 0xc09b),
+            (0, u32::MAX, 0xc099), // Returning to execute-only CS is valid.
+            (0, 0x1002, 0xc09b),   // Full loop fits, but native entry is ineligible.
+            (0, 0x1002, 0x009b),   // Same bytes in a 16-bit CS must stay interpreted.
+            (0, 0x1000, 0xc09b),   // INC fits; JMP fetch must fault before branching.
+        ] {
+            for cpu in [&mut expected, &mut actual] {
+                cpu.eip = 0x1000;
+                cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(8, base, limit, flags));
+            }
+            let before = engine.stats.native_steps;
+            let reference = Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 1024);
+            let native = engine
+                .run_batch(&mut actual, &mut native_bus, steps, 1024)
+                .unwrap();
+            assert_eq!(native, reference);
+            assert_eq!(actual.eip, expected.eip);
+            assert_eq!(actual.regs, expected.regs);
+            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
+            assert_eq!(actual.tsc(), expected.tsc());
+            assert_eq!(native_bus.ram, reference_bus.ram);
+            if limit == u32::MAX {
+                assert!(engine.stats.native_steps > before + 900);
+            } else {
+                assert_eq!(engine.stats.native_steps, before);
+            }
+            if limit == 0x1000 {
+                assert!(matches!(
+                    native.stop,
+                    BatchStop::Step {
+                        reason: BatchStepStop::Error(StepError::GeneralProtection {
+                            eip: 0x1001,
+                            code: 0,
+                        }),
+                        ..
+                    }
+                ));
+            }
+            steps += native.ran;
+        }
+    }
+
+    #[cfg(all(feature = "jit", target_arch = "arm"))]
+    #[test]
     fn arm_jit_matches_interpreter_across_budgets_memory_and_code_changes() {
         fn machine(jit: bool) -> Machine {
             let mut cpu = Cpu::new();

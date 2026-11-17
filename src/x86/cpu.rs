@@ -1572,7 +1572,10 @@ impl Cpu {
     #[inline(always)]
     pub fn set_seg_cache(&mut self, seg: SegmentReg, cache: SegmentCache) {
         #[cfg(any(
-            all(feature = "jit", not(a64_jit)),
+            all(
+                feature = "jit",
+                not(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))
+            ),
             all(feature = "r86chip-native", target_arch = "riscv32")
         ))]
         let previous = self.segments[seg as usize];
@@ -1593,8 +1596,12 @@ impl Cpu {
             if was_user != (self.cached_cpl == 3) {
                 self.invalidate_fetch_translations();
             }
-            // A64 context ids qualify CS base/D; entry checks the live limit.
-            #[cfg(all(feature = "jit", not(a64_jit)))]
+            // A64 qualifies CS base/D and checks the live limit. Thumb-2
+            // qualifies the base in its context and admits only 32-bit, 4 GiB CS.
+            #[cfg(all(
+                feature = "jit",
+                not(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))
+            ))]
             if previous.base != cache.base
                 || previous.limit != cache.limit
                 || (previous.flags ^ cache.flags) & !0x60 != 0
@@ -3051,7 +3058,8 @@ mod tests {
     #[test]
     fn code_segment_reload_keeps_linear_mappings_but_rechecks_fetch_window() {
         let mut cpu = Cpu::new();
-        let code = SegmentCache::flat(0x18, SEGMENT_FLAG_DEFAULT_BIG);
+        cpu.enter_protected_flat(0x3000, 0);
+        let code = SegmentCache::flat(0x18, 0xc09b);
         cpu.set_seg_cache(SegmentReg::Cs, code);
         let linear = LinearAddr(0x3000);
         let phys = PhysAddr(0x7000);
@@ -3061,23 +3069,24 @@ mod tests {
         assert_eq!(cpu.fetch_cache_phys(linear), Some(phys));
         assert_eq!(cpu.cached_read_translation(linear, false), Some(backing));
 
-        cpu.fill_fetch_cursor_after(0x3000, backing, 1, 16);
-        cpu.set_seg_cache(SegmentReg::Cs, code);
+        #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+        let epochs = (cpu.jit_mapping_epoch(), cpu.jit_global_epoch());
+        for code in [
+            code,
+            SegmentCache::new(0x18, 0x100, u32::MAX, 0xc09b),
+            SegmentCache::new(0x18, 0x100, 0xfff, 0xc09b),
+            SegmentCache::new(0x18, 0x100, 0xfff, 0x009b),
+            SegmentCache::new(0x18, 0x100, 0xfff, 0xc099),
+        ] {
+            cpu.fill_fetch_cursor_after(0x3000, backing, 1, 16);
+            cpu.set_seg_cache(SegmentReg::Cs, code);
 
-        assert_eq!(cpu.fetch_cursor_backing_u8(0x3001), None);
-        assert_eq!(cpu.fetch_cache_phys(linear), Some(phys));
-        assert_eq!(cpu.cached_read_translation(linear, false), Some(backing));
-
-        cpu.set_seg_cache(
-            SegmentReg::Cs,
-            SegmentCache {
-                base: 0x100,
-                ..code
-            },
-        );
-
-        assert_eq!(cpu.fetch_cache_phys(linear), Some(phys));
-        assert_eq!(cpu.cached_read_translation(linear, false), Some(backing));
+            assert_eq!(cpu.fetch_cursor_backing_u8(0x3001), None);
+            assert_eq!(cpu.fetch_cache_phys(linear), Some(phys));
+            assert_eq!(cpu.cached_read_translation(linear, false), Some(backing));
+            #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+            assert_eq!((cpu.jit_mapping_epoch(), cpu.jit_global_epoch()), epochs);
+        }
     }
 
     #[test]
