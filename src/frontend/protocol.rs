@@ -119,7 +119,7 @@ impl Profile {
             {
                 writeln!(out, "| {name} | {} |", clears.causes[i] - initial.causes[i]).unwrap();
             }
-            writeln!(out, "\n## 6. Top 20 retained exit sites\n\nRetained keys: {} / 4096. Total returns: {total}. Mapped returns: {mapped}. Overflow returns: {}.\n\nSites sample every {}th cumulative native return; counts are unscaled samples. Reason totals above are exact. Overflow is total minus mapped: it includes unsampled returns and samples omitted by the cap.\n\nCS:EIP is the committed return/resume site. Equal selectors and offsets across address spaces are merged. After the cap, existing keys keep counting samples; unseen keys are omitted. This is not necessarily the global top 20; periodic sampling can miss sites.\n\n| CS:EIP | Reason | Sampled returns |\n| --- | --- | ---: |", exits.sites.len(), total - mapped, ExitSites::SAMPLE_INTERVAL).unwrap();
+            writeln!(out, "\n## 6. Top 20 retained exit sites\n\nRetained keys: {} / 4096. Total returns: {total}. Mapped returns: {mapped}. Overflow returns: {}.\n\nSites randomly sample 1 in {} native returns on average; counts are unscaled samples. Reason totals above are exact. Overflow is total minus mapped: it includes unsampled returns and samples omitted by the cap.\n\nCS:EIP is the committed return/resume site. Equal selectors and offsets across address spaces are merged. After the cap, existing keys keep counting samples; unseen keys are omitted. This is not necessarily the global top 20.\n\n| CS:EIP | Reason | Sampled returns |\n| --- | --- | ---: |", exits.sites.len(), total - mapped, ExitSites::SAMPLE_INTERVAL).unwrap();
             let mut sites: Vec<_> = exits.sites.into_iter().collect();
             sites.sort_unstable_by(|(ka, ca), (kb, cb)| cb.cmp(ca).then(ka.cmp(kb)));
             for ((cs, eip, reason), count) in sites.into_iter().take(20) {
@@ -133,7 +133,7 @@ impl Profile {
             return out;
         }
         out.push_str("## 2. Native and interpreted work\n\n");
-        if self.engine == "[Interpreter (slow!)]" {
+        if !machine.jit_enabled() {
             writeln!(out, "Interpreted steps (interpreter selected): {work}\n").unwrap();
         }
         out.push_str("A64 native and fallback counters: not applicable.\n\n## 3. Native returns\n\nNot applicable: A64 JIT is not selected.\n\n## 4. Compilation and retained code\n\nNot applicable: A64 JIT is not selected.\n\n## 5. Cache clears\n\nNot applicable: A64 JIT is not selected.\n\n## 6. Top 20 retained exit sites\n\nNot applicable: A64 JIT is not selected.\n");
@@ -708,7 +708,8 @@ mod tests {
         machine.load_bootsector(&boot).unwrap();
         machine.enter_bootsector();
         machine.step_once().unwrap(); // Work before the profile is excluded.
-        let profile = Profile::start(&mut machine);
+        let mut profile = Profile::start(&mut machine);
+        profile.engine = "Renamed interpreter label";
         machine.step_once().unwrap();
         machine.step_once().unwrap();
         machine.step_once().unwrap(); // Already halted: idle, not work.

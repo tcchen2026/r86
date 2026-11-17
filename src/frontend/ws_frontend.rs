@@ -56,20 +56,16 @@ impl WsSession {
     }
 
     fn hello(&self, machine: &Machine) -> String {
-        let response = format!(
-            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"engine\":\"{}\",\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"memory-write\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]}}",
+        #[cfg(debug_assertions)]
+        let profile = ",\"profiling\":true";
+        #[cfg(not(debug_assertions))]
+        let profile = "";
+        format!(
+            "{{\"type\":\"hello\",\"ok\":true,\"version\":1,\"engine\":\"{}\",\"step\":{},\"slice_steps\":{},\"capabilities\":[\"run-steps\",\"run-until-step\",\"wait-text\",\"wait-serial\",\"type\",\"keydown\",\"keyup\",\"send-scancodes\",\"mouse-move\",\"mouse-button\",\"mouse-mode\",\"pointer\",\"usb-tablet\",\"display-mode\",\"power-button\",\"text-snapshot\",\"status\",\"hash-frame\",\"screenshot\",\"wait-frame-stable\",\"resume\",\"pause\",\"reset\",\"frame\",\"logs\",\"diagnostics\",\"memory\",\"memory-write\",\"release-input\",\"guest-bytes\",\"media\",\"media-remote\",\"media-tools\",\"power-on\",\"power-off\",\"files\",\"quit\"]{profile}}}",
             machine.engine_label(),
             machine.step_count(),
             self.slice_steps
-        );
-        #[cfg(debug_assertions)]
-        let response = {
-            let mut response = response;
-            response.pop();
-            response.push_str(",\"profiling\":true}");
-            response
-        };
-        response
+        )
     }
 
     fn handle_text(

@@ -509,21 +509,38 @@ impl ExitReason {
 /// One active session; exact reason totals and at most 4096 retained sites.
 /// Sites identify the committed return/resume CS:EIP, not code identities.
 #[cfg(debug_assertions)]
-#[derive(Default)]
 pub struct ExitSites {
     pub reasons: [u64; 10],
     pub sites: HashMap<(u16, u32, ExitReason), u64>,
+    sample_state: u32,
+}
+
+#[cfg(debug_assertions)]
+impl Default for ExitSites {
+    fn default() -> Self {
+        Self {
+            reasons: [0; 10],
+            sites: HashMap::new(),
+            sample_state: 1, // Xorshift needs a nonzero seed; guest state is unaffected.
+        }
+    }
 }
 
 #[cfg(debug_assertions)]
 impl ExitSites {
     /// W95A full site counting exceeded the debug-session overhead budget.
     /// Reason totals remain exact; site counts are unscaled 1-in-8 samples.
-    pub const SAMPLE_INTERVAL: u64 = 8;
+    pub const SAMPLE_INTERVAL: u32 = 8;
 
-    fn record(&mut self, cs: u16, eip: u32, reason: ExitReason, invocation: u64) {
+    fn record(&mut self, cs: u16, eip: u32, reason: ExitReason) {
         self.reasons[reason as usize] += 1;
-        if invocation % Self::SAMPLE_INTERVAL != 0 {
+        // Random selection avoids aliasing with periodic guest exit patterns.
+        let mut sample = self.sample_state;
+        sample ^= sample << 13;
+        sample ^= sample >> 17;
+        sample ^= sample << 5;
+        self.sample_state = sample;
+        if sample % Self::SAMPLE_INTERVAL != 0 {
             return;
         }
         let key = (cs, eip, reason);
@@ -1496,7 +1513,6 @@ impl Engine {
                             cpu.seg(SegmentReg::Cs).selector,
                             cpu.eip,
                             reason,
-                            self.stats.native_invocations,
                         );
                     }
                     #[cfg(feature = "jit-profile")]
@@ -1749,28 +1765,46 @@ mod tests {
     #[test]
     fn session_profile_map_cap_preserves_totals_and_existing_sites() {
         let mut profile = ExitSites::default();
-        for event in 1..=4100 * 8 {
-            profile.record(
-                0x13f,
-                ((event - 1) / 8) as u32,
-                ExitReason::MemoryGuard,
-                event,
-            );
-        }
-        for event in 4100 * 8 + 1..=4101 * 8 {
-            profile.record(0x13f, 0, ExitReason::MemoryGuard, event);
-        }
-        for event in 4101 * 8 + 1..=4102 * 8 {
-            profile.record(0x13f, 0, ExitReason::Budget, event); // Different key, beyond cap.
+        for eip in 0..65536 {
+            profile.record(0x13f, eip, ExitReason::MemoryGuard);
         }
         assert_eq!(profile.sites.len(), 4096);
-        assert_eq!(profile.sites[&(0x13f, 0, ExitReason::MemoryGuard)], 2);
-        assert_eq!(profile.reasons[ExitReason::MemoryGuard as usize], 4101 * 8);
-        assert_eq!(profile.reasons[ExitReason::Budget as usize], 8);
+        let key = *profile.sites.keys().next().unwrap();
+        let before = profile.sites[&key];
+        for _ in 0..1024 {
+            profile.record(key.0, key.1, key.2);
+        }
+        let mapped = profile.sites.values().sum::<u64>();
+        for _ in 0..1024 {
+            profile.record(0x13f, 0, ExitReason::Budget); // New key, beyond cap.
+        }
+        assert_eq!(profile.sites.len(), 4096);
+        assert!(profile.sites[&key] > before);
+        assert!(!profile.sites.contains_key(&(0x13f, 0, ExitReason::Budget)));
+        assert_eq!(
+            profile.reasons[ExitReason::MemoryGuard as usize],
+            65536 + 1024
+        );
+        assert_eq!(profile.reasons[ExitReason::Budget as usize], 1024);
+        assert_eq!(profile.sites.values().sum::<u64>(), mapped);
         assert_eq!(
             profile.reasons.iter().sum::<u64>() - profile.sites.values().sum::<u64>(),
-            4102 * 8 - 4097
+            65536 + 2048 - mapped
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn session_profile_samples_both_alternating_sites() {
+        let mut profile = ExitSites::default();
+        for event in 0..16384 {
+            profile.record(0x13f, event & 1, ExitReason::Budget);
+        }
+        assert_eq!(profile.reasons[ExitReason::Budget as usize], 16384);
+        for eip in 0..2 {
+            let samples = profile.sites[&(0x13f, eip, ExitReason::Budget)];
+            assert!(samples > 0 && samples < 8192);
+        }
     }
 
     #[cfg(debug_assertions)]

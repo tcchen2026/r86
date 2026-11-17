@@ -191,9 +191,9 @@ or engine cancels it; guest resets retain cumulative counters. No server file
 is written. The guest's running/paused state is unchanged. Reports include
 idle-corrected work and wall time, A64 fallback causes, exact native-return
 reasons, compilation, cache clears and up to 20 retained return sites (4096-key
-cap; sites sample every eighth return, with unscaled sample counts and exact
-reason totals). A64-only sections say not applicable on other engines. Ordinary release
-builds omit this feature. In debug-assertion builds, ``--measure-from-step``
+cap; sites randomly sample 1 in 8 returns on average, with unscaled sample
+counts and exact reason totals). A64-only sections say not applicable on other
+engines. Ordinary release builds omit this feature. In debug-assertion builds, ``--measure-from-step``
 also prints this report to stderr after the phase timer stops.
 
 ``memory`` reads RAM (default 256 bytes, maximum 64 KiB). ``linear: true``
