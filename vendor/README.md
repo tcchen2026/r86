@@ -18,8 +18,8 @@ changes. These are all of them; keep this list current:
 - `src/bootsplash.c`: the label in `etc/r86-engine` appears at the top right
   after the POST banner, during the r86 splash (40 columns), and on return
   to text mode (80 columns). No file means no label; the cursor is preserved.
-- `vgasrc/svgamodes.c`: VBE mode 1A0h, 640x340x16, twice the M5Stack
-  CardputerZero's 320x170 LCD; modes 1A1h/1A2h, 936x666 at 16/32 bpp,
+- `vgasrc/svgamodes.c`: VBE modes 1A0h/1A3h provide 640x340 at 16/32 bpp,
+  twice the M5Stack CardputerZero's 320x170 LCD. Modes 1A1h/1A2h provide 936x666 at 16/32 bpp,
   half the iPhone Duo's 1878x1335 upper half in laptop posture, with width
   rounded down to a multiple of eight pixels.
 

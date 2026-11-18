@@ -1,7 +1,6 @@
 ; nasm -f bin tests/bootsectors/firmware_vbe_640x340.asm -o tests/bootsectors/firmware_vbe_640x340.bin
-; The VGA BIOS's 640x340 RGB565 VBE mode (1A0h, twice the CardputerZero
-; panel): BIOS discovery, mode set and the four corner pixels through the
-; banked A000 window.
+; Enumerate the selected 640x340 mode and leave its ModeInfoBlock at 9000h.
+; Draw through A000, then switch to the linear framebuffer preserving VRAM.
 bits 16
 org 0x7c00
     cli
@@ -24,45 +23,67 @@ org 0x7c00
     mov dx, 0x3fb
     mov al, 3
     out dx, al
-    mov ax, 0x4f01
-    mov cx, 0x1a0
+    mov dword [0x9000], 'VBE2'
+    mov ax, 0x4f00
     mov di, 0x9000
     int 0x10
     cmp ax, 0x004f
     jne failed
-    cmp word [0x9012], 640
-    jne failed
-    cmp word [0x9014], 340
-    jne failed
-    cmp byte [0x9019], 16
-    jne failed
-    cmp word [0x9010], 1280
+    les si, [0x900e]           ; VideoModePtr
+.find_mode:
+    mov ax, [es:si]
+    add si, 2
+    cmp ax, 0xffff
+    je failed
+    cmp ax, [test_mode]
+    jne .find_mode
+    xor ax, ax
+    mov es, ax
+    mov ax, 0x4f01
+    mov cx, [test_mode]
+    mov di, 0x9000
+    int 0x10
+    cmp ax, 0x004f
     jne failed
     mov ax, 0x4f02
-    mov bx, 0x1a0
+    mov bx, [test_mode]
     int 0x10
     cmp ax, 0x004f
     jne failed
     mov ax, 0xa000
     mov es, ax
-    xor di, di
-    mov ax, 0xf800             ; red at (0,0)
-    stosw
-    mov di, 639*2
-    mov ax, 0x07e0             ; green at (639,0)
-    stosw
-    mov ax, 0x4f05             ; row 339 starts at 433920: 64 KiB bank 6
+    movzx ebp, byte [0x9019]
+    shr bp, 3                  ; bytes per pixel
+    mov si, corners
+.corner:
+    lodsd                      ; pixel index
+    imul eax, ebp
+    mov di, ax
+    shr eax, 16                ; select the 64 KiB bank
+    mov dx, ax
+    mov ax, 0x4f05
     xor bx, bx
-    mov dx, 6
     int 0x10
     cmp ax, 0x004f
     jne failed
-    mov di, 339*1280 - 6*65536
-    mov ax, 0x001f             ; blue at (0,339)
+    lodsw                      ; RGB565 color
+    cmp bp, 2
+    jne .rgb32
     stosw
-    mov di, 339*1280 + 639*2 - 6*65536
-    mov ax, 0xffff             ; white at (639,339)
-    stosw
+    add si, 4
+    jmp .next
+.rgb32:
+    lodsd                      ; XRGB8888 color
+    stosd
+.next:
+    cmp si, corners_end
+    jb .corner
+    mov ax, 0x4f02
+    mov bx, [test_mode]
+    or bx, 0xc000              ; linear framebuffer, preserve the four pixels
+    int 0x10
+    cmp ax, 0x004f
+    jne failed
     mov si, success
     jmp report
 failed:
@@ -95,5 +116,21 @@ shutdown:
     jmp $
 success: db 'R86_VBE_OK', 10, 0
 error: db 'R86_VBE_ERROR', 10, 0
+corners:                       ; pixel index, RGB565, XRGB8888
+    dd 0
+    dw 0xf800
+    dd 0xff0000
+    dd 639
+    dw 0x07e0
+    dd 0x00ff00
+    dd 339*640
+    dw 0x001f
+    dd 0x0000ff
+    dd 339*640+639
+    dw 0xffff
+    dd 0xffffff
+corners_end:
+times 0x1f0-($-$$) db 0
+test_mode: dw 0x1a0
 times 510-($-$$) db 0
 dw 0xaa55

@@ -107,5 +107,7 @@ struct generic_svga_mode svga_modes[] VAR16 = {
      * with width rounded down to a multiple of eight pixels */
     { 0x1a1, { MM_DIRECT, 936,  666,  16, 8, 16, SEG_GRAPH } },
     { 0x1a2, { MM_DIRECT, 936,  666,  32, 8, 16, SEG_GRAPH } },
+    /* r86: 32-bit counterpart of the CardputerZero's mode 1A0h */
+    { 0x1a3, { MM_DIRECT, 640,  340,  32, 8, 16, SEG_GRAPH } },
 };
 unsigned int svga_mcount VAR16 = ARRAY_SIZE(svga_modes);

@@ -36,8 +36,8 @@ use crate::ws_frontend::Remote;
 const SLICE_STEPS: u64 = 200_000;
 const FRAME_INTERVAL: Duration = Duration::from_millis(40);
 const TOAST: Duration = Duration::from_secs(4);
-/// The one VGA BIOS; its VBE mode 1A0h, 640x340, is twice the
-/// CardputerZero panel (vendor/seabios/vgasrc/svgamodes.c).
+/// The shared VGA BIOS offers twice the CardputerZero panel size, 640x340,
+/// at 16 bpp (1A0h) and 32 bpp (1A3h).
 const HANDHELD_VGA_BIOS: &str = "vgabios-stdvga.bin";
 /// The guest tools disc, installed beside the firmware by ports/share.sh.
 const TOOLS_ISO: &str = "r86_tools.iso";

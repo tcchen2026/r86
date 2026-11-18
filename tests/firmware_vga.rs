@@ -173,40 +173,55 @@ fn seabios_vbe_800x600_planar_and_rgb565() {
 
 #[test]
 #[ignore = "boots vendored SeaBIOS; cargo test --release --test firmware_vga -- --include-ignored"]
-fn vga_bios_offers_the_cardputer_640x340_mode() {
-    // Mode 1A0h is twice the CardputerZero panel; the guest queries, sets
-    // and draws it through the BIOS, so the mode reaches drivers such as VBEMP.
-    let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
-    let mut disk = vec![0; 8 << 20];
-    disk[..512].copy_from_slice(include_bytes!("bootsectors/firmware_vbe_640x340.bin"));
-    m.attach_disk(Disk::memory(disk, false));
-    m.load_bios_rom(include_bytes!("../firmware/seabios/bios.bin"))
+fn vga_bios_offers_the_cardputer_640x340_modes() {
+    for (mode, bpp) in [(0x1a0u16, 16u16), (0x1a3, 32)] {
+        let mut m = Machine::new_firmware(32 << 20, FirmwareDisplay::Vga).unwrap();
+        let mut disk = vec![0; 8 << 20];
+        disk[..512].copy_from_slice(include_bytes!("bootsectors/firmware_vbe_640x340.bin"));
+        disk[0x1f0..0x1f2].copy_from_slice(&mode.to_le_bytes());
+        m.attach_disk(Disk::memory(disk, false));
+        m.load_bios_rom(include_bytes!("../firmware/seabios/bios.bin"))
+            .unwrap();
+        m.load_option_rom(
+            0xc0000,
+            include_bytes!("../firmware/seabios/vgabios-stdvga.bin"),
+        )
         .unwrap();
-    m.load_option_rom(
-        0xc0000,
-        include_bytes!("../firmware/seabios/vgabios-stdvga.bin"),
-    )
-    .unwrap();
-    m.reset_bios();
-    let report = m.run_steps(100_000_000).unwrap();
-    let log = String::from_utf8_lossy(m.serial_output());
-    assert!(
-        matches!(report.stop, Some(GuestStepStatus::PoweredOff)),
-        "{report:?}\n{log}"
-    );
-    assert!(log.contains("R86_VBE_OK"), "{log}");
-    let info = m.vga().mode_info();
-    assert_eq!((info.width, info.height, info.bpp), (640, 340, 16));
-    let mut pixels = vec![0; 640 * 340 * 4];
-    m.vga().render_rgba(&mut pixels).unwrap();
-    for (x, y, color) in [
-        (0, 0, [255, 0, 0, 255]),
-        (639, 0, [0, 255, 0, 255]),
-        (0, 339, [0, 0, 255, 255]),
-        (639, 339, [255; 4]),
-    ] {
-        let pos = (y * 640 + x) * 4;
-        assert_eq!(&pixels[pos..pos + 4], &color, "at {x},{y}");
+        m.reset_bios();
+        let report = m.run_steps(100_000_000).unwrap();
+        let log = String::from_utf8_lossy(m.serial_output());
+        assert!(
+            matches!(report.stop, Some(GuestStepStatus::PoweredOff)),
+            "{report:?}\n{log}"
+        );
+        assert!(log.contains("R86_VBE_OK"), "{log}");
+        // INT 10h 4F01h left the ModeInfoBlock at 0000:9000.
+        let vbe = &m.ram()[0x9000..0x9100];
+        let word = |i| u16::from_le_bytes([vbe[i], vbe[i + 1]]);
+        let pitch = 640 * (bpp / 8);
+        assert_eq!(
+            (word(0x12), word(0x14), u16::from(vbe[0x19])),
+            (640, 340, bpp)
+        );
+        assert_eq!((word(0x10), word(0x32)), (pitch, pitch));
+        assert_ne!(word(0) & 0x80, 0, "VBE linear framebuffer attribute");
+        assert_ne!(u32::from_le_bytes(vbe[0x28..0x2c].try_into().unwrap()), 0);
+        let info = m.vga().mode_info();
+        assert_eq!(
+            (info.width, info.height, info.bpp, info.stride),
+            (640, 340, bpp, u32::from(pitch))
+        );
+        let mut pixels = vec![0; 640 * 340 * 4];
+        m.vga().render_rgba(&mut pixels).unwrap();
+        for (x, y, color) in [
+            (0, 0, [255, 0, 0, 255]),
+            (639, 0, [0, 255, 0, 255]),
+            (0, 339, [0, 0, 255, 255]),
+            (639, 339, [255; 4]),
+        ] {
+            let pos = (y * 640 + x) * 4;
+            assert_eq!(&pixels[pos..pos + 4], &color, "at {x},{y}");
+        }
     }
 }
 

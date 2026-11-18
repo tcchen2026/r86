@@ -50,7 +50,7 @@ def main() -> None:
             command = [
                 "make", "-C", str(source), f"-j{args.jobs}",
                 f"OUT=out-{name}/", f"KCONFIG_CONFIG={config_path}",
-                "PYTHON=python3", f"EXTRAVERSION=-r86-{5 if config == 'bios' else 3}",
+                "PYTHON=python3", f"EXTRAVERSION=-r86-{5 if config == 'bios' else 4}",
             ]
             subprocess.run(command + ["olddefconfig"], check=True)
             subprocess.run(command + [f"out-{name}/{target}"], check=True)
