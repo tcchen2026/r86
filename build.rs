@@ -26,6 +26,13 @@ fn main() {
     {
         println!("cargo::rustc-cfg=a64_jit");
     }
+    println!("cargo::rustc-check-cfg=cfg(t32_jit)");
+    if env::var_os("CARGO_FEATURE_MACHINE").is_some()
+        && env::var_os("CARGO_FEATURE_JIT_T32").is_some()
+        && env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("arm")
+    {
+        println!("cargo::rustc-cfg=t32_jit");
+    }
 }
 
 /// Compiles r86-win.exe's icon, manifest, dialogs and version
