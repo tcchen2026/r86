@@ -25,11 +25,14 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
   Explorer and 54 ms to Notepad (A64 JIT, 2026-11-19). In DIBENG's text
   expansion loop the JIT lowers 17 of 22 instructions; its five loads
   through ES with a 67h prefix (16-bit addressing in 32-bit code) still
-  run in the interpreter. A profile before these changes attributed
-  35–39 ms on Explorer and 6–8 ms on Notepad to VMDisp9x's QEMUMINI.VXD
-  erasing and redrawing the software pointer around every drawing
-  operation, and 34 ms of the Explorer switch to JIT lookup, dispatch and
-  admission.
+  run in the interpreter. VMDisp9x's QEMUMINI.VXD erases and redraws the
+  software pointer around every drawing operation: FBHDA_access_rect
+  (vxd_vbe.c) discards the drawing bounds. Per switch, 428 of 435
+  repaints to Explorer and 97–104 of 104–111 to Notepad did not touch
+  the pointer; skipping them would save about 34–39 ms and 6–8 ms
+  (cost per repaint from a profile before these JIT changes). That
+  profile also put 34 ms of the Explorer switch in JIT lookup, dispatch
+  and admission.
 - cpu: x87 registers are `f64` (`FpuState`, src/x86/cpu.rs). Integers
   loaded by FILD m64 or an integral 80-bit load stay exact only through
   moves, saves and integer or 80-bit stores; arithmetic, FCHS/FABS,
