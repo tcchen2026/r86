@@ -327,7 +327,7 @@ impl StepError {
 
 pub struct Interpreter;
 
-#[cfg(any(a64_jit, t32_jit))]
+#[cfg(a64_jit)]
 type SegmentTarget<'a, B> = dyn FnMut(&mut Cpu, &mut B) -> bool + 'a;
 
 #[derive(Clone, Copy)]
@@ -658,7 +658,7 @@ impl Interpreter {
             budget,
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             None,
-            #[cfg(any(a64_jit, t32_jit))]
+            #[cfg(a64_jit)]
             None,
         )
     }
@@ -691,9 +691,9 @@ impl Interpreter {
         Self::run_counted_batch::<B, false, true>(cpu, bus, start_step, budget, None)
     }
 
-    /// At a successful CS or SS load the native engine may already have a body
+    /// At a successful CS or SS load the A64 engine may already have a body
     /// for the new context. Ordinary instructions keep the usual batch loop.
-    #[cfg(any(a64_jit, t32_jit))]
+    #[cfg(a64_jit)]
     pub(crate) fn run_ineligible<B: Bus>(
         cpu: &mut Cpu,
         bus: &mut B,
@@ -719,7 +719,7 @@ impl Interpreter {
             1,
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             None,
-            #[cfg(any(a64_jit, t32_jit))]
+            #[cfg(a64_jit)]
             None,
         );
         // Keep this single-step boundary outside the large instruction kernel.
@@ -747,7 +747,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
-        #[cfg(any(a64_jit, t32_jit))] segment_target: Option<&mut SegmentTarget<'_, B>>,
+        #[cfg(a64_jit)] segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         bus.sync_ioram(cpu);
         #[cfg(feature = "r86chip")]
@@ -760,7 +760,7 @@ impl Interpreter {
                 budget as u32,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control,
-                #[cfg(any(a64_jit, t32_jit))]
+                #[cfg(a64_jit)]
                 segment_target,
             )
         } else {
@@ -771,7 +771,7 @@ impl Interpreter {
                 budget,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control,
-                #[cfg(any(a64_jit, t32_jit))]
+                #[cfg(a64_jit)]
                 segment_target,
             )
         };
@@ -801,7 +801,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] mut until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
-        #[cfg(any(a64_jit, t32_jit))] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
+        #[cfg(a64_jit)] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         let mut ran = 0;
         loop {
@@ -813,7 +813,7 @@ impl Interpreter {
                 part,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control.as_deref_mut(),
-                #[cfg(any(a64_jit, t32_jit))]
+                #[cfg(a64_jit)]
                 segment_target.as_deref_mut(),
             );
             ran += batch.ran;
@@ -838,7 +838,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] mut until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
-        #[cfg(any(a64_jit, t32_jit))] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
+        #[cfg(a64_jit)] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         let budget = if SINGLE { 1 } else { u64::from(budget) };
         if budget != 0 && cpu.halted {
@@ -910,7 +910,7 @@ impl Interpreter {
             }
             macro_rules! segment_loaded {
                 () => {
-                    #[cfg(any(a64_jit, t32_jit))]
+                    #[cfg(a64_jit)]
                     if !SINGLE && !CONTROL && chunk_left > 1 {
                         if let Some(target) = segment_target.as_deref_mut() {
                             if cpu.jit_code_eligible()
@@ -2850,7 +2850,7 @@ impl Interpreter {
                                 opcode,
                                 opcode2,
                             ));
-                            #[cfg(any(a64_jit, t32_jit))]
+                            #[cfg(a64_jit)]
                             if !SINGLE && !CONTROL && matches!(opcode2, 0x34 | 0x35 | 0xb2) {
                                 segment_loaded!();
                             }

@@ -683,6 +683,17 @@ The six-clear limit needs 11.8% fewer compiled bytes: the full run allocated
 At 1,275 Arm per join less 255 saved by direct handoff, 4.60 M joins give
 77.62. The 8.22 gap before helper costs favors stopping (moderate confidence).
 
+## W9T: segment-load handoff on Thumb-2
+
+Rejected 2026-11-19; the code is in history as `205d6e7`, reverted by the
+next commit. Porting arm64's `787c5cd` (end an interpreter batch after a
+CS or SS load that reaches compiled code) raised W95A's cost after boot
+from 73.122 to 73.825 Arm instructions per x86 step (+0.96%; a keep
+needed 70.928). It moved only 4,468 guest steps to native code in 650 M,
+so it cannot pay on this workload. W9's other change, compiling 32-bit
+code in size-limited segments (`233889e`), was not ported: it left W95A
+unchanged on arm64, so that code is not a cost there.
+
 ## ARMv6K backend (New 3DS)
 
 Status: checked 2026-11-15 on the user's question; nothing started.

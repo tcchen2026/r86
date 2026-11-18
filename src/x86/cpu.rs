@@ -1619,18 +1619,14 @@ impl Cpu {
         self.code_default16
     }
 
-    #[cfg(any(a64_jit, t32_jit))]
+    #[cfg(a64_jit)]
     #[inline(always)]
     pub(crate) fn jit_code_eligible(&self) -> bool {
         !self.halted
             && self.cr0 & CR0_PE != 0
             && self.eflags & ((1 << 8) | (1 << 17)) == 0
-            && if cfg!(a64_jit) {
-                !self.code_default16
-                    || self.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0
-            } else {
-                !self.code_default16 && self.seg(SegmentReg::Cs).limit == u32::MAX
-            }
+            && (!self.code_default16
+                || self.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0)
     }
 
     #[cfg(all(a64_jit, feature = "jit-profile"))]

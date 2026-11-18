@@ -406,13 +406,15 @@ pub(super) unsafe extern "C" fn profile_checked(
 }
 
 const HEAT: usize = 4096;
-pub(crate) const HOT: u8 = 16;
+const HOT: u8 = 16;
 /// Records in the block index: four-way sets. A 4 MiB arena holds about ten
 /// thousand blocks. On the TinyCore boot 16384 records replaced 21,324 live
 /// records in full sets and 32768 replaced 3,216.
 const BLOCKS: usize = 32768;
 const BLOCK_INSTRUCTIONS: usize = 32;
 const WINDOW: usize = 480;
+const TF: u32 = 1 << 8;
+const VM: u32 = 1 << 17;
 /// DS/ES/SS flat read and write proofs, plus the 32-bit stack proof.
 const FACTS: u32 = 0b1101 | 0b1101 << 8 | STACK_FACT | STACK32_FACT;
 const PLANE: usize = 1 << TABLE_BITS;
@@ -1021,7 +1023,6 @@ impl Engine {
         // EIP of the last instruction interpreted as cold code. Its sequential
         // successor is no block entry; interpretation continues to a transfer.
         let mut cold = None::<u32>;
-        let mut resumed = None;
         while ran < budget {
             #[cfg(feature = "jit-profile")]
             let profile_pm16 = code16::ENABLED && code16::pm16(cpu);
@@ -1036,7 +1037,11 @@ impl Engine {
                 }
             }
             let shadowed = cpu.interrupt_shadow();
-            let eligible = (!shadowed || resumed.is_some()) && cpu.jit_code_eligible();
+            let eligible = !shadowed
+                && !cpu.halted
+                && !cpu.code_default16()
+                && cpu.seg(SegmentReg::Cs).limit == u32::MAX
+                && cpu.eflags & (TF | VM) == 0;
             #[cfg(feature = "jit-profile")]
             if !eligible {
                 let reason = if shadowed {
@@ -1052,12 +1057,9 @@ impl Engine {
                 };
                 self.profile.iterations[reason as usize] += 1;
             }
-            let (limit, attention) = if shadowed {
-                (1, true)
-            } else {
-                bus.batch_attention_limit(start.wrapping_add(ran), budget - ran)
-                    .unwrap_or((1, false))
-            };
+            let (limit, attention) = bus
+                .batch_attention_limit(start.wrapping_add(ran), budget - ran)
+                .unwrap_or((1, false));
             let sequential = cold.is_some_and(|eip| cpu.eip.wrapping_sub(eip).wrapping_sub(1) < 15);
             cold = None;
             let mut first = false;
@@ -1069,11 +1071,7 @@ impl Engine {
                 cold = Some(cpu.eip);
             } else if eligible {
                 self.sync(cpu, bus);
-                let entry = match resumed.take() {
-                    Some(block) => Lookup::Native(block),
-                    None => self.lookup(cpu, bus)?,
-                };
-                let native = match entry {
+                let native = match self.lookup(cpu, bus)? {
                     Lookup::Native(block) => {
                         #[cfg(feature = "jit-profile")]
                         {
@@ -1155,15 +1153,10 @@ impl Engine {
                     if exit != EXIT_INTERPRET {
                         continue;
                     }
-                    if shadowed {
-                        // The single guarded instruction will be retried by run_one.
-                        debug_assert_eq!(executed, 0);
-                        cpu.restore_interrupt_shadow(true);
-                    }
                     self.stats.memory_exits += 1;
                 }
             }
-            let batch = if first {
+            let mut batch = if first {
                 Interpreter::run_batch(
                     cpu,
                     bus,
@@ -1173,25 +1166,15 @@ impl Engine {
             } else if eligible || shadowed || profile_pm16 {
                 Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
             } else {
-                Interpreter::run_ineligible(
-                    cpu,
-                    bus,
-                    start.wrapping_add(ran),
-                    budget - ran,
-                    &mut |cpu, bus| {
-                        let Probe::Known(Lookup::Native(block)) = self.probe(cpu, bus, false)
-                        else {
-                            return false;
-                        };
-                        if cpu.interrupt_shadow() && block.instructions != 1 {
-                            return false;
-                        }
-                        // Normal entry syncs the dispatch table before publishing this block.
-                        resumed = Some(block);
-                        true
-                    },
-                )
+                Interpreter::run_batch(cpu, bus, start.wrapping_add(ran), budget - ran)
             };
+            if shadowed && limit > 1 && matches!(batch.stop, BatchStop::Budget) {
+                // The shadow expired; let the machine observe pending interrupts.
+                batch.stop = BatchStop::Attention {
+                    instruction_step: start.wrapping_add(ran),
+                    was_interruptible: false,
+                };
+            }
             ran += batch.ran;
             self.stats.interpreted_steps += batch.ran;
             #[cfg(feature = "jit-profile")]

@@ -8032,7 +8032,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(any(a64_jit, t32_jit))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_ineligible_retf_resumes_only_precompiled_current_code() {
         let mut cpu = Cpu::new();
@@ -8081,79 +8081,6 @@ mod host_bus_tests {
         assert_eq!(run_return(&mut cpu, &mut bus, &mut engine, 2), 4);
         bus.write_phys_u8(PhysAddr(0x2000), 0x4b).unwrap(); // DEC EBX.
         assert_eq!(run_return(&mut cpu, &mut bus, &mut engine, u32::MAX - 1), 0);
-    }
-
-    #[cfg(any(a64_jit, t32_jit))]
-    #[test]
-    fn jit_ineligible_retf_then_stack_load_keeps_shadow_through_hit_or_fault() {
-        for load in [&[0x8e, 0xd0][..], &[0x17][..]] {
-            let target = 0x2000 + load.len();
-            let mut cpu = Cpu::new();
-            cpu.enter_protected_flat(target as u32, 0);
-            cpu.set_seg_cache(SegmentReg::Ds, SegmentCache::new(24, 0, 0x6003, 0x4093));
-            cpu.gdtr = crate::x86::cpu::TableReg {
-                base: 0x5000,
-                limit: 23,
-            };
-            cpu.regs[3] = 0x6000;
-            let mut bus = HostBus::new(0x10000);
-            bus.attention = false;
-            bus.next_attention_step = u64::MAX;
-            bus.ram[0x1000..0x1002].copy_from_slice(&[0x66, 0xcb]);
-            bus.ram[0x2000..target].copy_from_slice(load);
-            bus.ram[target..target + 2].copy_from_slice(&[0xff, 0x23]); // JMP [EBX].
-            write_ram_u32(&mut bus, 0x6000, target as u32);
-            for (offset, high) in [(8, 0x00cf_9b00), (16, 0x00cf_9300)] {
-                write_ram_u32(&mut bus, 0x5000 + offset, 0xffff);
-                write_ram_u32(&mut bus, 0x5004 + offset, high);
-            }
-            write_ram_u32(&mut bus, 0x4000, 0x2000);
-            write_ram_u32(&mut bus, 0x4004, 8);
-            write_ram_u32(&mut bus, 0x4008, 16);
-            let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-            engine.run_batch(&mut cpu, &mut bus, 0, 64).unwrap();
-            assert!(engine.stats.native_steps > 0);
-            // RETF enters PM32 at a cold SS load. Only the following JMP is compiled.
-            for (due, fault) in [(false, false), (false, true), (true, false)] {
-                cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(8, 0, 0xffff, 0x9b));
-                cpu.eip = 0x1000;
-                cpu.regs[0] = 16;
-                cpu.regs[3] = if fault { 0x6004 } else { 0x6000 };
-                cpu.regs[4] = 0x4000;
-                cpu.replace_eflags(0x202);
-                let start = cpu.tsc();
-                bus.next_attention_step = if due { start + 1 } else { u64::MAX };
-                let before = engine.stats.native_steps;
-                let result = engine.run_batch(&mut cpu, &mut bus, start, 5).unwrap();
-                let ran = if due { 2 } else { 3 };
-                assert_eq!(
-                    (result.ran, cpu.tsc(), cpu.interrupt_shadow()),
-                    (ran, start + ran, due)
-                );
-                assert_eq!(
-                    engine.stats.native_steps - before,
-                    u64::from(!due && !fault)
-                );
-                let instruction_step = start + ran - 1;
-                let expected = if fault {
-                    BatchStop::Step {
-                        instruction_step,
-                        instruction_eip: target as u32,
-                        was_interruptible: false,
-                        reason: BatchStepStop::Error(StepError::GeneralProtection {
-                            eip: target as u32,
-                            code: 0,
-                        }),
-                    }
-                } else {
-                    BatchStop::Attention {
-                        instruction_step,
-                        was_interruptible: false,
-                    }
-                };
-                assert_eq!(result.stop, expected);
-            }
-        }
     }
 
     #[cfg(a64_jit)]
