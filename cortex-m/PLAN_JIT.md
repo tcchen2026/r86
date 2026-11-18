@@ -521,12 +521,9 @@ arm64 backend.
 
 ## Deferred: compile 16-bit code
 
-Status: proposal, not approved, not started. User, 2026-11-15, on the Lead's
-recommendation: "document this we may do further". AGENTS.md ("JIT focus")
-keeps 16-bit code interpreter-only and reopens the question on a measurement
-that shows 16-bit code dominating a priority workload. The measurement below
-is offered as that evidence for Windows 95 on the Cortex-M33. A go needs the
-user's decision and an edit of that rule for this backend.
+The Lead recorded this proposal on 2026-11-15 at the user's request to
+"document this we may do further". The Windows 95 measurements below led to
+the [T16 pilot](#t16-16-bit-protected-mode-code-on-thumb-2).
 
 Measurement (W95A after step 250 M; `REPORT.md` "Task X"):
 - Mode shares: 16-bit protected (PM16) 19.18%, 32-bit 80.70%, real/V86
@@ -618,6 +615,46 @@ with `R86_T32_PROFILE_CODE16=1`; `REPORT.md` "Task Y, part 1"):
   8-bit and 16-bit ADC/SBB, RCL of an 8-bit register by 1 (1.3%), ROR of a
   16-bit register by CL (0.7%), JCXZ (0.9%), 8-bit XCHG (0.5%), MOV from a
   segment register (0.8%).
+
+## T16: 16-bit protected-mode code on Thumb-2
+
+**The Lead kept only Act 1** (`b0dd54a`, gates G1–G5 passed). Act 2 with Fix A cost 94.32 Arm instructions
+per x86 step after boot (+29.11% over Act 1) and cleared the arena eight times. The keep limits were 69.4
+Arm/step after boot and six clears over the full run. Both Act 2 builds passed differential tests and
+reproduced the baseline frame and guest RAM hashes at 250 M and 650 M steps.
+
+The goal was faster Windows 95 applications (W95A). The Intern used QEMU Cortex-M33 with `-icount shift=0`,
+the frozen Micro95 disk and `firmware/w95a.keys`. In Act 0, PM16 accounted for 19.36% of steps after boot
+and an estimated 57.24% of their Arm instructions. The three cost columns below use plain builds.
+
+| Stage | Boot 0–250 M (Arm/step) | W95A 0–650 M (Arm/step) | Apps 250–650 M (Arm/step) | Full W95A arena clears |
+| --- | ---: | ---: | ---: | ---: |
+| Act 0 baseline (`a8e4306`) | 94.62 | 81.47 | 73.25 | 3 |
+| Act 1 retain JIT mapping epochs on CS loads | 94.41 | 81.27 | 73.05 | 3 |
+| Act 2 PM16 pilot | 113.34 | 114.65 | 115.47 | 8 |
+| Act 2 with Fix A | 100.39 | 96.66 | 94.32 | 8 |
+
+D1 gave CPL3 PM16 code with a 16-bit stack (`CS.D=0`, `SS.B=0`) its own 8,192-slot `[linear, code]` plane.
+The dispatcher added the live CS base to IP. Each block checked the incoming IP before reserving budget
+to distinguish base/IP pairs with the same linear address. A constant `CODE16` Store fact let blocks
+survive segment changes by checking live segment bounds. Fix A reused the writable-alias hint and
+retired only the dispatch slots belonging to the modified physical page on single-page invalidation.
+
+| Sampled cost after boot (Arm/step) | Act 1 | Act 2 with Fix A | Change |
+| --- | ---: | ---: | ---: |
+| Native entry and return | 1.63 | 11.08 | +9.45 |
+| Other engine loop, lookup and Store work | 3.37 | 19.91 | +16.54 |
+| Table and context maintenance | 0.84 | 3.75 | +2.91 |
+| Identified compilation and reset sites | 0.17 | 0.62 | +0.45 |
+| Version checks, watches and revalidation | 1.38 | 0.48 | −0.90 |
+| Generated code (Fix A includes an estimated 3.19 for PM16) | 11.19 | 14.31 | +3.13 |
+| Interpreter | 40.15 | 26.44 | −13.71 |
+| Paging, shared helpers, devices and other | 14.33 | 17.73 | +3.40 |
+| **Total** | **73.05** | **94.32** | **+21.27** |
+
+After boot, native invocations rose from 2.79 M to 10.95 M. The counters recorded 51.38 M native PM16 steps.
+How much entry and lookup work is avoidable? How far could chains run across segment loads and CPL3 far transfers?
+Could smaller blocks or a different compilation threshold bring the 2 MiB arena within the clear limit?
 
 ## ARMv6K backend (New 3DS)
 
