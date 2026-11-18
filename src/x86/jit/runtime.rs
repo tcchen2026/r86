@@ -1065,7 +1065,7 @@ impl Engine {
         cpu.fill_fetch_cursor_after(cpu.eip, backing, 1, window as u32);
     }
 
-    fn lookup(&mut self, cpu: &mut Cpu, bus: &mut HostBus) -> Result<Lookup, String> {
+    fn lookup(&mut self, cpu: &mut Cpu, bus: &mut HostBus, admit: bool) -> Result<Lookup, String> {
         self.sync_mapping(cpu);
         self.sync_code(bus);
         let linear = LinearAddr(cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip));
@@ -1161,6 +1161,9 @@ impl Engine {
                 }
                 return Ok(Lookup::Interpret);
             }
+        }
+        if !admit {
+            return Ok(Lookup::Cold);
         }
         // Source versions are execute proofs, not heat identities. A data
         // write cannot cool entries; only changed recorded code restarts them.
@@ -1422,6 +1425,7 @@ impl Engine {
         bus.sync_ioram(cpu);
         bus.jit_prepare_code_pages();
         let mut ran = 0;
+        let mut resumed = None;
         while ran < budget {
             let mut cold = false;
             let mut repeat = None;
@@ -1435,7 +1439,7 @@ impl Engine {
             // PM32 retains its full CS limit rule and flat specializations.
             // Taking the normal interpreter batch also avoids a slow
             // per-instruction real-mode path during BIOS startup. The next
-            // machine boundary retries JIT.
+            // machine boundary or a segment load can resume native execution.
             let shadowed = cpu.interrupt_shadow();
             let eligible = cpu.jit_code_eligible();
             let plan = bus.batch_attention_limit(start.wrapping_add(ran), budget - ran);
@@ -1443,7 +1447,10 @@ impl Engine {
             let native_limit = if shadowed { 1 } else { limit };
             let native_attention = attention || shadowed;
             if eligible {
-                let entry = self.lookup(cpu, bus)?;
+                let entry = match resumed.take() {
+                    Some(entry) => entry,
+                    None => self.lookup(cpu, bus, true),
+                }?;
                 cold = matches!(entry, Lookup::Cold);
                 let native = match entry {
                     Lookup::Native(block) if !shadowed || block.is_single_instruction() => {
@@ -1599,7 +1606,7 @@ impl Engine {
                             continue;
                         }
                         #[cfg(feature = "jit-profile")]
-                        self.lookup(cpu, bus)?; // Opcode counts.
+                        self.lookup(cpu, bus, true)?; // Opcode counts.
                     }
                     assert!(
                         matches!(frame.exit_kind, 0..=4 | 7),
@@ -1700,7 +1707,25 @@ impl Engine {
                 // halt and explicit attention keep their own precise result.
                 Interpreter::run_one(cpu, bus, start.wrapping_add(ran))
             } else {
-                Interpreter::run_batch(cpu, bus, start.wrapping_add(ran), budget - ran)
+                Interpreter::run_ineligible(
+                    cpu,
+                    bus,
+                    start.wrapping_add(ran),
+                    budget - ran,
+                    &mut |cpu, bus| {
+                        let found = self.lookup(cpu, bus, false);
+                        match &found {
+                            Ok(Lookup::Native(block))
+                                if !cpu.interrupt_shadow() || block.is_single_instruction() => {}
+                            Err(_) => {}
+                            _ => return false,
+                        }
+                        // No guest instruction or publication intervenes before
+                        // the next iteration consumes this exact lookup.
+                        resumed = Some(found);
+                        true
+                    },
+                )
             };
             if shadowed && matches!(batch.stop, BatchStop::Budget) {
                 batch.stop = BatchStop::Attention {

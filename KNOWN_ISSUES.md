@@ -21,6 +21,13 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: on Windows window switches the interpreter runs 0.34% of guest
   instructions for 11.5% of cycles (INT/IRET, short budgets, page-split
   instructions); JIT dispatch takes another 21%.
+- perf: Windows 98 window switches on the Pi 5 take about 141 ms to
+  Explorer and 61 ms to Notepad (A64 JIT, 2026-11-18). VMDisp9x's
+  QEMUMINI.VXD erases and redraws the software pointer around every
+  drawing operation (35–39 / 6–8 ms); DIBENG's text expansion is
+  interpreted because its 32-bit code segment has a limit (20–21 ms of the
+  Notepad switch); JIT lookup, dispatch and admission take 34 ms of the
+  Explorer switch.
 - cpu: x87 registers are `f64` (`FpuState`, src/x86/cpu.rs). Integers
   loaded by FILD m64 or an integral 80-bit load stay exact only through
   moves, saves and integer or 80-bit stores; arithmetic, FCHS/FABS,

@@ -327,6 +327,9 @@ impl StepError {
 
 pub struct Interpreter;
 
+#[cfg(a64_jit)]
+type SegmentTarget<'a, B> = dyn FnMut(&mut Cpu, &mut B) -> bool + 'a;
+
 #[derive(Clone, Copy)]
 enum Prefix {
     None,
@@ -655,6 +658,8 @@ impl Interpreter {
             budget,
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
             None,
+            #[cfg(a64_jit)]
+            None,
         )
     }
 
@@ -683,7 +688,20 @@ impl Interpreter {
         start_step: u64,
         budget: u64,
     ) -> BatchResult {
-        Self::run_counted_batch::<B, false, true>(cpu, bus, start_step, budget)
+        Self::run_counted_batch::<B, false, true>(cpu, bus, start_step, budget, None)
+    }
+
+    /// At a successful CS or SS load the A64 engine may already have a body
+    /// for the new context. Ordinary instructions keep the usual batch loop.
+    #[cfg(a64_jit)]
+    pub(crate) fn run_ineligible<B: Bus>(
+        cpu: &mut Cpu,
+        bus: &mut B,
+        start_step: u64,
+        budget: u64,
+        target: &mut SegmentTarget<'_, B>,
+    ) -> BatchResult {
+        Self::run_counted_batch::<B, false, false>(cpu, bus, start_step, budget, Some(target))
     }
 
     /// Precise JIT handoffs use a specialization without a loop backedge.
@@ -700,6 +718,8 @@ impl Interpreter {
             start_step,
             1,
             #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
+            None,
+            #[cfg(a64_jit)]
             None,
         );
         // Keep this single-step boundary outside the large instruction kernel.
@@ -727,6 +747,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
+        #[cfg(a64_jit)] segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         bus.sync_ioram(cpu);
         #[cfg(feature = "r86chip")]
@@ -739,6 +760,8 @@ impl Interpreter {
                 budget as u32,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control,
+                #[cfg(a64_jit)]
+                segment_target,
             )
         } else {
             Self::run_large_batch::<B, SINGLE, CONTROL>(
@@ -748,6 +771,8 @@ impl Interpreter {
                 budget,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control,
+                #[cfg(a64_jit)]
+                segment_target,
             )
         };
         #[cfg(feature = "r86chip")]
@@ -776,6 +801,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] mut until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
+        #[cfg(a64_jit)] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         let mut ran = 0;
         loop {
@@ -787,6 +813,8 @@ impl Interpreter {
                 part,
                 #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))]
                 until_control.as_deref_mut(),
+                #[cfg(a64_jit)]
+                segment_target.as_deref_mut(),
             );
             ran += batch.ran;
             if batch.ran != u64::from(part)
@@ -810,6 +838,7 @@ impl Interpreter {
         #[cfg(all(feature = "wasm-jit", target_arch = "wasm32"))] mut until_control: Option<
             &mut crate::x86::jit::wasm::runtime::ColdEntries,
         >,
+        #[cfg(a64_jit)] mut segment_target: Option<&mut SegmentTarget<'_, B>>,
     ) -> BatchResult {
         let budget = if SINGLE { 1 } else { u64::from(budget) };
         if budget != 0 && cpu.halted {
@@ -876,6 +905,32 @@ impl Interpreter {
                     match $operation {
                         Ok(value) => value,
                         Err(error) => stop!(BatchStepStop::from(error)),
+                    }
+                };
+            }
+            macro_rules! segment_loaded {
+                () => {
+                    #[cfg(a64_jit)]
+                    if !SINGLE && !CONTROL && chunk_left > 1 {
+                        if let Some(target) = segment_target.as_deref_mut() {
+                            if cpu.jit_code_eligible()
+                                && (!cpu.interrupt_shadow() || bus.batch_interrupts_quiet())
+                            {
+                                let due = if attention_plan.is_some() {
+                                    bus.batch_attention_raised()
+                                } else {
+                                    bus.instruction_attention_due(instruction_step)
+                                };
+                                if due {
+                                    stop!(BatchStepStop::Attention);
+                                }
+                                if target(cpu, bus) {
+                                    loop_budget = instruction_step.wrapping_sub(start_step) + 1;
+                                    attention_at_limit = false;
+                                    break 'batch None;
+                                }
+                            }
+                        }
                     }
                 };
             }
@@ -1004,6 +1059,7 @@ impl Interpreter {
                         step_try!(pop_segment(cpu, bus, seg, operand16, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
+                            segment_loaded!();
                             if SINGLE
                                 || CONTROL
                                 || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
@@ -1903,6 +1959,7 @@ impl Interpreter {
                         step_try!(load_segment(cpu, bus, seg, selector, start_eip));
                         if seg == SegmentReg::Ss {
                             cpu.inhibit_maskable_interrupts();
+                            segment_loaded!();
                             if SINGLE
                                 || CONTROL
                                 || !continue_after_interrupt_shadow(cpu, bus, chunk_left > 1)
@@ -2275,24 +2332,31 @@ impl Interpreter {
                     0xca => {
                         let imm = step_try!(fetch_u16(cpu, bus)) as u32;
                         step_try!(far_ret(cpu, bus, operand16, imm, start_eip));
+                        segment_loaded!();
                     }
-                    0xcb => step_try!(far_ret(cpu, bus, operand16, 0, start_eip)),
+                    0xcb => {
+                        step_try!(far_ret(cpu, bus, operand16, 0, start_eip));
+                        segment_loaded!();
+                    }
                     0xcc => {
                         step_try!(deliver_software_interrupt(
                             cpu, bus, 3, cpu.eip, start_eip, false
                         ));
+                        segment_loaded!();
                     }
                     0xcd => {
                         let vector = step_try!(fetch_u8(cpu, bus));
                         step_try!(deliver_software_interrupt(
                             cpu, bus, vector, cpu.eip, start_eip, true
                         ));
+                        segment_loaded!();
                     }
                     0xce => {
                         if cpu.flag(EFLAGS_OF) {
                             step_try!(deliver_software_interrupt(
                                 cpu, bus, 4, cpu.eip, start_eip, false
                             ));
+                            segment_loaded!();
                         }
                     }
                     0xcf => {
@@ -2786,6 +2850,10 @@ impl Interpreter {
                                 opcode,
                                 opcode2,
                             ));
+                            #[cfg(a64_jit)]
+                            if !SINGLE && !CONTROL && matches!(opcode2, 0x34 | 0x35 | 0xb2) {
+                                segment_loaded!();
+                            }
                         }
                     }
                     _ => {

@@ -8034,6 +8034,112 @@ mod host_bus_tests {
 
     #[cfg(a64_jit)]
     #[test]
+    fn jit_ineligible_retf_resumes_only_precompiled_current_code() {
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x2000, 0);
+        let flat = SegmentCache::flat(8, 0xc09b);
+        cpu.set_seg_cache(SegmentReg::Cs, flat);
+        cpu.gdtr = crate::x86::cpu::TableReg {
+            base: 0x5000,
+            limit: 15,
+        };
+        let mut bus = HostBus::new(0x10000);
+        bus.attention = false;
+        bus.next_attention_step = u64::MAX;
+        write_ram_u32(&mut bus, 0x5008, 0xffff);
+        write_ram_u32(&mut bus, 0x500c, 0x00cf_9b00);
+        write_ram_u32(&mut bus, 0x4000, 0x2000);
+        write_ram_u32(&mut bus, 0x4004, 8);
+        bus.ram[0x1000] = 0xcb; // RETF from a limited PM32 CS.
+        bus.ram[0x2000..0x2003].copy_from_slice(&[0x43, 0xeb, 0xfd]);
+        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+
+        let run_return = |cpu: &mut Cpu,
+                          bus: &mut HostBus,
+                          engine: &mut crate::x86::jit::runtime::Engine,
+                          delta: u32| {
+            cpu.set_seg_cache(
+                SegmentReg::Cs,
+                SegmentCache {
+                    limit: 0x7fff,
+                    ..flat
+                },
+            );
+            cpu.eip = 0x1000;
+            cpu.regs[3] = 0;
+            cpu.regs[4] = 0x4000;
+            let tsc = cpu.tsc();
+            let before = engine.stats.native_steps;
+            let result = engine.run_batch(cpu, bus, tsc, 5).unwrap();
+            assert_eq!((result.ran, result.stop), (5, BatchStop::Budget));
+            assert_eq!(
+                (cpu.eip, cpu.regs[3], cpu.regs[4], cpu.tsc()),
+                (0x2000, delta, 0x4008, tsc + 5)
+            );
+            engine.stats.native_steps - before
+        };
+        for _ in 0..=crate::x86::jit::runtime::HOT {
+            assert_eq!(run_return(&mut cpu, &mut bus, &mut engine, 2), 0);
+        }
+        assert_eq!(engine.stats.compiled_blocks, 0);
+        engine.run_batch(&mut cpu, &mut bus, 100, 64).unwrap();
+        assert_eq!(run_return(&mut cpu, &mut bus, &mut engine, 2), 4);
+        bus.write_phys_u8(PhysAddr(0x2000), 0x4b).unwrap(); // DEC EBX.
+        assert_eq!(run_return(&mut cpu, &mut bus, &mut engine, u32::MAX - 1), 0);
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
+    fn jit_ineligible_stack_load_observes_shadow_before_native_target() {
+        for load in [&[0x8e, 0xd0][..], &[0x17][..]] {
+            let mut cpu = Cpu::new();
+            let target = 0x1000 + load.len();
+            cpu.enter_protected_flat(target as u32, 0);
+            cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(8, 0, 0xffff, 0x9b));
+            cpu.set_seg_cache(SegmentReg::Ss, SegmentCache::new(16, 0, 0xffff, 0x93));
+            cpu.gdtr = crate::x86::cpu::TableReg {
+                base: 0x5000,
+                limit: 23,
+            };
+            let mut bus = HostBus::new(0x10000);
+            bus.attention = false;
+            bus.next_attention_step = u64::MAX;
+            bus.ram[0x1000..target].copy_from_slice(load);
+            bus.ram[target..target + 2].copy_from_slice(&[0xeb, 0xfe]);
+            write_ram_u32(&mut bus, 0x5010, 0xffff);
+            write_ram_u32(&mut bus, 0x5014, 0x0000_9300);
+            write_ram_u32(&mut bus, 0x4000, 16);
+            let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
+            engine.run_batch(&mut cpu, &mut bus, 0, 64).unwrap();
+            assert!(engine.stats.native_steps > 0);
+            for due in [false, true] {
+                cpu.set_seg_cache(SegmentReg::Ss, SegmentCache::flat(24, 0xc093));
+                cpu.eip = 0x1000;
+                cpu.regs[0] = 16;
+                cpu.regs[4] = 0x4000;
+                cpu.replace_eflags(0x202);
+                let start = cpu.tsc();
+                bus.next_attention_step = if due { start } else { u64::MAX };
+                let before = engine.stats.native_steps;
+                let result = engine.run_batch(&mut cpu, &mut bus, start, 4).unwrap();
+                let ran = if due { 1 } else { 2 };
+                assert_eq!(result.ran, ran);
+                assert_eq!(
+                    result.stop,
+                    BatchStop::Attention {
+                        instruction_step: start + ran - 1,
+                        was_interruptible: false,
+                    }
+                );
+                assert_eq!(cpu.interrupt_shadow(), due);
+                assert_eq!((cpu.eip, cpu.tsc()), (target as u32, start + ran));
+                assert_eq!(engine.stats.native_steps - before, ran - 1);
+            }
+        }
+    }
+
+    #[cfg(a64_jit)]
+    #[test]
     fn jit_shadowed_instructions_keep_budget_attention_and_fault_boundaries() {
         for code16 in [false, true] {
             for flags in [2, 0x202] {
