@@ -614,6 +614,119 @@ fn native_pm16_target_limit_faults_precede_stack_and_counter_commits() {
 }
 
 #[test]
+fn native_pm32_limited_cs_fetch_and_direct_targets() {
+    // INC precedes each branch. A guard exit must let it retire once, and a
+    // taken branch must fault at its own EIP before changing ESP or ECX.
+    let start = 0x10100;
+    for (bytes, taken) in [
+        (&[0x43, 0x74, 0x70][..], false),
+        (&[0x43, 0x74, 0x70][..], true),
+        (&[0x43, 0xe2, 0x70][..], true),
+        (&[0x43, 0xe8, 0x70, 0, 0, 0][..], true),
+    ] {
+        let (frame, stop) = check_mode(
+            bytes,
+            |cpu, _| {
+                cpu.eip = start;
+                let mut cs = cpu.seg(SegmentReg::Cs);
+                cs.limit = start + 0x10;
+                cpu.set_seg_cache(SegmentReg::Cs, cs);
+                cpu.regs[1] = 2;
+                cpu.regs[3] = if taken { u32::MAX } else { 0 };
+            },
+            false,
+            false,
+        );
+        assert_eq!((frame.completed, frame.eip, frame.exit_kind), (0, start, 7));
+        if taken {
+            assert!(
+                matches!(stop, BatchStop::Step { reason: BatchStepStop::Error(
+                StepError::GeneralProtection { eip, code: 0 }), .. } if eip == start + 1)
+            );
+        } else {
+            assert_eq!(stop, BatchStop::Budget);
+        }
+    }
+    // One instruction ends at EIP ffffffff (next EIP zero). Its last byte
+    // still exceeds the limit, even though its linear address wraps into RAM.
+    let (frame, stop) = check_mode(
+        &[0xb8, 1, 2, 3, 4],
+        |cpu, _| {
+            cpu.eip = u32::MAX - 4;
+            let mut cs = cpu.seg(SegmentReg::Cs);
+            cs.limit = u32::MAX - 1;
+            cpu.set_seg_cache(SegmentReg::Cs, cs);
+        },
+        false,
+        false,
+    );
+    assert_eq!((frame.completed, frame.exit_kind), (0, 7));
+    assert!(matches!(
+        stop,
+        BatchStop::Step {
+            reason: BatchStepStop::Error(StepError::GeneralProtection { .. }),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn native_pm32_limited_cs_indirect_targets_use_operand_width_before_commit() {
+    for op in [
+        &[0xc3][..],
+        &[0xc2, 0x10, 0],
+        &[0xff, 0xd0],
+        &[0xff, 0xe0],
+        &[0xff, 0x15, 0x20, 4, 0, 0],
+    ] {
+        for (word, target, allowed) in [
+            (false, 0x10110, true),
+            (false, 0x20110, false),
+            (true, 0x20110, true),
+        ] {
+            let mut bytes = vec![0x43]; // Retire INC before a dynamic target miss.
+            if word {
+                bytes.push(0x66);
+            }
+            bytes.extend_from_slice(op);
+            let (frame, stop) = check_mode(
+                &bytes,
+                |cpu, mem| {
+                    cpu.eip = 0x10100;
+                    let mut cs = cpu.seg(SegmentReg::Cs);
+                    cs.limit = 0x10110;
+                    cpu.set_seg_cache(SegmentReg::Cs, cs);
+                    cpu.regs[0] = target;
+                    mem.word(0x70800, target);
+                    mem.word(0x30420, target);
+                },
+                allowed,
+                false,
+            );
+            if allowed {
+                assert_eq!(stop, BatchStop::Budget);
+            } else {
+                assert_eq!(
+                    (frame.completed, frame.eip, frame.exit_kind),
+                    (1, 0x10101, 7)
+                );
+                assert_eq!(frame.regs[4], 0x800);
+                assert!(matches!(
+                    stop,
+                    BatchStop::Step {
+                        reason: BatchStepStop::Error(StepError::GeneralProtection {
+                            eip: 0x10101,
+                            code: 0
+                        }),
+                        ..
+                    }
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn native_pm16_decode_stops_at_deferred_forms_and_ip_boundary() {
     for bytes in [
         &[0x9a, 0, 0, 0, 0][..],

@@ -69,7 +69,7 @@ pub struct Frame {
     pub completed: u64,
     /// Kind 5 requests attention; kind 6 also requires the adapter to install
     /// STI's interrupt shadow before handing control back to the machine.
-    /// Kind 7 leaves before a CODE16 fetch/target limit violation.
+    /// Kind 7 retries a block fetch or near target against the live CS limit.
     pub exit_kind: u32,
     /// No deliverable PIC request or bus attention at entry, independent of IF.
     /// Constant for this invocation: generated code accesses only RAM or plain

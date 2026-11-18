@@ -18,9 +18,9 @@
 //! the access lowering. SoftMMU misses return before the attempted instruction.
 //! All state is committed before returning to Rust; no lazy-flag ABI leaks out.
 //!
-//! Entry requires protected mode without VM/debug step. PM32 requires a full
-//! CS limit. PM16 requires SS.B=0 and checks all segments, block fetch limits
-//! and near targets before their commits. The budget ends by the next machine
+//! Entry requires protected mode without VM/debug step. PM16 requires SS.B=0
+//! and checks all segments. PM16 and size-limited PM32 check the last fetched
+//! byte and near targets before their commits. The budget ends by the next machine
 //! event. During an interrupt shadow the adapter may invoke only a recognized
 //! one-instruction entry with budget one, retaining the shadow/attention boundary.
 //! An insufficient budget returns without executing any instruction. The runtime
@@ -1484,11 +1484,12 @@ pub fn block(
     let mut attention_exits = Vec::new();
     let done = a.label();
     let budget_exit = a.label();
-    let code_exit = code16.then(|| a.label());
+    let check_cs = block_facts & (soft::CODE16 | soft::LIMITED_CS) != 0;
+    let code_exit = check_cs.then(|| a.label());
     a.add_sub_imm(BUDGET, BUDGET, count, true, true, true);
     a.b_cond(Cond::Cc, budget_exit);
     if let Some(fail) = code_exit {
-        let mut last_ip = block.instructions.last().unwrap().next_eip - 1;
+        let mut last_ip = block.instructions.last().unwrap().next_eip.wrapping_sub(1);
         for instruction in &block.instructions {
             if let Op::Branch { target, .. }
             | Op::Loop { target, .. }
@@ -1510,7 +1511,7 @@ pub fn block(
     let mut stack_end = 0;
     let mut stack_remaining = 0;
     for (index, instruction) in block.instructions.iter().enumerate() {
-        let indirect16 = code16
+        let check_target = check_cs
             && matches!(
                 instruction.op,
                 Op::Return { .. }
@@ -1520,7 +1521,7 @@ pub fn block(
                         ..
                     }
             );
-        let site = (instruction.op.can_exit() || indirect16).then(|| InstructionExit {
+        let site = (instruction.op.can_exit() || check_target).then(|| InstructionExit {
             segments: &segments,
             range: ranges[index],
             miss: a.label(),
@@ -1528,7 +1529,7 @@ pub fn block(
             steps_before: index as u16,
             repeat: repeat_control(instruction.op).map(|control| (control, instruction.next_eip)),
             division: matches!(instruction.op, Op::Divide { .. }),
-            code_miss: indirect16.then(|| a.label()),
+            code_miss: check_target.then(|| a.label()),
         });
         if matches!(instruction.op, Op::Movs { .. } | Op::String { .. }) {
             segments.set(block_facts);
@@ -2820,7 +2821,7 @@ pub fn block(
             }
             Op::IndirectJump { src } => {
                 read_value(&mut a, LHS, src, site.as_ref(), &mut faults);
-                if indirect16 {
+                if check_target {
                     soft::code_limit(&mut a, LHS, site.as_ref().unwrap().code_miss.unwrap());
                 }
             }

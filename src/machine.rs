@@ -8050,7 +8050,8 @@ mod host_bus_tests {
         write_ram_u32(&mut bus, 0x500c, 0x00cf_9b00);
         write_ram_u32(&mut bus, 0x4000, 0x2000);
         write_ram_u32(&mut bus, 0x4004, 8);
-        bus.ram[0x1000] = 0xcb; // RETF from a limited PM32 CS.
+        // Operand-size override pops a dword frame in PM16 on a 32-bit stack.
+        bus.ram[0x1000..0x1002].copy_from_slice(&[0x66, 0xcb]);
         bus.ram[0x2000..0x2003].copy_from_slice(&[0x43, 0xeb, 0xfd]);
         let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
 
@@ -8058,13 +8059,7 @@ mod host_bus_tests {
                           bus: &mut HostBus,
                           engine: &mut crate::x86::jit::runtime::Engine,
                           delta: u32| {
-            cpu.set_seg_cache(
-                SegmentReg::Cs,
-                SegmentCache {
-                    limit: 0x7fff,
-                    ..flat
-                },
-            );
+            cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(8, 0, 0x7fff, 0x9b));
             cpu.eip = 0x1000;
             cpu.regs[3] = 0;
             cpu.regs[4] = 0x4000;

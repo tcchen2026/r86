@@ -42,6 +42,7 @@ const FLAT_SEGMENT_PROOFS: u32 = {
 };
 
 pub const CODE16: u32 = 1 << 30;
+pub const LIMITED_CS: u32 = 1 << 31;
 
 #[repr(C)]
 pub struct View {
@@ -134,7 +135,7 @@ pub fn recheck_code(a: &mut Assembler, witness: Reg, linear: Reg, fail: Label) {
 
 impl View {
     /// PM16 specializes only code/stack size and uses dynamic based segments.
-    /// PM32 specializes flat data/stack proofs. FS/GS
+    /// PM32 specializes flat data/stack proofs and whether CS needs a limit check. FS/GS
     /// are often replaced for TLS; including them would split otherwise
     /// identical code and consume context ids for ordinary TLS changes.
     /// The adapter qualifies each link with these facts and the CS base.
@@ -143,17 +144,26 @@ impl View {
             return CODE16; // Eligibility requires SS.B=0; native helpers cannot load SS.
         }
         let (flat_segments, flat_write_segments) = cpu.jit_segment_masks();
-        (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS
+        let flat = (flat_segments | (flat_write_segments << 8)) & FLAT_SEGMENT_PROOFS;
+        flat | if cpu.seg(SegmentReg::Cs).limit == u32::MAX {
+            0
+        } else {
+            LIMITED_CS
+        }
     }
 
     pub fn new(cpu: &mut Cpu, rechecks: bool) -> Self {
         let (entries, state) = cpu.translation_cache.jit_view();
+        let cs = cpu.seg(SegmentReg::Cs);
+        // Only a transfer out of native execution can reload CS.
+        let mut bounds = [[0, u32::MAX]; 6];
+        bounds[SegmentReg::Cs as usize][1] = cs.limit;
         let mut view = Self {
             entries,
-            state: state | (u64::from(cpu.seg(crate::x86::cpu::SegmentReg::Cs).base) << 32),
+            state: state | (u64::from(cs.base) << 32),
             permissions: 0,
             bases: [0; 6],
-            bounds: [[0, u32::MAX]; 6],
+            bounds,
             rechecks: cpu.translation_cache.rechecks.as_ptr(),
             recheck_context: cpu.translation_cache.recheck_context,
             walk_root: if rechecks {

@@ -1625,11 +1625,8 @@ impl Cpu {
         !self.halted
             && self.cr0 & CR0_PE != 0
             && self.eflags & ((1 << 8) | (1 << 17)) == 0
-            && if self.code_default16 {
-                self.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0
-            } else {
-                self.seg(SegmentReg::Cs).limit == u32::MAX
-            }
+            && (!self.code_default16
+                || self.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0)
     }
 
     #[cfg(all(a64_jit, feature = "jit-profile"))]

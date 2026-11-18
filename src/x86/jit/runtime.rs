@@ -15,8 +15,8 @@
 //! 12-bit context id. Context changes retain links; exhausting the 4095 ids
 //! clears both privilege planes before any id is reused.
 //! Protected 16-bit code requires a 16-bit stack and uses dynamic based segment
-//! checks. Real mode, V86 and debug stepping remain interpreted. PM32 keeps its
-//! full CS limit requirement and flat segment specializations.
+//! checks. Real mode, V86 and debug stepping remain interpreted. PM32 specializes
+//! flat data segments and checks fetches and near targets when CS has a limit.
 //! Execute revalidation is per page: the previous per-PC tags caused about
 //! 88 million context-related exits in the firmware workload. Restoring all
 //! entries of a revalidated page reduced a development cold boot from 48.1 to
@@ -1435,8 +1435,7 @@ impl Engine {
             let mut after_native = false;
             #[cfg(feature = "jit-profile")]
             let mut write_token_miss = false;
-            // Real mode, V86 and TF remain interpreted. PM16 requires SS.B=0;
-            // PM32 retains its full CS limit rule and flat specializations.
+            // Real mode, V86 and TF remain interpreted. PM16 requires SS.B=0.
             // Taking the normal interpreter batch also avoids a slow
             // per-instruction real-mode path during BIOS startup. The next
             // machine boundary or a segment load can resume native execution.
@@ -1892,10 +1891,10 @@ mod tests {
     }
 
     fn context_probe() -> (Engine, Cpu, *const u32) {
-        context_probe_mode(false)
+        context_probe_mode(false, u32::MAX)
     }
 
-    fn context_probe_mode(code16: bool) -> (Engine, Cpu, *const u32) {
+    fn context_probe_mode(code16: bool, limit: u32) -> (Engine, Cpu, *const u32) {
         let mut engine = Engine::with_limits(64 * 1024, 1).unwrap();
         let mut cpu = Cpu::new();
         cpu.enter_protected_flat(0x100, 0);
@@ -1906,6 +1905,9 @@ mod tests {
                 cpu.set_seg_cache(seg, cache);
             }
         }
+        let mut cs = cpu.seg(SegmentReg::Cs);
+        cs.limit = limit;
+        cpu.set_seg_cache(SegmentReg::Cs, cs);
         engine.sync_mapping(&mut cpu);
         let table = engine.arena.allocate_entries();
         let entries = engine.arena.entries_pointer(table);
@@ -1950,27 +1952,36 @@ mod tests {
     }
 
     #[test]
-    fn native_pm16_linked_body_checks_changed_cs_limit_and_mode_eligibility() {
-        let (mut engine, mut cpu, _) = context_probe_mode(true);
-        let epoch = cpu.jit_mapping_epoch();
-        let tag = engine.links[0].tag;
-        assert!(cpu.jit_code_eligible());
-        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+    fn native_linked_body_rechecks_the_live_cs_limit_in_both_code_sizes() {
+        for code16 in [false, true] {
+            let (mut engine, mut cpu, _) = context_probe_mode(code16, 0xffff);
+            let epoch = cpu.jit_mapping_epoch();
+            let tag = engine.links[0].tag;
+            assert!(cpu.jit_code_eligible());
+            assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+            let mut cs = cpu.seg(SegmentReg::Cs);
+            cs.limit = 0xff;
+            cpu.set_seg_cache(SegmentReg::Cs, cs);
+            engine.sync_mapping(&mut cpu);
+            assert_eq!(cpu.jit_mapping_epoch(), epoch);
+            assert_eq!(engine.link_context(), tag);
+            let frame = dispatch_probe(&mut engine, &mut cpu);
+            assert_eq!((frame.completed, frame.eip, frame.exit_kind), (0, 0x100, 7));
+            cs.limit = 0x100;
+            cpu.set_seg_cache(SegmentReg::Cs, cs);
+            engine.sync_mapping(&mut cpu);
+            assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
+        }
+    }
+
+    #[test]
+    fn jit_pm16_mode_eligibility() {
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(0x100, 0);
         let mut cs = cpu.seg(SegmentReg::Cs);
-        cs.limit = 0xff;
+        cs.flags &= !crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
         cpu.set_seg_cache(SegmentReg::Cs, cs);
-        engine.sync_mapping(&mut cpu);
-        assert_eq!(cpu.jit_mapping_epoch(), epoch);
-        assert_eq!(engine.links[0].tag, tag);
-        let frame = dispatch_probe(&mut engine, &mut cpu);
-        assert_eq!((frame.completed, frame.eip, frame.exit_kind), (0, 0x100, 7));
-        cs.limit = 0x100;
-        cpu.set_seg_cache(SegmentReg::Cs, cs);
-        engine.sync_mapping(&mut cpu);
-        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
         let mut ss = cpu.seg(SegmentReg::Ss);
-        ss.flags |= crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
-        cpu.set_seg_cache(SegmentReg::Ss, ss);
         assert!(!cpu.jit_code_eligible());
         ss.flags &= !crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
         cpu.set_seg_cache(SegmentReg::Ss, ss);
@@ -2026,15 +2037,16 @@ mod tests {
         assert_eq!(engine.link_context(), tag);
         assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 1);
 
-        // CS limits stay dynamic; changing D selects another context. Neither
-        // load expires the mapping epoch or discards the retained old link.
+        // An unchecked PM32 body cannot be entered from limited PM32 or PM16.
         let mut changed_cs = cs;
         changed_cs.limit = 0xffff;
         cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
         assert_eq!(cpu.jit_mapping_epoch(), epoch);
         engine.sync_mapping(&mut cpu);
         assert_eq!(engine.links[0].tag, tag);
-        assert!(!cpu.jit_code_eligible()); // A limited PM32 CS cannot enter.
+        assert!(cpu.jit_code_eligible());
+        assert_ne!(engine.link_context(), tag);
+        assert_eq!(dispatch_probe(&mut engine, &mut cpu).completed, 0);
         changed_cs.flags ^= crate::x86::cpu::SEGMENT_FLAG_DEFAULT_BIG;
         cpu.set_seg_cache(SegmentReg::Cs, changed_cs);
         assert_eq!(cpu.jit_mapping_epoch(), epoch);

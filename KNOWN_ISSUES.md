@@ -21,13 +21,15 @@ Tags: perf, cpu, device, host (frontends, console, host services), tool, build.
 - perf: on Windows window switches the interpreter runs 0.34% of guest
   instructions for 11.5% of cycles (INT/IRET, short budgets, page-split
   instructions); JIT dispatch takes another 21%.
-- perf: Windows 98 window switches on the Pi 5 take about 141 ms to
-  Explorer and 61 ms to Notepad (A64 JIT, 2026-11-18). VMDisp9x's
-  QEMUMINI.VXD erases and redraws the software pointer around every
-  drawing operation (35–39 / 6–8 ms); DIBENG's text expansion is
-  interpreted because its 32-bit code segment has a limit (20–21 ms of the
-  Notepad switch); JIT lookup, dispatch and admission take 34 ms of the
-  Explorer switch.
+- perf: Windows 98 window switches on the Pi 5 take about 124 ms to
+  Explorer and 54 ms to Notepad (A64 JIT, 2026-11-19). In DIBENG's text
+  expansion loop the JIT lowers 17 of 22 instructions; its five loads
+  through ES with a 67h prefix (16-bit addressing in 32-bit code) still
+  run in the interpreter. A profile before these changes attributed
+  35–39 ms on Explorer and 6–8 ms on Notepad to VMDisp9x's QEMUMINI.VXD
+  erasing and redrawing the software pointer around every drawing
+  operation, and 34 ms of the Explorer switch to JIT lookup, dispatch and
+  admission.
 - cpu: x87 registers are `f64` (`FpuState`, src/x86/cpu.rs). Integers
   loaded by FILD m64 or an integral 80-bit load stay exact only through
   moves, saves and integer or 80-bit stores; arithmetic, FCHS/FABS,
@@ -119,9 +121,10 @@ PE is not raised, and tininess at the smallest-normal rounding boundary is
 not modeled. Sound is SB16 with OPL2: no OPL3, MPU-401, recording or ADPCM.
 Networking is IPv4 TCP, ARP, DHCP and DNS A only. USB is UHCI with one
 HID tablet. Real-mode and V86 code always runs in the interpreter. The A64
-JIT also compiles 16-bit protected-mode code with a 16-bit stack; the other
-JITs compile only 32-bit code segments. Far transfers, string instructions,
-LES/LDS and SS loads in 16-bit code still run in the interpreter.
+JIT compiles 32-bit protected-mode code segments of any size and 16-bit
+protected-mode code with a 16-bit stack. The other JITs compile only 32-bit
+code segments. Far transfers, string instructions, LES/LDS and SS loads in
+16-bit code still run in the interpreter.
 
 ## Unexplained
 
