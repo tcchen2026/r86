@@ -5,7 +5,7 @@
 //! Armv8-M Mainline.
 
 use super::arena::Arena;
-use super::lower::{self, CODE16, Frame, STACK_FACT, STACK32_FACT};
+use super::lower::{self, Frame, STACK_FACT, STACK32_FACT};
 use crate::x86::cpu::{SegmentCache, SegmentReg};
 use crate::x86::jit::decode;
 use crate::x86::{BackingToken, BatchStop, Bus, Cpu, Interpreter, LinearAddr, MemError, PhysAddr};
@@ -93,11 +93,7 @@ impl Fixture {
     }
 
     fn with_facts(bytes: &[u8], eip: u32, facts: u32) -> Self {
-        let decoded = if facts == CODE16 {
-            decode::block_code16(bytes, eip, 64)
-        } else {
-            decode::block_extended(bytes, eip, 64)
-        };
+        let decoded = decode::block_extended(bytes, eip, 64);
         assert_eq!(decoded.byte_len, bytes.len(), "decode {bytes:02x?}");
         let compiled =
             lower::block(&decoded, facts).unwrap_or_else(|| panic!("native block {bytes:02x?}"));
@@ -106,14 +102,10 @@ impl Fixture {
             decoded.instructions.len(),
             "partial block {bytes:02x?}"
         );
-        Self::publish_mode(compiled, facts == CODE16)
+        Self::publish(compiled)
     }
 
     fn publish(compiled: lower::Compiled) -> Self {
-        Self::publish_mode(compiled, false)
-    }
-
-    fn publish_mode(compiled: lower::Compiled, word: bool) -> Self {
         let mut arena = Arena::new(1 << 16).unwrap();
         let shared = lower::shared();
         let entry = arena.publish(&shared.code).unwrap();
@@ -121,14 +113,8 @@ impl Fixture {
         let miss = (entry + shared.miss * 2) as u32 | 1;
         Self {
             _arena: arena,
-            entry: (entry + if word { shared.entry16 * 2 } else { 0 }) | 1,
-            dispatch: (entry
-                + if word {
-                    shared.dispatch16 * 2
-                } else {
-                    shared.dispatch * 2
-                })
-                | 1,
+            entry: entry | 1,
+            dispatch: (entry + shared.dispatch * 2) | 1,
             block: block | 1,
             count: compiled.instructions,
             table: alloc::vec![[0, miss]; 1 << lower::TABLE_BITS],
@@ -223,7 +209,7 @@ fn shared_stub_matches_reference() {
     let shared = lower::shared();
     assert_eq!((shared.dispatch, shared.miss), (7, 22));
     assert_eq!(
-        &shared.code[..shared.entry16],
+        &shared.code[..],
         &[
             0xe92d, 0x5ff0, 0xea4f, 0x0e00, 0xe89e, 0x0ff0, 0x4708, 0xf8de, 0x103c, 0xea80, 0x3210,
             0xea4f, 0x42c2, 0xeb01, 0x4112, 0xf8d1, 0x2000, 0xebb2, 0x0f00, 0xbf08, 0xf8d1, 0xf004,
@@ -1606,370 +1592,4 @@ fn arm_jit_word_stack_or_operand_ends_before_stack_operation() {
             assert_eq!(native.data, memory.data);
         }
     }
-}
-
-fn pm16(seed: u32) -> Cpu {
-    let mut cpu = initial(seed);
-    cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0x0b, 0, 0xffff, 0xfb));
-    for seg in [SegmentReg::Ds, SegmentReg::Es, SegmentReg::Ss] {
-        cpu.set_seg_cache(seg, SegmentCache::new(0x13, 0x10000, 0xffff, 0xf3));
-    }
-    cpu
-}
-
-/// Pointer TLBs belong to the native buffer only. A refused access must leave
-/// all state untouched, then reproduce the oracle through ordinary handoff.
-fn pm16_case(bytes: &[u8], mut cpu: Cpu, native: bool, fault: Option<crate::x86::StepError>) {
-    let fixture = Fixture::with_facts(bytes, cpu.eip, CODE16);
-    let mut memory = Bytes(0x00000180u32.to_le_bytes().repeat(0x30000 / 4));
-    let linear = cpu.seg(SegmentReg::Cs).base + cpu.eip;
-    memory.0[linear as usize..linear as usize + bytes.len()].copy_from_slice(bytes);
-    let mut actual_memory = Bytes(memory.0.clone());
-    let mut expected = cpu.clone();
-    for page in (0..0x30000u32).step_by(4096) {
-        cpu.fill_cached_write_translation(
-            LinearAddr(page),
-            BackingToken(actual_memory.0.as_mut_ptr() as u64 + u64::from(page)),
-            true,
-        );
-    }
-    let (frame, count) = fixture.run_with(&mut cpu, fixture.count);
-    let mut oracle = Ok(());
-    for _ in 0..fixture.count {
-        oracle = Interpreter::step(&mut expected, &mut memory).map(|_| ());
-        if oracle.is_err() {
-            break;
-        }
-    }
-    assert_eq!(oracle, fault.map_or(Ok(()), Err), "oracle {bytes:02x?}");
-    if native {
-        assert_eq!(
-            (frame.exit, count),
-            (lower::EXIT_BOUNDARY, fixture.count),
-            "{bytes:02x?}"
-        );
-        assert_eq!(frame.regs, expected.regs, "{bytes:02x?}");
-        assert_eq!(frame.eip, expected.eip, "{bytes:02x?}");
-        assert_eq!(
-            frame.eflags() | 2,
-            expected.effective_eflags(),
-            "{bytes:02x?}"
-        );
-    } else {
-        assert_eq!(
-            (frame.exit, count),
-            (lower::EXIT_INTERPRET, 0),
-            "{bytes:02x?}"
-        );
-        assert_eq!(frame.regs, cpu.regs, "{bytes:02x?}");
-        assert_eq!(frame.eip, cpu.eip);
-        assert_eq!(frame.eflags() | 2, cpu.effective_eflags());
-        let mut original = Bytes(0x00000180u32.to_le_bytes().repeat(0x30000 / 4));
-        original.0[linear as usize..linear as usize + bytes.len()].copy_from_slice(bytes);
-        assert_eq!(actual_memory.0, original.0);
-        cpu.invalidate_translation_cache();
-        let mut handoff = Ok(());
-        for _ in 0..fixture.count {
-            handoff = Interpreter::step(&mut cpu, &mut actual_memory).map(|_| ());
-            if handoff.is_err() {
-                break;
-            }
-        }
-        assert_eq!(handoff, oracle, "handoff {bytes:02x?}");
-        assert_eq!(cpu.regs, expected.regs);
-        assert_eq!(cpu.eip, expected.eip);
-        assert_eq!(cpu.effective_eflags(), expected.effective_eflags());
-    }
-    assert_eq!(actual_memory.0, memory.0, "memory {bytes:02x?}");
-}
-
-#[test]
-fn pm16_effective_addresses_wrap_before_bounds_and_preserve_widths() {
-    for mode in 0..3 {
-        for rm in 0..8 {
-            for prefix in [&[][..], &[0x66][..]] {
-                for opcode in [0x8b, 0x89, 0x8d] {
-                    let mut bytes = prefix.to_vec();
-                    bytes.extend([opcode, mode << 6 | rm]);
-                    match mode {
-                        0 if rm == 6 => bytes.extend([0x20, 0]),
-                        1 => bytes.push(0xf0),
-                        2 => bytes.extend([0xf0, 0xff]),
-                        _ => {}
-                    }
-                    let mut cpu = pm16(7);
-                    for reg in [3, 5] {
-                        cpu.regs[reg] = 0x8765_ffe0;
-                    }
-                    for reg in [6, 7] {
-                        cpu.regs[reg] = 0x4321_0050;
-                    }
-                    pm16_case(&bytes, cpu, true, None);
-                }
-            }
-        }
-    }
-    // Address and operand overrides are independent; no EA16 truncation here.
-    for bytes in [
-        &[0x67, 0x8b, 3][..],
-        &[0x66, 0x67, 0x8b, 3],
-        &[0x66, 0x8d, 7],
-    ] {
-        let mut cpu = pm16(7);
-        cpu.regs[3] = 0x10040;
-        cpu.set_seg_cache(
-            SegmentReg::Ds,
-            SegmentCache::new(0x13, 0x10000, 0x1ffff, 0xf3),
-        );
-        pm16_case(bytes, cpu, true, None);
-    }
-    let mut cpu = pm16(7);
-    cpu.regs[3] = 0x1234_ffff;
-    pm16_case(
-        &[0x8b, 7],
-        cpu.clone(),
-        false,
-        Some(crate::x86::StepError::GeneralProtection {
-            eip: 0x100,
-            code: 0,
-        }),
-    );
-    // Wider limit permits the word, but the page split still uses the interpreter.
-    cpu.set_seg_cache(
-        SegmentReg::Ds,
-        SegmentCache::new(0x13, 0x10000, 0x10000, 0xf3),
-    );
-    pm16_case(&[0x8b, 7], cpu, false, None);
-}
-
-#[test]
-fn pm16_narrow_alu_rotates_and_byte_exchange_match_interpreter() {
-    for seed in 0..40 {
-        for op in [0x10, 0x18] {
-            for (dst, src) in [(0, 1), (4, 0), (0, 4), (4, 4), (7, 6)] {
-                pm16_case(&[op, 0xc0 | src << 3 | dst], pm16(seed), true, None);
-                pm16_case(&[op | 1, 0xc0 | src << 3 | dst], pm16(seed), true, None);
-            }
-            pm16_case(&[op | 4, 0xff], pm16(seed), true, None);
-            pm16_case(&[op | 5, 0xff, 0xff], pm16(seed), true, None);
-        }
-        for modrm in [0xc0, 0xc4, 0xe0, 0xe4, 0xfe] {
-            pm16_case(&[0x86, modrm], pm16(seed), true, None);
-        }
-        for modrm in [0xd0, 0xd4, 0xd7, 0xd8, 0xdc] {
-            for opcode in [0xd0, 0xd1] {
-                pm16_case(&[opcode, modrm], pm16(seed), true, None);
-            }
-        }
-        for count in [0, 1, 2, 8, 15, 16, 17, 31, 32, 255] {
-            let mut cpu = pm16(seed);
-            cpu.regs[1] = (cpu.regs[1] & !255) | count;
-            pm16_case(&[0xd3, 0xc8], cpu, true, None); // ROR AX,CL
-            pm16_case(&[0xc1, 0xc8, count as u8], pm16(seed), true, None);
-        }
-        // ADC/SBB across memory, including a high-byte source and aliases.
-        for bytes in [
-            &[0x10, 0x27][..],
-            &[0x11, 7],
-            &[0x18, 0x27],
-            &[0x19, 7],
-            &[0x80, 0x17, 0xff],
-            &[0x81, 0x1f, 0xff, 0xff],
-            &[0x86, 0x27],
-        ] {
-            let mut cpu = pm16(seed);
-            cpu.regs[3] = 0xffff_5000;
-            pm16_case(bytes, cpu, true, None);
-        }
-    }
-}
-
-#[test]
-fn pm16_stack_width_wrap_and_faults_match_interpreter() {
-    for bytes in [
-        &[0x50][..],
-        &[0x54],
-        &[0x58],
-        &[0x5c],
-        &[0x68, 0x80, 1],
-        &[0x6a, 0xff],
-        &[0xff, 0x76, 0],
-        &[0xc9],
-        &[0xe8, 0x7d, 0],
-        &[0xff, 0xd0],
-        &[0xff, 0xd4],
-        &[0xff, 0x16, 0, 0x50],
-        &[0xc3],
-        &[0xc2, 0x10, 0],
-        &[0x06],
-        &[0x0e],
-        &[0x16],
-        &[0x1e],
-        &[0x0f, 0xa0],
-        &[0x0f, 0xa8],
-        &[0x66, 0x50],
-        &[0x66, 0x58],
-        &[0x66, 0x5c],
-        &[0x66, 0xc9],
-        &[0x66, 0x1e],
-        &[0x66, 0xc3],
-        &[0x66, 0xc2, 0x10, 0],
-        &[0x66, 0xff, 0xd0],
-        &[0x66, 0xff, 0xe0],
-        &[0x66, 0xe8, 0x7a, 0, 0, 0],
-    ] {
-        let mut cpu = pm16(7);
-        cpu.regs[0] = 0x180;
-        cpu.regs[4] = 0xabcd_5000;
-        cpu.regs[5] = 0x1234_5020;
-        pm16_case(bytes, cpu, true, None);
-    }
-    for (sp, bytes, native, fault) in [
-        (0, &[0x50][..], true, false),
-        (0xffff, &[0x50][..], true, false),
-        (1, &[0x50][..], false, true),
-        (0xfffe, &[0x58][..], true, false),
-        (0xffff, &[0x58][..], false, true),
-        (2, &[0x66, 0x50][..], false, true),
-    ] {
-        let mut cpu = pm16(7);
-        cpu.regs[4] = 0xabcd_0000 | sp;
-        pm16_case(
-            bytes,
-            cpu,
-            native,
-            fault.then_some(crate::x86::StepError::StackFault {
-                eip: 0x100,
-                code: 0,
-            }),
-        );
-    }
-    for seg in [SegmentReg::Ds, SegmentReg::Ss] {
-        for good in [false, true] {
-            let mut cpu = pm16(7);
-            cpu.set_seg_cache(seg, SegmentCache::new(0x13, 0x10000, 0x3fff, 0xf7));
-            cpu.regs[3] = if good { 0xabcd_4000 } else { 0xabcd_3fff };
-            cpu.regs[4] = if good { 0xabcd_4002 } else { 0xabcd_4001 };
-            let (bytes, fault) = if seg == SegmentReg::Ss {
-                (
-                    &[0x50][..],
-                    crate::x86::StepError::StackFault {
-                        eip: 0x100,
-                        code: 0,
-                    },
-                )
-            } else {
-                (
-                    &[0x8b, 7][..],
-                    crate::x86::StepError::GeneralProtection {
-                        eip: 0x100,
-                        code: 0,
-                    },
-                )
-            };
-            pm16_case(bytes, cpu, good, (!good).then_some(fault));
-        }
-    }
-}
-
-#[test]
-fn pm16_cs_read_permissions_selectors_and_target_fault_order() {
-    for segment in 0..6 {
-        for bytes in [
-            alloc::vec![0x8c, 0xc0 | segment << 3],
-            alloc::vec![0x66, 0x8c, 0xc0 | segment << 3],
-            alloc::vec![0x8c, 7 | segment << 3],
-        ] {
-            let mut cpu = pm16(7);
-            cpu.regs[3] = 0x1234_5000;
-            pm16_case(&bytes, cpu, true, None);
-        }
-    }
-    let gp = crate::x86::StepError::GeneralProtection {
-        eip: 0x100,
-        code: 0,
-    };
-    for (flags, write, good) in [
-        (0xfb, false, true),
-        (0xf9, false, false),
-        (0xfb, true, false),
-    ] {
-        let mut cpu = pm16(7);
-        cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0xb, 0, 0xffff, flags));
-        cpu.regs[3] = 0x1234_5000;
-        pm16_case(
-            &[0x2e, if write { 0x89 } else { 0x8b }, 7],
-            cpu,
-            good,
-            (!good).then_some(gp.clone()),
-        );
-    }
-    for bytes in [
-        &[0xb8, 1, 0][..],
-        &[0xe8, 0x7d, 0],
-        &[0xeb, 0x7e],
-        &[0xe2, 0x7e],
-        &[0xff, 0xd0],
-        &[0xff, 0xe0],
-        &[0xff, 0x16, 0, 0x50],
-        &[0xc3],
-        &[0xc2, 0x10, 0],
-    ] {
-        let mut cpu = pm16(7);
-        let limit = if bytes[0] == 0xb8 { 0x101 } else { 0x17f };
-        cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0xb, 0, limit, 0xfb));
-        cpu.regs[0] = 0x180;
-        cpu.regs[1] = 2;
-        cpu.regs[4] = 0xabcd_5000;
-        pm16_case(bytes, cpu, false, Some(gp.clone()));
-    }
-}
-
-#[test]
-fn pm16_loop_cx_ip_wrap_and_alias_dispatch() {
-    for opcode in 0xe0..=0xe3 {
-        for prefix in [&[][..], &[0x66][..], &[0x67][..]] {
-            for cx in [0x10000, 0x10001, 0x10002] {
-                for zf in [0, 0x40] {
-                    let mut bytes = prefix.to_vec();
-                    bytes.extend([opcode, 0x7d]);
-                    let mut cpu = pm16(7);
-                    cpu.regs[1] = cx;
-                    cpu.replace_eflags(2 | zf);
-                    pm16_case(&bytes, cpu, true, None);
-                }
-            }
-        }
-    }
-    let mut cpu = pm16(7);
-    cpu.eip = 0xffff;
-    // Sequential fetching retains 10000h, matching the interpreter/A64.
-    pm16_case(&[0x40], cpu, true, None);
-    let mut cpu = pm16(7);
-    cpu.eip = 0xfffe;
-    pm16_case(&[0xeb, 0], cpu, true, None); // A 16-bit near target wraps.
-    let mut jump = Fixture::with_facts(&[0xeb, 0x7e], 0x100, CODE16);
-    let target = Fixture::with_facts(&[0x43], 0x180, CODE16);
-    // Both bases resolve the same target IP correctly through linear tags.
-    for base in [0, 0x10000] {
-        let mut cpu = pm16(7);
-        cpu.set_seg_cache(SegmentReg::Cs, SegmentCache::new(0xb, base, 0xffff, 0xfb));
-        jump.table[lower::table_slot(base + 0x180)] = [base + 0x180, target.block as u32];
-        let (frame, count) = jump.run_with(&mut cpu, 2);
-        assert_eq!((count, frame.eip), (2, 0x181));
-        assert_eq!(
-            frame.regs[3],
-            (cpu.regs[3] & !0xffff) | (cpu.regs[3].wrapping_add(1) & 0xffff)
-        );
-    }
-    // A stale block has the same linear tag but was decoded at IP=280h.
-    let alias = Fixture::with_facts(&[0x40], 0x280, CODE16);
-    jump.table[lower::table_slot(0x180)] = [0x180, alias.block as u32];
-    let mut cpu = pm16(7);
-    let (frame, count) = jump.run_with(&mut cpu, 2);
-    assert_eq!(
-        (frame.exit, count, frame.eip, frame.remaining),
-        (lower::EXIT_BOUNDARY, 1, 0x180, 1)
-    );
-    assert_eq!(frame.regs, cpu.regs);
 }

@@ -621,11 +621,13 @@ with `R86_T32_PROFILE_CODE16=1`; `REPORT.md` "Task Y, part 1"):
 
 ## T16: 16-bit protected-mode code on Thumb-2
 
-**Research verdict, 2026-11-18: stop the Thumb-2 PM16 pilot.** Act 1
-(`b0dd54a`, G1–G5) is kept. Both pilots passed G1/G2 (differential tests,
-frame and RAM). Fix A cost 94.32 Arm/step with eight full-run clears
-(limits 69.4 and six). At fixed coverage, 62.53 (73.05 − 13.71 + 3.19)
-leaves 6.87 for overhead. Fix A added 31.78.
+**Stopped, 2026-11-18:** the research's verdict, then the user's decision.
+Act 1 (`b0dd54a`, G1–G5) is kept. The Act 2 code with Fix A is kept in
+history as `a8a2ef3`, marked as an experiment and reverted by the next
+commit. Both pilots passed G1/G2 (differential tests, frame and RAM).
+Fix A cost 94.32 Arm/step with eight full-run clears (limits 69.4 and
+six). At fixed coverage, 62.53 (73.05 − 13.71 + 3.19) leaves 6.87 for
+overhead. Fix A added 31.78.
 
 The Intern used frozen Micro95 and `firmware/w95a.keys` on QEMU Cortex-M33
 with `-icount shift=0`. Act 0 PM16 took 19.36% of app steps and ~57% of cost.

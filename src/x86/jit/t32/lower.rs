@@ -19,9 +19,8 @@
 //! case leaves before the instruction, which the interpreter then executes with
 //! its own fault and device semantics. Native code writes guest RAM only through
 //! write-tag hits; those exclude watched code pages, so compiled bytes cannot
-//! change during an invocation. Data accesses without a compiled flat fact
-//! check the live base, inclusive bounds and permissions. PM16 uses this
-//! checked path for every segment, including readable CS.
+//! change during an invocation. DS/ES/SS accesses require the block's compiled
+//! flat-segment facts; FS/GS check their dynamic base, limit and permission.
 //!
 //! Undefined flag values follow the shared interpreter, which is the
 //! differential oracle: logic and shifts clear AF; SHLD/SHRD keep AF, and OF
@@ -49,8 +48,6 @@ const PF_AF: u32 = 0x14;
 pub const STACK_FACT: u32 = 1 << 6;
 /// Block fact: SS has a 32-bit stack pointer; accesses still need checking.
 pub const STACK32_FACT: u32 = 1 << 7;
-/// PM16 user code, SS.B=0; all segment accesses use live bounds.
-pub const CODE16: u32 = 1 << 30;
 
 /// Access attribution grows generated blocks; opt in separately so ordinary
 /// jit-profile runs retain the plain build's code-cache pressure.
@@ -75,7 +72,7 @@ pub struct Frame {
     /// Instructions the chain may still complete. Each block reserves its
     /// full length on entry; a precise exit refunds the unexecuted rest.
     pub remaining: u32,
-    /// Current plane: [eip, code] for PM32, [linear, code] for user PM16.
+    /// Dispatch table for the current privilege: [eip, code] pairs.
     pub table: u32,
     /// Loaded together with LDRD by every guard.
     pub tlb_state: u32,
@@ -93,11 +90,6 @@ pub struct Frame {
     /// HostBus::batch_interrupts_quiet() at entry. Native code performs no
     /// device access, so this remains constant throughout the invocation.
     pub quiet: u32,
-    pub cs_base: u32,
-    pub cs_limit: u32,
-    pub cs_readable: u32,
-    #[cfg(feature = "jit-profile")]
-    pub ip_checks: u32,
     #[cfg(feature = "jit-profile")]
     pub checked_profile: u32,
     #[cfg(feature = "jit-profile")]
@@ -129,11 +121,6 @@ const CHECKED_CALLBACK: i32 = field(offset_of!(Frame, checked_callback));
 const POPF_MASK: i32 = field(offset_of!(Frame, popf_mask));
 const SELECTORS: i32 = field(offset_of!(Frame, selectors));
 const QUIET: i32 = field(offset_of!(Frame, quiet));
-const CS_BASE: i32 = field(offset_of!(Frame, cs_base));
-const CS_LIMIT: i32 = field(offset_of!(Frame, cs_limit));
-const CS_READABLE: i32 = field(offset_of!(Frame, cs_readable));
-#[cfg(feature = "jit-profile")]
-const IP_CHECKS: i32 = field(offset_of!(Frame, ip_checks));
 const _: () = assert!(offset_of!(Frame, regs) == 0);
 const _: () = assert!(TLB == TLB_STATE + 4 && TLB_STATE % 8 == 0);
 
@@ -154,10 +141,6 @@ impl Frame {
     pub(super) fn set_segments(&mut self, cpu: &crate::x86::Cpu) {
         let (flat, flat_write) = cpu.jit_segment_masks();
         let (bases, limits, read, write) = cpu.jit_based_segments();
-        if cpu.code_default16() {
-            (self.cs_readable, self.cs_base, _, self.cs_limit) =
-                cpu.jit_data_segment_range(SegmentReg::Cs);
-        }
         self.based = 0;
         for (index, segment) in DATA_SEGMENTS.into_iter().enumerate() {
             let bit = 1 << segment as u32;
@@ -224,8 +207,6 @@ pub struct Shared {
     pub code: Vec<u16>,
     pub dispatch: usize,
     pub miss: usize,
-    pub entry16: usize,
-    pub dispatch16: usize,
 }
 
 pub fn shared() -> Shared {
@@ -249,44 +230,16 @@ pub fn shared() -> Shared {
     a.ldr(R2, R1, 0);
     a.cmp(R2, R0);
     a.with_cond(Cond::Eq, |a| a.ldr(PC, R1, 4));
-    let miss_label = a.label();
-    a.bind(miss_label);
     let miss = a.offset();
     a.str(R0, FRAME, EIP);
     a.mov(R0, Operand::Imm(EXIT_BOUNDARY));
     a.str(R0, FRAME, EXIT);
     a.stm(FRAME, GUESTS);
     a.pop(regs(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 15]));
-    // PM16 keeps the incoming IP in R0 even when dispatch hashes CS.base+IP.
-    let entry16 = a.offset();
-    a.push(regs(&[4, 5, 6, 7, 8, 9, 10, 11, 12, 14]));
-    a.mov(FRAME, R0);
-    a.ldm(FRAME, GUESTS);
-    a.ldr(R0, FRAME, EIP);
-    a.bx(R1);
-    let dispatch16 = a.offset();
-    a.ldr(R3, FRAME, CS_BASE);
-    a.dp(Dp::Add, false, R3, R3, R0);
-    a.ldr(R1, FRAME, TABLE);
-    a.dp(Dp::Eor, false, R2, R3, Operand::Reg(R3, Shift::Lsr(12)));
-    a.mov(R2, Operand::Reg(R2, Shift::Lsl(32 - TABLE_BITS)));
-    a.dp(
-        Dp::Add,
-        false,
-        R1,
-        R1,
-        Operand::Reg(R2, Shift::Lsr(29 - TABLE_BITS)),
-    );
-    a.ldr(R2, R1, 0);
-    a.cmp(R2, R3);
-    a.with_cond(Cond::Eq, |a| a.ldr(PC, R1, 4));
-    a.b(miss_label);
     Shared {
         code: a.finish(),
         dispatch,
         miss,
-        entry16,
-        dispatch16,
     }
 }
 
@@ -466,16 +419,12 @@ impl Lower {
         }
     }
 
-    fn code16(&self) -> bool {
-        self.facts & CODE16 != 0
-    }
-
     fn flat(&self, segment: SegmentReg, write: bool) -> bool {
         self.facts & 1 << (segment as u32 + if write { 8 } else { 0 }) != 0
     }
 
     fn addressable(&self, segment: SegmentReg) -> bool {
-        segment != SegmentReg::Cs || self.code16()
+        segment != SegmentReg::Cs
     }
 
     // Preserve string admission: DS/ES/SS need their flat proof; FS/GS
@@ -493,7 +442,6 @@ impl Lower {
 
     fn supported(&self, op: Op) -> bool {
         let stack = self.facts & (STACK_FACT | STACK32_FACT) != 0;
-        let word = self.code16();
         match op {
             Op::Nop
             | Op::ByteSwap { .. }
@@ -511,8 +459,7 @@ impl Lower {
             Op::Mov { src, .. } | Op::Extend { src, .. } => self.value(src, false),
             Op::Store { address, .. } => self.addressable(address.segment),
             Op::Alu { kind, dst, src } => {
-                (dst.bits == 32 || word || !matches!(kind, Alu::Adc | Alu::Sbb))
-                    && self.value(src, false)
+                (dst.bits == 32 || !matches!(kind, Alu::Adc | Alu::Sbb)) && self.value(src, false)
             }
             Op::Compare { lhs, .. } => self.value(lhs, false),
             Op::MemoryAlu {
@@ -521,7 +468,7 @@ impl Lower {
                 bits,
                 ..
             } => {
-                (bits == 32 || word || !matches!(kind, Alu::Adc | Alu::Sbb))
+                (bits == 32 || !matches!(kind, Alu::Adc | Alu::Sbb))
                     && self.addressable(address.segment)
             }
             Op::Shift { dst, kind, count } => {
@@ -538,8 +485,6 @@ impl Lower {
                         kind <= 2
                             || (dst.bits == 32
                                 && (kind <= 4 || (kind <= 6 && count == Value::Immediate(1))))
-                            || (word && dst.bits == 16 && kind == 3)
-                            || (word && matches!(kind, 5 | 6) && count == Value::Immediate(1))
                     }
                     Value::Memory { address, .. } => kind <= 2 && self.addressable(address.segment),
                     Value::Immediate(_) => false,
@@ -553,7 +498,7 @@ impl Lower {
                 self.value(src, false)
             }
             Op::Exchange { kind, dst, src } => {
-                (src.bits == 32 || ((src.bits == 16 || word) && kind == ExchangeOp::Swap))
+                (src.bits == 32 || (src.bits == 16 && kind == ExchangeOp::Swap))
                     && self.value(dst, true)
             }
             Op::ConditionalMove { dst, src, .. } => dst.bits == 32 && self.value(src, false),
@@ -582,25 +527,20 @@ impl Lower {
                 repeat: None,
                 ..
             } => self.string_segment(SegmentReg::Es, true),
-            Op::Push { src, bits } => (word || (stack && bits == 32)) && self.value(src, false),
-            Op::Pop { dst } => word || (stack && dst.bits == 32),
-            Op::ReadSegment { dst, .. } => word && self.value(dst, true),
+            Op::Push { src, bits: 32 } => stack && self.value(src, false),
+            Op::Pop { dst } => stack && dst.bits == 32,
             Op::PushAll { bits: 32 }
             | Op::PopAll { bits: 32 }
             | Op::PushFlags { bits: 32 }
-            | Op::PopFlags { bits: 32 } => stack,
-            Op::PushSegment { bits, .. } => word || (stack && bits == 32),
-            Op::Call { target, bits } => {
-                (word || (stack && bits == 32)) && self.value(target, false)
-            }
-            Op::Return { bits, .. } | Op::Leave { bits } => word || (stack && bits == 32),
+            | Op::PopFlags { bits: 32 }
+            | Op::PushSegment { bits: 32, .. } => stack,
+            Op::Call { target, bits: 32 } => stack && self.value(target, false),
+            Op::Return { bits: 32, .. } | Op::Leave { bits: 32 } => stack,
             Op::IndirectJump { src } => {
-                (word
-                    || matches!(
-                        src,
-                        Value::Register(Register { bits: 32, .. }) | Value::Memory { bits: 32, .. }
-                    ))
-                    && self.value(src, false)
+                matches!(
+                    src,
+                    Value::Register(Register { bits: 32, .. }) | Value::Memory { bits: 32, .. }
+                ) && self.value(src, false)
             }
             _ => false,
         }
@@ -609,37 +549,6 @@ impl Lower {
     fn emit(mut self, block: &Block) -> Vec<u16> {
         let needed = flag_requirements(block);
         let count = block.instructions.len() as u32;
-        let alias = self.a.label();
-        let bounds = self.a.label();
-        if self.code16() {
-            // Same linear address under a different CS base can name a block
-            // decoded at another IP. Leave before reserving any guest steps.
-            #[cfg(feature = "jit-profile")]
-            {
-                self.a.ldr(R2, FRAME, IP_CHECKS);
-                self.a.dp(Dp::Add, false, R2, R2, Operand::Imm(1));
-                self.a.str(R2, FRAME, IP_CHECKS);
-            }
-            self.a.mov_imm(R1, block.instructions[0].eip);
-            self.a.cmp(R0, R1);
-            self.a.b_cond(Cond::Ne, alias);
-            let mut high = block.instructions.last().unwrap().next_eip - 1;
-            for instruction in &block.instructions {
-                match instruction.op {
-                    Op::Branch { target, .. }
-                    | Op::Loop { target, .. }
-                    | Op::Call {
-                        target: Value::Immediate(target),
-                        ..
-                    } => high = high.max(target),
-                    _ => {}
-                }
-            }
-            self.a.ldr(R2, FRAME, CS_LIMIT);
-            self.a.mov_imm(R1, high);
-            self.a.cmp(R2, R1);
-            self.a.b_cond(Cond::Cc, bounds);
-        }
         // Reserve the whole block, or return before its first instruction.
         let budget = self.a.label();
         self.a.ldr(R0, FRAME, REMAINING);
@@ -684,16 +593,6 @@ impl Lower {
                 .mov_imm(R0, block.instructions[completed as usize - 1].next_eip);
             self.a.str(R0, FRAME, EIP);
             self.a.mov(R0, Operand::Imm(kind));
-            self.a.b(self.tail);
-        }
-        if self.code16() {
-            self.a.bind(bounds);
-            self.a.str(R0, FRAME, EIP);
-            self.a.mov(R0, Operand::Imm(EXIT_INTERPRET));
-            self.a.b(self.tail);
-            self.a.bind(alias);
-            self.a.str(R0, FRAME, EIP);
-            self.a.mov(R0, Operand::Imm(EXIT_BOUNDARY));
             self.a.b(self.tail);
         }
         self.a.bind(budget);
@@ -1016,23 +915,15 @@ impl Lower {
                 dst
             }
             (None, None) => {
-                self.a
-                    .mov_imm(dst, address.displacement & mask(address.bits));
+                self.a.mov_imm(dst, address.displacement);
                 return dst;
             }
         };
-        let value = if address.displacement == 0 {
-            base
-        } else {
-            self.a.add_imm(dst, base, address.displacement, R12);
-            dst
-        };
-        if address.bits == 16 {
-            self.a.extend(16, false, dst, value, 0);
-            dst
-        } else {
-            value
+        if address.displacement == 0 {
+            return base;
         }
+        self.a.add_imm(dst, base, address.displacement, R12);
+        dst
     }
 
     /// Linear address in `dst` (R0 or R1) or a bare guest register. Checked
@@ -1057,29 +948,6 @@ impl Lower {
         miss: Label,
         dst: Reg,
     ) -> Reg {
-        if segment == SegmentReg::Cs {
-            let a = &mut self.a;
-            if write {
-                a.b(miss);
-                return dst;
-            }
-            a.ldr(R12, FRAME, CS_READABLE);
-            a.cmp(R12, Operand::Imm(0));
-            a.b_cond(Cond::Eq, miss);
-            let end = if bytes > 1 {
-                a.dp(Dp::Add, true, R2, offset, Operand::Imm(bytes - 1));
-                a.b_cond(Cond::Cs, miss);
-                R2
-            } else {
-                offset
-            };
-            a.ldr(R12, FRAME, CS_LIMIT);
-            a.cmp(end, R12);
-            a.b_cond(Cond::Hi, miss);
-            a.ldr(R12, FRAME, CS_BASE);
-            a.dp(Dp::Add, false, dst, offset, R12);
-            return dst;
-        }
         let index = DATA_SEGMENTS
             .iter()
             .position(|&seg| seg == segment)
@@ -1170,12 +1038,6 @@ impl Lower {
     /// Stack offset to guarded linear address; the flat fact emits the
     /// existing guard alone. The checked path uses R0 and preserves R1.
     fn stack_access(&mut self, offset: Reg, bytes: u32, write: bool, miss: Label) -> Reg {
-        let offset = if self.code16() {
-            self.a.extend(16, false, R0, offset, 0);
-            R0
-        } else {
-            offset
-        };
         let linear = if self.facts & STACK_FACT != 0 {
             offset
         } else {
@@ -1187,30 +1049,10 @@ impl Lower {
 
     /// Commit after the store; R0 is an offset only with the flat fact.
     fn pushed(&mut self, bytes: u32) {
-        if self.code16() {
-            self.a.dp(Dp::Sub, false, R12, ESP, Operand::Imm(bytes));
-            self.a.bfi(ESP, R12, 0, 16);
-        } else if self.facts & STACK_FACT != 0 {
+        if self.facts & STACK_FACT != 0 {
             self.a.mov(ESP, R0);
         } else {
             self.a.dp(Dp::Sub, false, ESP, ESP, Operand::Imm(bytes));
-        }
-    }
-
-    fn stack_advance(&mut self, base: Reg, bytes: u32) {
-        if self.code16() {
-            self.a.add_imm(R12, base, bytes, R2);
-            self.a.bfi(ESP, R12, 0, 16);
-        } else {
-            self.a.add_imm(ESP, base, bytes, R12);
-        }
-    }
-
-    fn check_target(&mut self, target: Reg, miss: Label) {
-        if self.code16() {
-            self.a.ldr(R12, FRAME, CS_LIMIT);
-            self.a.cmp(target, R12);
-            self.a.b_cond(Cond::Hi, miss);
         }
     }
 
@@ -1296,23 +1138,11 @@ impl Lower {
             let shift = 32 - bits;
             let left = self.top(lhs, bits, R0);
             let right = self.top_operand(rhs, bits, R12);
-            let carry = matches!(kind, Alu::Adc | Alu::Sbb);
-            if carry {
-                self.carry_in(kind == Alu::Adc, R2);
-            }
             let auxiliary = needed & PF_AF != 0 && !logic;
             if auxiliary {
                 self.a.dp(Dp::Eor, false, R2, left, right);
             }
-            if kind == Alu::Adc {
-                // Carry-in must cross the padding below the guest width.
-                self.a.mov_imm(R3, mask(shift));
-                self.a.dp(Dp::Orr, false, R0, left, R3);
-            }
             self.a.dp(op, set, R0, left, right);
-            if carry {
-                self.narrow_carry_result(R0, shift, set, R12);
-            }
             if logic && needed != 0 {
                 self.a.cmp(R0, Operand::Imm(0));
             }
@@ -1333,19 +1163,6 @@ impl Lower {
             } else {
                 Flags::Cpsr(matches!(kind, Alu::Add | Alu::Adc))
             };
-        }
-    }
-
-    /// ADCS/SBCS set C/V/N at the top-aligned guest width. Ignore their
-    /// padding when computing Z, then leave the aligned result for PF/AF.
-    fn narrow_carry_result(&mut self, result: Reg, padding: u8, set: bool, temp: Reg) {
-        self.a.bfc(result, 0, padding);
-        if set {
-            self.a.mrs(temp);
-            self.a.cmp(result, Operand::Imm(0));
-            self.a
-                .dp_cond(Cond::Eq, Dp::Orr, false, temp, temp, Operand::Imm(Z_BIT));
-            self.a.msr_flags(temp);
         }
     }
 
@@ -1716,30 +1533,15 @@ impl Lower {
                 self.a.dp_cond(Cond::Eq, Dp::Add, false, reg, reg, step);
                 self.a.dp_cond(Cond::Ne, Dp::Sub, false, reg, reg, step);
             }
-            Op::ReadSegment { dst, segment } => match dst {
-                Value::Register(dst) => {
-                    self.a.ldr(R1, FRAME, SELECTORS + 4 * segment as i32);
-                    self.write_low(dst, R1);
-                }
-                Value::Memory { address, .. } => {
-                    self.clobber();
-                    let miss = self.miss(index);
-                    let linear = self.access(address, 16, true, miss, R0);
-                    self.a.ldr(R1, FRAME, SELECTORS + 4 * segment as i32);
-                    self.a.store_indexed(16, R1, R3, linear);
-                }
-                Value::Immediate(_) => unreachable!(),
-            },
-            Op::PushSegment { segment, bits } => {
+            Op::PushSegment { segment, .. } => {
                 self.clobber();
                 let miss = self.miss(index);
-                self.a
-                    .dp(Dp::Sub, false, R0, ESP, Operand::Imm(u32::from(bits / 8)));
+                self.a.dp(Dp::Sub, false, R0, ESP, Operand::Imm(4));
                 // A 32-bit slot, but only the selector word is accessed.
                 let linear = self.stack_access(R0, 2, true, miss);
                 self.a.ldr(R1, FRAME, SELECTORS + 4 * segment as i32);
                 self.a.store_indexed(16, R1, R3, linear);
-                self.pushed(u32::from(bits / 8));
+                self.pushed(4);
             }
             Op::PushFlags { .. } => {
                 self.clobber();
@@ -1810,7 +1612,7 @@ impl Lower {
                     return true;
                 }
             }
-            Op::Push { src, bits } => {
+            Op::Push { src, .. } => {
                 let value = match self.load(src, index) {
                     Src::Imm(value) => {
                         self.a.mov_imm(R1, value);
@@ -1821,94 +1623,58 @@ impl Lower {
                 };
                 self.clobber();
                 let miss = self.miss(index);
-                self.push(value, bits, miss);
+                self.push(value, miss);
             }
             Op::Pop { dst } => {
                 self.clobber();
                 let miss = self.miss(index);
-                let bytes = u32::from(dst.bits / 8);
-                let linear = self.stack_access(ESP, bytes, false, miss);
-                self.a.load_indexed(dst.bits, false, R0, R3, linear);
-                self.stack_advance(ESP, bytes);
-                self.write_low(dst, R0);
+                let linear = self.stack_access(ESP, 4, false, miss);
+                self.a.load_indexed(32, false, R0, R3, linear);
+                self.a.dp(Dp::Add, false, ESP, ESP, Operand::Imm(4));
+                self.a.mov(guest(dst.index), R0);
             }
-            Op::Leave { bits } => {
+            Op::Leave { .. } => {
                 self.clobber();
                 let miss = self.miss(index);
-                let bytes = u32::from(bits / 8);
-                let linear = self.stack_access(EBP, bytes, false, miss);
-                self.a.load_indexed(bits, false, R0, R3, linear);
-                self.stack_advance(EBP, bytes);
-                self.write_low(
-                    Register {
-                        index: 5,
-                        bits,
-                        shift: 0,
-                    },
-                    R0,
-                );
+                let linear = self.stack_access(EBP, 4, false, miss);
+                self.a.load_indexed(32, false, R0, R3, linear);
+                self.a.dp(Dp::Add, false, ESP, EBP, Operand::Imm(4));
+                self.a.mov(EBP, R0);
             }
-            Op::Call { target, bits } => {
-                let value = self.load(target, index);
-                self.clobber();
-                let miss = self.miss(index);
-                // Read and validate the target before the stack store or SP.
-                // A failing push rewrites Frame.eip to this instruction.
-                let destination = match value {
+            Op::Call { target, .. } => {
+                // The target is read before the push. Frame.eip is only
+                // consumed by a completed block, so storing it early is safe.
+                let destination = match self.load(target, index) {
                     Src::Imm(value) => Some(value),
                     Src::Reg(reg) => {
-                        let target = if bits == 16 {
-                            self.a.extend(16, false, R0, reg, 0);
-                            R0
-                        } else {
-                            reg
-                        };
-                        self.check_target(target, miss);
-                        self.a.str(target, FRAME, EIP);
+                        self.a.str(reg, FRAME, EIP);
                         None
                     }
                     Src::High(_) => unreachable!(),
                 };
+                self.clobber();
+                let miss = self.miss(index);
                 self.a.mov_imm(R1, next);
-                self.push(R1, bits, miss);
+                self.push(R1, miss);
                 match destination {
                     Some(value) => self.exit_to(value),
                     None => self.exit(),
                 }
                 return true;
             }
-            Op::Return { pop, bits } => {
+            Op::Return { pop, .. } => {
                 self.clobber();
                 let miss = self.miss(index);
-                let bytes = u32::from(bits / 8);
-                let linear = self.stack_access(ESP, bytes, false, miss);
-                self.a.load_indexed(bits, false, R0, R3, linear);
-                self.check_target(R0, miss);
-                self.stack_advance(ESP, bytes + u32::from(pop));
+                let linear = self.stack_access(ESP, 4, false, miss);
+                self.a.load_indexed(32, false, R0, R3, linear);
+                self.a.add_imm(ESP, ESP, 4 + u32::from(pop), R12);
                 self.exit_with(R0);
                 return true;
             }
             Op::IndirectJump { src } => {
                 let value = self.load(src, index);
                 let value = self.low(value, R0);
-                if self.code16() {
-                    self.clobber();
-                    let bits = match src {
-                        Value::Register(reg) => reg.bits,
-                        Value::Memory { bits, .. } => bits,
-                        _ => unreachable!(),
-                    };
-                    if bits == 16 {
-                        self.a.extend(16, false, R0, value, 0);
-                    } else {
-                        self.a.mov(R0, value);
-                    }
-                    let miss = self.miss(index);
-                    self.check_target(R0, miss);
-                    self.exit_with(R0);
-                } else {
-                    self.exit_with(value);
-                }
+                self.exit_with(value);
                 return true;
             }
             Op::PushAll { .. } => {
@@ -1938,22 +1704,14 @@ impl Lower {
             Op::Loop {
                 target,
                 zero,
-                counter_bits,
+                counter_bits: _,
             } => {
                 self.clobber();
                 let ecx = guest(1);
-                let counter = if counter_bits == 16 {
-                    self.a.dp(Dp::Sub, false, R0, ecx, Operand::Imm(1));
-                    self.a.bfi(ecx, R0, 0, 16);
-                    self.a.extend(16, false, R0, R0, 0);
-                    R0
-                } else {
-                    self.a.dp(Dp::Sub, false, ecx, ecx, Operand::Imm(1));
-                    ecx
-                };
+                self.a.dp(Dp::Sub, false, ecx, ecx, Operand::Imm(1));
                 let taken = self.a.label();
                 let done = self.a.label();
-                self.a.cmp(counter, Operand::Imm(0));
+                self.a.cmp(ecx, Operand::Imm(0));
                 match zero {
                     None => self.a.b_cond(Cond::Ne, taken),
                     Some(value) => {
@@ -1979,15 +1737,9 @@ impl Lower {
                 self.spill();
                 let cond = match condition {
                     BranchCondition::Flags(cc) => self.condition(cc),
-                    BranchCondition::EcxZero { bits } => {
+                    BranchCondition::EcxZero { bits: _ } => {
                         self.clobber();
-                        let counter = if bits == 16 {
-                            self.a.extend(16, false, R0, guest(1), 0);
-                            R0
-                        } else {
-                            guest(1)
-                        };
-                        self.a.cmp(counter, Operand::Imm(0));
+                        self.a.cmp(guest(1), Operand::Imm(0));
                         Cond::Eq
                     }
                 };
@@ -2101,14 +1853,7 @@ impl Lower {
             }
             self.a.str(temp, FRAME, AUXILIARY);
         }
-        if shift != 0 && kind == Alu::Adc {
-            self.a.mov_imm(temp, mask(shift));
-            self.a.dp(Dp::Orr, false, R1, R1, temp);
-        }
         self.a.dp(op, set, R1, R1, right);
-        if shift != 0 && matches!(kind, Alu::Adc | Alu::Sbb) {
-            self.narrow_carry_result(R1, shift, set, temp);
-        }
         if logic && needed != 0 {
             self.a.cmp(R1, Operand::Imm(0));
         }
@@ -2168,7 +1913,7 @@ impl Lower {
     /// for every count up to 31.
     fn shift(&mut self, index: usize, dst: Value, kind: u8, count: Value, needed: u32) {
         if kind >= 5 {
-            // Through-carry rotates are admitted only by one.
+            // Admission limits through-carry rotates to a 32-bit register by 1.
             let Value::Register(dst) = dst else {
                 unreachable!()
             };
@@ -2218,16 +1963,6 @@ impl Lower {
             }
             Value::Immediate(_) => unreachable!(),
         };
-        if rotate && bits == 16 {
-            // Two copies let the 32-bit ROR yield the word's CF/OF too.
-            self.a.dp(
-                Dp::Orr,
-                false,
-                value,
-                value,
-                Operand::Reg(value, Shift::Lsl(16)),
-            );
-        }
         let shift = |count: u8| match kind {
             0 => Shift::Lsl(count),
             1 => Shift::Lsr(count),
@@ -2446,40 +2181,27 @@ impl Lower {
     /// RCL/RCR by one preserve SF/ZF/PF/AF; CF and OF follow the interpreter.
     fn rotate_carry(&mut self, dst: Register, kind: u8) {
         self.clobber();
-        let sign = dst.bits - 1;
-        let reg = if dst.bits == 32 {
-            guest(dst.index)
-        } else {
-            self.a
-                .extend(dst.bits, false, R3, guest(dst.index), dst.shift);
-            R3
-        };
+        let reg = guest(dst.index);
         let a = &mut self.a;
         a.ldr(R12, FRAME, NZCV);
         a.mov(R0, Operand::Reg(R12, Shift::Lsr(29)));
         a.dp(Dp::Eor, false, R0, R0, Operand::Imm(1));
         a.dp(Dp::And, false, R0, R0, Operand::Imm(1));
         if kind == 5 {
-            a.mov(R1, Operand::Reg(reg, Shift::Lsr(sign)));
+            a.mov(R1, Operand::Reg(reg, Shift::Lsr(31)));
             a.dp(Dp::Orr, false, reg, R0, Operand::Reg(reg, Shift::Lsl(1)));
-            a.dp(Dp::Eor, false, R2, R1, Operand::Reg(reg, Shift::Lsr(sign)));
+            a.dp(Dp::Eor, false, R2, R1, Operand::Reg(reg, Shift::Lsr(31)));
         } else {
             a.dp(Dp::And, false, R1, reg, Operand::Imm(1));
             a.mov(R2, Operand::Reg(reg, Shift::Lsr(1)));
-            a.dp(Dp::Orr, false, reg, R2, Operand::Reg(R0, Shift::Lsl(sign)));
+            a.dp(Dp::Orr, false, reg, R2, Operand::Reg(R0, Shift::Lsl(31)));
             a.dp(Dp::Eor, false, R2, reg, Operand::Reg(reg, Shift::Lsl(1)));
-            a.mov(R2, Operand::Reg(R2, Shift::Lsr(sign)));
-        }
-        if dst.bits != 32 {
-            a.dp(Dp::And, false, R2, R2, Operand::Imm(1));
+            a.mov(R2, Operand::Reg(R2, Shift::Lsr(31)));
         }
         a.dp(Dp::Bic, false, R12, R12, Operand::Imm(C_BIT | V_BIT));
         a.dp(Dp::Eor, false, R1, R1, Operand::Imm(1));
         a.dp(Dp::Orr, false, R12, R12, Operand::Reg(R1, Shift::Lsl(29)));
         a.dp(Dp::Orr, false, R12, R12, Operand::Reg(R2, Shift::Lsl(28)));
-        if dst.bits != 32 {
-            self.write_low(dst, reg);
-        }
         self.store_flags();
     }
 
@@ -2488,12 +2210,7 @@ impl Lower {
         match (kind, dst) {
             (ExchangeOp::Swap, Value::Register(dst)) => {
                 let target = guest(dst.index);
-                if src.bits == 8 {
-                    self.a.extend(8, false, R0, target, dst.shift);
-                    self.a.extend(8, false, R1, source, src.shift);
-                    self.write_low(dst, R1);
-                    self.write_low(src, R0);
-                } else if target != source {
+                if target != source {
                     self.a.mov(R0, target);
                     self.write_low(dst, source);
                     self.write_low(src, R0);
@@ -2504,7 +2221,6 @@ impl Lower {
                 let miss = self.miss(index);
                 let linear = self.access(address, src.bits, true, miss, R0);
                 self.a.load_indexed(src.bits, false, R1, R3, linear);
-                let source = self.low(register(src), R2);
                 self.a.store_indexed(src.bits, source, R3, linear);
                 self.write_low(src, R1);
             }
@@ -2617,26 +2333,20 @@ impl Lower {
         self.flags = Flags::Frame;
     }
 
-    /// PUSH a value held outside the guard's registers.
-    fn push(&mut self, value: Reg, bits: u8, miss: Label) {
+    /// PUSH a 32-bit value held outside the guard's registers.
+    fn push(&mut self, value: Reg, miss: Label) {
         assert!(![R0, R2, R3, R12].contains(&value));
-        self.a
-            .dp(Dp::Sub, false, R0, ESP, Operand::Imm(u32::from(bits / 8)));
-        let linear = self.stack_access(R0, u32::from(bits / 8), true, miss);
-        self.a.store_indexed(bits, value, R3, linear);
-        self.pushed(u32::from(bits / 8));
+        self.a.dp(Dp::Sub, false, R0, ESP, Operand::Imm(4));
+        let linear = self.stack_access(R0, 4, true, miss);
+        self.a.store_indexed(32, value, R3, linear);
+        self.pushed(4);
     }
 
     /// Continue at a static `eip`, probing its table slot inline.
     fn exit_to(&mut self, eip: u32) {
         self.spill();
-        let code16 = self.code16();
         let a = &mut self.a;
         a.mov_imm(R0, eip);
-        if code16 {
-            a.ldr(PC, FRAME, DISPATCH);
-            return;
-        }
         a.ldr(R1, FRAME, TABLE);
         let offset = table_slot(eip) as u32 * 8;
         if offset > 0xfff {

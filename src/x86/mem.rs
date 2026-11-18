@@ -668,8 +668,8 @@ pub trait Bus {
         true
     }
 
-    /// Native JIT reverse-alias bookkeeping at write grants, never cache hits.
-    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+    /// A64 reverse-alias bookkeeping at a write grant, never on a cache hit.
+    #[cfg(a64_jit)]
     fn cached_write_translation_granted(&self, _linear: LinearAddr, _backing: BackingToken) {}
 
     /// Cache notification after a successful walk. As with native-read hooks,

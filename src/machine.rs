@@ -3069,7 +3069,7 @@ impl HostBus {
             .and_then(|pages| pages.single_retired_version(previous_epoch))
     }
 
-    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+    #[cfg(a64_jit)]
     pub(crate) fn jit_single_retired_page(
         &self,
         previous_epoch: u64,
@@ -3108,7 +3108,7 @@ impl HostBus {
             .get_or_insert_with(|| crate::x86::jit::validity::CodePages::new(self.ram.len()));
         let (version, promoted) = pages.watch(offset >> 12);
         if promoted {
-            #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+            #[cfg(a64_jit)]
             match pages.take_write_alias(offset >> 12).single() {
                 Some(Some(slot)) => cpu
                     .translation_cache
@@ -3118,7 +3118,7 @@ impl HostBus {
                     .translation_cache
                     .revoke_writable_aliases(self.ram.as_ptr() as u64 + (offset & !4095) as u64),
             }
-            #[cfg(not(any(a64_jit, all(feature = "jit-t32", target_arch = "arm"))))]
+            #[cfg(not(a64_jit))]
             cpu.translation_cache
                 .revoke_writable_aliases(self.ram.as_ptr() as u64 + (offset & !4095) as u64);
         }
@@ -3133,7 +3133,7 @@ impl HostBus {
             .get_or_insert_with(|| crate::x86::jit::validity::CodePages::new(self.ram.len()));
     }
 
-    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+    #[cfg(a64_jit)]
     pub(crate) fn jit_ram_offset(&self, token: BackingToken) -> u64 {
         // A qualified fetch token already refers to this stable RAM allocation.
         // Admission counts do not install a code watch or revoke writable aliases.
@@ -4582,7 +4582,7 @@ impl Bus for HostBus {
         index < self.frame_roles.len()
     }
 
-    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+    #[cfg(a64_jit)]
     #[inline]
     fn cached_write_translation_granted(&self, linear: LinearAddr, backing: BackingToken) {
         if let Some(pages) = &self.jit_code_pages {
@@ -5426,7 +5426,7 @@ mod host_bus_tests {
             (0x10000, u32::MAX, 0xc09b),
             (0, u32::MAX, 0xc099), // Returning to execute-only CS is valid.
             (0, 0x1002, 0xc09b),   // Full loop fits, but native entry is ineligible.
-            (0, 0x1002, 0x009b),   // Ring-0 PM16 remains interpreted.
+            (0, 0x1002, 0x009b),   // Same bytes in a 16-bit CS must stay interpreted.
             (0, 0x1000, 0xc09b),   // INC fits; JMP fetch must fault before branching.
         ] {
             for cpu in [&mut expected, &mut actual] {
@@ -5461,112 +5461,6 @@ mod host_bus_tests {
                     }
                 ));
             }
-            steps += native.ran;
-        }
-    }
-
-    #[cfg(all(feature = "jit-t32", target_arch = "arm"))]
-    #[test]
-    fn arm_jit_pm16_planes_survive_cs_switches_and_retire_changed_code() {
-        let make = || {
-            let mut cpu = Cpu::new();
-            cpu.enter_protected_flat(0x1000, 0);
-            cpu.set_seg_cache(SegmentReg::Ss, SegmentCache::new(0x13, 0, 0xffff, 0xf3));
-            let mut bus = HostBus::new(0x40000);
-            bus.attention = false;
-            bus.next_attention_step = u64::MAX;
-            for base in [0, 0x10000, 0x20000] {
-                bus.ram[base + 0x1000..base + 0x1003].copy_from_slice(&[0x40, 0xeb, 0x0d]);
-                bus.ram[base + 0x1010..base + 0x1013].copy_from_slice(&[0x43, 0xeb, 0xed]);
-            }
-            (cpu, bus)
-        };
-        let (mut actual, mut bus) = make();
-        let (mut expected, mut reference_bus) = make();
-        let mut engine = crate::x86::jit::runtime::Engine::new().unwrap();
-        let mut steps = 0;
-        for (round, (base, word)) in [
-            (0, false),
-            (0x10000, true),
-            (0x20000, true),
-            (0x10000, true),
-            (0, false),
-            (0x20000, true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            for cpu in [&mut actual, &mut expected] {
-                cpu.eip = 0x1000;
-                cpu.set_seg_cache(
-                    SegmentReg::Cs,
-                    SegmentCache::new(
-                        0xb,
-                        base,
-                        if word { 0xffff } else { u32::MAX },
-                        if word { 0xfb } else { 0xc0fb },
-                    ),
-                );
-            }
-            let clears = engine.stats.table_clears;
-            let resolved = engine.stats.resolved;
-            let native_steps = engine.stats.native_steps;
-            let oracle = Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 1024);
-            let native = engine
-                .run_batch(&mut actual, &mut bus, steps, 1024)
-                .unwrap();
-            assert_eq!(native, oracle);
-            assert_eq!(actual.regs, expected.regs);
-            assert_eq!(actual.eip, expected.eip);
-            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
-            assert_eq!(actual.tsc(), expected.tsc());
-            assert_eq!(bus.ram, reference_bus.ram);
-            assert!(engine.stats.native_steps > native_steps + 800);
-            if round >= 3 {
-                assert_eq!(engine.stats.table_clears, clears, "retained mode {word}");
-                assert_eq!(
-                    engine.stats.resolved, resolved,
-                    "chained without Rust lookup"
-                );
-            }
-            steps += native.ran;
-        }
-        // A write to either plane's code, a global flush and a non-global
-        // CR3 flush must not leave stale native entries in the other plane.
-        for (base, word, flush) in [(0x10000, true, 0), (0, false, 1), (0x20000, true, 2)] {
-            for cpu in [&mut actual, &mut expected] {
-                cpu.eip = 0x1000;
-                cpu.set_seg_cache(
-                    SegmentReg::Cs,
-                    SegmentCache::new(
-                        0xb,
-                        base,
-                        if word { 0xffff } else { u32::MAX },
-                        if word { 0xfb } else { 0xc0fb },
-                    ),
-                );
-                if flush == 1 {
-                    cpu.invalidate_fetch_cache();
-                }
-                if flush == 2 {
-                    cpu.cr4 |= crate::x86::cpu::CR4_PGE;
-                    cpu.invalidate_non_global_translations();
-                }
-            }
-            for b in [&mut bus, &mut reference_bus] {
-                b.write_phys_u8(PhysAddr(u64::from(base + 0x1010)), 0x4b)
-                    .unwrap();
-            }
-            let oracle = Interpreter::run_batch(&mut expected, &mut reference_bus, steps, 1024);
-            let native = engine
-                .run_batch(&mut actual, &mut bus, steps, 1024)
-                .unwrap();
-            assert_eq!(native, oracle);
-            assert_eq!(actual.regs, expected.regs);
-            assert_eq!(actual.eip, expected.eip);
-            assert_eq!(actual.effective_eflags(), expected.effective_eflags());
-            assert_eq!(actual.tsc(), expected.tsc());
-            assert_eq!(bus.ram, reference_bus.ram);
             steps += native.ran;
         }
     }
@@ -6191,7 +6085,7 @@ mod host_bus_tests {
         }
     }
 
-    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
+    #[cfg(a64_jit)]
     #[test]
     fn jit_write_alias_hints_revoke_both_aliases_and_preserve_reused_rows() {
         for two in [false, true] {
@@ -6205,17 +6099,7 @@ mod host_bus_tests {
                 write_ram_u32(&mut bus, 0x5004, 0x9067);
                 write_ram_u32(&mut bus, 0x5008, 0x9067);
                 let token = bus.cached_backing_token(PhysAddr(0x9000));
-                // A grant made before CodePages exists has no reverse hint.
-                mmu::write_linear_u32(&mut cpu, &mut bus, LinearAddr(0x1000), 0).unwrap();
-                assert!(
-                    cpu.cached_current_write_translation(LinearAddr(0x1000))
-                        .is_some()
-                );
-                bus.jit_code_stamp(&mut cpu, token);
-                assert!(
-                    cpu.cached_current_write_translation(LinearAddr(0x1000))
-                        .is_none()
-                );
+                bus.jit_code_stamp(&mut cpu, token); // First promotion handles pre-JIT grants.
                 // First write retires the watch; the second grants the first row.
                 for value in [1, 2] {
                     mmu::write_linear_u32(&mut cpu, &mut bus, LinearAddr(0x1000), value).unwrap();
