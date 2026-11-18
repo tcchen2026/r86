@@ -44,7 +44,8 @@ code will.
 Benchmark W95A (F8) is the application workload. After step 250 M: JIT
 **75.30** Arm instructions per x86 step, interpreter **176.87** (`REPORT.md`
 "Task X"). 16-bit protected-mode code is 19% of those steps and about 55% of
-the JIT's time; see "Deferred: compile 16-bit code".
+the JIT's time. See the
+[measurements that led to T16](#measurements-that-led-to-t16).
 
 Scene K1 (task Y, `tmp/t32/task-y.txt`; `REPORT.md` "Task Y"): kept.
 Stack operations under a checked 32-bit SS: new block fact
@@ -502,13 +503,15 @@ holds this block.
 
 ## Act 7: not part of this plan
 
-Interpreter 16-bit paths (about 45% of W95 time after act 3: the largest
-item left, a user decision); compiling 16-bit code (documented below under
-"Deferred: compile 16-bit code"); the quiet test for
-POPFD in the shared interpreter (STI has it); revalidation after writes to a
-code page (`jit_code_stamp`, 174 k times); `probe_linear_write_u8_at_priv`;
-direct block links; TLB refill in native code; the new operations in the
-arm64 backend.
+The 16-bit interpreter paths took about 45% of W95 time after act 3, the
+largest remaining cost. Further work on them is a user decision. For 16-bit
+compilation, see the
+[measurements that led to T16](#measurements-that-led-to-t16).
+
+Other deferred work includes the quiet test for POPFD in the shared
+interpreter (STI has it), revalidation after code-page writes
+(`jit_code_stamp`, 174 k times), `probe_linear_write_u8_at_priv`, direct
+block links, native TLB refill and the new operations in the arm64 backend.
 
 ## End leaves, judged on W95 after act 5
 
@@ -519,11 +522,11 @@ arm64 backend.
 - Memory node, any act: more than three arena clears on W95; report it; the
   Lead decides whether the code arena grows to 3 MiB inside the 12 MiB cap.
 
-## Deferred: compile 16-bit code
+## Measurements that led to T16
 
-The Lead recorded this proposal on 2026-11-15 at the user's request to
-"document this we may do further". The Windows 95 measurements below led to
-the [T16 pilot](#t16-16-bit-protected-mode-code-on-thumb-2).
+The Lead recorded these Windows 95 measurements and the proposed stages on
+2026-11-15 at the user's request. For the outcome, see the
+[T16 pilot and research](#t16-16-bit-protected-mode-code-on-thumb-2).
 
 Measurement (W95A after step 250 M; `REPORT.md` "Task X"):
 - Mode shares: 16-bit protected (PM16) 19.18%, 32-bit 80.70%, real/V86
@@ -618,43 +621,65 @@ with `R86_T32_PROFILE_CODE16=1`; `REPORT.md` "Task Y, part 1"):
 
 ## T16: 16-bit protected-mode code on Thumb-2
 
-**The Lead kept only Act 1** (`b0dd54a`, gates G1–G5 passed). Act 2 with Fix A cost 94.32 Arm instructions
-per x86 step after boot (+29.11% over Act 1) and cleared the arena eight times. The keep limits were 69.4
-Arm/step after boot and six clears over the full run. Both Act 2 builds passed differential tests and
-reproduced the baseline frame and guest RAM hashes at 250 M and 650 M steps.
+**Research verdict, 2026-11-18: stop the Thumb-2 PM16 pilot.** Act 1
+(`b0dd54a`, G1–G5) is kept. Both pilots passed G1/G2 (differential tests,
+frame and RAM). Fix A cost 94.32 Arm/step with eight full-run clears
+(limits 69.4 and six). At fixed coverage, 62.53 (73.05 − 13.71 + 3.19)
+leaves 6.87 for overhead. Fix A added 31.78.
 
-The goal was faster Windows 95 applications (W95A). The Intern used QEMU Cortex-M33 with `-icount shift=0`,
-the frozen Micro95 disk and `firmware/w95a.keys`. In Act 0, PM16 accounted for 19.36% of steps after boot
-and an estimated 57.24% of their Arm instructions. The three cost columns below use plain builds.
+The Intern used frozen Micro95 and `firmware/w95a.keys` on QEMU Cortex-M33
+with `-icount shift=0`. Act 0 PM16 took 19.36% of app steps and ~57% of cost.
 
-| Stage | Boot 0–250 M (Arm/step) | W95A 0–650 M (Arm/step) | Apps 250–650 M (Arm/step) | Full W95A arena clears |
+| Plain W95A (Arm instructions per x86 step) | Boot 0–250 M | Full 0–650 M | Apps 250–650 M | Full clears |
 | --- | ---: | ---: | ---: | ---: |
 | Act 0 baseline (`a8e4306`) | 94.62 | 81.47 | 73.25 | 3 |
-| Act 1 retain JIT mapping epochs on CS loads | 94.41 | 81.27 | 73.05 | 3 |
+| Act 1 retain mapping epochs on CS loads | 94.41 | 81.27 | 73.05 | 3 |
 | Act 2 PM16 pilot | 113.34 | 114.65 | 115.47 | 8 |
-| Act 2 with Fix A | 100.39 | 96.66 | 94.32 | 8 |
+| Act 2 Fix A, writable-alias hint and per-physical-page slot retirement | 100.39 | 96.66 | 94.32 | 8 |
 
-D1 gave CPL3 PM16 code with a 16-bit stack (`CS.D=0`, `SS.B=0`) its own 8,192-slot `[linear, code]` plane.
-The dispatcher added the live CS base to IP. Each block checked the incoming IP before reserving budget
-to distinguish base/IP pairs with the same linear address. A constant `CODE16` Store fact let blocks
-survive segment changes by checking live segment bounds. Fix A reused the writable-alias hint and
-retired only the dispatch slots belonging to the modified physical page on single-page invalidation.
+D1 gave CPL3 PM16 with `SS.B=0` an 8,192-slot `[linear, code]` plane.
+Blocks checked IP before reserving budget and shared the `CODE16` Store fact.
 
-| Sampled cost after boot (Arm/step) | Act 1 | Act 2 with Fix A | Change |
+| Sampled cost after boot (Arm/step) | Act 1 | Fix A | Change |
 | --- | ---: | ---: | ---: |
 | Native entry and return | 1.63 | 11.08 | +9.45 |
-| Other engine loop, lookup and Store work | 3.37 | 19.91 | +16.54 |
+| Other engine loop, lookup and Store | 3.37 | 19.91 | +16.54 |
 | Table and context maintenance | 0.84 | 3.75 | +2.91 |
-| Identified compilation and reset sites | 0.17 | 0.62 | +0.45 |
-| Version checks, watches and revalidation | 1.38 | 0.48 | −0.90 |
-| Generated code (Fix A includes an estimated 3.19 for PM16) | 11.19 | 14.31 | +3.13 |
+| Compilation and reset sites | 0.17 | 0.62 | +0.45 |
+| Versions, watches and revalidation | 1.38 | 0.48 | −0.90 |
+| Generated code (estimated PM16 cost 3.19) | 11.19 | 14.31 | +3.13 |
 | Interpreter | 40.15 | 26.44 | −13.71 |
 | Paging, shared helpers, devices and other | 14.33 | 17.73 | +3.40 |
 | **Total** | **73.05** | **94.32** | **+21.27** |
 
-After boot, native invocations rose from 2.79 M to 10.95 M. The counters recorded 51.38 M native PM16 steps.
-How much entry and lookup work is avoidable? How far could chains run across segment loads and CPL3 far transfers?
-Could smaller blocks or a different compilation threshold bring the 2 MiB arena within the clear limit?
+The two engine rows grew by 1,275 Arm instructions per extra invocation
+(8.16 M), including cold iterations. Probe/Store took 340, eligibility and
+deadlines 207, publication 87, Frame/invoke 367, stubs 10 and other loop
+work 264. Two first-way probe hits, publication and stubs alone cost 309–310.
+
+Across both modes, the leading interpreted entries after boot were MOV Sreg
+(3.34 M), POP DS (680k), POP FS (605k), POP GS (593k), RETF (`CB`, 477k),
+LODSB (394k) and CALL FAR (`9A`, 393k). Of 8.35 M PM16 returns, 6.90 M were
+unsupported, 886k hit guards and 538k were cold. Blocks read live DS/ES/FS/GS
+rights, bounds and bases. A cached load could refresh its Frame row and chain.
+
+PM16/PM32 code bytes averaged 394/380 per block and 113/98 per static x86 op.
+After boot, clears rose from one to four and compiles from 7,091 to 25,123
+(13,904 PM16, 11,219 PM32). Of these, 18,112 rebuilt code lost to clears.
+The six-clear limit needs 11.8% fewer compiled bytes: the full run allocated
+16.6 MB, and seven 2 MiB fills hold 14.7 MB.
+
+| Lever, ranked by after-boot Arm/step saved | Saving | Estimated source lines |
+| --- | ---: | ---: |
+| Reuse A64's cached MOV/POP segment helper, 6.14 → 12.11 steps per PM16 run | 9.67 modeled after direct handoff | 70–120 |
+| Skip the second lookup on a known interpreter target | 4.97 measured (89.35), 0.46 on PM32 alone (72.59) | <10 |
+| Retain Frame segment state | ≤2.99 on Fix A, overlaps longer runs | 40–80 |
+| Join same-ring far transfers with precise stack faults, 14.48 steps/run | 1.72 modeled | 150–300 |
+| Also join cached far-pointer loads, 15.02 steps/run | 0.33 modeled | 30–70 |
+| Raise PM16 admission from 16 to 64 visits | −1.72 measured (96.04), five full clears | 1 |
+
+At 1,275 Arm per join less 255 saved by direct handoff, 4.60 M joins give
+77.62. The 8.22 gap before helper costs favors stopping (moderate confidence).
 
 ## ARMv6K backend (New 3DS)
 
