@@ -13,6 +13,8 @@ pub struct Arena {
     base: *mut u8,
     bytes: usize,
     used: usize,
+    #[cfg(feature = "jit-profile")]
+    high_water: usize,
 }
 
 impl Arena {
@@ -24,6 +26,8 @@ impl Arena {
             base,
             bytes,
             used: 0,
+            #[cfg(feature = "jit-profile")]
+            high_water: 0,
         })
     }
 
@@ -34,6 +38,11 @@ impl Arena {
 
     pub fn used_bytes(&self) -> usize {
         self.used
+    }
+
+    #[cfg(feature = "jit-profile")]
+    pub fn high_water_bytes(&self) -> usize {
+        self.high_water
     }
 
     /// Whether `code` halfwords and `data` bytes can both still be placed.
@@ -50,6 +59,10 @@ impl Arena {
         // SAFETY: the range is inside this exclusively owned region.
         let start = unsafe { self.base.add(self.used) };
         self.used += bytes;
+        #[cfg(feature = "jit-profile")]
+        {
+            self.high_water = self.high_water.max(self.used);
+        }
         Some(start)
     }
 

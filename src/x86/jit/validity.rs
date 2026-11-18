@@ -25,11 +25,11 @@ use core::cell::Cell;
 
 /// Conservative reverse ownership: no slot, one slot, or multiple slots.
 /// Reuse need not unlink the old page; consumers check the remembered identity.
-#[cfg(a64_jit)]
+#[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct AliasSlot(u16);
 
-#[cfg(a64_jit)]
+#[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
 impl AliasSlot {
     pub const MANY: Self = Self(u16::MAX);
 
@@ -129,7 +129,7 @@ pub struct CodePages {
     // Cell keeps published raw version pointers valid across notifications.
     // The allocation never moves or grows; execution and mutation are exclusive.
     versions: Vec<Cell<u64>>,
-    #[cfg(a64_jit)]
+    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
     write_aliases: Vec<Cell<AliasSlot>>,
 }
 
@@ -141,7 +141,7 @@ impl CodePages {
             versions: alloc::vec![Cell::new(0); bytes.div_ceil(4096)],
             // Translations granted before JIT activation are not recorded.
             // The first promotion scans; later grants are tracked at fill.
-            #[cfg(a64_jit)]
+            #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
             write_aliases: alloc::vec![Cell::new(AliasSlot::MANY); bytes.div_ceil(4096)],
         }
     }
@@ -185,14 +185,14 @@ impl CodePages {
             .then_some(self.retired_page)
     }
 
-    #[cfg(a64_jit)]
+    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
     pub(crate) fn record_write_alias(&self, page: usize, slot: usize) {
         let mut aliases = self.write_aliases[page].get();
         aliases.record(slot);
         self.write_aliases[page].set(aliases);
     }
 
-    #[cfg(a64_jit)]
+    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
     pub(crate) fn take_write_alias(&mut self, page: usize) -> AliasSlot {
         self.write_aliases[page].replace(AliasSlot::default())
     }

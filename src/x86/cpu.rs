@@ -687,7 +687,7 @@ impl LinearTranslationCache {
     }
 
     /// A reverse hint may name a reused row. Revoke only the original backing.
-    #[cfg(a64_jit)]
+    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
     pub(crate) fn revoke_writable_row(&mut self, slot: usize, backing_page: u64) {
         let entry = &mut self.entries[slot];
         if entry
@@ -1597,7 +1597,7 @@ impl Cpu {
                 self.invalidate_fetch_translations();
             }
             // A64 qualifies CS base/D and checks the live limit. Thumb-2
-            // qualifies the base in its context and admits only 32-bit, 4 GiB CS.
+            // qualifies PM32 by base/4 GiB limit; PM16 checks IP and live limits.
             #[cfg(all(
                 feature = "jit",
                 not(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))
@@ -1718,7 +1718,9 @@ impl Cpu {
         } else {
             (0, cache.limit)
         };
-        let rights = if seg != SegmentReg::Cs && cache.selector & !3 != 0 && access & 0x18 == 0x10 {
+        let rights = if seg == SegmentReg::Cs && cache.selector & !3 != 0 && access & 0x1a == 0x1a {
+            1 // Readable code; stores through CS always fault.
+        } else if seg != SegmentReg::Cs && cache.selector & !3 != 0 && access & 0x18 == 0x10 {
             1 | (access & 2)
         } else {
             0

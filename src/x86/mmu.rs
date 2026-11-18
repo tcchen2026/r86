@@ -443,9 +443,9 @@ fn fill_cached_write_translation<B: Bus>(
     user: bool,
 ) {
     cpu.fill_cached_write_translation(linear, backing, user);
-    #[cfg(a64_jit)]
+    #[cfg(any(a64_jit, all(feature = "jit-t32", target_arch = "arm")))]
     bus.cached_write_translation_granted(linear, backing);
-    #[cfg(not(a64_jit))]
+    #[cfg(not(any(a64_jit, all(feature = "jit-t32", target_arch = "arm"))))]
     let _ = bus;
 }
 

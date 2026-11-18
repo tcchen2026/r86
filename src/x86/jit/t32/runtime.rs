@@ -16,12 +16,14 @@
 //! 4 MiB arena, compiling lukewarm boot code thrashes the cache (measured on
 //! the TinyCore boot: admission at three visits compiled each block ~8 times).
 //!
-//! Blocks chain through a native table of [eip, code] pairs, one plane per
-//! privilege so supervisor-only code is never reached from CPL 3. An entry is
+//! PM32 blocks chain through [eip, code] pairs, one plane per privilege.
+//! User PM16 has a separate [linear, code] plane and checks the incoming IP
+//! and live CS limit at entry. An entry is
 //! inserted only after the full lookup above succeeds. Native code cannot
 //! change mappings, CPL, CS, segment facts or watched code, so the table stays
-//! valid for a whole invocation; before each invocation the runtime clears it
-//! after any fact, CS base or global mapping change, drops non-global entries
+//! valid for a whole invocation. PM32 fact/base changes clear only its planes;
+//! PM16 needs no flat facts and its dispatcher adds the live CS base. Global
+//! mapping changes clear all planes; the runtime drops non-global entries
 //! after a non-global flush, and an INVLPG range's or a retired page's entries.
 //!
 //! Each block reserves its length from the invocation budget, which ends at
@@ -36,12 +38,12 @@
 
 use super::arena::Arena;
 use super::lower::{
-    self, EXIT_ATTENTION, EXIT_BOUNDARY, EXIT_INTERPRET, EXIT_SHADOW, Frame, STACK_FACT,
+    self, CODE16, EXIT_ATTENTION, EXIT_BOUNDARY, EXIT_INTERPRET, EXIT_SHADOW, Frame, STACK_FACT,
     STACK32_FACT, TABLE_BITS,
 };
 use super::store::{Record, Store};
 use crate::machine::HostBus;
-use crate::x86::cpu::{SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
+use crate::x86::cpu::{CR0_PE, SEGMENT_FLAG_DEFAULT_BIG, SegmentReg};
 use crate::x86::jit::decode;
 use crate::x86::{BackingToken, BatchResult, BatchStop, Bus, Cpu, Interpreter, LinearAddr};
 #[cfg(feature = "jit-profile")]
@@ -134,6 +136,8 @@ mod profile {
     #[derive(Default)]
     pub struct Counters {
         pub code16: super::code16::Counters,
+        pub ip_checks: u64,
+        pub pm16_native_steps: u64,
         pub iterations: [u64; 10],
         pub native_returns: [u64; 11],
         pub native_steps: [u64; 8],
@@ -440,7 +444,7 @@ pub struct Stats {
     pub compile_nanoseconds: u128,
 }
 
-/// What the whole dispatch table was filled under.
+/// What the PM32 dispatch planes were filled under.
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct Context {
     global: u64,
@@ -448,24 +452,70 @@ struct Context {
     cs_base: u32,
 }
 
+const NO_SLOT: u16 = u16::MAX;
+const NO_PAGE: u32 = u32::MAX;
+
+/// One active dispatch slot's backing-page list. `version` also marks
+/// membership in `filled`: page retirement leaves that membership intact,
+/// so republishing an empty slot cannot append a duplicate filled index.
+#[derive(Clone, Copy)]
+struct PageSlot {
+    linear: u32, // Page plus bit 0 for a global translation.
+    version: *const u64,
+    ram_page: u32,
+    previous: u16,
+    next: u16,
+}
+
+impl PageSlot {
+    const EMPTY: Self = Self {
+        linear: 0,
+        version: core::ptr::null(),
+        ram_page: NO_PAGE,
+        previous: NO_SLOT,
+        next: NO_SLOT,
+    };
+
+    fn unlink(slots: &mut [Self], heads: &mut [u16], slot: usize) {
+        let old = slots[slot];
+        if old.ram_page == NO_PAGE {
+            return;
+        }
+        if old.previous == NO_SLOT {
+            heads[old.ram_page as usize] = old.next;
+        } else {
+            slots[usize::from(old.previous)].next = old.next;
+        }
+        if old.next != NO_SLOT {
+            slots[usize::from(old.next)].previous = old.previous;
+        }
+        slots[slot].ram_page = NO_PAGE;
+    }
+}
+
 pub struct Engine {
     arena: Arena,
     /// Shared stubs, as Thumb addresses (bit 0 set).
     entry: usize,
     dispatch: usize,
+    entry16: usize,
+    dispatch16: usize,
     miss: u32,
     shared_bytes: usize,
     store: Store,
     /// Visits of not yet admitted entries: (EIP, count), direct-mapped.
     heat: Box<[(u32, u8)]>,
-    /// Two planes (supervisor, user) of [eip, code] pairs.
+    /// PM32 supervisor/user [eip, code], then PM16 user [linear, code].
     table: Box<[[u32; 2]]>,
     /// Table indices filled since the last clear.
     filled: Vec<u16>,
-    /// Per table slot: the block's linear page, bit 0 for a global
-    /// translation, and its CodePages version cell.
-    pages: Box<[(u32, *const u64)]>,
+    filled16: Vec<u16>,
+    pages: Box<[PageSlot]>,
+    /// Intrusive lists of active slots, indexed by backing RAM page. All
+    /// three planes share these lists; slot reuse unlinks the previous page.
+    page_heads: Vec<u16>,
     context: Option<Context>,
+    global: u64,
     mapping: u64,
     code: u64,
     pub stats: Stats,
@@ -486,6 +536,7 @@ struct Native {
     instructions: u32,
     /// CodePages version cell of its page.
     version: *const u64,
+    ram_page: usize,
 }
 
 enum Lookup {
@@ -523,13 +574,18 @@ impl Engine {
             arena,
             entry: base | 1,
             dispatch: (base + shared.dispatch * 2) | 1,
+            entry16: (base + shared.entry16 * 2) | 1,
+            dispatch16: (base + shared.dispatch16 * 2) | 1,
             miss,
             store: Store::new(BLOCKS),
             heat: alloc::vec![(0, 0); HEAT].into_boxed_slice(),
-            table: alloc::vec![[0, miss]; 2 * PLANE].into_boxed_slice(),
+            table: alloc::vec![[0, miss]; 3 * PLANE].into_boxed_slice(),
             filled: Vec::new(),
-            pages: alloc::vec![(0, core::ptr::null()); 2 * PLANE].into_boxed_slice(),
+            filled16: Vec::new(),
+            pages: alloc::vec![PageSlot::EMPTY; 3 * PLANE].into_boxed_slice(),
+            page_heads: Vec::new(),
             context: None,
+            global: 0,
             mapping: 0,
             code: 0,
             stats: Stats::default(),
@@ -548,7 +604,7 @@ impl Engine {
         {
             self.profile.table_clears[TableCause::ArenaReset as usize] += 1;
         }
-        self.clear_table();
+        self.clear_table(true);
         self.arena.reset(self.shared_bytes);
         // No block can observe an old version after this point.
         bus.jit_release_code_pages();
@@ -556,15 +612,28 @@ impl Engine {
         Ok(())
     }
 
-    fn clear_table(&mut self) {
+    fn clear_table(&mut self, all: bool) {
         if self.filled.len() > PLANE / 8 {
-            self.table.fill([0, self.miss]);
+            self.table[..2 * PLANE].fill([0, self.miss]);
         } else {
             for &index in &self.filled {
                 self.table[usize::from(index)] = [0, self.miss];
             }
         }
+        for &slot in &self.filled {
+            let slot = usize::from(slot);
+            PageSlot::unlink(&mut self.pages, &mut self.page_heads, slot);
+            self.pages[slot] = PageSlot::EMPTY;
+        }
         self.filled.clear();
+        if all {
+            for index in self.filled16.drain(..) {
+                let slot = 2 * PLANE + usize::from(index);
+                self.table[slot] = [0, self.miss];
+                PageSlot::unlink(&mut self.pages, &mut self.page_heads, slot);
+                self.pages[slot] = PageSlot::EMPTY;
+            }
+        }
         self.stats.table_clears += 1;
     }
 
@@ -582,6 +651,13 @@ impl Engine {
                 self.profile.code16.report(&mut report);
             }
             self.profile.report(&mut report);
+            report += &format!(
+                "t32 profile pm16: native_steps={} ip_checks={} unchanged_page_rewatches={} arena_high_water_bytes={}\n",
+                self.profile.pm16_native_steps,
+                self.profile.ip_checks,
+                self.stats.revalidations,
+                self.arena.high_water_bytes(),
+            );
             let mut top: Vec<_> = (0..2048).filter(|&i| self.unsupported[i] != 0).collect();
             top.sort_by_key(|&i| core::cmp::Reverse(self.unsupported[i]));
             for i in top {
@@ -608,6 +684,9 @@ impl Engine {
     }
 
     fn facts(cpu: &Cpu) -> u32 {
+        if cpu.code_default16() {
+            return CODE16;
+        }
         let (flat, flat_write) = cpu.jit_segment_masks();
         let stack32 = if cpu.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG != 0 {
             STACK32_FACT
@@ -619,15 +698,49 @@ impl Engine {
 
     /// Remove the table entries that `retire` selects by page and version.
     fn retire_table(&mut self, retire: impl Fn(u32, *const u64) -> bool) {
-        let (table, pages, miss) = (&mut self.table, &self.pages, self.miss);
+        let (table, pages, heads, miss) = (
+            &mut self.table,
+            &mut self.pages,
+            &mut self.page_heads,
+            self.miss,
+        );
         self.filled.retain(|&slot| {
             let slot = usize::from(slot);
-            let keep = !retire(pages[slot].0, pages[slot].1);
+            let keep = !retire(pages[slot].linear, pages[slot].version);
             if !keep {
                 table[slot] = [0, miss];
+                PageSlot::unlink(pages, heads, slot);
+                pages[slot] = PageSlot::EMPTY;
             }
             keep
         });
+        self.filled16.retain(|&index| {
+            let slot = 2 * PLANE + usize::from(index);
+            let keep = !retire(pages[slot].linear, pages[slot].version);
+            if !keep {
+                table[slot] = [0, miss];
+                PageSlot::unlink(pages, heads, slot);
+                pages[slot] = PageSlot::EMPTY;
+            }
+            keep
+        });
+        self.stats.table_retirements += 1;
+    }
+
+    /// A single backing-page retirement visits only its active slots.
+    fn retire_code_page(&mut self, ram_page: usize, version: *const u64) {
+        let mut next = self
+            .page_heads
+            .get_mut(ram_page)
+            .map(|head| core::mem::replace(head, NO_SLOT))
+            .unwrap_or(NO_SLOT);
+        while next != NO_SLOT {
+            let slot = usize::from(next);
+            debug_assert_eq!(self.pages[slot].version, version);
+            next = self.pages[slot].next;
+            self.table[slot] = [0, self.miss];
+            self.pages[slot].ram_page = NO_PAGE;
+        }
         self.stats.table_retirements += 1;
     }
 
@@ -645,35 +758,45 @@ impl Engine {
         let observed = profile::CpuContext::capture(cpu, context.facts, context.global);
         let code = bus.jit_code_epoch();
         if code != self.code {
-            match bus.jit_single_retired_version(self.code) {
-                Some(version) => {
+            match bus.jit_single_retired_page(self.code) {
+                Some((ram_page, version)) => {
                     #[cfg(feature = "jit-profile")]
                     {
                         self.profile.table_retirements[TableCause::CodePage as usize] += 1;
                     }
-                    self.retire_table(|_, page| page == version)
+                    self.retire_code_page(ram_page, version)
                 }
                 None => {
                     #[cfg(feature = "jit-profile")]
                     {
                         self.profile.table_clears[TableCause::CodeEpoch as usize] += 1;
                     }
-                    self.clear_table()
+                    self.clear_table(true)
                 }
             }
             self.code = code;
         }
         let mapping = cpu.jit_mapping_epoch();
         let invalidated = cpu.take_jit_invalidated_range();
-        if self.context != Some(context) {
+        let global_changed = self.global != context.global;
+        let context_changed = !cpu.code_default16() && self.context != Some(context);
+        if global_changed || context_changed {
             #[cfg(feature = "jit-profile")]
             {
                 let cause = self.profile.context_cause(observed);
                 self.profile.table_clears[cause as usize] += 1;
             }
-            self.clear_table();
+            self.clear_table(global_changed);
+        }
+        if global_changed {
+            self.context = None;
+        }
+        if !cpu.code_default16() {
             self.context = Some(context);
-        } else {
+        }
+        self.global = context.global;
+        // PM16 may survive a PM32 context clear, but never a mapping change.
+        if !global_changed {
             if self.mapping != mapping {
                 #[cfg(feature = "jit-profile")]
                 {
@@ -781,6 +904,7 @@ impl Engine {
             address: record.address as usize,
             instructions: record.instructions,
             version: record.version_ptr,
+            ram_page: (bus.jit_ram_offset(hit.backing) >> 12) as usize,
         }))
     }
 
@@ -811,7 +935,11 @@ impl Engine {
             .min(WINDOW)
             .min((u32::MAX - cpu.eip) as usize + 1);
         let bytes = bus.jit_code_bytes(offset, window);
-        let decoded = decode::block_extended(bytes, cpu.eip, BLOCK_INSTRUCTIONS);
+        let decoded = if facts == CODE16 {
+            decode::block_code16(bytes, cpu.eip, BLOCK_INSTRUCTIONS)
+        } else {
+            decode::block_extended(bytes, cpu.eip, BLOCK_INSTRUCTIONS)
+        };
         let mut record = Record {
             eip: cpu.eip,
             facts,
@@ -857,22 +985,45 @@ impl Engine {
             address: address | 1,
             instructions: compiled.instructions,
             version: version_ptr,
+            ram_page: offset as usize >> 12,
         }))
     }
 
     /// Enter the validated block for the current EIP in the dispatch table;
     /// returns the first slot of its privilege plane.
     fn publish(&mut self, cpu: &Cpu, block: Native) -> usize {
-        let slot = usize::from(cpu.cpl() == 3) * PLANE + lower::table_slot(cpu.eip);
-        // A validated block may be reached from any chain in this context.
-        if self.table[slot][1] == self.miss {
-            self.filled.push(slot as u16);
-        }
-        self.table[slot] = [cpu.eip, block.address as u32];
         let linear = cpu.seg(SegmentReg::Cs).base.wrapping_add(cpu.eip);
+        let word = cpu.code_default16();
+        let tag = if word { linear } else { cpu.eip };
+        let plane = if word { 2 } else { usize::from(cpu.cpl() == 3) } * PLANE;
+        let index = lower::table_slot(tag);
+        let slot = plane + index;
+        if self.pages[slot].version.is_null() {
+            if word {
+                self.filled16.push(index as u16);
+            } else {
+                self.filled.push(slot as u16);
+            }
+        }
+        self.table[slot] = [tag, block.address as u32];
         // The fetch-cache entry found by the lookup is still current.
         let global = cpu.fetch_translation_is_global(LinearAddr(linear));
-        self.pages[slot] = (linear & !4095 | u32::from(global), block.version);
+        if self.pages[slot].ram_page != block.ram_page as u32 {
+            PageSlot::unlink(&mut self.pages, &mut self.page_heads, slot);
+            if self.page_heads.len() <= block.ram_page {
+                self.page_heads.resize(block.ram_page + 1, NO_SLOT);
+            }
+            let first = self.page_heads[block.ram_page];
+            if first != NO_SLOT {
+                self.pages[usize::from(first)].previous = slot as u16;
+            }
+            self.page_heads[block.ram_page] = slot as u16;
+            self.pages[slot].previous = NO_SLOT;
+            self.pages[slot].next = first;
+            self.pages[slot].ram_page = block.ram_page as u32;
+        }
+        self.pages[slot].linear = linear & !4095 | u32::from(global);
+        self.pages[slot].version = block.version;
         slot & !(PLANE - 1)
     }
 
@@ -898,6 +1049,9 @@ impl Engine {
             return None;
         }
         let plane = self.publish(cpu, block);
+        let word = cpu.code_default16();
+        let entry = if word { self.entry16 } else { self.entry };
+        let dispatch = if word { self.dispatch16 } else { self.dispatch };
         cpu.begin_instruction();
         cpu.segment_override = None;
         let budget = limit.min(u64::from(u32::MAX)) as u32;
@@ -906,7 +1060,7 @@ impl Engine {
             eip: cpu.eip,
             remaining: budget,
             table: self.table[plane..].as_ptr() as usize as u32,
-            dispatch: self.dispatch as u32,
+            dispatch: dispatch as u32,
             popf_mask: crate::x86::interp::popfd_change_mask(cpu).unwrap_or(0),
             quiet: u32::from(bus.batch_interrupts_quiet()),
             selectors: [
@@ -951,7 +1105,7 @@ impl Engine {
             // exclude watched code, and the translation cache is not modified
             // during the call.
             unsafe {
-                let entry: Invoke = core::mem::transmute(self.entry);
+                let entry: Invoke = core::mem::transmute(entry);
                 entry(&mut frame, address);
             }
             self.stats.invocations += 1;
@@ -998,6 +1152,11 @@ impl Engine {
             }
         }
         let executed = u64::from(budget - frame.remaining);
+        #[cfg(feature = "jit-profile")]
+        if word {
+            self.profile.ip_checks += u64::from(frame.ip_checks);
+            self.profile.pm16_native_steps += executed;
+        }
         cpu.regs = frame.regs;
         cpu.eip = frame.eip;
         cpu.jit_commit_flags(frame.eflags());
@@ -1039,8 +1198,13 @@ impl Engine {
             let shadowed = cpu.interrupt_shadow();
             let eligible = !shadowed
                 && !cpu.halted
-                && !cpu.code_default16()
-                && cpu.seg(SegmentReg::Cs).limit == u32::MAX
+                && if cpu.code_default16() {
+                    cpu.cr0 & CR0_PE != 0
+                        && cpu.cpl() == 3
+                        && cpu.seg(SegmentReg::Ss).flags & SEGMENT_FLAG_DEFAULT_BIG == 0
+                } else {
+                    cpu.seg(SegmentReg::Cs).limit == u32::MAX
+                }
                 && cpu.eflags & (TF | VM) == 0;
             #[cfg(feature = "jit-profile")]
             if !eligible {
@@ -1209,7 +1373,7 @@ fn profile_memory(bytes: &[u8], decoded: &decode::Block, facts: u32) -> u8 {
         })
         .count();
     let prefixes = &bytes[..prefix_len];
-    let address16 = prefixes.contains(&0x67);
+    let address16 = (facts == CODE16) != prefixes.contains(&0x67);
     let operand = decoded
         .instructions
         .first()
@@ -1323,5 +1487,100 @@ fn profile_name(key: u16) -> String {
         format!("{prefix}0f {:02x}", key & 0xff)
     } else {
         format!("{prefix}{key:02x}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::x86::cpu::SegmentCache;
+
+    fn publish(engine: &mut Engine, versions: &[u64], page: usize, plane: usize, ip: u32) -> usize {
+        let mut cpu = Cpu::new();
+        cpu.enter_protected_flat(ip, 0);
+        let (selector, flags) = match plane {
+            0 => (8, 0xc09b),
+            1 => (0xb, 0xc0fb),
+            _ => (0xb, 0xfb),
+        };
+        cpu.set_seg_cache(
+            SegmentReg::Cs,
+            SegmentCache::new(selector, 0, u32::MAX, flags),
+        );
+        engine.publish(
+            &cpu,
+            Native {
+                address: 0x1001 + 32 * page,
+                instructions: 1,
+                version: &versions[page],
+                ram_page: page,
+            },
+        ) + lower::table_slot(ip)
+    }
+
+    #[test]
+    fn page_retirement_covers_all_planes_and_preserves_other_pages() {
+        let versions = [1, 1];
+        let mut engine = Engine::with_capacity(65536).unwrap();
+        let mut retired = Vec::new();
+        for plane in 0..3 {
+            for ip in [0x100, 0x120] {
+                retired.push(publish(&mut engine, &versions, 0, plane, ip));
+            }
+        }
+        let other = publish(&mut engine, &versions, 1, 2, 0x140);
+        let kept = engine.table[other];
+        for _ in 0..32 {
+            engine.retire_code_page(0, &versions[0]);
+            for &slot in &retired {
+                assert_eq!(engine.table[slot][1], engine.miss);
+            }
+            assert_eq!(engine.table[other], kept);
+            for plane in 0..3 {
+                for ip in [0x100, 0x120] {
+                    publish(&mut engine, &versions, 0, plane, ip);
+                }
+            }
+        }
+        // Page retirement can empty slots many times between context clears.
+        // Republishing must not grow the filled-index allocation without bound.
+        assert_eq!(
+            engine.filled.len() + engine.filled16.len(),
+            retired.len() + 1
+        );
+        engine.clear_table(false);
+        assert_eq!(engine.table[other], kept);
+        engine.retire_code_page(0, &versions[0]);
+        for slot in retired {
+            assert_eq!(engine.table[slot][1], engine.miss);
+        }
+        assert_eq!(engine.table[other], kept);
+    }
+
+    #[test]
+    fn reused_slots_and_bulk_retirement_keep_page_lists_sound() {
+        let versions = [1, 1, 1];
+        let mut engine = Engine::with_capacity(65536).unwrap();
+        let reused = publish(&mut engine, &versions, 0, 2, 0x100);
+        let old_page = publish(&mut engine, &versions, 0, 1, 0x120);
+        assert_eq!(publish(&mut engine, &versions, 1, 2, 0x100), reused);
+        let kept = engine.table[reused];
+        engine.retire_code_page(0, &versions[0]);
+        assert_eq!(engine.table[reused], kept);
+        assert_eq!(engine.table[old_page][1], engine.miss);
+        let separate = publish(&mut engine, &versions, 2, 0, 0x1100);
+        let separate_code = engine.table[separate];
+        // The mapping-invalidation scan still unlinks every selected slot.
+        engine.retire_table(|linear, _| linear & !4095 == 0);
+        assert_eq!(engine.table[reused][1], engine.miss);
+        assert_eq!(engine.table[separate], separate_code);
+        engine.retire_code_page(1, &versions[1]);
+        assert_eq!(engine.table[separate], separate_code);
+        engine.clear_table(true); // Multi-page/global fallback.
+        publish(&mut engine, &versions, 0, 2, 0x100);
+        engine.retire_code_page(2, &versions[2]);
+        assert_ne!(engine.table[reused][1], engine.miss);
+        engine.retire_code_page(0, &versions[0]);
+        assert_eq!(engine.table[reused][1], engine.miss);
     }
 }
